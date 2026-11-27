@@ -8,7 +8,11 @@ import {
   GeminiOperationError,
   type GeminiInventory,
 } from './gemini-environments'
-import { geminiProxyAddress, geminiProxyOptionLabel } from './gemini-operations'
+import {
+  geminiProxyAddress,
+  geminiProxyOptionLabel,
+  isGeminiProxy,
+} from './gemini-operations'
 import { GeminiProxyPanel } from './gemini-proxy-panel'
 
 vi.mock('@tanstack/react-router', () => ({
@@ -561,4 +565,61 @@ test('Gemini import selector and proxy panel render proxy IP and exit IP for unl
   expect(proxyPanelHtml).toContain('45.67.89.10:1080')
   expect(proxyPanelHtml).toContain('出口 IP')
   expect(proxyPanelHtml).toContain('203.0.113.45')
+})
+
+test('isGeminiProxy accepts HTTP and domain proxies while rejecting local and IPv6', () => {
+  expect(
+    isGeminiProxy({
+      id: 'px-socks4',
+      enabled: true,
+      kind: 'socks5',
+      address_family: 4,
+      status: 'ok',
+    })
+  ).toBe(true)
+  expect(
+    isGeminiProxy({
+      id: 'px-http',
+      enabled: true,
+      kind: 'http',
+      address_family: 4,
+      status: 'ok',
+    })
+  ).toBe(true)
+  expect(
+    isGeminiProxy({
+      id: 'px-domain',
+      enabled: true,
+      kind: 'socks5',
+      address_family: null,
+      status: 'ok',
+    })
+  ).toBe(true)
+  expect(
+    isGeminiProxy({
+      id: 'px-v6',
+      enabled: true,
+      kind: 'socks5',
+      address_family: 6,
+      status: 'ok',
+    })
+  ).toBe(false)
+  expect(
+    isGeminiProxy({
+      id: 'px-local',
+      enabled: true,
+      kind: 'local',
+      address_family: null,
+      status: 'ok',
+    })
+  ).toBe(false)
+  expect(
+    isGeminiProxy({
+      id: 'px-fail',
+      enabled: true,
+      kind: 'http',
+      address_family: 4,
+      status: 'fail',
+    })
+  ).toBe(false)
 })

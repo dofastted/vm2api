@@ -1,4 +1,5 @@
 import type { GeminiEnvironment } from '@/features/import/gemini-environments'
+import type { PoolBriefRef } from './panel-pools'
 import type { WindowEstimate } from './panel-pricing'
 
 /**
@@ -82,12 +83,12 @@ export type VmCodexCredits = {
 
 export type CragLicenseStatus = {
   status:
-  | 'unlicensed'
-  | 'valid'
-  | 'expired'
-  | 'not_yet_valid'
-  | 'invalid'
-  | 'unconfigured'
+    | 'unlicensed'
+    | 'valid'
+    | 'expired'
+    | 'not_yet_valid'
+    | 'invalid'
+    | 'unconfigured'
   valid: boolean
   vm_id: string
   /** offline: CRAGU1 universal code. online: device-bound CRAGL1. */
@@ -114,13 +115,13 @@ export type CragLicenseResponse = {
 export type VmTelemetryState = {
   enabled: boolean
   state:
-  | 'disabled'
-  | 'idle'
-  | 'waiting_credentials'
-  | 'waiting_egress'
-  | 'uploading'
-  | 'error'
-  | 'unsupported'
+    | 'disabled'
+    | 'idle'
+    | 'waiting_credentials'
+    | 'waiting_egress'
+    | 'uploading'
+    | 'error'
+    | 'unsupported'
   pending_events: number
   last_upload_at: string | null
   last_error: string | null
@@ -396,11 +397,11 @@ export type Vm = {
   /** Mutable stored quota state: official windows may be reconciled from headers. */
   quota_observations?: {
     official:
-    | ({ updated_at: string | null } & Record<
-      '5h' | '7d',
-      QuotaObservation | null
-    >)
-    | null
+      | ({ updated_at: string | null } & Record<
+          '5h' | '7d',
+          QuotaObservation | null
+        >)
+      | null
     passive: Record<'5h' | '7d', QuotaObservation | null>
   } | null
   utilization_5h?: number | null
@@ -538,18 +539,20 @@ export type Vm = {
   quota_inherited?: VmQuotaView | null
   /** OpenAI 的生效额度与限制原因；不包含 Claude 分档/weekly split。 */
   openai_quota_policy?:
-  | (OpenAIQuotaPolicy & {
-    reason: string | null
-    restricted_until: number | null
-    concurrency_override: boolean
-    rpm_override: boolean
-    sessions_override: boolean
-  })
-  | null
+    | (OpenAIQuotaPolicy & {
+        reason: string | null
+        restricted_until: number | null
+        concurrency_override: boolean
+        rpm_override: boolean
+        sessions_override: boolean
+      })
+    | null
   /** 当前有效调度等级；自动模式范围 1～7，手动模式范围 1～10。 */
   schedule_level?: number
   /** 调度等级来源；缺失时按自动模式展示。 */
   schedule_level_mode?: 'auto' | 'manual'
+  /** 所属统一分组池列表（前端聚合或后端附带）。 */
+  pools?: PoolBriefRef[]
   /** 本槽工作时段；null / 缺省 = 24h 接单。窗口外不参与调度。 */
   active_hours?: VmActiveHours | null
   /** 工作时段实际使用的时区（自身钉住 → 槽位时区 → UTC）。 */
@@ -788,16 +791,16 @@ export type VmDetailPayload = {
   proxy?: VmProxySnap | null
   account?: Record<string, unknown> | null
   billing?:
-  | (Record<string, unknown> & {
-    by_model?: VmBillingModelRow[]
-    usage_stats?: VmUsageStats | null
-    window_5h?: VmBillingPeriod | null
-    window_7d?: VmBillingPeriod | null
-    prev_window_5h?: VmClosedWindow | null
-    prev_window_7d?: VmClosedWindow | null
-    window_5h_projection?: VmWindowProjection | null
-  })
-  | null
+    | (Record<string, unknown> & {
+        by_model?: VmBillingModelRow[]
+        usage_stats?: VmUsageStats | null
+        window_5h?: VmBillingPeriod | null
+        window_7d?: VmBillingPeriod | null
+        prev_window_5h?: VmClosedWindow | null
+        prev_window_7d?: VmClosedWindow | null
+        window_5h_projection?: VmWindowProjection | null
+      })
+    | null
   [key: string]: unknown
 }
 

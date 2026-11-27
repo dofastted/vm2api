@@ -516,4 +516,86 @@ with tempfile.TemporaryDirectory(prefix="gemini-resident-") as temporary:
         fake_handler.send_json_error.assert_called_once_with(502, "gemini_inference_failed")
         bad_conn.close.assert_called_once()
 
+        # 16. proxy_config accepts HTTP + domain proxies while rejecting localhost/loopback/IPv6/numeric-TLD.
+        assert impl.proxy_config("http://user:pw@192.0.2.20:8080") == ("192.0.2.20", "8080")
+        assert impl.proxy_config("http://proxy.example.com") == ("proxy.example.com", "80")
+        assert impl.proxy_config("socks5://proxy.example.com:1080") == ("proxy.example.com", "1080")
+        assert impl.proxy_config("socks5h://u:p@sub.proxy-1.example.com:1080") == (
+            "sub.proxy-1.example.com",
+            "1080",
+        )
+        for bad_proxy in (
+            "http://localhost:8080",
+            "socks5h://foo.localhost:1080",
+            "http://127.0.0.1:8080",
+            "socks5h://169.254.1.1:1080",
+            "socks5h://[2001:db8::1]:1080",
+            "http://2130706433:8080",
+            "https://proxy.example.com:443",
+        ):
+            try:
+                impl.proxy_config(bad_proxy)
+                raise AssertionError(f"expected Failure for {bad_proxy}")
+            except impl.Failure as err:
+                assert err.status == 400
+
+        # 17. acquire_slot_network writes egress_options (domain_forward/dns_empty_types/dns_upstream)
+        #     into egress.json and recycles the lease when egress_options change.
+        egress_cfgs = []
+
+        def fake_start_net_opts(lease_dir, network):
+            egress_cfgs.append(json.loads((lease_dir / "egress.json").read_text()))
+            r_fd, w_fd = os.pipe()
+            os.close(w_fd)
+            return r_fd
+
+        relay_a, egress_a = Mock(), Mock()
+        relay_a.poll.return_value = None
+        egress_a.poll.return_value = None
+        relay_b, egress_b = Mock(), Mock()
+        relay_b.poll.return_value = None
+        egress_b.poll.return_value = None
+        opts_a = {
+            "domain_forward": True,
+            "dns_empty_types": [64, 65],
+            "dns_upstream": "https://8.8.8.8/dns-query",
+        }
+        opts_b = {"domain_forward": False, "dns_empty_types": [64, 65]}
+        with (
+            patch.object(host, "start_network", side_effect=fake_start_net_opts),
+            patch.object(host, "stop_network"),
+            patch.object(impl, "host_tcp_listening", return_value=True),
+            patch.object(impl.os, "chown"),
+            patch.object(impl.subprocess, "run", return_value=SimpleNamespace(returncode=0)),
+            patch.object(
+                impl.subprocess, "Popen", side_effect=[relay_a, egress_a, relay_b, egress_b]
+            ),
+        ):
+            env_dir = directory / ENV_ID
+            net = ["1", "2016", "proxy.example.com", "8080"]
+            http_proxy = "http://u:p@proxy.example.com:8080"
+            http_hash = hashlib.sha256(http_proxy.encode()).digest()
+            l1 = host.acquire_slot_network(
+                1, env_dir, net, "px-http", http_proxy, http_hash, lambda u: ["true"], egress_options=opts_a
+            )
+            assert egress_cfgs[0]["domain_forward"] is True
+            assert egress_cfgs[0]["dns_empty_types"] == [64, 65]
+            assert egress_cfgs[0]["dns_upstream"] == "https://8.8.8.8/dns-query"
+            assert egress_cfgs[0]["proxy_url"].startswith("http://u:p@198.18.252.5:")
+            # Matching egress_options reuses existing lease.
+            l1_reuse = host.acquire_slot_network(
+                1, env_dir, net, "px-http", http_proxy, http_hash, lambda u: ["true"], egress_options=opts_a
+            )
+            assert l1_reuse is l1
+            host.release_slot_network(1, l1_reuse)
+            host.release_slot_network(1, l1)
+            # Different egress_options creates fresh lease with updated egress.json.
+            l2 = host.acquire_slot_network(
+                1, env_dir, net, "px-http", http_proxy, http_hash, lambda u: ["true"], egress_options=opts_b
+            )
+            assert l2 is not l1
+            assert "domain_forward" not in egress_cfgs[1]
+            assert egress_cfgs[1]["dns_empty_types"] == [64, 65]
+            host.release_slot_network(1, l2)
+
 print("gemini-host-resident: ALL PASS")

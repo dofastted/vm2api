@@ -5,7 +5,9 @@ import path from 'node:path'
 import { filterModelCatalogForKey, keyModelError } from '../admin/key-models.mjs'
 import { formatHealthSse, synthesizeProtocolResponse } from '../admin/health-probe.mjs'
 import { summarizeBody } from '../admin/request-log.mjs'
-import { keyTierPolicyFromRecord } from '../admin/key-scope.mjs'
+import { filterModelsForPoolAccess, keyTierPolicyFromRecord, resolvePoolAccessForKey } from '../admin/key-scope.mjs'
+import { isDbOpen } from '../db/database.mjs'
+import { requestedPoolIdFromHeaders } from '../protocol/pool-prompt-policy.mjs'
 import { PLATFORM_SCOPE, normalizeOwnerId, ownerScopeFromRequest } from '../admin/resource-owner.mjs'
 import {
   buildGeminiRequest,
@@ -35,7 +37,14 @@ import { isGeminiProtocolAllowed } from './routing-config.mjs'
 import { GEMINI_LICENSE_MESSAGES } from './subscription.mjs'
 import { createGeminiSlotPrefs, parseGeminiDisplayName, parseGeminiScheduleLevel } from './slot-prefs.mjs'
 import { resolveCragGeminiPromptPolicy } from './system-prompt.mjs'
+import { configuredDnsUpstream, proxyDnsEmptyTypes } from '../vm/egress.mjs'
 import { compileWithProtoFront, protoFrontMode } from '../transport/proto-front-client.mjs'
+import {
+  clientBlockErrorOf,
+  isTrustedGateDecision,
+  resolveRiskRepos,
+  runUnifiedPreDispatch,
+} from '../protocol/unified-pre-dispatch.mjs'
 
 const PANEL_PATH = '/api/panel/gemini'
 const PUBLIC_PATH = '/v1/gemini/sessions'
@@ -82,7 +91,7 @@ const RUN_ERRORS = {
   ],
   gemini_proxy_error: [
     502,
-    '无法通过绑定代理连接 Google 上游，请在「代理」页探活检查 SOCKS5 节点连通性与出口质量，或更换代理后重试',
+    '无法通过绑定代理连接 Google 上游，请在「代理」页探活检查代理节点连通性与出口质量，或更换代理后重试',
   ],
   gemini_model_unavailable: [409, '上游不支持或未开放所选模型（404），请先点击「拉取模型」刷新最新模型目录后再试'],
   gemini_models_empty: [502, '上游未返回可调用模型，请检查账号资格与代理连通性，或重新完成授权后再拉取'],
@@ -229,6 +238,10 @@ const HOST_ERRORS = {
   gemini_terminal_limit: [429, '终端会话或连接票据已达上限，请关闭现有终端或稍后重试'],
   gemini_oauth_import_invalid: [400, 'Google 账号文件中的凭据格式无效'],
   gemini_oauth_import_rejected: [400, 'Google 凭据已过期或未获授权，请导出新文件或进行 Google 授权'],
+  gemini_oauth_client_not_configured: [
+    503,
+    '宿主机未配置可用的 Google OAuth 客户端凭据，请检查 /etc/vm2api/gemini-oauth.env 或重新安装 Gemini 签名载荷',
+  ],
   gemini_test_oauth_unsupported: [503, '当前签名载荷不支持 Google OAuth 推理测试'],
   gemini_test_auth_required: [409, '请先为 Gemini 环境完成授权'],
   gemini_test_invalid_input: [400, '请选择此环境的 Gemini 模型并输入有效的测试内容'],
@@ -331,6 +344,10 @@ export function geminiProxyFor(proxyPool, proxyId, opts) {
   return proxyFor(proxyPool, proxyId, opts)
 }
 
+export function geminiProxyEgressOptionsFor(proxyPool, proxyId, opts) {
+  return proxyEgressOptionsFor(proxyPool, proxyId, opts)
+}
+
 const AUTH_STAGE_MESSAGES = {
   network_prepare: 'Gemini 宿主服务在线，但隔离网络初始化失败，请检查宿主服务日志与 ip/nft/iptables 环境',
   relay_start: 'Gemini 宿主服务在线，但宿主侧代理中继未能启动，请检查宿主服务日志',
@@ -430,7 +447,7 @@ function hostRequest(socketPath, operation, payload) {
 }
 
 function redactProxyAuth(value) {
-  return value.replace(/socks5h?:\/\/[^\s/?#<>"`]*@[^\s<>"`]*/gi, '[redacted proxy URL]')
+  return value.replace(/(?:socks5h?|https?):\/\/[^\s/?#<>"`]*@[^\s<>"`]*/gi, '[redacted proxy URL]')
 }
 
 function text(value, size = 128) {
@@ -819,8 +836,30 @@ function authorizationInput(body) {
   }
 }
 
-function proxyFor(proxyPool, proxyId, { allowUnhealthy = false, forBinding = false, ownerUserId = null } = {}) {
-  if (!validId(proxyId)) throw hostError('gemini_proxy_unavailable', 409)
+function isAllowedProxyHost(hostname) {
+  if (typeof hostname !== 'string' || !hostname || hostname.length > 253) return false
+  const family = isIP(hostname)
+  if (family === 4) {
+    return !/^(?:127\.|169\.254\.|22[4-9]\.|23[0-9]\.|0\.0\.0\.0$|255\.255\.255\.255$)/.test(hostname)
+  }
+  if (family === 6) return false
+  const lower = hostname.toLowerCase()
+  if (
+    lower === 'localhost' ||
+    lower.endsWith('.localhost') ||
+    lower.endsWith('.localdomain') ||
+    lower.endsWith('.') ||
+    lower.includes('..')
+  ) {
+    return false
+  }
+  const labels = lower.split('.')
+  if (/^\d+$/.test(labels[labels.length - 1])) return false
+  return labels.every((label) => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label))
+}
+
+function proxyRecordFor(proxyPool, proxyId, ownerUserId = null) {
+  if (!validId(proxyId)) return null
   const targetOwner = normalizeOwnerId(ownerUserId)
   const scopedList = proxyPool?.snapshot({ ownerUserId: targetOwner || null })?.proxies || []
   let proxy = scopedList.find((entry) => entry.id === proxyId)
@@ -829,6 +868,34 @@ function proxyFor(proxyPool, proxyId, { allowUnhealthy = false, forBinding = fal
     const platformList = proxyPool?.snapshot({ ownerUserId: null })?.proxies || []
     proxy = platformList.find((entry) => entry.id === proxyId)
   }
+  return proxy || null
+}
+
+function proxyEgressOptionsFor(proxyPool, proxyId, { ownerUserId = null } = {}) {
+  if (!proxyPool || !validId(proxyId)) return null
+  const proxy = proxyRecordFor(proxyPool, proxyId, ownerUserId)
+  const withAuth = proxyPool.getProxyByIdWithAuth?.(proxyId) || null
+  const opts = {}
+  if (proxy?.domain_forward === true || withAuth?.domain_forward === true) {
+    opts.domain_forward = true
+  }
+  const emptyTypes = proxyDnsEmptyTypes(
+    withAuth?.dns_disable_svcb_https !== undefined ? withAuth : proxy,
+  )
+  if (emptyTypes.length) {
+    opts.dns_empty_types = emptyTypes
+  }
+  const dnsUpstream = configuredDnsUpstream()
+  if (dnsUpstream) {
+    opts.dns_upstream = dnsUpstream
+  }
+  return Object.keys(opts).length ? opts : null
+}
+
+function proxyFor(proxyPool, proxyId, { allowUnhealthy = false, forBinding = false, ownerUserId = null } = {}) {
+  if (!validId(proxyId)) throw hostError('gemini_proxy_unavailable', 409)
+  const targetOwner = normalizeOwnerId(ownerUserId)
+  const proxy = proxyRecordFor(proxyPool, proxyId, targetOwner)
   const pOwner = normalizeOwnerId(proxy?.owner_user_id)
   const ownerAllowed = targetOwner ? !pOwner || pOwner === targetOwner : !pOwner
   if (
@@ -846,15 +913,21 @@ function proxyFor(proxyPool, proxyId, { allowUnhealthy = false, forBinding = fal
   }
   try {
     const url = new URL(proxyPool.getProxyByIdWithAuth(proxyId)?.url)
+    const isSocks = url.protocol === 'socks5:' || url.protocol === 'socks5h:'
+    const isHttp = url.protocol === 'http:'
+    const port = url.port || (isHttp ? '80' : '')
     if (
-      (url.protocol === 'socks5:' || url.protocol === 'socks5h:') &&
-      isIP(url.hostname) === 4 &&
-      url.port &&
-      !/^(?:127\.|169\.254\.|22[4-9]\.|23[0-9]\.|0\.0\.0\.0$|255\.255\.255\.255$)/.test(url.hostname) &&
+      (isSocks || isHttp) &&
+      isAllowedProxyHost(url.hostname) &&
+      port &&
       (!url.pathname || url.pathname === '/') &&
       !url.hash &&
       !url.search
     ) {
+      if (isHttp) {
+        const auth = url.username || url.password ? `${url.username}${url.password ? `:${url.password}` : ''}@` : ''
+        return `http://${auth}${url.hostname}:${port}`
+      }
       return url.href.replace(/^socks5:/, 'socks5h:')
     }
   } catch {
@@ -868,7 +941,13 @@ async function readEnvironment(callHost, id) {
 }
 
 function boundProxy(proxyPool, environment, options) {
-  return { proxy_id: environment.proxy_id, proxy_url: proxyFor(proxyPool(), environment.proxy_id, options) }
+  const pool = proxyPool()
+  const egressOptions = proxyEgressOptionsFor(pool, environment.proxy_id, options)
+  return {
+    proxy_id: environment.proxy_id,
+    proxy_url: proxyFor(pool, environment.proxy_id, options),
+    ...(egressOptions ? { egress_options: egressOptions } : {}),
+  }
 }
 
 function hostStreamRequest(socketPath, operation, payload, { signal, timeoutMs = 300_000 } = {}) {
@@ -957,12 +1036,14 @@ export async function warmGeminiEnvironments({ callHost = callGeminiHost, proxyP
       continue
     }
     const proxySha256 = crypto.createHash('sha256').update(proxyUrl).digest('hex')
+    const egressOptions = proxyEgressOptionsFor(pool, env.proxy_id)
     try {
       const res = await callHost('warm', {
         id: env.id,
         proxy_id: env.proxy_id,
         proxy_url: proxyUrl,
         proxy_sha256: proxySha256,
+        ...(egressOptions ? { egress_options: egressOptions } : {}),
       })
       if (res?.runtime_ready === true || res?.warmed === true) report.warmed += 1
       else if (res?.warming === true) report.warming += 1
@@ -1097,10 +1178,12 @@ export async function checkGeminiAccounts({
       continue
     }
     try {
+      const egressOptions = proxyEgressOptionsFor(pool, env.proxy_id, { ownerUserId })
       const refreshed = await callHost('refresh', {
         id: env.id,
         proxy_id: env.proxy_id,
         proxy_url: proxyUrl,
+        ...(egressOptions ? { egress_options: egressOptions } : {}),
       })
       report.checked += 1
       const { changed } = reconcileGeminiAccountCheck(env.id, refreshed, {
@@ -1140,10 +1223,16 @@ export function createGeminiTerminal({ proxyPool, callHost = callGeminiHost }) {
       if (typeof environment.proxy_id !== 'string' || !ID.test(environment.proxy_id)) {
         throw hostError('gemini_proxy_unavailable', 409)
       }
-      return { proxy_id: environment.proxy_id, proxy_url: proxyFor(proxyPool(), environment.proxy_id) }
+      const pool = proxyPool()
+      const egressOptions = proxyEgressOptionsFor(pool, environment.proxy_id)
+      return {
+        proxy_id: environment.proxy_id,
+        proxy_url: proxyFor(pool, environment.proxy_id),
+        ...(egressOptions ? { egress_options: egressOptions } : {}),
+      }
     },
     errorMessage(code, stage) {
-      if (code === 'gemini_proxy_unavailable') return '需要绑定可用的 IPv4 SOCKS5 代理'
+      if (code === 'gemini_proxy_unavailable') return '需要绑定可用的 SOCKS5 / HTTP 代理'
       if (code === 'gemini_environment_not_found') return 'Gemini 环境不存在'
       if (code === 'gemini_environment_conflict') return 'Gemini 环境状态已变化，请刷新后重试'
       return (
@@ -1346,11 +1435,14 @@ export function createGeminiPanelHandler({
           return fail(400, 'gemini_oauth_import_invalid', HOST_ERRORS.gemini_oauth_import_invalid[1])
         }
         const ownerUserId = normalizeOwnerId(body?.owner_user_id)
-        const proxyUrl = proxyFor(proxyPool(), body.proxy_id, { ownerUserId, forBinding: true })
+        const pool = proxyPool()
+        const proxyUrl = proxyFor(pool, body.proxy_id, { ownerUserId, forBinding: true })
+        const egressOptions = proxyEgressOptionsFor(pool, body.proxy_id, { ownerUserId })
         let created = await callHost('create', {
           name,
           proxy_id: body.proxy_id,
           proxy_url: proxyUrl,
+          ...(egressOptions ? { egress_options: egressOptions } : {}),
           ...(maxConcurrency != null ? { max_concurrency: maxConcurrency } : {}),
           ...(method === 'api_key' ? { auth_method: method, api_key: apiKey } : {}),
           ...(normalizedImport != null && {
@@ -1626,8 +1718,16 @@ export function createGeminiPanelHandler({
       }
       if (req.method === 'POST' && action === 'refresh') {
         const environment = environmentView(await callHost('get', { id }))
-        const proxyUrl = proxyFor(proxyPool(), environment.proxy_id, { ownerUserId: envOwnerOf(id) })
-        let refreshed = await callHost('refresh', { id, proxy_id: environment.proxy_id, proxy_url: proxyUrl })
+        const pool = proxyPool()
+        const ownerUserId = envOwnerOf(id)
+        const proxyUrl = proxyFor(pool, environment.proxy_id, { ownerUserId })
+        const egressOptions = proxyEgressOptionsFor(pool, environment.proxy_id, { ownerUserId })
+        let refreshed = await callHost('refresh', {
+          id,
+          proxy_id: environment.proxy_id,
+          proxy_url: proxyUrl,
+          ...(egressOptions ? { egress_options: egressOptions } : {}),
+        })
         if (environment.auth_method === 'oauth' && cragSubscription?.ensureEnvironmentSeat) {
           const seat = await cragSubscription
             .ensureEnvironmentSeat(id, { env: refreshed })
@@ -1647,13 +1747,17 @@ export function createGeminiPanelHandler({
       if (action !== 'authorization') return fail(404, 'not_found')
       if (req.method === 'POST') {
         const environment = environmentView(await callHost('get', { id }))
-        const proxyUrl = proxyFor(proxyPool(), environment.proxy_id, { ownerUserId: envOwnerOf(id) })
+        const pool = proxyPool()
+        const ownerUserId = envOwnerOf(id)
+        const proxyUrl = proxyFor(pool, environment.proxy_id, { ownerUserId })
         const proxySha256 = crypto.createHash('sha256').update(proxyUrl).digest('hex')
+        const egressOptions = proxyEgressOptionsFor(pool, environment.proxy_id, { ownerUserId })
         const auth = await callHost('authorize', {
           id,
           proxy_id: environment.proxy_id,
           proxy_url: proxyUrl,
           proxy_sha256: proxySha256,
+          ...(egressOptions ? { egress_options: egressOptions } : {}),
         })
         const url = officialGeminiAuthUrl(auth?.url)
         if (!url || !ID.test(auth?.attempt_id ?? '')) throw hostError(FAILURE)
@@ -1666,13 +1770,17 @@ export function createGeminiPanelHandler({
           return fail(400, 'gemini_invalid_authorization_code', '请输入 Google 授权码或完整回调链接')
         }
         const environment = environmentView(await callHost('get', { id }))
-        const proxyUrl = proxyFor(proxyPool(), environment.proxy_id, { ownerUserId: envOwnerOf(id) })
+        const pool = proxyPool()
+        const ownerUserId = envOwnerOf(id)
+        const proxyUrl = proxyFor(pool, environment.proxy_id, { ownerUserId })
         const proxySha256 = crypto.createHash('sha256').update(proxyUrl).digest('hex')
+        const egressOptions = proxyEgressOptionsFor(pool, environment.proxy_id, { ownerUserId })
         let completed = await callHost('complete', {
           id,
           proxy_id: environment.proxy_id,
           proxy_url: proxyUrl,
           proxy_sha256: proxySha256,
+          ...(egressOptions ? { egress_options: egressOptions } : {}),
           attempt_id: body.attempt_id,
           ...authorization,
         })
@@ -1712,7 +1820,7 @@ export function createGeminiPanelHandler({
           error.code === 'gemini_authorization_unavailable' && stage ? AUTH_STAGE_MESSAGES[stage] : message
         return fail(status, error.code, resolvedMessage, stage ? { stage } : null)
       }
-      if (error?.code === 'gemini_proxy_unavailable') return fail(409, error.code, '需要绑定可用的 IPv4 SOCKS5 代理')
+      if (error?.code === 'gemini_proxy_unavailable') return fail(409, error.code, '需要绑定可用的 SOCKS5 / HTTP 代理')
       if (error?.code === 'gemini_environment_not_found') return fail(404, error.code, 'Gemini 环境不存在')
       if (error?.code === 'gemini_environment_conflict')
         return fail(409, error.code, 'Gemini 环境状态已变化，请刷新后重试')
@@ -2065,6 +2173,14 @@ export function createGeminiPublicHandler({
   apiKeyStore = null,
   getRoutingConfig = null,
   getHealthMonitor = null,
+  cfg = null,
+  settings = null,
+  refusalGuards = null,
+  refusalDevices = null,
+  refusalSessions = null,
+  preDispatch = null,
+  poolsRepo = null,
+  geminiOwnerMap = null,
 }) {
   const geminiScopeFromReq = (req) => {
     const rec = req?.apiKeyRecord || null
@@ -2084,10 +2200,58 @@ export function createGeminiPublicHandler({
           : null
     return { ownerScope, allowedEnvIds }
   }
+  const resolveGeminiPoolAccess = (req, { model = null, ownerScope = null, geminiEnvs = null } = {}) => {
+    const requestedPoolId = requestedPoolIdFromHeaders(req?.headers || {})
+    const rec = req?.apiKeyRecord || null
+    const explicitIntent =
+      Boolean(requestedPoolId) ||
+      rec?.pool_binding_mode === 'strict_pool' ||
+      Boolean(rec?.default_pool_id) ||
+      (Array.isArray(rec?.allowed_pool_ids) && rec.allowed_pool_ids.length > 0)
+    if (!poolsRepo && !isDbOpen() && !explicitIntent) {
+      return {
+        ok: true,
+        status: 200,
+        code: null,
+        mode: 'legacy_scope',
+        legacy: true,
+        isDowngraded: false,
+        originPool: null,
+        effectivePool: null,
+        allowedPoolIds: [],
+        allowedMembers: null,
+        allowedGeminiEnvIds: null,
+        allowedModels: [],
+      }
+    }
+    return resolvePoolAccessForKey({
+      key: rec,
+      apiKeyKind: req?.apiKeyKind || null,
+      requestedPoolId,
+      model,
+      poolsRepo: poolsRepo || null,
+      geminiEnvs,
+      geminiOwnerMap: typeof geminiOwnerMap === 'function' ? geminiOwnerMap() : geminiOwnerMap,
+      ownerScope,
+    })
+  }
+  const narrowGeminiScope = (scope, poolAccess) => {
+    if (!poolAccess || poolAccess.legacy) return scope
+    const poolEnvIds = Array.isArray(poolAccess.allowedGeminiEnvIds) ? poolAccess.allowedGeminiEnvIds : []
+    const allowedEnvIds = Array.isArray(scope.allowedEnvIds)
+      ? scope.allowedEnvIds.filter((id) => poolEnvIds.includes(id))
+      : [...poolEnvIds]
+    return { ...scope, allowedEnvIds }
+  }
   return async function handleGeminiPublic(
     req,
     res,
-    { logBag: externalLogBag = null, logCtx: externalLogCtx = null, catalogSnapshot = null } = {},
+    {
+      logBag: externalLogBag = null,
+      logCtx: externalLogCtx = null,
+      catalogSnapshot = null,
+      preDispatchDecision = null,
+    } = {},
   ) {
     res.setHeader('Cache-Control', 'no-store')
     const keyGroupType = req.apiKeyKind === 'managed' ? req.apiKeyRecord?.group_type || 'all' : null
@@ -2100,7 +2264,7 @@ export function createGeminiPublicHandler({
         },
       })
     }
-    const geminiScope = geminiScopeFromReq(req)
+    const baseGeminiScope = geminiScopeFromReq(req)
     const url = new URL(req.url || PUBLIC_PATH, 'http://127.0.0.1')
     const googleModels = url.pathname === '/v1beta/models'
     const singleModelGet = req.method === 'GET' ? parseGeminiModelGetPath(url.pathname) : null
@@ -2108,10 +2272,30 @@ export function createGeminiPublicHandler({
       req.method === 'GET' &&
       ([PUBLIC_PATH, '/v1/models', '/models', '/v1beta/models'].includes(url.pathname) || singleModelGet)
     ) {
+      const modelsPoolAccess = resolveGeminiPoolAccess(req, { ownerScope: baseGeminiScope.ownerScope })
+      if (!modelsPoolAccess.ok) {
+        const status = modelsPoolAccess.status || 403
+        const code = modelsPoolAccess.code || 'pool_unavailable'
+        const message = modelsPoolAccess.message || '分组池不可用'
+        return json(
+          res,
+          status,
+          protocolErrorBody(
+            googleModels || singleModelGet?.version === 'v1beta' ? 'gemini' : 'openai-chat',
+            status,
+            code,
+            message,
+          ),
+        )
+      }
+      const effectiveModelScope = narrowGeminiScope(baseGeminiScope, modelsPoolAccess)
       try {
-        const catalog = await scheduler.catalog(geminiScope)
+        const catalog = await scheduler.catalog(effectiveModelScope)
+        const poolFilteredList = filterModelsForPoolAccess(publicModels(catalog, req), modelsPoolAccess, {
+          geminiEnvs: Array.isArray(catalog?.accounts) ? catalog.accounts : null,
+        })
         if (singleModelGet) {
-          const hit = findCatalogModel(publicModels(catalog, req).data, singleModelGet.model)
+          const hit = findCatalogModel(poolFilteredList.data, singleModelGet.model)
           if (!hit) {
             return json(
               res,
@@ -2126,7 +2310,7 @@ export function createGeminiPublicHandler({
           }
           return json(res, 200, singleModelGet.version === 'v1beta' ? googleModelEntry(hit) : hit)
         }
-        return json(res, 200, googleModels ? googleModelList(catalog, req) : publicModels(catalog, req))
+        return json(res, 200, googleModels ? formatGoogleModelList(poolFilteredList.data) : poolFilteredList)
       } catch (error) {
         const mapped = publicError(error)
         return json(
@@ -2374,6 +2558,96 @@ export function createGeminiPublicHandler({
         denied.status,
         protocolErrorBody(protocol, denied.status, denied.body.error.code, denied.body.error.message),
       )
+    }
+
+    // Fail-Closed pool authorization BEFORE JEV and BEFORE Gemini slot admission.
+    // Google/Gemini pools never inject Anthropic System Prompt policies.
+    const ownGeminiOwnerMap = typeof geminiOwnerMap === 'function' ? geminiOwnerMap() : geminiOwnerMap
+    const hasCatalogAccounts = Array.isArray(catalogSnapshot?.accounts)
+    const canReusePoolAccess =
+      Boolean(req._poolAccess) &&
+      (!ownGeminiOwnerMap || req._poolAccess._geminiOwnerMapChecked === true) &&
+      (!hasCatalogAccounts || req._poolAccess._geminiEnvsChecked === true)
+    const poolAccess = canReusePoolAccess
+      ? req._poolAccess
+      : resolveGeminiPoolAccess(req, {
+          model: targetModel,
+          ownerScope: baseGeminiScope.ownerScope,
+          geminiEnvs: hasCatalogAccounts ? catalogSnapshot.accounts : null,
+        })
+    if (!poolAccess.ok) {
+      const status = poolAccess.status || 403
+      const code = poolAccess.code || 'pool_unavailable'
+      const message = poolAccess.message || '分组池不可用'
+      logBag.error_code = code
+      logBag.error_message = message
+      logBag.final_state = 'policy_blocked'
+      logBag.attempt_count = 0
+      return respondJson(status, protocolErrorBody(protocol, status, code, message))
+    }
+    if (poolAccess.effectivePool?.id) {
+      logBag.resolved_pool_id = poolAccess.effectivePool.id
+    }
+    const geminiScope = narrowGeminiScope(baseGeminiScope, poolAccess)
+
+    // Bypasses #1-#4 closed: every public Gemini inference call must clear the
+    // unified pre-dispatch JEV gate BEFORE any Gemini account/slot reservation.
+    const existingDecision = preDispatchDecision || req._preDispatchDecision || null
+    let gateDecision = isTrustedGateDecision(existingDecision) ? existingDecision : null
+    if (!gateDecision) {
+      const riskState = resolveRiskRepos({ settings, refusalGuards, refusalDevices, refusalSessions })
+      const preDispatchInput = {
+        req,
+        inbound: body,
+        body:
+          body && typeof body === 'object' && !Array.isArray(body) && targetModel && !body.model
+            ? { ...body, model: targetModel }
+            : body,
+        headers: req.headers,
+        distillRules: cfg?.distill,
+        policy: riskState.policy,
+        settings,
+        repo: riskState.repo,
+        devices: riskState.devices,
+        sessions: riskState.sessions,
+        requestId: activeLogCtx?.request_id || '',
+        poolJevProfile:
+          poolAccess.effectivePool?.jev_profile || req.poolJevProfile || req.apiKeyRecord?.jev_profile || null,
+        zeroInject: false,
+        channel: 'gemini',
+        enforceHardAndJev: true,
+        backend: 'oauth',
+        openaiPlatform: false,
+      }
+      gateDecision =
+        typeof preDispatch === 'function'
+          ? await preDispatch(preDispatchInput)
+          : await runUnifiedPreDispatch(preDispatchInput)
+    }
+    if (gateDecision?.action === 'block') {
+      logBag.via = gateDecision.via || 'jev'
+      logBag.attempt_count = 0
+      logBag.final_state = gateDecision.final_state || 'policy_blocked'
+      logBag.error_code = gateDecision.error_code || 'policy_blocked'
+      logBag.error_message = gateDecision.message || '请求被协议拦截'
+      if (gateDecision.error_details) {
+        logBag.error_details = { ...(logBag.error_details || {}), ...gateDecision.error_details }
+      }
+      logBag.intercept = gateDecision.intercept || null
+      logBag.jev_state = gateDecision.jev_state || null
+      const retryAfter = gateDecision.retry_after_sec || gateDecision.error?.retryAfterSec
+      if (retryAfter) res.setHeader?.('Retry-After', String(retryAfter))
+      const clientErr = clientBlockErrorOf(gateDecision)
+      return respondJson(
+        clientErr.status,
+        protocolErrorBody(protocol, clientErr.status, clientErr.code, clientErr.message, clientErr.details),
+      )
+    }
+    if (gateDecision?.intercept && !logBag.intercept) logBag.intercept = gateDecision.intercept
+    if (gateDecision?.jev_passed) {
+      logBag._jevPassed = true
+      if (gateDecision.jev_state) logBag._jevPassState = gateDecision.jev_state
+      if (gateDecision.scores) logBag._jevPassScores = gateDecision.scores
     }
 
     const healthMonitor = typeof getHealthMonitor === 'function' ? getHealthMonitor() : null

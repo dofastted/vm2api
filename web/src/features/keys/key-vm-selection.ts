@@ -14,6 +14,9 @@ export function keyVmSelection(
   vms: Vm[],
   inventoryReady: boolean
 ) {
+  if (draft.pool_binding_mode === 'strict_pool') {
+    return { draft, removed: [] as string[], blocked: false }
+  }
   const allowTenantEmpty =
     draft.permission_tier === 'tenant' &&
     Boolean(String(draft.owner_id || '').trim())

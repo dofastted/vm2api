@@ -5,6 +5,7 @@ import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 import {
+  AGY_PATCHED_SHA256,
   AGY_SHA256,
   CRAG_GEMINI_PRODUCT,
   installGeminiPayload,
@@ -183,6 +184,14 @@ test('CRAG encrypted craggemini payload verification rejects tampering, wrong is
   assert.equal(extracted.product, CRAG_GEMINI_PRODUCT)
   assert.equal(extracted.issuerId, authority.issuerId)
   assert.equal(extracted.payloadKeyId, authority.payloadKeyId)
+
+  // Seed with matching AGY_PATCHED_SHA256 pin -> also accepted as pinned agy 1.5.9 eligibility build.
+  const patchedRoot = path.join(root, 'patched-ok')
+  const { dir: patchedDir } = seedCragGeminiPayloadDir(patchedRoot, authority, {
+    agyDigestOverride: AGY_PATCHED_SHA256,
+  })
+  const patchedAuth = readCragGeminiPackageAuthority(patchedDir, authority.publicPem)
+  assert.equal(patchedAuth.issuerId, authority.issuerId)
 
   // Wrong issuer public key rejected.
   assert.throws(() => readCragGeminiPackageAuthority(okDir, wrongAuthority.publicPem), {

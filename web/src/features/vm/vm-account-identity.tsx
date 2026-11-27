@@ -12,6 +12,7 @@ import {
   slotRawEmail,
 } from '@/lib/vm-kind'
 import { claudeTier } from '@/lib/vm-status'
+import { NodePoolBadges } from '@/features/pools/node-pool-badges'
 import { ActiveVmBadge } from '@/features/vm/active-vm-badge'
 import { VmRentedMark } from '@/features/vm/vm-owner-line'
 
@@ -89,6 +90,7 @@ export function VmAccountIdentity({ vm }: { vm: Vm }) {
         <span className='truncate' title={node}>
           {node}
         </span>
+        <NodePoolBadges pools={vm.pools} maxVisible={2} compact />
       </div>
     </div>
   )

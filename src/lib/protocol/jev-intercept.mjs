@@ -1223,6 +1223,180 @@ function pushPromptContent(raw, content) {
   }
 }
 
+function decodeInlineTextBase64(data, mediaType = '') {
+  if (typeof data !== 'string' || !data) return ''
+  const inline = /^data:(text\/[\w.+-]+|application\/(?:json|xml))(?:;charset=utf-8)?;base64,/i.exec(data)
+  const media = String(mediaType || '').trim()
+  const encoded = (
+    inline ? data.slice(inline[0].length) : /^(?:text\/|application\/(?:json|xml)$)/i.test(media) ? data : ''
+  ).trim()
+  if (!encoded || encoded.length > 86_000 || !/^[\da-z+/]+={0,2}$/i.test(encoded)) return ''
+  try {
+    return new TextDecoder('utf-8', { fatal: true }).decode(Buffer.from(encoded, 'base64'))
+  } catch {
+    return ''
+  }
+}
+
+const isPlainObj = (value) => Boolean(value && typeof value === 'object' && !Array.isArray(value))
+
+function pushGeminiParts(raw, parts) {
+  if (typeof parts === 'string') {
+    if (parts) raw.push(parts)
+    return
+  }
+  if (!Array.isArray(parts)) return
+  for (const part of parts) {
+    if (typeof part === 'string') {
+      if (part) raw.push(part)
+      continue
+    }
+    if (!isPlainObj(part)) continue
+    // Mirror `parseGeminiNativeInbound` (`isPlainObject(...)` precedence):
+    // only plain-object tool/file/inline/code parts take those branches, so a
+    // truthy decoy like `{ functionCall: true, text: '...' }` or `{ fileData: 1, text: '...' }`
+    // still falls through to `part.text` just like upstream parsing.
+    if (
+      isPlainObj(part.functionCall) ||
+      isPlainObj(part.function_call) ||
+      isPlainObj(part.functionResponse) ||
+      isPlainObj(part.function_response)
+    ) {
+      continue
+    }
+    const inline = isPlainObj(part.inlineData)
+      ? part.inlineData
+      : isPlainObj(part.inline_data)
+        ? part.inline_data
+        : null
+    if (inline) {
+      const decoded = decodeInlineTextBase64(inline.data, inline.mimeType || inline.mime_type)
+      if (decoded) raw.push(decoded)
+      continue
+    }
+    if (isPlainObj(part.fileData) || isPlainObj(part.file_data)) continue
+    const execCode = isPlainObj(part.executableCode)
+      ? part.executableCode
+      : isPlainObj(part.executable_code)
+        ? part.executable_code
+        : null
+    const execResult = isPlainObj(part.codeExecutionResult)
+      ? part.codeExecutionResult
+      : isPlainObj(part.code_execution_result)
+        ? part.code_execution_result
+        : null
+    if (execCode || execResult) {
+      if (execCode) {
+        const code = typeof execCode.code === 'string' ? execCode.code : ''
+        if (code) raw.push(code)
+      }
+      if (execResult) {
+        const outcome =
+          typeof execResult.outcome === 'string' && execResult.outcome !== 'OUTCOME_OK' ? execResult.outcome : ''
+        const output = typeof execResult.output === 'string' ? execResult.output : ''
+        if (outcome && output) raw.push(`${outcome}\n${output}`)
+        else if (output) raw.push(output)
+        else if (outcome) raw.push(outcome)
+      }
+      continue
+    }
+    if (typeof part.text === 'string' && part.text) {
+      raw.push(part.text)
+    }
+  }
+}
+
+function pushGeminiInstruction(raw, instruction) {
+  if (!instruction) return
+  if (typeof instruction === 'string') {
+    raw.push(instruction)
+    return
+  }
+  if (Array.isArray(instruction)) {
+    for (const item of instruction) pushGeminiInstruction(raw, item)
+    return
+  }
+  if (typeof instruction === 'object') {
+    if (typeof instruction.text === 'string') raw.push(instruction.text)
+    if (Array.isArray(instruction.parts)) pushGeminiParts(raw, instruction.parts)
+  }
+}
+
+/**
+ * Extract Gemini `contents` aligned with `parseGeminiNativeInbound`:
+ * - Leading `role === 'system' || role === 'developer'` entries fold into system text.
+ * - Non-leading `system`/`developer` entries become user `<system-reminder>` turns upstream,
+ *   so we emit them into BOTH `systemTexts` and unwrapped `userTexts` (for JEV classifier).
+ * - Only exact lowercase `'model'` and `'assistant'` are skipped as assistant history; every
+ *   other role (empty, `'user'`, custom/unknown/capitalized roles) becomes `'user'` upstream.
+ */
+function extractGeminiContents(src) {
+  const userTexts = []
+  const systemTexts = []
+  if (!src || typeof src !== 'object') return { userTexts, systemTexts }
+  const contents = Array.isArray(src.contents) ? src.contents : []
+  let inLeadingSystem = true
+  for (const item of contents) {
+    if (typeof item === 'string') {
+      inLeadingSystem = false
+      if (item.trim()) userTexts.push(item)
+      continue
+    }
+    if (!item || typeof item !== 'object') continue
+    const rawRole = typeof item.role === 'string' ? item.role : ''
+    const pieces = []
+    if (Array.isArray(item.parts)) pushGeminiParts(pieces, item.parts)
+    else if (typeof item.text === 'string') pieces.push(item.text)
+    else if (typeof item.content === 'string') pieces.push(item.content)
+    const joined = pieces.filter(Boolean).join('\n').trim()
+    if (rawRole === 'system' || rawRole === 'developer') {
+      if (joined) {
+        systemTexts.push(joined)
+        if (!inLeadingSystem) userTexts.push(joined)
+      }
+      continue
+    }
+    inLeadingSystem = false
+    if (rawRole === 'model' || rawRole === 'assistant') continue
+    if (joined) userTexts.push(joined)
+  }
+  return { userTexts, systemTexts }
+}
+
+/** Extract user-visible turns from Gemini `contents` matching upstream `parseGeminiNativeInbound`. */
+function extractGeminiUserTexts(src) {
+  return extractGeminiContents(src).userTexts
+}
+
+/** Extract search queries from `/v1/alpha/search` payloads (`query`, `q`, `queries`, `commands.search_query`). */
+function extractSearchQueryTexts(src) {
+  if (!src || typeof src !== 'object') return []
+  const out = []
+  const add = (value) => {
+    if (typeof value === 'string') {
+      const trimmed = value.trim()
+      if (trimmed) out.push(trimmed)
+      return
+    }
+    if (value && typeof value === 'object') {
+      if (typeof value.q === 'string' && value.q.trim()) out.push(value.q.trim())
+      if (typeof value.query === 'string' && value.query.trim()) out.push(value.query.trim())
+    }
+  }
+  add(src.query)
+  add(src.q)
+  if (Array.isArray(src.queries)) {
+    for (const item of src.queries) add(item)
+  }
+  if (src.commands && typeof src.commands === 'object' && !Array.isArray(src.commands)) {
+    const searchList = Array.isArray(src.commands.search_query) ? src.commands.search_query : []
+    for (const item of searchList) add(item)
+    const openList = Array.isArray(src.commands.open) ? src.commands.open : []
+    for (const item of openList) add(item)
+  }
+  return out
+}
+
 /** Caller prompt fields. Official template bodies are removed before return. */
 function promptPieces(src, keepReminders) {
   if (!src || typeof src !== 'object') return []
@@ -1230,6 +1404,8 @@ function promptPieces(src, keepReminders) {
   pushPromptContent(raw, src.system)
   pushPromptContent(raw, src.instructions)
   pushPromptContent(raw, src.developer)
+  pushGeminiInstruction(raw, src.systemInstruction)
+  pushGeminiInstruction(raw, src.system_instruction)
   const messages = Array.isArray(src.messages) ? src.messages : []
   for (const message of messages) {
     if (!['system', 'developer'].includes(String(message?.role || '').toLowerCase())) continue
@@ -1241,6 +1417,8 @@ function promptPieces(src, keepReminders) {
     if (role !== 'system' && role !== 'developer') continue
     pushPromptContent(raw, item.content ?? item.text)
   }
+  const geminiSystem = extractGeminiContents(src).systemTexts
+  for (const text of geminiSystem) raw.push(text)
   return raw.map((text) => stripOfficialPromptWhitelist(text, keepReminders)).filter(Boolean)
 }
 
@@ -1258,7 +1436,19 @@ export function jevDocument(
   })
   const seen = new Set()
   const prompts = []
+  const extraUsers = []
+  const seenExtra = new Set()
+  const pushExtra = (text) => {
+    const cleaned = keepPromptReminders ? String(text || '').trim() : cleanUserAsk(text)
+    const norm = normalizeText(cleaned)
+    if (!norm || seenExtra.has(norm)) return
+    seenExtra.add(norm)
+    extraUsers.push(cleaned)
+  }
   for (const src of inbound === body ? [inbound] : [inbound, body]) {
+    if (typeof src?.prompt === 'string') pushExtra(src.prompt)
+    for (const text of extractGeminiUserTexts(src)) pushExtra(text)
+    for (const text of extractSearchQueryTexts(src)) pushExtra(text)
     for (const piece of promptPieces(src, keepPromptReminders)) {
       const norm = normalizeText(piece)
       if (!norm || seen.has(norm)) continue
@@ -1266,7 +1456,7 @@ export function jevDocument(
       prompts.push(norm)
     }
   }
-  return [users, cleanUserAsk(inbound?.prompt), prompts.join('\n')].filter(Boolean).join('\n')
+  return [users, extraUsers.join('\n'), prompts.join('\n')].filter(Boolean).join('\n')
 }
 
 /** User text only. System prompts, env blocks, and tool payloads are not the ask. */
@@ -1280,20 +1470,8 @@ function jevModelContentText(content) {
     if (file.type === 'content') return jevModelContentText(file.content)
     if (file.type === 'text' || typeof file.text === 'string') return cleanUserAsk(file.data ?? file.text)
     const data = file.data ?? file.file_data
-    if (typeof data !== 'string') return ''
-    const inline = /^data:(text\/[\w.+-]+|application\/(?:json|xml))(?:;charset=utf-8)?;base64,/i.exec(data)
-    const media = file.media_type || file.mime_type || ''
-    const encoded = inline
-      ? data.slice(inline[0].length)
-      : /^(?:text\/|application\/(?:json|xml)$)/i.test(media)
-        ? data
-        : ''
-    if (!encoded || encoded.length > 86_000 || !/^[\da-z+/]+={0,2}$/i.test(encoded)) return ''
-    try {
-      return cleanUserAsk(new TextDecoder('utf-8', { fatal: true }).decode(Buffer.from(encoded, 'base64')))
-    } catch {
-      return ''
-    }
+    const decoded = decodeInlineTextBase64(data, file.media_type || file.mime_type || '')
+    return decoded ? cleanUserAsk(decoded) : ''
   }
   if (type && !['text', 'input_text', 'message'].includes(type)) return ''
   if (typeof content.text === 'string') return cleanUserAsk(content.text)
@@ -1308,7 +1486,7 @@ export function jevCurrentAsk(document) {
   if (!text) return ''
   const marked = text.split('\n[current ask]\n')
   const block = marked.length > 1 ? marked[marked.length - 1] : text
-  return block.replace(/^\[user (?:message|input) \d+\]\n/, '').trim()
+  return block.replace(/^\[(?:user (?:message|input)|gemini content|search query) \d+\]\n/, '').trim()
 }
 
 function buildJevModelParts(inbound, body = inbound, { interceptSession = null, ctx = null } = {}) {
@@ -1340,8 +1518,8 @@ function buildJevModelParts(inbound, body = inbound, { interceptSession = null, 
       if (role !== 'user') return
       push(`user message ${index + 1}`, jevModelContentText(message?.content))
     })
-    const input = typeof src?.input === 'string' ? [src.input] : Array.isArray(src?.input) ? src.input : []
     if (messageStart > 0) continue
+    const input = typeof src?.input === 'string' ? [src.input] : Array.isArray(src?.input) ? src.input : []
     input.forEach((item, index) => {
       if (typeof item === 'string') {
         push(`user input ${index + 1}`, cleanUserAsk(item))
@@ -1351,6 +1529,14 @@ function buildJevModelParts(inbound, body = inbound, { interceptSession = null, 
       const role = String(item?.role || 'user').toLowerCase()
       if (role !== 'user' && role !== '') return
       push(`user input ${index + 1}`, jevModelContentText(item?.content ?? item))
+    })
+    const geminiContents = extractGeminiUserTexts(src)
+    geminiContents.forEach((text, index) => {
+      push(`gemini content ${index + 1}`, cleanUserAsk(text))
+    })
+    const searchQueries = extractSearchQueryTexts(src)
+    searchQueries.forEach((text, index) => {
+      push(`search query ${index + 1}`, cleanUserAsk(text))
     })
   }
   if (!parts.length) return { parts, seen: [...seen], text: '' }

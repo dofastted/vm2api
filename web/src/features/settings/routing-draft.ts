@@ -645,7 +645,11 @@ export function computePendingCards(
   return {
     sticky: {
       binding: (ds.enabled !== false) !== (ss.enabled !== false),
-      ttl: Number(ds.ttl_seconds ?? 86400) !== Number(ss.ttl_seconds ?? 86400),
+      ttl:
+        Number(ds.session_ttl_seconds ?? ds.ttl_seconds ?? 86400) !==
+          Number(ss.session_ttl_seconds ?? ss.ttl_seconds ?? 86400) ||
+        Number(ds.machine_ttl_seconds ?? 604800) !==
+          Number(ss.machine_ttl_seconds ?? 604800),
       outbound:
         String(ds.outbound_session || 'rebuild') !==
         String(ss.outbound_session || 'rebuild'),

@@ -25,6 +25,7 @@ const PANEL_VIEWS: ViewId[] = [
   'cluster',
   'vm',
   'import',
+  'pools',
   'specs',
   'proxies',
   'models',
@@ -64,7 +65,10 @@ const ROLE_VIEWS: Record<'admin' | 'super' | 'user', ViewId[]> = {
 }
 
 const concrete = (path: string) =>
-  path.replace('$id', 'vm-01').replace('$tab', 'about')
+  path
+    .replace('$id', 'vm-01')
+    .replace('$poolId', 'pool_12345678')
+    .replace('$tab', 'about')
 const openPages = (views: string[] | null) =>
   PAGE_PATHS.filter((path) => canOpenPath(views, concrete(path)))
 
@@ -72,6 +76,8 @@ describe('route ↔ view table', () => {
   it('finds the page files', () => {
     expect(PAGE_PATHS).toContain('/')
     expect(PAGE_PATHS).toContain('/vm/$id')
+    expect(PAGE_PATHS).toContain('/pools')
+    expect(PAGE_PATHS).toContain('/pools/$poolId')
     expect(PAGE_PATHS).toContain('/settings/$tab')
     expect(PAGE_PATHS).not.toContain('/route')
   })
@@ -108,6 +114,8 @@ describe('nested pages follow their parent view', () => {
     ['/vm/vm-01', 'vm'],
     ['/vm/vm-01?tab=usage', 'vm'],
     ['/vm/', 'vm'],
+    ['/pools/pool_12345678', 'pools'],
+    ['/pools/', 'pools'],
     ['/settings/about', 'settings'],
     ['/settings/', 'settings'],
     ['/', null],
@@ -123,6 +131,9 @@ describe('nested pages follow their parent view', () => {
   it('blocks a child exactly when its parent is blocked', () => {
     for (const views of Object.values(ROLE_VIEWS)) {
       expect(canOpenPath(views, '/vm/vm-01')).toBe(canOpenPath(views, '/vm'))
+      expect(canOpenPath(views, '/pools/pool_12345678')).toBe(
+        canOpenPath(views, '/pools')
+      )
       expect(canOpenPath(views, '/settings/about')).toBe(
         canOpenPath(views, '/settings')
       )

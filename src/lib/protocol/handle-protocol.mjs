@@ -21,14 +21,20 @@ import {
   refusalSessionId,
   riskPrincipal,
 } from '../core/refusal-guard.mjs'
+import { isDbOpen } from '../db/database.mjs'
 import { RefusalGuardsRepo } from '../db/repos/refusal-guards-repo.mjs'
 import { RefusalDeviceBlocksRepo } from '../db/repos/refusal-device-blocks-repo.mjs'
 import { RefusalSessionBlocksRepo } from '../db/repos/refusal-session-blocks-repo.mjs'
 import { SettingsRepo } from '../db/repos/settings-repo.mjs'
-import { findAccount } from '../admin/panel-api.mjs'
 import { makeApiKeyGateError } from '../admin/api-keys.mjs'
-import { readJevConfig, scopeAccountFromVm } from './jev-intercept.mjs'
-import { observeUpstreamRisk, runProtocolIntercept, upstreamRiskClientError } from './intercept-gate.mjs'
+import { readJevConfig } from './jev-intercept.mjs'
+import { observeUpstreamRisk, upstreamRiskClientError } from './intercept-gate.mjs'
+import {
+  clientBlockErrorOf,
+  isTrustedGateDecision,
+  projectCandidateAccounts,
+  runUnifiedPreDispatch,
+} from './unified-pre-dispatch.mjs'
 import {
   toClaudeMessages,
   isClientStream,
@@ -44,7 +50,12 @@ import {
   createClaudeMessageAssembler,
   applyClaudeSSELineToMessage,
 } from './convert.mjs'
-import { sanitizeInboundBody, defaultSeedPolicy, callerAutoCompactWindow } from './seed-policy.mjs'
+import {
+  sanitizeInboundBody,
+  sanitizeOutboundHeaders,
+  defaultSeedPolicy,
+  callerAutoCompactWindow,
+} from './seed-policy.mjs'
 import { fingerprintRequest } from './client-fingerprint.mjs'
 import { validateOfficialModel } from './models.mjs'
 import { handleCodexImages, handleCodexProtocol, handleCodexSearch } from './handle-codex.mjs'
@@ -86,9 +97,16 @@ import {
   keyAllowsVm,
   keyScopeFromRequest,
   keyTierPolicyFromRecord,
+  resolvePoolAccessForKey,
   vmGroupType,
   vmPoolDenial,
 } from '../admin/key-scope.mjs'
+import {
+  applyPoolPromptToAnthropicBody,
+  isPoolZeroInjectMode,
+  requestedPoolIdFromHeaders,
+  resolvePoolSystemPromptPolicy,
+} from './pool-prompt-policy.mjs'
 import { keyModelError } from '../admin/key-models.mjs'
 import {
   resolveInferenceEngine,
@@ -138,6 +156,7 @@ import {
   extractFirstUserIdentity,
   outboundSessionMode,
   resolveInboundIdentity,
+  resolveSchedulerIdentity,
   resolveSeatIdentity,
   resolveOutboundSessionId,
   sessionIdFromOutboundBody,
@@ -305,6 +324,41 @@ function authenticatedTenant(req) {
   if (req.panelUserId != null) return `panel-id:${req.panelUserId}`
   if (req.panelUser) return `panel-user:${req.panelUser}`
   return ''
+}
+
+/**
+ * Extract read-only scheduler identity strictly before sanitizeInboundBody /
+ * sanitizeOutboundHeaders strip client machine_id/device_id/metadata.user_id.
+ */
+export function prepareInboundProtocolContext({
+  inbound,
+  headers = {},
+  pathName = '',
+  protocol = '',
+  poolId = '',
+  apiKeyId = '',
+  seedPolicy = defaultSeedPolicy(),
+  autoCompactWindow = callerAutoCompactWindow(inbound),
+} = {}) {
+  const inboundIdentity = resolveSchedulerIdentity({
+    inbound,
+    headers,
+    poolId,
+    apiKeyId,
+  })
+  const legacyInboundIdentity = resolveInboundIdentity({
+    inbound,
+    headers,
+  })
+  const ctx = {
+    path: pathName,
+    protocol,
+    body: sanitizeInboundBody(inbound, seedPolicy),
+    headers: sanitizeOutboundHeaders(headers),
+    autoCompactWindow,
+    inboundIdentity,
+  }
+  return { ctx, inboundIdentity, legacyInboundIdentity }
 }
 
 export function createHandleProtocol(deps) {
@@ -530,6 +584,45 @@ export function createHandleProtocol(deps) {
     }
   }
 
+  function applyGateDecisionToLogBag(decision, logBag, { mandatoryOnly = false } = {}) {
+    if (!decision) return
+    if (!mandatoryOnly && decision.intercept) logBag.intercept = decision.intercept
+    if (decision.action === 'downgrade' && decision.route) logBag.risk_route = decision.route
+    if (decision.action === 'downgrade' && decision.jev_downgrade_pool_id) {
+      logBag.jev_downgrade_pool_id = decision.jev_downgrade_pool_id
+    }
+    if (!mandatoryOnly) logBag.risk_wait = false
+    if (decision.jev_passed) {
+      logBag._jevPassed = true
+      if (decision.jev_state) logBag._jevPassState = decision.jev_state
+      if (decision.scores) logBag._jevPassScores = decision.scores
+    }
+  }
+
+  function writeGateBlockResponse(decision, { res, logBag }) {
+    stats.errors++
+    logBag.via = decision.via
+    logBag.attempt_count = 0
+    logBag.final_state = decision.final_state
+    logBag.error_code = decision.error_code || decision.error?.body?.error?.code || null
+    logBag.error_message = decision.message || decision.error?.body?.error?.message || null
+    if (decision.error_details) {
+      logBag.error_details = { ...(logBag.error_details || {}), ...decision.error_details }
+    }
+    logBag.intercept = decision.intercept || null
+    logBag.jev_state = decision.jev_state || null
+    const clientErr = clientBlockErrorOf(decision)
+    const errPayload = clientErr.body
+    if (res.headersSent && logBag.protocol === 'anthropic.messages') {
+      res.write(buildAnthropicSseError(errPayload.error))
+      res.end()
+    } else {
+      const retryAfter = decision.retry_after_sec || decision.error?.retryAfterSec
+      if (retryAfter) res.setHeader?.('retry-after', String(retryAfter))
+      json(res, clientErr.status, errPayload)
+    }
+  }
+
   async function applyProtocolIntercept({
     req,
     inbound,
@@ -540,6 +633,12 @@ export function createHandleProtocol(deps) {
     res,
     account = null,
     scopeMatched = false,
+    candidateAccounts = null,
+    poolJevProfile = null,
+    zeroInject = undefined,
+    channel = 'anthropic',
+    skipDistill = undefined,
+    enforceHardAndJev = undefined,
     bodyCtx = null,
     interceptSessionKey = null,
     identity,
@@ -549,20 +648,45 @@ export function createHandleProtocol(deps) {
     apiPlatform,
     riskState,
   }) {
+    // Reuse a trusted frame-level pre-dispatch verdict (e.g. Responses WebSocket)
+    // only when its evaluated backend matches the resolved inference backend and
+    // an API endpoint-level review requirement was not skipped upstream.
+    const prevDecision = req?._preDispatchDecision
+    let prevInterceptBy = ''
+    if (typeof prevDecision?.intercept === 'string' && prevDecision.intercept) {
+      try {
+        prevInterceptBy = String(JSON.parse(prevDecision.intercept)?.by || '')
+      } catch {
+        prevInterceptBy = ''
+      }
+    }
+    const canReusePreDispatch =
+      isTrustedGateDecision(prevDecision) &&
+      prevDecision.action !== 'block' &&
+      (!backend || !prevDecision.backend || prevDecision.backend === backend) &&
+      !(backend === 'api' && scopeMatched && ['scope', 'platform', 'unchecked'].includes(prevInterceptBy))
+    if (canReusePreDispatch) {
+      applyGateDecisionToLogBag(prevDecision, logBag, { mandatoryOnly })
+      return false
+    }
     const official =
       isOfficialClaudeCodeTraffic(req.headers, inbound) ||
       isOfficialClaudeClient(fp.client_class) ||
       (detectProxiedOfficialCcFromRoutingFile(routingConfigPath) && isProxiedOfficialClaudeCode(inbound, req.headers))
     const classifier = classifyClaudeRequestPurpose(inbound, { officialTraffic: official })
     const interceptSession = interceptSessionKey ? peekInterceptSession(interceptSessionKey) : null
-    const decision = await runProtocolIntercept({
+    const decision = await runUnifiedPreDispatch({
+      req,
       inbound,
       body,
       headers: req.headers,
       identity,
       official,
       classifier,
-      zeroInject: isZeroInjectMode(),
+      zeroInject:
+        typeof zeroInject === 'boolean'
+          ? zeroInject
+          : isZeroInjectMode(req?._poolAccess?.effectivePool || null, channel),
       distillRules: cfg.distill,
       policy: riskState.policy,
       jev: mandatoryOnly ? null : readRuntimeJev(),
@@ -572,6 +696,11 @@ export function createHandleProtocol(deps) {
       requestId,
       account,
       scopeMatched,
+      candidateAccounts,
+      poolJevProfile: poolJevProfile || req.poolJevProfile || req.apiKeyRecord?.jev_profile || null,
+      channel,
+      skipDistill,
+      enforceHardAndJev,
       bodyCtx,
       interceptSession,
       mandatoryOnly,
@@ -580,46 +709,165 @@ export function createHandleProtocol(deps) {
       openaiPlatform: apiPlatform,
     })
     if (!decision || decision.action !== 'block') {
-      if (!mandatoryOnly && decision?.intercept) logBag.intercept = decision.intercept
-      if (decision?.route) logBag.risk_route = decision.route
-      if (!mandatoryOnly) logBag.risk_wait = decision.wait === true
-      if (decision?.jevPassed) {
-        logBag._jevPassed = true
-        if (decision.jevState) logBag._jevPassState = decision.jevState
-        if (decision.jevScores) logBag._jevPassScores = decision.jevScores
-      }
+      applyGateDecisionToLogBag(decision, logBag, { mandatoryOnly })
+      if (!mandatoryOnly && req) req._preDispatchDecision = decision
       return false
     }
-    stats.errors++
-    logBag.via = decision.via
-    logBag.attempt_count = 0
-    logBag.final_state = decision.final_state
-    logBag.error_code = decision.logErrorCode || decision.error?.body?.error?.code || null
-    logBag.error_message = decision.errorMessage || decision.error?.body?.error?.message || null
-    if (decision.errorDetails) {
-      logBag.error_details = { ...(logBag.error_details || {}), ...decision.errorDetails }
-    }
-    logBag.intercept = decision.intercept || null
-    logBag.jev_state = decision.jevState || null
-    if (res.headersSent && logBag.protocol === 'anthropic.messages') {
-      res.write(buildAnthropicSseError(decision.error.body.error))
-      res.end()
-    } else {
-      if (decision.error?.retryAfterSec) res.setHeader?.('retry-after', String(decision.error.retryAfterSec))
-      json(res, decision.error.status, decision.error.body)
-    }
+    writeGateBlockResponse(decision, { res, logBag })
     return true
   }
 
-  function isZeroInjectMode() {
-    const routing = getRouting() || {}
-    const inject = String(routing?.compatibility?.persona_inject || '')
-      .trim()
-      .toLowerCase()
-    const preset = String(routing?.compatibility?.persona_preset || '')
-      .trim()
-      .toLowerCase()
-    return inject === 'zero' || preset === 'zero'
+  function isZeroInjectMode(effectivePool = null, nodeProvider = 'anthropic') {
+    return isPoolZeroInjectMode(effectivePool, getRouting() || {}, { nodeProvider })
+  }
+
+  function legacyPoolAccessResult() {
+    return {
+      ok: true,
+      status: 200,
+      code: null,
+      mode: 'legacy_scope',
+      legacy: true,
+      isDowngraded: false,
+      originPool: null,
+      effectivePool: null,
+      allowedPoolIds: [],
+      allowedMembers: null,
+      allowedVmIds: null,
+      allowedClaudeVmIds: null,
+      allowedCodexVmIds: null,
+      allowedGeminiEnvIds: null,
+      allowedEndpointIds: null,
+      allowedModels: [],
+    }
+  }
+
+  function intersectAllowedIds(existing, poolIds) {
+    const allowed = Array.isArray(poolIds) ? poolIds : []
+    if (Array.isArray(existing) && existing.length > 0) {
+      return existing.filter((id) => allowed.includes(id))
+    }
+    return [...allowed]
+  }
+
+  function loadVmInventoryForPoolAccess() {
+    if (Array.isArray(deps.vms)) return deps.vms
+    if (typeof deps.listVms === 'function') {
+      try {
+        const rows = deps.listVms()
+        if (Array.isArray(rows)) return rows
+      } catch {}
+    }
+    if (cfg?.paths?.project) {
+      try {
+        const rows = listVms(cfg.paths.project)
+        if (Array.isArray(rows)) return rows
+      } catch {}
+    }
+    return null
+  }
+
+  function loadApiEndpointInventoryForPoolAccess() {
+    if (Array.isArray(deps.apiEndpoints)) return deps.apiEndpoints
+    try {
+      const rows = apiEndpointStore?.listRaw?.() ?? apiEndpointStore?.list?.()
+      if (Array.isArray(rows)) return rows
+    } catch {}
+    return null
+  }
+
+  function loadGeminiOwnerMapForPoolAccess() {
+    if (typeof deps.geminiOwnerMap === 'function') {
+      try {
+        return deps.geminiOwnerMap()
+      } catch {}
+    }
+    return deps.geminiOwnerMap || null
+  }
+
+  function hasExplicitPoolIntent(req, { requestedPoolId = null, jevDowngradePoolId = null } = {}) {
+    if (requestedPoolId || jevDowngradePoolId) return true
+    const rec = req?.apiKeyRecord
+    if (!rec) return false
+    if (rec.pool_binding_mode === 'strict_pool') return true
+    if (rec.default_pool_id) return true
+    if (Array.isArray(rec.allowed_pool_ids) && rec.allowed_pool_ids.length > 0) return true
+    return false
+  }
+
+  function resolveRequestPoolAccess(
+    req,
+    {
+      model = null,
+      ownerScope = null,
+      jevDowngradePoolId = null,
+      isTrustedDowngrade = false,
+      trustedDowngradePoolIds = null,
+      geminiEnvs = null,
+    } = {},
+  ) {
+    const requestedPoolId = requestedPoolIdFromHeaders(req?.headers || {})
+    const explicitIntent = hasExplicitPoolIntent(req, { requestedPoolId, jevDowngradePoolId })
+    if (!deps.poolsRepo && !isDbOpen() && !explicitIntent) {
+      return legacyPoolAccessResult()
+    }
+    const resolvedGeminiEnvs = Array.isArray(geminiEnvs)
+      ? geminiEnvs
+      : Array.isArray(deps.geminiEnvs)
+        ? deps.geminiEnvs
+        : null
+    const resolvedGeminiOwnerMap = loadGeminiOwnerMapForPoolAccess()
+    const access = resolvePoolAccessForKey({
+      key: req?.apiKeyRecord || null,
+      apiKeyKind: req?.apiKeyKind || null,
+      requestedPoolId,
+      jevDowngradePoolId,
+      isTrustedDowngrade,
+      trustedDowngradePoolIds,
+      model,
+      poolsRepo: deps.poolsRepo || null,
+      vms: loadVmInventoryForPoolAccess(),
+      geminiEnvs: resolvedGeminiEnvs,
+      geminiOwnerMap: resolvedGeminiOwnerMap,
+      apiEndpoints: loadApiEndpointInventoryForPoolAccess(),
+      ownerScope,
+    })
+    return {
+      ...access,
+      _geminiOwnerMapChecked: Boolean(resolvedGeminiOwnerMap),
+      _geminiEnvsChecked: Array.isArray(resolvedGeminiEnvs),
+    }
+  }
+
+  function rejectPoolAccess(res, poolAccess, logBag, protocol = '') {
+    stats.errors++
+    const status = poolAccess?.status || 403
+    const code = poolAccess?.code || 'pool_unavailable'
+    const message = poolAccess?.message || '分组池不可用'
+    logBag.error_code = code
+    logBag.error_message = message
+    logBag.final_state = 'policy_blocked'
+    logBag.attempt_count = 0
+    if (protocol === 'google.gemini') {
+      return json(res, status, {
+        error: {
+          code: status,
+          status: status === 403 ? 'PERMISSION_DENIED' : 'FAILED_PRECONDITION',
+          message,
+          details: [{ '@type': 'type.googleapis.com/google.rpc.ErrorInfo', reason: code }],
+        },
+      })
+    }
+    return json(
+      res,
+      status,
+      makeError({
+        type: ErrorType.PERMISSION,
+        code,
+        message,
+        status,
+      }).body,
+    )
   }
 
   function refusalRepo() {
@@ -825,10 +1073,6 @@ export function createHandleProtocol(deps) {
       return
     }
 
-    if (protocol === 'anthropic.messages' && req.apiKeyRecord?.group_type === 'gemini') {
-      return deps.handleGeminiMessages(req, res, { logBag, logCtx })
-    }
-
     let inbound
     try {
       inbound = await readBody(req, inboundBodyLimit(getRouting(), cfg.limits.max_body_bytes))
@@ -874,6 +1118,63 @@ export function createHandleProtocol(deps) {
     )
     logBag.inbound_device_id = sessionIdForLog(auditIdentity.deviceId)
     logBag.reasoning_effort = reasoningEffortOf(inbound)
+    const fp = fingerprintRequest(req, inbound)
+    const riskState = { policy: refusalPolicy(), repo: refusalRepo(), devices: deviceRepo(), sessions: sessionRepo() }
+    const gateArgs = { req, inbound, fp, logBag, requestId: logCtx.request_id, res, identity: auditIdentity, riskState }
+
+    // Bypass #3 closed: `/v1/messages` with a Gemini-scoped key must pass pool
+    // Fail-Closed authorization AND unified pre-dispatch JEV BEFORE delegating.
+    if (protocol === 'anthropic.messages' && req.apiKeyRecord?.group_type === 'gemini') {
+      const bypassOwnerScope = ownerScopeFromRequest(req, apiKeyStore?.users)
+      let bypassGeminiCatalog = null
+      if (
+        !Array.isArray(deps.geminiEnvs) &&
+        typeof deps.geminiScheduler?.catalog === 'function' &&
+        hasExplicitPoolIntent(req, { requestedPoolId: requestedPoolIdFromHeaders(req?.headers || {}) })
+      ) {
+        try {
+          bypassGeminiCatalog = await deps.geminiScheduler.catalog({ ownerScope: bypassOwnerScope })
+        } catch {}
+      }
+      const bypassPoolAccess = resolveRequestPoolAccess(req, {
+        model: inbound?.model || null,
+        ownerScope: bypassOwnerScope,
+        geminiEnvs: Array.isArray(bypassGeminiCatalog?.accounts) ? bypassGeminiCatalog.accounts : null,
+      })
+      if (!bypassPoolAccess.ok) {
+        return rejectPoolAccess(res, bypassPoolAccess, logBag, protocol)
+      }
+      req._poolAccess = bypassPoolAccess
+      if (bypassPoolAccess.effectivePool?.id) {
+        logBag.resolved_pool_id = bypassPoolAccess.effectivePool.id
+      }
+      if (bypassPoolAccess.effectivePool?.jev_profile) {
+        req.poolJevProfile = bypassPoolAccess.effectivePool.jev_profile
+      }
+      if (
+        await applyProtocolIntercept({
+          ...gateArgs,
+          body: inbound,
+          poolJevProfile: bypassPoolAccess.effectivePool?.jev_profile || req.poolJevProfile || null,
+          zeroInject: isPoolZeroInjectMode(bypassPoolAccess.effectivePool, getRouting() || {}, {
+            nodeProvider: 'google',
+          }),
+          channel: 'gemini',
+          enforceHardAndJev: true,
+          backend: 'oauth',
+          apiPlatform: false,
+        })
+      ) {
+        return
+      }
+      req.body = inbound
+      return deps.handleGeminiMessages(req, res, {
+        logBag,
+        logCtx,
+        preDispatchDecision: req._preDispatchDecision || null,
+        ...(bypassGeminiCatalog ? { catalogSnapshot: bypassGeminiCatalog } : {}),
+      })
+    }
 
     const rawInboundBackend = resolveInferenceBackend(req)
     const inboundKeyPolicy = req.apiKeyKind === 'managed' ? keyTierPolicyFromRecord(req.apiKeyRecord) : null
@@ -927,16 +1228,60 @@ export function createHandleProtocol(deps) {
         }
       }
       if (!preferGeminiApiChannel) {
+        // Bypass #4 closed: `all` key + Antigravity model must pass pool
+        // Fail-Closed authorization AND unified pre-dispatch JEV BEFORE delegating.
+        const bypassOwnerScope = ownerScopeFromRequest(req, apiKeyStore?.users)
+        if (
+          !preloadedGeminiCatalog &&
+          !Array.isArray(deps.geminiEnvs) &&
+          typeof deps.geminiScheduler?.catalog === 'function' &&
+          hasExplicitPoolIntent(req, { requestedPoolId: requestedPoolIdFromHeaders(req?.headers || {}) })
+        ) {
+          try {
+            preloadedGeminiCatalog = await deps.geminiScheduler.catalog({ ownerScope: bypassOwnerScope })
+          } catch {}
+        }
+        const bypassPoolAccess = resolveRequestPoolAccess(req, {
+          model: inbound?.model || null,
+          ownerScope: bypassOwnerScope,
+          geminiEnvs: Array.isArray(preloadedGeminiCatalog?.accounts) ? preloadedGeminiCatalog.accounts : null,
+        })
+        if (!bypassPoolAccess.ok) {
+          return rejectPoolAccess(res, bypassPoolAccess, logBag, protocol)
+        }
+        req._poolAccess = bypassPoolAccess
+        if (bypassPoolAccess.effectivePool?.id) {
+          logBag.resolved_pool_id = bypassPoolAccess.effectivePool.id
+        }
+        if (bypassPoolAccess.effectivePool?.jev_profile) {
+          req.poolJevProfile = bypassPoolAccess.effectivePool.jev_profile
+        }
+        if (
+          await applyProtocolIntercept({
+            ...gateArgs,
+            body: inbound,
+            poolJevProfile: bypassPoolAccess.effectivePool?.jev_profile || req.poolJevProfile || null,
+            zeroInject: isPoolZeroInjectMode(bypassPoolAccess.effectivePool, getRouting() || {}, {
+              nodeProvider: 'google',
+            }),
+            channel: 'gemini',
+            enforceHardAndJev: true,
+            backend: 'oauth',
+            apiPlatform: false,
+          })
+        ) {
+          return
+        }
         req.body = inbound
         return (deps.handleGeminiPublic || deps.handleGeminiMessages)(req, res, {
           logBag,
           logCtx,
+          preDispatchDecision: req._preDispatchDecision || null,
           ...(preloadedGeminiCatalog ? { catalogSnapshot: preloadedGeminiCatalog } : {}),
         })
       }
     }
 
-    const fp = fingerprintRequest(req, inbound)
     // Before the health probe: its synthesized or fail-closed replies would otherwise answer
     // probe-shaped third-party traffic, and with the switch on no probe is answered at all.
     // Official Claude Code only ever speaks Messages, so other inbound protocols on a Claude
@@ -974,8 +1319,6 @@ export function createHandleProtocol(deps) {
     }
     // After the Desktop sign-in probe, which runs no model.
     if (rejectKeyModel(req, res, protocol, inbound?.model, logBag)) return
-    const riskState = { policy: refusalPolicy(), repo: refusalRepo(), devices: deviceRepo(), sessions: sessionRepo() }
-    const gateArgs = { req, inbound, fp, logBag, requestId: logCtx.request_id, res, identity: auditIdentity, riskState }
     if (await applyProtocolIntercept({ ...gateArgs, body: inbound, mandatoryOnly: true })) return
     if (
       claudeCodeOnlyFromRouting(routingNow) &&
@@ -1066,13 +1409,22 @@ export function createHandleProtocol(deps) {
 
     const callerEnvironment = protocol === 'anthropic.messages' ? callerCwdDeclaration(inbound?.system) : null
     const autoCompactWindow = callerAutoCompactWindow(inbound)
-    let ctx = {
-      path: pathName,
+    const { ctx: preparedCtx, legacyInboundIdentity } = prepareInboundProtocolContext({
+      inbound,
+      headers: req.headers,
+      pathName,
       protocol,
-      body: sanitizeInboundBody(inbound, defaultSeedPolicy()),
-      headers: { ...req.headers },
+      poolId:
+        requestedPoolIdFromHeaders(req.headers) ||
+        req.apiKeyRecord?.default_pool_id ||
+        req.apiKeyRecord?.vm_pool_id ||
+        '',
+      apiKeyId: req.apiKeyRecord?.id ?? '',
+      seedPolicy: defaultSeedPolicy(),
       autoCompactWindow,
-    }
+    })
+    const outboundReqHeaders = preparedCtx.headers
+    let ctx = preparedCtx
     ctx = applyIntercept(cfg.intercept.rules, 'before_convert', ctx)
     const bodyCheck = protocol === 'google.gemini' ? { ok: true } : validateRequestBody(protocol, ctx.body)
     if (!bodyCheck.ok) {
@@ -1088,8 +1440,58 @@ export function createHandleProtocol(deps) {
     if (inboundKeyPolicy) {
       keyScope = { ...keyScope, permission_tier: inboundKeyPolicy.permission_tier }
     }
+    // Step [2]: Fail-Closed pool authorization & effectivePool pre-evaluation
+    // strictly BEFORE JEV (Step [4]) and slot/endpoint admission.
+    let activePoolAccess = resolveRequestPoolAccess(req, {
+      model: ctx.body?.model || inbound?.model || null,
+      ownerScope: reqOwnerScope,
+    })
+    if (
+      !activePoolAccess.ok &&
+      activePoolAccess.reason === 'missing' &&
+      req.apiKeyRecord?.pool_binding_mode !== 'strict_pool' &&
+      !req.apiKeyRecord?.default_pool_id &&
+      !(Array.isArray(req.apiKeyRecord?.allowed_pool_ids) && req.apiKeyRecord.allowed_pool_ids.length) &&
+      !requestedPoolIdFromHeaders(req.headers) &&
+      keyScope.vm_pool_id &&
+      !keyScope.vm_pool_error
+    ) {
+      activePoolAccess = legacyPoolAccessResult()
+    }
+    if (!activePoolAccess.ok) {
+      return rejectPoolAccess(res, activePoolAccess, logBag, protocol)
+    }
+    let effectivePool = activePoolAccess.effectivePool || null
+    req._poolAccess = activePoolAccess
+    if (effectivePool) {
+      logBag.resolved_pool_id = effectivePool.id
+      if (effectivePool.jev_profile) {
+        req.poolJevProfile = effectivePool.jev_profile
+      }
+      if (!activePoolAccess.legacy) {
+        keyScope = {
+          ...keyScope,
+          vm_pool_id: effectivePool.id,
+          vm_pool_error: null,
+          allowed_vms: activePoolAccess.allowedVmIds || [],
+          ...(effectivePool.jev_profile ? { jev_profile: effectivePool.jev_profile } : {}),
+        }
+        if (effectivePool.id && !ctx.inboundIdentity?.poolId) {
+          ctx = {
+            ...ctx,
+            inboundIdentity: { ...ctx.inboundIdentity, poolId: effectivePool.id },
+          }
+        }
+      }
+    }
     let inferenceBackend = rawBackend === 'api' ? 'api' : 'oauth'
     let apiScope = rawBackend === 'api' ? apiScheduleScope(req, keyScope.group_type, apiKeyStore?.users) : null
+    if (!activePoolAccess.legacy && apiScope) {
+      apiScope = {
+        ...apiScope,
+        allowedEndpointIds: intersectAllowedIds(apiScope.allowedEndpointIds, activePoolAccess.allowedEndpointIds || []),
+      }
+    }
     if (rawBackend === 'api') {
       if (reqOwnerScope.type !== 'platform' && !apiScheduler?.hasOwnedEndpoints?.(reqOwnerScope, apiScope)) {
         stats.errors++
@@ -1104,8 +1506,24 @@ export function createHandleProtocol(deps) {
         return json(res, 403, errorResult.body)
       }
     } else if (rawBackend === 'all') {
-      const candidateApiScope = apiScheduleScope(req, keyScope.group_type, apiKeyStore?.users)
+      let candidateApiScope = apiScheduleScope(req, keyScope.group_type, apiKeyStore?.users)
+      if (!activePoolAccess.legacy) {
+        candidateApiScope = {
+          ...candidateApiScope,
+          allowedEndpointIds: intersectAllowedIds(
+            candidateApiScope.allowedEndpointIds,
+            activePoolAccess.allowedEndpointIds || [],
+          ),
+        }
+      }
       if (protocol === 'google.gemini') {
+        inferenceBackend = 'api'
+        apiScope = candidateApiScope
+      } else if (
+        !activePoolAccess.legacy &&
+        (activePoolAccess.allowedVmIds?.length || 0) === 0 &&
+        (activePoolAccess.allowedEndpointIds?.length || 0) > 0
+      ) {
         inferenceBackend = 'api'
         apiScope = candidateApiScope
       } else if (apiScheduler?.hasOwnedEndpoints?.(reqOwnerScope, candidateApiScope)) {
@@ -1253,7 +1671,6 @@ export function createHandleProtocol(deps) {
       logBag.error_message = errorResult.body?.error?.message || null
       return json(res, 403, errorResult.body)
     }
-    if (imageModel) return serveImageModelTurn({ req, res, protocol, body: ctx.body, logBag })
     if (platform.platform === 'anthropic') {
       try {
         validateImageDimensions(ctx.body)
@@ -1268,8 +1685,9 @@ export function createHandleProtocol(deps) {
       }
     }
     // Codex returns before conversion. Distill does not apply to OpenAI platform models; the rest
-    // of the gate scans them only when jev.openai_platform_enabled is on.
+    // of the gate scans them only when jev.openai_platform_enabled is on or pool/scope matches.
     if (
+      !imageModel &&
       platform.platform !== 'openai' &&
       inferenceBackend !== 'api' &&
       protocol === 'anthropic.messages' &&
@@ -1295,20 +1713,48 @@ export function createHandleProtocol(deps) {
     }
     const auditBody = ctx.body
     const earlyBodyCtx = createRequestBodyContext(auditBody)
+    const candidateAccounts =
+      inferenceBackend === 'api' || imageModel
+        ? null
+        : projectCandidateAccounts({
+            projectRoot: cfg.paths?.project,
+            keyScope,
+            ownerScope: reqOwnerScope,
+            platform: platform.platform,
+            accountQuota,
+          })
+    const gateChannel = imageModel
+      ? 'images'
+      : protocol === 'google.gemini' || platform.platform === 'gemini'
+        ? 'gemini'
+        : platform.platform === 'openai'
+          ? 'openai'
+          : 'anthropic'
+    const poolIsZeroInject = isPoolZeroInjectMode(effectivePool, getRouting() || {}, {
+      nodeProvider: platform.platform,
+      isInternalCall: Boolean(req.apiKeyKind === 'master' && isHealthRealBypass(req.headers)),
+    })
     if (
       preReviewEnabled &&
       (await applyProtocolIntercept({
         ...gateArgs,
         body: auditBody,
         scopeMatched: apiRiskReview,
+        candidateAccounts,
+        poolJevProfile: effectivePool?.jev_profile || req.poolJevProfile || keyScope.jev_profile || null,
+        zeroInject: poolIsZeroInject,
+        channel: gateChannel,
+        enforceHardAndJev: imageModel || gateChannel === 'gemini',
+        skipDistill: Boolean(imageModel),
         bodyCtx: earlyBodyCtx,
         skipMandatory: true,
         backend: inferenceBackend,
-        apiPlatform: apiPicked ? apiOpenAI : undefined,
+        apiPlatform: imageModel ? false : apiPicked ? apiOpenAI : undefined,
       }))
     ) {
       return
     }
+    if (imageModel) return serveImageModelTurn({ req, res, protocol, body: ctx.body, logBag, keyScope })
     let observedHop = false
     const afterHop = (result) => {
       observedHop = true
@@ -1340,7 +1786,6 @@ export function createHandleProtocol(deps) {
       }
       return reason
     }
-    const scopedRiskGate = logBag.risk_wait === true
     const route = logBag.risk_route
     if (route) {
       const unavailable = () => {
@@ -1359,20 +1804,66 @@ export function createHandleProtocol(deps) {
         )
       }
       if (route.kind === 'pool') {
-        const narrowed = applyVmPool({ ...keyScope, vm_pool_id: route.target })
         const pin = pinVmId || ''
         const owner = panelDiagnostics ? { type: 'any' } : ownerScopeFromRequest(req, apiKeyStore?.users)
-        const eligible = narrowed.allowed_vms.filter((id) => {
-          const vm = getVm(cfg.paths.project, id)
-          return (
-            vm &&
-            vmMatchesOwnerScope(vm, owner) &&
-            keyAllowsVm({ ...narrowed, group_type: platform.platform }, vm) &&
-            keyAllowsVm(keyScope, vm)
-          )
-        })
-        if (narrowed.vm_pool_error || !eligible.length || (pin && !eligible.includes(pin))) return unavailable()
-        keyScope = { ...narrowed, allowed_vms: eligible }
+        const preDecision = req._preDispatchDecision
+        const isTrustedDowngrade =
+          isTrustedGateDecision(preDecision) &&
+          preDecision.action === 'downgrade' &&
+          preDecision.jev_downgrade_pool_id === route.target
+        const trustedDowngradePoolIds = [riskState.policy?.risk_audit?.downgrade_pool].filter(Boolean)
+        let handledBySchedulerPool = false
+        if (isTrustedDowngrade && (!activePoolAccess.legacy || deps.poolsRepo || isDbOpen())) {
+          const downgradedAccess = resolveRequestPoolAccess(req, {
+            model: ctx.body?.model || inbound?.model || null,
+            ownerScope: owner,
+            jevDowngradePoolId: route.target,
+            isTrustedDowngrade: true,
+            trustedDowngradePoolIds,
+          })
+          if (downgradedAccess.ok && !downgradedAccess.legacy) {
+            if (inferenceBackend === 'api') {
+              const allowedEps = downgradedAccess.allowedEndpointIds || []
+              if (!allowedEps.length) return unavailable()
+              apiScope = { ...apiScope, allowedEndpointIds: allowedEps }
+            } else {
+              const platformVmIds =
+                platform.platform === 'openai'
+                  ? downgradedAccess.allowedCodexVmIds || []
+                  : downgradedAccess.allowedClaudeVmIds || []
+              if (!platformVmIds.length || (pin && !platformVmIds.includes(pin))) return unavailable()
+              keyScope = {
+                ...keyScope,
+                vm_pool_id: route.target,
+                vm_pool_error: null,
+                allowed_vms: platformVmIds,
+              }
+            }
+            activePoolAccess = downgradedAccess
+            effectivePool = downgradedAccess.effectivePool
+            req._poolAccess = downgradedAccess
+            logBag.resolved_pool_id = effectivePool?.id || route.target
+            logBag.is_downgraded = true
+            handledBySchedulerPool = true
+          } else if (!activePoolAccess.legacy) {
+            return unavailable()
+          }
+        }
+        if (!handledBySchedulerPool) {
+          if (!activePoolAccess.legacy) return unavailable()
+          const narrowed = applyVmPool({ ...keyScope, vm_pool_id: route.target })
+          const eligible = narrowed.allowed_vms.filter((id) => {
+            const vm = getVm(cfg.paths.project, id)
+            return (
+              vm &&
+              vmMatchesOwnerScope(vm, owner) &&
+              keyAllowsVm({ ...narrowed, group_type: platform.platform }, vm) &&
+              keyAllowsVm(keyScope, vm)
+            )
+          })
+          if (narrowed.vm_pool_error || !eligible.length || (pin && !eligible.includes(pin))) return unavailable()
+          keyScope = { ...narrowed, allowed_vms: eligible }
+        }
       }
       if (route.kind === 'model') {
         if (keyModelError(req, route.target, { anthropic: protocol === 'anthropic.messages' })) return unavailable()
@@ -1419,17 +1910,7 @@ export function createHandleProtocol(deps) {
         keyScope,
         afterHop,
       }
-      // Account scope needs the slot, so the Codex hop runs the same gate again
-      // once a candidate is claimed. Without a scope the pre-hop verdict stands.
-      const accountGate = !scopedRiskGate
-        ? null
-        : (account) =>
-            applyProtocolIntercept({
-              ...gateArgs,
-              body: auditBody,
-              account,
-              skipMandatory: true,
-            })
+      // Pre-dispatch JEV has already run before slot admission (zero Phase-3 inversion).
       if (protocol === 'anthropic.messages') {
         const codex = normalizeCodexRouting(routing.codex)
         return runWithCodexKey(req, res, logBag, () =>
@@ -1456,7 +1937,7 @@ export function createHandleProtocol(deps) {
             },
             projectRoot: cfg.paths.project,
             captureOutbound: logCtx.capture_outbound === true,
-            accountGate,
+            preDispatchDecision: req._preDispatchDecision || null,
             ops: deps.codexOps || {},
             ...codexSticky,
           }),
@@ -1476,7 +1957,7 @@ export function createHandleProtocol(deps) {
           routing,
           projectRoot: cfg.paths.project,
           captureOutbound: logCtx.capture_outbound === true,
-          accountGate,
+          preDispatchDecision: req._preDispatchDecision || null,
           ops: deps.codexOps || {},
           ...codexSticky,
         }),
@@ -1527,8 +2008,19 @@ export function createHandleProtocol(deps) {
     // Evaluated here on purpose -- after the risk/route pass may have re-picked
     // `apiPicked`, so the policy always comes from the endpoint actually used.
     // Never derived from caller input.
+    const apiPoolPrompt =
+      inferenceBackend === 'api'
+        ? resolvePoolSystemPromptPolicy(effectivePool, getRouting() || {}, {
+            nodeProvider: platform.platform,
+            isInternalCall: Boolean(requestContext || (req.apiKeyKind === 'master' && isHealthRealBypass(req.headers))),
+          })
+        : null
     const preserveApiCallerBody =
-      inferenceBackend === 'api' && !apiNonAnthropic && apiPicked?.endpoint?.body_policy === 'caller'
+      inferenceBackend === 'api' &&
+      !apiNonAnthropic &&
+      (apiPoolPrompt?.applies
+        ? apiPoolPrompt.apiBodyPolicy === 'caller'
+        : apiPicked?.endpoint?.body_policy === 'caller')
     const pfTarget =
       inferenceBackend === 'api'
         ? apiOpenAI
@@ -1546,7 +2038,7 @@ export function createHandleProtocol(deps) {
           targetFamily: pfTarget,
           handoffMode: 'canonical',
           reqPath: pathName,
-          headers: req.headers,
+          headers: outboundReqHeaders,
           body: ctx.body,
           routing: getRouting() || {},
           endpointBodyPolicy: apiPicked?.endpoint?.body_policy || '',
@@ -1576,7 +2068,7 @@ export function createHandleProtocol(deps) {
         targetFamily: pfTarget,
         handoffMode: 'canonical',
         reqPath: pathName,
-        headers: req.headers,
+        headers: outboundReqHeaders,
         body: ctx.body,
         routing: getRouting() || {},
         endpointBodyPolicy: apiPicked?.endpoint?.body_policy || '',
@@ -1764,8 +2256,8 @@ export function createHandleProtocol(deps) {
       routing: getRouting(),
     }
     // Pool identity comes from inbound metadata.user_id (or an explicit device_id),
-    // read before outbound cleaning. API key never scopes it.
-    const inboundIdentity = resolveInboundIdentity({ inbound, body: ctx.body, headers: req.headers })
+    // extracted before sanitizeInboundBody ran. API key never scopes it.
+    const inboundIdentity = legacyInboundIdentity
     const stickyDeviceId = inboundIdentity.deviceId
     if (childDeclaredWithoutParent(inbound, req.headers)) {
       stats.errors++
@@ -1920,12 +2412,21 @@ export function createHandleProtocol(deps) {
     }
     // Anthropic 400s a subscription request whose system field carries a third-party
     // agent prompt; the same text in the first user message is accepted.
+    // Skip relocation when an explicit Anthropic pool policy (`zero_inject` /
+    // `override` / `passthrough`) owns `system` directly.
+    const preRelocatePoolPrompt = resolvePoolSystemPromptPolicy(effectivePool, getRouting() || {}, {
+      nodeProvider: platform.platform,
+      isInternalCall: Boolean(requestContext || (req.apiKeyKind === 'master' && isHealthRealBypass(req.headers))),
+    })
+    const poolOwnsSystemDirectly =
+      preRelocatePoolPrompt.applies && ['zero_inject', 'override', 'passthrough'].includes(preRelocatePoolPrompt.mode)
     let cragRelocated = null
     if (
       !apiNonAnthropic &&
       inferenceBackend !== 'api' &&
       !requestContext &&
       !officialPassthrough &&
+      !poolOwnsSystemDirectly &&
       (!officialTraffic || hasForeignSystemBlock(ctx.body.system)) &&
       thirdPartyRelocateEnabled(getRouting())
     ) {
@@ -1960,17 +2461,32 @@ export function createHandleProtocol(deps) {
         ))
     let personaHideTokens = 0
     if (inferenceBackend === 'api') {
-      if (!preserveApiCallerBody && !apiNonAnthropic && !requestContext) {
-        ctx.body = applyCrsUnofficialPersona(ctx.body, {
-          officialClient: officialPassthrough,
-          forceConfigured: !officialPassthrough,
-          routingFile: routingConfigPath,
-          cacheTtl: requestedCacheTtl,
-          headers: req.headers,
-          sessionId: outboundSessionId,
-          model: ctx.body?.model,
-          cliVersion: OFFICIAL_CLI_VERSION,
-        })
+      if (apiPoolPrompt) {
+        logBag.prompt_policy = {
+          mode: apiPoolPrompt.mode,
+          source: apiPoolPrompt.source,
+          pool_id: apiPoolPrompt.poolId,
+        }
+      }
+      if (!apiNonAnthropic && !requestContext) {
+        if (apiPoolPrompt?.applies && apiPoolPrompt.mode === 'override') {
+          ctx.body = applyPoolPromptToAnthropicBody(ctx.body, apiPoolPrompt)
+        } else if (!preserveApiCallerBody) {
+          ctx.body = applyCrsUnofficialPersona(ctx.body, {
+            officialClient: officialPassthrough,
+            forceConfigured: !officialPassthrough,
+            ...(apiPoolPrompt?.applies && apiPoolPrompt.cliPreset ? { mode: apiPoolPrompt.cliPreset } : {}),
+            routingFile: routingConfigPath,
+            cacheTtl: requestedCacheTtl,
+            headers: req.headers,
+            sessionId: outboundSessionId,
+            model: ctx.body?.model,
+            cliVersion: OFFICIAL_CLI_VERSION,
+          })
+          if (apiPoolPrompt?.applies && apiPoolPrompt.mode === 'append') {
+            ctx.body = applyPoolPromptToAnthropicBody(ctx.body, apiPoolPrompt)
+          }
+        }
       }
       if (!officialPassthrough && !requestContext && !apiGemini) {
         ctx.body = repairCacheBreakpoints(ctx.body, {
@@ -1979,17 +2495,19 @@ export function createHandleProtocol(deps) {
           fillMissing: !preserveApiCallerBody,
         })
       }
+      const apiEffectivePersonaMode =
+        apiPoolPrompt?.applies && apiPoolPrompt.cliPreset ? apiPoolPrompt.cliPreset : personaMode
       personaHideTokens =
         requestContext ||
         apiNonAnthropic ||
         preserveApiCallerBody ||
-        personaUsagePassthroughFromRoutingFile(routingConfigPath, personaMode)
+        personaUsagePassthroughFromRoutingFile(routingConfigPath, apiEffectivePersonaMode)
           ? 0
           : personaHideForUnofficial(personaIn, ctx.body, {
               officialClient: officialPassthrough,
-              mode: personaMode,
-              hides: personaHidesUsageFromRoutingFile(routingConfigPath),
-              standing: standingUsageFromRoutingFile(routingConfigPath),
+              mode: apiEffectivePersonaMode,
+              hides: personaHidesUsageFromRoutingFile(routingConfigPath, apiEffectivePersonaMode),
+              standing: standingUsageFromRoutingFile(routingConfigPath, apiEffectivePersonaMode),
             })
     }
 
@@ -2267,6 +2785,7 @@ export function createHandleProtocol(deps) {
         // Set only when a group member actually supplied the sticky key.
         batchMember: !isProbe && batchApplied,
         stickyDeviceId,
+        inboundIdentity: ctx.inboundIdentity,
         deviceKey,
         skipSessionSeat: seatless,
         familyKey: summarySession ? null : familyKey,
@@ -2317,21 +2836,6 @@ export function createHandleProtocol(deps) {
               ? `slot:${selected.slotIndex ?? 'x'}:${attemptStartedAt}`
               : `${attemptStartedAt}:${selected.vmId || extra.attemptNo || ''}`,
           })
-          if (scopedRiskGate) {
-            const blocked = await applyProtocolIntercept({
-              ...gateArgs,
-              body: auditBody,
-              account: scopeAccountFromVm(selected?.vm, findAccount(accountQuota, selected?.vm)?.unified),
-              bodyCtx: earlyBodyCtx,
-              skipMandatory: true,
-              interceptSessionKey: attemptSessionId ? `${selected.accountId}:${attemptSessionId}` : null,
-            })
-            if (blocked) {
-              const error = new Error('response already sent')
-              error.code = 'response_sent'
-              throw error
-            }
-          }
           const identity = loadVmIdentity(selected.exec)
           if (identity && attemptSessionId) identity.callerSessionId = attemptSessionId
           const credMode = credentialModeFromOauth(selected.vm?.claude || {})
@@ -2366,10 +2870,21 @@ export function createHandleProtocol(deps) {
           const preserveCliHopThinkingBlocks = !thinkingRepaired
           const cliHop = resolveOfficialCcInference(selected.vm, routingNow) === 'cli-hop'
           const resolvedPersona = resolveSlotPersonaPreset(selected.vm, routingNow)
+          const attemptPoolPrompt = resolvePoolSystemPromptPolicy(effectivePool, routingNow, {
+            nodeProvider: 'anthropic',
+            isInternalCall: Boolean(requestContext || healthReal),
+          })
+          logBag.prompt_policy = {
+            mode: attemptPoolPrompt.mode,
+            source: attemptPoolPrompt.source,
+            pool_id: attemptPoolPrompt.poolId,
+          }
+          const effectiveCliPersona =
+            attemptPoolPrompt.applies && attemptPoolPrompt.cliPreset ? attemptPoolPrompt.cliPreset : resolvedPersona
           const preserveCallerEnvironment = !presetFlagEnabled(
             routingNow?.compatibility,
             'persona_env_presets',
-            resolvedPersona,
+            effectiveCliPersona,
           )
           let hopBody = body
           if (cliHop) {
@@ -2390,7 +2905,10 @@ export function createHandleProtocol(deps) {
                 kernelConfig: readSlotKernelConfig(selected.exec?.homeDir),
               })
             if (cragPrint) {
-              const cragPersona = resolveCragPrintPersona(selected.vm, routingNow)
+              const cragPersona =
+                attemptPoolPrompt.applies && attemptPoolPrompt.cragPreset
+                  ? attemptPoolPrompt.cragPreset
+                  : resolveCragPrintPersona(selected.vm, routingNow)
               const caps = preparedHop.ready.health?.capabilities
               const preserveToolNames = deferToolNameRewrite && caps?.includes('generation_controls_v3')
               const cragInput = cragRelocated || (hasCragSystem ? { ...personaIn, system: cragSystem } : personaIn)
@@ -2461,6 +2979,8 @@ export function createHandleProtocol(deps) {
                 preset: cragPersona,
                 officialPassthrough: officialPassthrough && !cacheControlRepaired,
                 capabilities: Array.isArray(caps) ? caps : [],
+                health: preparedHop.ready.health || null,
+                promptPolicy: attemptPoolPrompt.applies ? attemptPoolPrompt : null,
                 agentSummary: !!summarySession,
                 foldSystemMessages: routingNow?.compatibility?.crag_fold_history_system !== false,
               })
@@ -2483,7 +3003,7 @@ export function createHandleProtocol(deps) {
               }
               const nativeCragV3 = caps?.includes('generation_controls_v3') && caps?.includes('linux_tui_native_queue')
               if (identity && !nativeCragV3) {
-                hopBody = applyCrsIdentityReplace(hopBody, identity, inbound, req.headers, {
+                hopBody = applyCrsIdentityReplace(hopBody, identity, inbound, outboundReqHeaders, {
                   officialClient: officialTraffic,
                   sessionId: attemptSessionId,
                   mode: sessionMode,
@@ -2511,6 +3031,7 @@ export function createHandleProtocol(deps) {
                 transport: preparedHop.ready.health?.transport,
                 persona: cragPersona,
                 prompt_mode: hopBody.crag_prompt?.mode || 'default',
+                ...(attemptPoolPrompt.applies ? { pool_prompt_mode: attemptPoolPrompt.mode } : {}),
                 safeguards_stripped: Boolean(personaIn.safeguards != null && hopBody.safeguards == null),
                 ...(cacheControlRepaired ? { cache_control_repaired: true } : {}),
               }
@@ -2541,20 +3062,46 @@ export function createHandleProtocol(deps) {
               }
             }
             // The front rewrite already produces the official two-block shape.
-            const outboundProfile = profileForPreset(resolvedPersona)
+            const cliPoolPassthrough = attemptPoolPrompt.applies && attemptPoolPrompt.mode === 'passthrough'
+            const effectiveOfficialPassthrough =
+              attemptPoolPrompt.applies && attemptPoolPrompt.mode !== 'official' ? false : officialPassthrough
+            const outboundProfile = profileForPreset(effectiveCliPersona)
             // Render once from caller input with the selected slot's identity, not the pre-selection environment.
-            if (!requestContext && !officialPassthrough) {
-              hopBody = applyCrsUnofficialPersona(prepareCliPersonaInput(shallowCopyBody(personaIn), resolvedPersona), {
-                forceConfigured: true,
-                routingFile: routingConfigPath,
-                cacheTtl: requestedCacheTtl,
-                mode: resolvedPersona,
-                sessionId: attemptSessionId,
-                model: hopBody?.model,
-                cliVersion: outboundProfile.cliVersion,
-                identity,
-                entrypoint: entrypointNow,
-              })
+            if (!requestContext && !effectiveOfficialPassthrough) {
+              if (cliPoolPassthrough) {
+                hopBody = shallowCopyBody(personaIn)
+              } else if (attemptPoolPrompt.applies && attemptPoolPrompt.mode === 'override') {
+                const overridden = applyPoolPromptToAnthropicBody(shallowCopyBody(personaIn), attemptPoolPrompt)
+                hopBody = applyCrsUnofficialPersona(prepareCliPersonaInput(overridden, 'zero'), {
+                  forceConfigured: true,
+                  routingFile: routingConfigPath,
+                  cacheTtl: requestedCacheTtl,
+                  mode: 'zero',
+                  sessionId: attemptSessionId,
+                  model: hopBody?.model,
+                  cliVersion: outboundProfile.cliVersion,
+                  identity,
+                  entrypoint: entrypointNow,
+                })
+              } else {
+                hopBody = applyCrsUnofficialPersona(
+                  prepareCliPersonaInput(shallowCopyBody(personaIn), effectiveCliPersona),
+                  {
+                    forceConfigured: true,
+                    routingFile: routingConfigPath,
+                    cacheTtl: requestedCacheTtl,
+                    mode: effectiveCliPersona,
+                    sessionId: attemptSessionId,
+                    model: hopBody?.model,
+                    cliVersion: outboundProfile.cliVersion,
+                    identity,
+                    entrypoint: entrypointNow,
+                  },
+                )
+                if (attemptPoolPrompt.applies && attemptPoolPrompt.mode === 'append') {
+                  hopBody = applyPoolPromptToAnthropicBody(hopBody, attemptPoolPrompt)
+                }
+              }
               // The re-render starts from the raw caller body; re-apply this account's thinking ownership to it.
               hopBody = filterThinkingForAccount(hopBody, selected.accountId, thinkingOwnerStore).body
               for (const policy of extra.repairs || []) hopBody = repairAnthropicRequest(hopBody, policy)
@@ -2564,13 +3111,14 @@ export function createHandleProtocol(deps) {
               repaired: thinkingRepaired,
               cacheTtl: requestedCacheTtl,
               requestContext,
-              preserveSystem: false,
-              preserveCacheTtl: officialPassthrough && !cacheControlRepaired,
+              preserveSystem: cliPoolPassthrough,
+              preserveCacheTtl: effectiveOfficialPassthrough && !cacheControlRepaired,
               preserveThinkingBlocks: preserveCliHopThinkingBlocks,
               preserveCallerEnvironment,
               autoCompactWindow: ctx.autoCompactWindow,
               routing: routingNow,
-              personaPreset: !requestContext && !officialPassthrough ? resolvedPersona : null,
+              personaPreset:
+                !requestContext && !effectiveOfficialPassthrough && !cliPoolPassthrough ? effectiveCliPersona : null,
             })
             if (!requestContext) {
               hopBody = ensureBillingAttribution(hopBody, {
@@ -2579,7 +3127,7 @@ export function createHandleProtocol(deps) {
                 cliVersion: outboundProfile.cliVersion,
                 indexes: billingIndexesFromMessages(hopBody.messages),
                 entrypoint: entrypointNow,
-                passthrough: officialPassthrough,
+                passthrough: effectiveOfficialPassthrough,
               })
             }
             const materialized = await materializeRemoteImageSources(hopBody)
@@ -2588,7 +3136,7 @@ export function createHandleProtocol(deps) {
               hopBody = materialized
             }
             if (identity) {
-              hopBody = applyCrsIdentityReplace(hopBody, identity, inbound, req.headers, {
+              hopBody = applyCrsIdentityReplace(hopBody, identity, inbound, outboundReqHeaders, {
                 officialClient: officialTraffic,
                 sessionId: attemptSessionId,
                 mode: sessionMode,
@@ -2615,7 +3163,7 @@ export function createHandleProtocol(deps) {
 
             personaHideTokens = 0
             logBag.inference_engine = resolveInferenceEngine(selected.vm, routingNow)
-            logBag.persona_preset = resolveSlotPersonaPreset(selected.vm, routingNow)
+            logBag.persona_preset = effectiveCliPersona
             logBag.outbound_profile = { cli_version: outboundProfile.cliVersion }
             logBag.official_cc_inference = 'cli-hop'
             logBag.provider = 'local_cli'
@@ -2649,12 +3197,45 @@ export function createHandleProtocol(deps) {
             }
           }
 
-          preserveCacheBreakpoints = officialPassthrough && !cacheControlRepaired
+          const effectiveHttpOfficialPassthrough =
+            attemptPoolPrompt.applies && attemptPoolPrompt.mode !== 'official' ? false : officialPassthrough
+          preserveCacheBreakpoints = effectiveHttpOfficialPassthrough && !cacheControlRepaired
           cacheTtl = requestedCacheTtl
-          if (!requestContext && !officialPassthrough) {
-            const configuredMode = modeOverride || resolveSlotPersonaPreset(selected.vm, routingNow)
-            const rewritten = repairCacheBreakpoints(
-              applyCrsUnofficialPersona(shallowCopyBody(personaIn), {
+          const configuredMode =
+            attemptPoolPrompt.applies && attemptPoolPrompt.cliPreset
+              ? attemptPoolPrompt.cliPreset
+              : modeOverride || resolveSlotPersonaPreset(selected.vm, routingNow)
+          if (!requestContext && !effectiveHttpOfficialPassthrough) {
+            if (attemptPoolPrompt.applies && attemptPoolPrompt.mode === 'passthrough') {
+              hopBody = officialMessagesBody(shallowCopyBody(personaIn))
+              for (const policy of extra.repairs || []) hopBody = repairAnthropicRequest(hopBody, policy)
+              personaHideTokens = 0
+            } else if (attemptPoolPrompt.applies && attemptPoolPrompt.mode === 'override') {
+              const overridden = applyPoolPromptToAnthropicBody(shallowCopyBody(personaIn), attemptPoolPrompt)
+              const rewritten = repairCacheBreakpoints(
+                applyCrsUnofficialPersona(overridden, {
+                  officialClient: false,
+                  forceConfigured: true,
+                  routingFile: routingConfigPath,
+                  cacheTtl: requestedCacheTtl,
+                  mode: 'zero',
+                  headers: req.headers,
+                  sessionId: attemptSessionId,
+                  model: personaIn?.model,
+                  cliVersion: OFFICIAL_CLI_VERSION,
+                  identity,
+                }),
+                {
+                  limit: Number(routingNow?.compatibility?.cache_control_limit) || 4,
+                  fallbackTtl: requestedCacheTtl,
+                  fillMissing: true,
+                },
+              )
+              hopBody = officialMessagesBody(rewritten)
+              for (const policy of extra.repairs || []) hopBody = repairAnthropicRequest(hopBody, policy)
+              personaHideTokens = 0
+            } else {
+              let rendered = applyCrsUnofficialPersona(shallowCopyBody(personaIn), {
                 officialClient: false,
                 forceConfigured: true,
                 routingFile: routingConfigPath,
@@ -2665,26 +3246,29 @@ export function createHandleProtocol(deps) {
                 model: personaIn?.model,
                 cliVersion: OFFICIAL_CLI_VERSION,
                 identity,
-              }),
-              {
+              })
+              if (attemptPoolPrompt.applies && attemptPoolPrompt.mode === 'append') {
+                rendered = applyPoolPromptToAnthropicBody(rendered, attemptPoolPrompt)
+              }
+              const rewritten = repairCacheBreakpoints(rendered, {
                 limit: Number(routingNow?.compatibility?.cache_control_limit) || 4,
                 fallbackTtl: requestedCacheTtl,
                 fillMissing: true,
-              },
-            )
-            hopBody = officialMessagesBody(rewritten)
-            for (const policy of extra.repairs || []) hopBody = repairAnthropicRequest(hopBody, policy)
-            personaHideTokens = personaUsagePassthroughFromRoutingFile(routingConfigPath, configuredMode)
-              ? 0
-              : personaHideForUnofficial(personaIn, rewritten, {
-                  officialClient: false,
-                  mode: configuredMode,
-                  hides: personaHidesUsageFromRoutingFile(routingConfigPath, configuredMode),
-                  standing: standingUsageFromRoutingFile(routingConfigPath, configuredMode),
-                })
+              })
+              hopBody = officialMessagesBody(rewritten)
+              for (const policy of extra.repairs || []) hopBody = repairAnthropicRequest(hopBody, policy)
+              personaHideTokens = personaUsagePassthroughFromRoutingFile(routingConfigPath, configuredMode)
+                ? 0
+                : personaHideForUnofficial(personaIn, rewritten, {
+                    officialClient: false,
+                    mode: configuredMode,
+                    hides: personaHidesUsageFromRoutingFile(routingConfigPath, configuredMode),
+                    standing: standingUsageFromRoutingFile(routingConfigPath, configuredMode),
+                  })
+            }
           }
           logBag.inference_engine = resolveInferenceEngine(selected.vm, routingNow)
-          logBag.persona_preset = resolveSlotPersonaPreset(selected.vm, routingNow)
+          logBag.persona_preset = configuredMode
           logBag.official_cc_inference = 'http'
           logBag.provider = 'anthropic_api'
           const prepared = prepareOutboundEnvelope({
@@ -2714,7 +3298,7 @@ export function createHandleProtocol(deps) {
             cacheBreakpoints,
             preserveThinkingBlocks,
             preserveCallerEnvironment,
-            reqHeaders: req.headers,
+            reqHeaders: outboundReqHeaders,
             homeDir: selected.exec?.homeDir || '',
             credentialMode: credMode,
             authScheme: isApiKeyMode(credMode) ? 'apikey' : 'oauth',
@@ -2751,7 +3335,7 @@ export function createHandleProtocol(deps) {
             return streamAndAssembleClaudeMessage({
               candidate,
               body,
-              reqHeaders: req.headers,
+              reqHeaders: outboundReqHeaders,
               timeoutMs: cfg.limits.upstream_timeout_ms,
               idleTimeoutMs: streamIdleTimeoutMs,
               signal,
@@ -2815,7 +3399,7 @@ export function createHandleProtocol(deps) {
               dropSampling: attemptMeta?.dropSampling === true,
               requestContext: attemptMeta?.requestContext || requestContext,
               body,
-              reqHeaders: req.headers,
+              reqHeaders: outboundReqHeaders,
               timeoutMs: cfg.limits.upstream_timeout_ms,
               idleTimeoutMs: streamIdleTimeoutMs,
               identity: loadVmIdentity(candidate.exec),
@@ -3214,6 +3798,59 @@ export function createHandleProtocol(deps) {
     logBag.model = typeof body?.model === 'string' ? body.model : null
     logBag.inbound_summary = summarizeBody(body)
     if (rejectKeyModel(req, res, protocol, body?.model, logBag)) return
+    const searchOwnerScope = ownerScopeFromRequest(req, apiKeyStore?.users)
+    const searchPoolAccess = resolveRequestPoolAccess(req, {
+      model: body?.model || null,
+      ownerScope: searchOwnerScope,
+    })
+    if (!searchPoolAccess.ok) {
+      return rejectPoolAccess(res, searchPoolAccess, logBag, protocol)
+    }
+    req._poolAccess = searchPoolAccess
+    if (searchPoolAccess.effectivePool?.id) logBag.resolved_pool_id = searchPoolAccess.effectivePool.id
+    const searchIdentity = refusalAuditIdentity({
+      inbound: body,
+      body,
+      headers: req.headers,
+      principal: riskPrincipal(req),
+    })
+    const searchRiskState = {
+      policy: refusalPolicy(),
+      repo: refusalRepo(),
+      devices: deviceRepo(),
+      sessions: sessionRepo(),
+    }
+    if (
+      await applyProtocolIntercept({
+        req,
+        inbound: body,
+        body,
+        fp: fingerprintRequest(req, body),
+        logBag,
+        requestId: logCtx.request_id,
+        res,
+        identity: searchIdentity,
+        riskState: searchRiskState,
+        poolJevProfile: searchPoolAccess.effectivePool?.jev_profile || req.poolJevProfile || null,
+        zeroInject: false,
+        channel: 'search',
+        enforceHardAndJev: true,
+        skipDistill: true,
+        backend: 'oauth',
+        apiPlatform: false,
+      })
+    ) {
+      return
+    }
+    const searchKeyScope =
+      !searchPoolAccess.legacy && searchPoolAccess.effectivePool
+        ? {
+            ...keyScopeFromRequest(req),
+            vm_pool_id: searchPoolAccess.effectivePool.id,
+            vm_pool_error: null,
+            allowed_vms: searchPoolAccess.allowedVmIds || [],
+          }
+        : undefined
     return runWithCodexKey(req, res, logBag, () =>
       handleCodexSearch({
         req,
@@ -3225,7 +3862,9 @@ export function createHandleProtocol(deps) {
         routing: getRouting() || {},
         projectRoot: cfg.paths.project,
         stickyRouter,
-        ownerScope: ownerScopeFromRequest(req, apiKeyStore?.users),
+        ownerScope: searchOwnerScope,
+        ops: deps.codexOps || {},
+        ...(searchKeyScope ? { keyScope: searchKeyScope } : {}),
       }),
     )
   }
@@ -3246,7 +3885,7 @@ export function createHandleProtocol(deps) {
    * when the last user message carries images) answered in the caller's protocol. The row is
    * an Images row, so it bills image usage alone like /v1/images.
    */
-  async function serveImageModelTurn({ req, res, protocol, body, logBag }) {
+  async function serveImageModelTurn({ req, res, protocol, body, logBag, keyScope = null }) {
     const turn = imagesRequestFromTurn(protocol, body)
     if (!turn.ok) {
       stats.errors++
@@ -3303,6 +3942,7 @@ export function createHandleProtocol(deps) {
           stickyRouter,
           ownerScope: ownerScopeFromRequest(req, apiKeyStore?.users),
           ops: deps.codexOps || {},
+          ...(keyScope ? { keyScope } : {}),
         })
       })
     } finally {
@@ -3430,6 +4070,59 @@ export function createHandleProtocol(deps) {
     logBag.inbound_summary = summarizeImagesBody(body)
     // No model means the upstream default, which a limited key cannot name.
     if (rejectKeyModel(req, res, protocol, body?.model, logBag)) return
+    const imagesOwnerScope = ownerScopeFromRequest(req, apiKeyStore?.users)
+    const imagesPoolAccess = resolveRequestPoolAccess(req, {
+      model: body?.model || null,
+      ownerScope: imagesOwnerScope,
+    })
+    if (!imagesPoolAccess.ok) {
+      return rejectPoolAccess(res, imagesPoolAccess, logBag, protocol)
+    }
+    req._poolAccess = imagesPoolAccess
+    if (imagesPoolAccess.effectivePool?.id) logBag.resolved_pool_id = imagesPoolAccess.effectivePool.id
+    const imagesIdentity = refusalAuditIdentity({
+      inbound: body,
+      body,
+      headers: req.headers,
+      principal: riskPrincipal(req),
+    })
+    const imagesRiskState = {
+      policy: refusalPolicy(),
+      repo: refusalRepo(),
+      devices: deviceRepo(),
+      sessions: sessionRepo(),
+    }
+    if (
+      await applyProtocolIntercept({
+        req,
+        inbound: body,
+        body,
+        fp: fingerprintRequest(req, body),
+        logBag,
+        requestId: logCtx.request_id,
+        res,
+        identity: imagesIdentity,
+        riskState: imagesRiskState,
+        poolJevProfile: imagesPoolAccess.effectivePool?.jev_profile || req.poolJevProfile || null,
+        zeroInject: false,
+        channel: 'images',
+        enforceHardAndJev: true,
+        skipDistill: true,
+        backend: 'oauth',
+        apiPlatform: false,
+      })
+    ) {
+      return
+    }
+    const imagesKeyScope =
+      !imagesPoolAccess.legacy && imagesPoolAccess.effectivePool
+        ? {
+            ...keyScopeFromRequest(req),
+            vm_pool_id: imagesPoolAccess.effectivePool.id,
+            vm_pool_error: null,
+            allowed_vms: imagesPoolAccess.allowedVmIds || [],
+          }
+        : undefined
     return runWithCodexKey(req, res, logBag, () =>
       handleCodexImages({
         req,
@@ -3442,7 +4135,9 @@ export function createHandleProtocol(deps) {
         routing: getRouting() || {},
         projectRoot: cfg.paths.project,
         stickyRouter,
-        ownerScope: ownerScopeFromRequest(req, apiKeyStore?.users),
+        ownerScope: imagesOwnerScope,
+        ops: deps.codexOps || {},
+        ...(imagesKeyScope ? { keyScope: imagesKeyScope } : {}),
       }),
     )
   }

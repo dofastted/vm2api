@@ -12,7 +12,6 @@ export type SystemPromptKernelSet = 'cli-node' | 'crag' | 'craggemini'
 export function systemPromptSaveToast(
   kernelSet: SystemPromptKernelSet,
   compat: Compat | undefined,
-  inherited: number,
   kernel?: { updated?: number } | null
 ): string {
   if (kernelSet === 'craggemini') {
@@ -25,7 +24,7 @@ export function systemPromptSaveToast(
       cragPersonaFromCompat(compat) === 'zero' ? '0注入' : '官方完整'
     return `已保存 · CRAG v2 print · ${label}`
   }
-  return protocolPersonaSaveToast(compat, inherited, kernel)
+  return protocolPersonaSaveToast(compat, kernel)
 }
 
 /**

@@ -101,6 +101,11 @@ test('maps check ids, check codes, and failed job error codes to Chinese with se
           state: 'fail',
           code: 'gemini_sandbox_apparmor_restricted',
         },
+        {
+          id: 'agy_patch',
+          state: 'fail',
+          code: 'gemini_maintenance_agy_patch_missing',
+        },
       ],
       job: {
         id: 'job-2',
@@ -121,6 +126,9 @@ test('maps check ids, check codes, and failed job error codes to Chinese with se
   expect(html).toContain('非特权沙箱（bwrap / AppArmor）')
   expect(html).toContain('AppArmor 限制了非特权 user namespace')
   expect(html).toContain('gemini_sandbox_apparmor_restricted')
+  expect(html).toContain('Antigravity CLI 资格补丁')
+  expect(html).toContain('尚未应用资格补丁')
+  expect(html).toContain('gemini_maintenance_agy_patch_missing')
   expect(html).toContain('宿主仍有进行中的 Gemini 授权、终端、推理或维护任务')
   expect(html).toContain('gemini_maintenance_busy')
 

@@ -11,6 +11,17 @@ import { Readable } from 'node:stream'
 import { WebSocket, WebSocketServer } from 'ws'
 import { computedUpstreamTransport, inferenceWebsocketEnabled } from './codex-route.mjs'
 import { DEFAULT_MAX_REQUEST_BYTES, inboundBodyLimit } from '../core/config.mjs'
+import { keyScopeFromRequest } from '../admin/key-scope.mjs'
+import { ownerScopeFromRequest } from '../admin/resource-owner.mjs'
+import { isOfficialClaudeCodeTraffic } from '../identity/crs-persona.mjs'
+import { resolveInferenceBackend } from '../pool/api-protocol.mjs'
+import { detectInboundPlatform } from './platform-detect.mjs'
+import {
+  clientBlockErrorOf,
+  projectCandidateAccounts,
+  resolveRiskRepos,
+  runUnifiedPreDispatch,
+} from './unified-pre-dispatch.mjs'
 
 export const RESPONSES_WS_QUEUE_LIMIT = 32
 export const RESPONSES_WS_REPLAY_MAX_ITEMS = 32
@@ -460,6 +471,14 @@ export function createResponsesWsHandler({
   json,
   getRouting,
   maxBodyBytes = DEFAULT_MAX_REQUEST_BYTES,
+  cfg = null,
+  settings = null,
+  refusalGuards = null,
+  refusalDevices = null,
+  refusalSessions = null,
+  accountQuota = null,
+  apiKeyStore = null,
+  preDispatch = null,
 } = {}) {
   const wss = new WebSocketServer({ noServer: true, maxPayload: maxBodyBytes })
 
@@ -576,6 +595,93 @@ export function createResponsesWsHandler({
           activeHopCompleted = false
           const req = createProtocolReq(upgradeReq, hopBody)
           currentReq = req
+
+          // Frame-level pre-dispatch JEV gate: every `response.create` frame
+          // must clear JEV BEFORE handleProtocol/slot admission. Blocked frames
+          // receive a standardized WS error frame while the socket stays alive.
+          const detected = detectInboundPlatform(hopBody?.model)
+          const framePlatform = detected?.ok ? detected.platform : ''
+          const rawBackend = resolveInferenceBackend(req)
+          const frameBackend = rawBackend === 'api' ? 'api' : 'oauth'
+          const frameKeyScope = keyScopeFromRequest(req)
+          const frameOwnerScope = ownerScopeFromRequest(req, apiKeyStore?.users)
+          const frameCandidates =
+            frameBackend === 'api' || !cfg?.paths?.project
+              ? null
+              : projectCandidateAccounts({
+                  projectRoot: cfg.paths.project,
+                  keyScope: frameKeyScope,
+                  ownerScope: frameOwnerScope,
+                  platform: framePlatform,
+                  accountQuota,
+                })
+          const personaInject = String(routing?.compatibility?.persona_inject || '')
+            .trim()
+            .toLowerCase()
+          const personaPreset = String(routing?.compatibility?.persona_preset || '')
+            .trim()
+            .toLowerCase()
+          const zeroInject = personaInject === 'zero' || personaPreset === 'zero'
+          const official = isOfficialClaudeCodeTraffic(req.headers, hopBody)
+          const riskState = resolveRiskRepos({ settings, refusalGuards, refusalDevices, refusalSessions })
+          const preDispatchInput = {
+            req,
+            inbound: hopBody,
+            body: hopBody,
+            headers: req.headers,
+            official,
+            zeroInject,
+            distillRules: cfg?.distill,
+            policy: riskState.policy,
+            settings,
+            repo: riskState.repo,
+            devices: riskState.devices,
+            sessions: riskState.sessions,
+            candidateAccounts: frameCandidates,
+            poolJevProfile: req.poolJevProfile || req.apiKeyRecord?.jev_profile || null,
+            channel: framePlatform === 'gemini' ? 'gemini' : framePlatform === 'openai' ? 'openai' : 'anthropic',
+            backend: frameBackend,
+            openaiPlatform: framePlatform === 'openai',
+          }
+          let frameDecision = null
+          try {
+            frameDecision =
+              typeof preDispatch === 'function'
+                ? await preDispatch(preDispatchInput)
+                : await runUnifiedPreDispatch(preDispatchInput)
+          } catch (error) {
+            console.warn('[responses-ws] pre-dispatch gate error', error?.code || error?.name || 'unknown_error')
+            currentReq = null
+            sendFrame(
+              ws,
+              responsesWsErrorFrame({
+                status: 503,
+                type: 'overloaded_error',
+                code: 'policy_gate_error',
+                message: 'Pre-dispatch policy check failed',
+              }),
+            )
+            continue
+          }
+          if (closed) return
+          if (frameDecision?.action === 'block') {
+            currentReq = null
+            const clientErr = clientBlockErrorOf(frameDecision)
+            sendFrame(
+              ws,
+              responsesWsErrorFrame({
+                status: clientErr.status,
+                type: clientErr.type,
+                code: clientErr.code,
+                message: clientErr.message,
+                details: clientErr.details,
+                requestId: clientErr.requestId,
+              }),
+            )
+            continue
+          }
+          if (frameDecision) req._preDispatchDecision = frameDecision
+
           let hopClientAborted = false
           const res = createProtocolRes()
           const bridge = createSseJsonBridge()
