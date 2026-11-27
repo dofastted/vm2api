@@ -22,6 +22,7 @@ import {
   resolveRiskRepos,
   runUnifiedPreDispatch,
 } from './unified-pre-dispatch.mjs'
+import { SchedulerApiError, SchedulerUnavailableError } from '../scheduler/scheduler-runtime.mjs'
 
 export const RESPONSES_WS_QUEUE_LIMIT = 32
 export const RESPONSES_WS_REPLAY_MAX_ITEMS = 32
@@ -479,7 +480,11 @@ export function createResponsesWsHandler({
   accountQuota = null,
   apiKeyStore = null,
   preDispatch = null,
+  schedulerRuntime = null,
+  getSchedulerRuntime = null,
 } = {}) {
+  const resolveSchedulerRuntime = () =>
+    (typeof getSchedulerRuntime === 'function' ? getSchedulerRuntime() : schedulerRuntime) || null
   const wss = new WebSocketServer({ noServer: true, maxPayload: maxBodyBytes })
 
   function handshakeRes(socket) {
@@ -535,12 +540,16 @@ export function createResponsesWsHandler({
     let busy = false
     let closed = false
     let currentReq = null
+    let currentRes = null
     let activeResponseId = null
     let activeHopCompleted = false
 
     const abortCurrent = () => {
       try {
         currentReq?.abort?.()
+      } catch {}
+      try {
+        currentRes?.destroy?.()
       } catch {}
     }
 
@@ -594,6 +603,8 @@ export function createResponsesWsHandler({
           activeResponseId = null
           activeHopCompleted = false
           const req = createProtocolReq(upgradeReq, hopBody)
+          const activeRt = resolveSchedulerRuntime()
+          if (activeRt) req._schedulerRuntime = activeRt
           currentReq = req
 
           // Frame-level pre-dispatch JEV gate: every `response.create` frame
@@ -684,6 +695,7 @@ export function createResponsesWsHandler({
 
           let hopClientAborted = false
           const res = createProtocolRes()
+          currentRes = res
           const bridge = createSseJsonBridge()
           let jsonBody = ''
           const flushBridge = () => {
@@ -710,18 +722,51 @@ export function createResponsesWsHandler({
           } catch (error) {
             console.warn('[responses-ws] request failed', error?.code || error?.name || 'unknown_error')
             if (!res.writableEnded) res.end()
-            sendFrame(
-              ws,
-              responsesWsErrorFrame({
-                status: 500,
-                type: 'api_error',
-                code: 'api_error',
-                message: 'Responses request failed',
-              }),
-            )
+            if (error instanceof SchedulerUnavailableError || error?.code === 'scheduler_unavailable') {
+              sendFrame(
+                ws,
+                responsesWsErrorFrame({
+                  status: 503,
+                  type: 'api_error',
+                  code: 'scheduler_unavailable',
+                  message: error?.message || 'Rust scheduler sidecar is unavailable',
+                  details: { retry_after_sec: 1 },
+                }),
+              )
+            } else if (error instanceof SchedulerApiError) {
+              const status = error.status || 503
+              sendFrame(
+                ws,
+                responsesWsErrorFrame({
+                  status,
+                  type:
+                    status === 429
+                      ? 'rate_limit_error'
+                      : status === 403
+                        ? 'permission_error'
+                        : status === 422
+                          ? 'invalid_request_error'
+                          : 'api_error',
+                  code: error.code || 'scheduler_error',
+                  message: error.message || 'scheduler request rejected',
+                  ...(error.retryAfterSec ? { details: { retry_after_sec: error.retryAfterSec } } : {}),
+                }),
+              )
+            } else {
+              sendFrame(
+                ws,
+                responsesWsErrorFrame({
+                  status: 500,
+                  type: 'api_error',
+                  code: 'api_error',
+                  message: 'Responses request failed',
+                }),
+              )
+            }
             continue
           } finally {
             currentReq = null
+            currentRes = null
           }
           if (closed) return
           bridge.finish()

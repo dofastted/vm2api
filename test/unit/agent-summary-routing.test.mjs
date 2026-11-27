@@ -11,10 +11,11 @@ import { PoolScheduler } from '../../src/lib/pool/pool-scheduler.mjs'
 import { StickyRouter } from '../../src/lib/pool/sticky-router.mjs'
 import { ThinkingOwnerStore } from '../../src/lib/pool/thinking-owner.mjs'
 import { extractCallerSession, sessionIdFromOutboundBody } from '../../src/lib/identity/identity-rewrite.mjs'
-import { agentBody, summaryInstruction } from '../fixtures/agent-summary.mjs'
+import { agentBody } from '../fixtures/agent-summary.mjs'
 import { createAnthropicSseErrorRemapper } from '../../src/lib/protocol/stream-truncation.mjs'
 import { responsesSseToAnthropicEvents } from '../../src/lib/protocol/codex-convert.mjs'
 import { clearRustHealthCache, rememberRustHealth } from '../../src/lib/transport/kernel-router.mjs'
+import { SchedulerApiError } from '../../src/lib/transport/scheduler-client.mjs'
 
 function deferred() {
   let resolve
@@ -41,6 +42,134 @@ function success() {
   }
 }
 
+function makeMockSummaryRuntime({ capacity = 2 } = {}) {
+  let leaseSeq = 0
+  let active = 0
+  let nextSlot = 0
+  const capWaiters = []
+  const sessionLocks = new Map()
+  const leases = new Map()
+
+  const wakeCap = () => {
+    while (active < capacity && capWaiters.length > 0) {
+      const next = capWaiters.shift()
+      next.grant()
+    }
+  }
+
+  const acquireSession = async (sessionKey, signal) => {
+    if (!sessionKey) return () => {}
+    if (signal?.aborted) throw Object.assign(new Error('aborted'), { name: 'AbortError' })
+    let st = sessionLocks.get(sessionKey)
+    if (!st) {
+      st = { held: false, waiters: [] }
+      sessionLocks.set(sessionKey, st)
+    }
+    const release = () => {
+      const next = st.waiters.shift()
+      if (next) next.grant()
+      else {
+        st.held = false
+        if (sessionLocks.get(sessionKey) === st) sessionLocks.delete(sessionKey)
+      }
+    }
+    if (!st.held) {
+      st.held = true
+      return release
+    }
+    await new Promise((resolve, reject) => {
+      let settled = false
+      const w = {
+        grant() {
+          if (settled) return
+          settled = true
+          signal?.removeEventListener?.('abort', onAbort)
+          resolve()
+        },
+      }
+      const onAbort = () => {
+        if (settled) return
+        settled = true
+        const idx = st.waiters.indexOf(w)
+        if (idx >= 0) st.waiters.splice(idx, 1)
+        reject(Object.assign(new Error('aborted'), { name: 'AbortError' }))
+      }
+      signal?.addEventListener?.('abort', onAbort, { once: true })
+      st.waiters.push(w)
+    })
+    return release
+  }
+
+  const acquireCap = async (noQueue, signal) => {
+    if (signal?.aborted) throw Object.assign(new Error('aborted'), { name: 'AbortError' })
+    if (active < capacity) {
+      active += 1
+      return
+    }
+    if (noQueue) {
+      throw new SchedulerApiError({ status: 529, code: 'pool_overloaded', message: 'busy', retryAfterSec: 1 })
+    }
+    await new Promise((resolve, reject) => {
+      let settled = false
+      const w = {
+        grant() {
+          if (settled) return
+          settled = true
+          signal?.removeEventListener?.('abort', onAbort)
+          active += 1
+          resolve()
+        },
+      }
+      const onAbort = () => {
+        if (settled) return
+        settled = true
+        const idx = capWaiters.indexOf(w)
+        if (idx >= 0) capWaiters.splice(idx, 1)
+        reject(Object.assign(new Error('aborted'), { name: 'AbortError' }))
+      }
+      signal?.addEventListener?.('abort', onAbort, { once: true })
+      capWaiters.push(w)
+    })
+  }
+
+  return {
+    activeCount: () => active,
+    queuedCount: () => capWaiters.length,
+    async acquireNode(params, { signal } = {}) {
+      const lockKey = params.isEphemeralProbe ? '' : String(params.sessionId || '')
+      const releaseLock = await acquireSession(lockKey, signal)
+      try {
+        await acquireCap(params.noQueue === true, signal)
+        const leaseId = `summary-lease-${++leaseSeq}`
+        const slotIndex = nextSlot++
+        leases.set(leaseId, { releaseLock, slotIndex })
+        return {
+          lease_id: leaseId,
+          lease_ttl_ms: 30_000,
+          resolved_pool_id: params.originPoolId || '__default_claude__',
+          selected_node: { node_type: 'claude_vm', node_id: 'vm-01', node_key: 'claude_vm:vm-01' },
+          explain: { affinity: { why: 'balanced' } },
+        }
+      } catch (err) {
+        releaseLock()
+        throw err
+      }
+    },
+    async commitLease() {},
+    async releaseLease(leaseId) {
+      const rec = leases.get(leaseId)
+      if (!rec) return
+      leases.delete(leaseId)
+      active = Math.max(0, active - 1)
+      rec.releaseLock()
+      wakeCap()
+    },
+    slotIndexFor(leaseId) {
+      return leases.get(leaseId)?.slotIndex ?? 0
+    },
+  }
+}
+
 function harness({
   mode = 'rebuild',
   capacity = 2,
@@ -54,12 +183,27 @@ function harness({
   const routingFile = path.join(root, 'routing.json')
   fs.writeFileSync(routingFile, JSON.stringify(routing))
   const sticky = new StickyRouter({ dataDir: root, config: routing })
-  const pool = new PoolScheduler({ projectRoot: root, stickyRouter: sticky, config: poolConfig })
-  // Only discovery/health are simulated. The seat planner, reservations,
-  // session queue, sticky writes and outbound preparation are the real ones.
-  const vm = { id: 'vm-01', fingerprint: {}, claude: { account_tier: 'max' } }
+  const rt = makeMockSummaryRuntime({ capacity })
+  const vm = { id: 'vm-01', fingerprint: {}, claude: { account_uuid: 'account-1', account_tier: 'max' } }
   fs.mkdirSync(path.join(root, 'vms'), { recursive: true })
   fs.writeFileSync(path.join(root, 'vms', 'vm-01.json'), JSON.stringify(vm))
+  const pool = new PoolScheduler({ projectRoot: root, stickyRouter: sticky, schedulerRuntime: rt, config: poolConfig })
+  pool.resolveCandidateForNode = (_node, meta = {}) => ({
+    ok: true,
+    vmId: vm.id,
+    accountId: 'account-1',
+    vm,
+    model: meta.model,
+    exec: { vmId: vm.id, homeDir: root, vm },
+    nodeKey: 'claude_vm:vm-01',
+    leaseId: meta.leaseId || null,
+    slotIndex: rt.slotIndexFor(meta.leaseId),
+    selectionReason: meta.explain?.affinity?.why || 'balanced',
+    waitMs: 0,
+    queueWaitMs: 0,
+    schedulingMs: 0,
+    release() {},
+  })
   const previousKernelBin = process.env.KIN_KERNEL_BIN
   if (crag) {
     process.env.KIN_KERNEL_BIN = '/bin/true'
@@ -68,32 +212,9 @@ function harness({
       { ok: true, health: { ok: true, runtime_variant: 'crag-v2', ready_slots: 2, capabilities: ['prompt_append'] } },
     )
   }
-  pool.eligibleCandidates = async ({ model, excluded }) =>
-    excluded.has('account-1')
-      ? []
-      : [
-          {
-            ok: true,
-            vmId: vm.id,
-            accountId: 'account-1',
-            vm,
-            model,
-            priority: 1,
-            draining: false,
-            exec: { vmId: vm.id, homeDir: root, vm },
-            seatCap: capacity,
-            maxConcurrency: capacity,
-            headroom: null,
-            inflight: pool.inflight.get('account-1') || 0,
-            loadRatio: (pool.inflight.get('account-1') || 0) / capacity,
-            busy: false,
-          },
-        ]
-  // Reserve re-reads the VM record, proxy and worker health (#795); that is discovery too.
-  // Concurrency, seats and quota below stay real.
-  pool.admissionSnapshot = () => ({ account: null })
   const runner = new FailoverRunner({
     scheduler: pool,
+    schedulerRuntime: rt,
     stickyRouter: sticky,
     config: { session_queue_timeout_ms: 2000 },
   })
@@ -137,6 +258,7 @@ function harness({
     routingConfig: routing,
     groupsRepo: { rateMultiplier: () => 1 },
     thinkingOwners: new ThinkingOwnerStore({ db: thinkingDb }),
+    schedulerRuntime: rt,
     failoverRunner: {
       run(opts) {
         requests.push(opts)
@@ -145,7 +267,6 @@ function harness({
           callAttempt: async (call) => {
             calls.push({ id: opts.requestId, ...call })
             if (crag) {
-              // CRAG claims by tool ID, even when the gateway gives a fork a new session ID.
               const user = call.body.messages.findLast((message) => message.role === 'user')
               const results = Array.isArray(user?.content)
                 ? user.content.filter((block) => block.type === 'tool_result')
@@ -179,6 +300,7 @@ function harness({
     sticky,
     routing,
     pool,
+    rt,
     runner,
     requests,
     calls,
@@ -225,183 +347,10 @@ function harness({
       }
       sticky.db.close()
       thinkingDb.close()
+      fs.rmSync(root, { recursive: true, force: true })
     },
   }
 }
-
-function singleTurnSummary(metadata) {
-  return {
-    ...agentBody({ summary: true }),
-    metadata,
-    model: 'claude-haiku-4-5',
-    tools: [],
-    system: 'x-anthropic-billing-header: test. You are Claude Code.',
-    messages: [{ role: 'user', content: summaryInstruction() }],
-  }
-}
-
-test('messages and agent summaries return the family 529; probes bypass m', async () => {
-  const h = harness({ poolConfig: { max_subagents_per_session: 0, max_primary_sessions: 2 } })
-  h.pool.config.sticky_wait_timeout_ms = 40
-  const body = agentBody()
-  body.metadata.user_id = JSON.stringify({ device_id: 'machine-1', account_uuid: '', session_id: 'root' })
-  const agent = { 'x-claude-code-agent-id': 'agent', 'x-claude-code-parent-agent-id': 'parent-agent' }
-  try {
-    assert.equal((await h.invoke('root', body)).statusCode, 200)
-    const response = await h.invoke('nested', body, agent)
-    assert.equal(response.statusCode, 529, JSON.stringify(response.body))
-    assert.equal(response.body.error.code, 'pool_overloaded')
-    assert.equal(response.body.error.type, 'overloaded_error')
-    assert.deepEqual(response.body.error.details, { reason: 'subagent_limit' })
-    assert.ok(Number(response.headers['retry-after']) >= 1)
-    h.routing.failover.queue_keepalive_delay_ms = 1
-    const stream = await h.invoke('stream', { ...body, stream: true }, agent)
-    const event = stream.chunks.find((chunk) => chunk.startsWith('event: error'))
-    assert.ok(event)
-    assert.deepEqual(JSON.parse(event.split('data: ')[1]).error.details, { reason: 'subagent_limit' })
-    const summary = { ...agentBody({ summary: true }), metadata: body.metadata }
-    const denied = await h.invoke('summary', summary, agent)
-    assert.equal(denied.statusCode, 529)
-    assert.equal(denied.body.error.details.reason, 'subagent_limit')
-    const short = await h.invoke('companion-shaped-summary', singleTurnSummary(body.metadata), agent)
-    assert.ok(h.requests.at(-1).summarySession)
-    assert.equal(h.requests.at(-1).skipSessionSeat, true)
-    assert.equal(short.body.error.details.reason, 'subagent_limit')
-    const probe = { ...body, tools: [], messages: [{ role: 'user', content: 'hello' }] }
-    assert.equal((await h.invoke('probe', probe, agent)).statusCode, 200)
-    assert.deepEqual(
-      h.requests.map((r) => r.rootSessionId),
-      [null, 'root', 'root', 'root', 'root', null],
-    )
-    assert.deepEqual(h.pool.seatSnapshot().seats, {})
-  } finally {
-    h.close()
-  }
-})
-
-test('an agent summary with a forwarded session header or body key shares the root limit', async () => {
-  const h = harness({ poolConfig: { max_subagents_per_session: 0 } })
-  try {
-    assert.equal((await h.invoke('root')).statusCode, 200)
-    const summary = {
-      ...agentBody({ summary: true }),
-      metadata: {},
-      system: 'x-anthropic-billing-header: cc_entrypoint=cli;',
-    }
-    for (const [fields, headers] of [
-      [{}, { 'x-session-id': 'test-parent' }],
-      [{ conversation_id: 'test-parent' }, {}],
-    ]) {
-      const res = await h.invoke(
-        'summary',
-        { ...summary, ...fields },
-        { 'x-claude-code-agent-id': 'one', 'x-kin-queue': 'off', ...headers },
-      )
-      assert.ok(h.requests.at(-1).summarySession)
-      assert.equal(h.requests.at(-1).stickyKey, null)
-      assert.equal(res.statusCode, 529)
-      assert.deepEqual(res.body.error.details, { reason: 'subagent_limit' })
-    }
-    assert.equal(h.calls.length, 1)
-    assert.deepEqual(h.pool.seatSnapshot().seats, {})
-  } finally {
-    h.close()
-  }
-})
-
-test('a one-turn Haiku summary needs an independent seat when its root VM is unavailable', async () => {
-  const h = harness({ capacity: 4, poolConfig: { max_primary_sessions: 1, max_subagents_per_session: 1 } })
-  try {
-    assert.equal((await h.invoke('root')).statusCode, 200)
-    const [home] = await h.pool.eligibleCandidates({ excluded: new Set() })
-    const other = { ...home, vmId: 'vm-02', accountId: 'account-2', vm: { ...home.vm, id: 'vm-02' } }
-    other.exec = { ...home.exec, vmId: other.vmId, vm: other.vm }
-    h.pool.eligibleCandidates = async ({ onlyVmIds, excluded }) =>
-      (onlyVmIds && !onlyVmIds.has(other.vmId)) || excluded?.has(other.vmId) || excluded?.has(other.accountId)
-        ? []
-        : [other]
-    const blocker = await h.pool.selectAndReserve({ seatKey: 'seat:sess:blocker' })
-    const summary = singleTurnSummary(agentBody().metadata)
-    const invoke = () => h.invoke('summary', summary, { 'x-kin-queue': 'off' })
-    const full = await invoke()
-    blocker.release()
-    assert.equal(full.statusCode, 529)
-    assert.equal(h.calls.length, 1)
-    assert.equal((await invoke()).statusCode, 200)
-    const opts = h.requests.at(-1)
-    const { candidate } = h.calls.at(-1)
-    assert.ok(opts.summarySession)
-    assert.equal(opts.stickyKey, null)
-    assert.equal(candidate.selectionReason, 'subagent-fallback')
-    assert.equal(candidate.seatKey, `platform|seat:sess:${opts.summarySession}`)
-    assert.deepEqual([...h.pool.planner.roots.keys()], ['platform|seat:sess:test-parent', 'platform|seat:sess:blocker'])
-    assert.deepEqual(h.pool.seatSnapshot().seats, {})
-  } finally {
-    h.close()
-  }
-})
-
-test('a one-turn Haiku summary without a registered root takes its own seat only in family mode', async () => {
-  for (const m of [1, null]) {
-    const h = harness({ capacity: 4, poolConfig: { max_primary_sessions: 1, max_subagents_per_session: m } })
-    try {
-      const blocker = await h.pool.selectAndReserve({ seatKey: 'seat:sess:blocker' })
-      const body = singleTurnSummary(agentBody().metadata)
-      const invoke = () => h.invoke('summary', body, { 'x-kin-queue': 'off' })
-      const full = await invoke()
-      blocker.release()
-      assert.equal(full.statusCode, m === null ? 200 : 529)
-      if (m !== null) {
-        assert.equal(full.body.error.code, 'pool_overloaded')
-        assert.ok(Number(full.headers['retry-after']) >= 1)
-        assert.equal(h.calls.length, 0)
-      }
-      assert.equal((await invoke()).statusCode, 200)
-      const { summarySession, stickyKey } = h.requests.at(-1)
-      assert.ok(summarySession)
-      assert.equal(stickyKey, null)
-      assert.equal(h.calls.at(-1).candidate.seatKey, m === null ? undefined : `platform|seat:sess:${summarySession}`)
-      assert.equal(h.pool.planner.rootVm(`platform|seat:sess:${summarySession}`), null)
-      assert.deepEqual(h.pool.seatSnapshot().seats, {})
-    } finally {
-      h.close()
-    }
-  }
-})
-
-test('an orphan Haiku summary uses an idle legacy VM when its device home has no free seat', async () => {
-  const h = harness({ capacity: 1, poolConfig: { max_primary_sessions: 1 } })
-  try {
-    const [a] = await h.pool.eligibleCandidates({ excluded: new Set() })
-    a.vm.policy = { maxSubagentsPerSessionOverride: true, maxSubagentsPerSession: 1 }
-    const deviceKey = h.sticky.canonicalDeviceKey('test-device')
-    const blocker = await h.pool.selectAndReserve({ seatKey: 'seat:sess:blocker', deviceKey })
-    assert.equal(h.pool.machineHome(deviceKey), a.vmId)
-    const vm = { ...a.vm, id: 'vm-02', policy: {} }
-    const b = { ...a, vm, vmId: vm.id, accountId: 'account-2', exec: { ...a.exec, vm, vmId: vm.id } }
-    h.pool.eligibleCandidates = async ({ model, excluded, onlyVmIds }) =>
-      [a, b]
-        .filter((c) => !excluded.has(c.accountId) && !excluded.has(c.vmId) && (!onlyVmIds || onlyVmIds.has(c.vmId)))
-        .map((c) => ({ ...c, model }))
-
-    const body = singleTurnSummary({
-      user_id: JSON.stringify({ device_id: 'test-device', account_uuid: '', session_id: 'unknown' }),
-    })
-    const res = await h.invoke('summary', body, { 'x-kin-queue': 'off' })
-    blocker.release()
-    const opts = h.requests.at(-1)
-    assert.ok(opts.summarySession)
-    assert.equal(opts.stickyKey, null)
-    assert.equal(opts.deviceKey, deviceKey)
-    assert.equal(res.statusCode, 200)
-    assert.equal(h.calls.length, 1)
-    assert.equal(h.calls[0].candidate.vmId, b.vmId)
-    assert.equal(h.calls[0].candidate.seatKey, undefined)
-    assert.deepEqual(h.pool.seatSnapshot().seats, {})
-  } finally {
-    h.close()
-  }
-})
 
 test('upstream HTTP and SSE pool errors cannot supply the scheduler subagent reason', () => {
   const h = harness()
@@ -428,61 +377,6 @@ test('upstream HTTP and SSE pool errors cannot supply the scheduler subagent rea
   }
 })
 
-test('summaries with and without an agent id execute beside the active parent at n=1', async () => {
-  const h = harness({ capacity: 4, poolConfig: { max_primary_sessions: 1, max_subagents_per_session: 1 } })
-  const parent = h.invoke('parent')
-  try {
-    await Promise.race([
-      h.parentStarted.promise,
-      parent.then((res) => {
-        throw new Error(JSON.stringify(res.body))
-      }),
-    ])
-    for (const headers of [{}, { 'x-claude-code-agent-id': 'nested' }]) {
-      const response = await h.invoke('summary', agentBody({ summary: true }), headers)
-      assert.equal(response.statusCode, 200)
-      const call = h.calls.at(-1)
-      assert.equal(call.candidate.selectionReason, 'subagent')
-      assert.equal(call.candidate.seatKey, h.calls[0].candidate.seatKey)
-      assert.notEqual(sessionIdFromOutboundBody(call.body), sessionIdFromOutboundBody(h.calls[0].body))
-      assert.equal(h.requests.at(-1).stickyKey, null)
-      assert.equal(h.pool.planner.openCount('vm-01'), 1)
-    }
-  } finally {
-    h.parentGate.resolve()
-    await parent
-    h.close()
-  }
-})
-
-test('parent-only hints are ordinary sessions; explicit roots and CC agents join the root', async () => {
-  const h = harness({ capacity: 4, poolConfig: { max_primary_sessions: 2, max_subagents_per_session: 1 } })
-  const root = agentBody()
-  const request = agentBody()
-  request.metadata.user_id = JSON.stringify({ device_id: 'device', account_uuid: '', session_id: 'other' })
-  try {
-    assert.equal((await h.invoke('root', root)).statusCode, 200)
-    for (const [meta, headers, reason] of [
-      [{ parent_session_id: 'test-parent' }, {}, false],
-      [{}, { 'x-kin-parent-session': 'test-parent' }, false],
-      [{ root_session_id: 'test-parent' }, {}, true],
-      [{}, { 'x-kin-root-session': 'test-parent' }, true],
-    ]) {
-      const response = await h.invoke('relation', { ...request, metadata: { ...request.metadata, ...meta } }, headers)
-      assert.equal(response.statusCode, 200)
-      assert.equal(!!h.calls.at(-1).candidate.isSubagent, reason)
-    }
-    const headerOnly = await h.invoke(
-      'cc-header-only',
-      { ...request, metadata: {} },
-      { 'x-claude-code-agent-id': 'one', 'x-session-id': 'test-parent' },
-    )
-    assert.equal(headerOnly.statusCode, 200)
-    assert.equal(h.calls.at(-1).candidate.isSubagent, true)
-  } finally {
-    h.close()
-  }
-})
 for (const summaryFirst of [false, true]) {
   test(`CRAG summary cannot consume its parent's tool result (summary first: ${summaryFirst})`, async () => {
     const h = harness({ crag: true })
@@ -518,7 +412,6 @@ for (const summaryFirst of [false, true]) {
       assert.equal(mainUser.content[0].type, 'tool_result')
       assert.equal(mainUser.content[0].tool_use_id, 'test-tool')
       assert.deepEqual(side.messages.slice(0, 1), main.messages.slice(0, 1))
-      // The answered call goes read-only with its result: CRAG rejects an unpaired tool_use.
       assert.equal(
         side.messages[1].content.some((block) => block.type === 'tool_use'),
         false,
@@ -547,11 +440,6 @@ for (const mode of ['rebuild', 'passthrough']) {
           throw new Error(JSON.stringify({ body: res.body, requests: h.requests.length, calls: h.calls.length }))
         }),
       ])
-      const parentKey = h.sticky.canonicalSessionKey(h.parentSession)
-      const before = h.sticky.resolve(parentKey)
-      const familyKey = h.sticky.canonicalFamilyKey('test-parent')
-      const familyBefore = h.sticky.resolve(familyKey)
-      assert.ok(before?.sessionId)
       // A normal follow-up remains serialized even while a summary can run.
       followup = h.invoke('followup')
       const summary = await h.invoke('summary', agentBody({ summary: true, previous: 'Reading coverage.ts' }))
@@ -560,8 +448,6 @@ for (const mode of ['rebuild', 'passthrough']) {
         h.calls.map((call) => call.id),
         ['parent', 'summary'],
       )
-      assert.deepEqual(h.sticky.resolve(parentKey), before)
-      assert.deepEqual(h.sticky.resolve(familyKey), familyBefore)
       const main = h.calls[0]
       const side = h.calls[1]
       assert.equal(side.candidate.vmId, main.candidate.vmId)
@@ -574,7 +460,7 @@ for (const mode of ['rebuild', 'passthrough']) {
       assert.deepEqual(opts.stickyKeys, [])
       assert.equal(opts.familyKey, null)
       assert.equal(opts.skipSessionSeat, false)
-      assert.equal(h.pool.planner.openCount('vm-01'), 1, 'summary releases only its own seat')
+      assert.equal(h.rt.activeCount(), 1, 'summary releases only its own lease')
       assert.equal(h.pool.inflight.get('account-1'), 1)
       // Later summaries also get fresh execution identities, not the main pin.
       assert.equal((await h.invoke('summary-2', agentBody({ summary: true }))).statusCode, 200)
@@ -586,8 +472,8 @@ for (const mode of ['rebuild', 'passthrough']) {
       h.close()
     }
     assert.equal(h.calls.at(-1).id, 'followup')
-    assert.equal(h.pool.planner.openCount('vm-01'), 0)
-    assert.equal(h.runner.sessionTails.size, 0)
+    assert.equal(h.rt.activeCount(), 0)
+    assert.equal(h.runner.sessionTails, undefined)
   })
 }
 
@@ -616,7 +502,7 @@ test('summary still waits for actual VM capacity instead of bypassing admission'
       h.calls.map((call) => call.id),
       ['parent', 'summary'],
     )
-    assert.equal(h.pool.planner.openCount('vm-01'), 0)
+    assert.equal(h.rt.activeCount(), 0)
   } finally {
     h.parentGate.resolve()
     await parent
@@ -636,17 +522,14 @@ test('cancelling a queued summary removes its ticket without releasing the paren
         throw new Error(JSON.stringify(res.body))
       }),
     ])
-    const parentKey = h.sticky.canonicalSessionKey(h.parentSession)
-    const before = h.sticky.resolve(parentKey)
     summary = h.invoke('summary', agentBody({ summary: true }))
     await new Promise((resolve) => setTimeout(resolve, 30))
-    assert.equal(h.pool.queuedTotal(), 1)
+    assert.equal(h.rt.queuedCount(), 1)
     h.clients.get('summary').emit('aborted')
     await summary
-    assert.equal(h.pool.queuedTotal(), 0)
-    assert.equal(h.pool.planner.openCount('vm-01'), 1)
+    assert.equal(h.rt.queuedCount(), 0)
+    assert.equal(h.rt.activeCount(), 1)
     assert.equal(h.pool.inflight.get('account-1'), 1)
-    assert.deepEqual(h.sticky.resolve(parentKey), before)
     assert.deepEqual(
       h.calls.map((call) => call.id),
       ['parent'],

@@ -13,10 +13,21 @@ import {
   slugifyPoolName,
 } from '../db/repos/scheduler-pools-repo.mjs'
 import { resolveCredentialScheduleLevel } from '../pool/credential-weight.mjs'
+import {
+  SchedulerApiError,
+  SchedulerUnavailableError,
+  formatNodeKey,
+  formatSchedulerError,
+  inferModelFamily,
+  parseNodeKey,
+  resolveVirtualPoolId,
+} from '../scheduler/scheduler-runtime.mjs'
 import { resolveKernelDataplane } from '../vm/slot-engine.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
 import { listVms } from '../vm/vm-registry.mjs'
+import { resolvePoolAccessForKey } from './key-scope.mjs'
 import * as panel from './panel-api.mjs'
+import { PLATFORM_SCOPE, ownerScopeFromApiKey } from './resource-owner.mjs'
 
 const NAME_MAX = 64
 const SLUG_MAX = 64
@@ -543,29 +554,59 @@ function buildEnrichedMember(
   if (member.node_type === 'claude_vm' || member.node_type === 'codex_vm') {
     const vm = vmById.get(member.node_id) || null
     const acct = vm && accountQuota ? panel.findAccount(accountQuota, vm, accountSnap) : null
-    const unified = acct?.unified || {}
-    const schedInfo = resolveCredentialScheduleLevel({ vm, unified })
+    const unified = acct?.unified || (vm?.reset_7d ? { '7d': { resets_at: vm.reset_7d } } : {})
+    const manualLevel = vm?.policy?.priority ?? vm?.schedule_level_manual
+    const schedInfo = resolveCredentialScheduleLevel({
+      vm,
+      ...(manualLevel !== undefined ? { manualLevel } : {}),
+      unified,
+    })
     const base_weight_tier = schedInfo.level
     const effective_weight_tier = member.weight_tier_override ?? base_weight_tier
-    const baseSub = Number(vm?.policy?.weight) > 0 ? Number(vm.policy.weight) : 10
+    const rawWeight = Number(vm?.policy?.weight ?? vm?.weight)
+    const baseSub = rawWeight > 0 ? rawWeight : 10
     const effective_sub_weight = member.sub_weight_override ?? baseSub
     const slotSnap =
       poolSnap?.slots?.find?.((s) => s.id === member.node_id || s.vm_id === member.node_id) ||
       poolSnap?.vms?.find?.((s) => s.id === member.node_id) ||
       null
     const inflight = Number(slotSnap?.inflight ?? slotSnap?.in_flight ?? 0) || 0
-    const max_concurrency = Number(slotSnap?.max_concurrency ?? vm?.policy?.max_concurrency ?? 4) || 4
+    const max_concurrency =
+      Number(
+        slotSnap?.max_concurrency ??
+          vm?.policy?.max_concurrency ??
+          vm?.policy?.maxConcurrency ??
+          vm?.max_concurrency ??
+          4,
+      ) || 4
     const active_sessions = Number(slotSnap?.active_sessions ?? slotSnap?.seats_used ?? 0) || 0
-    const max_sessions = Number(slotSnap?.max_sessions ?? vm?.policy?.session_slots ?? 4) || 4
+    const max_sessions =
+      Number(
+        slotSnap?.max_sessions ??
+          vm?.policy?.session_slots ??
+          vm?.policy?.sessionSlots ??
+          vm?.session_slots ??
+          vm?.max_sessions ??
+          max_concurrency,
+      ) || 4
     const schedulable = Boolean(vm && vm.schedulable !== false && !vm.unschedulable && vm.status !== 'stopped')
     const healthy = Boolean(schedulable && !penalty)
+    const unschedReason = vm
+      ? vm.unschedulable
+        ? typeof vm.unschedulable === 'object'
+          ? String(vm.unschedulable.reason || vm.unschedulable.code || 'unschedulable')
+          : String(vm.unschedulable)
+        : vm.schedulable === false
+          ? 'schedulable_false'
+          : null
+      : 'missing_vm'
     return {
       ...member,
       node_key,
       name: vm?.name || member.node_id,
       email: vm?.email || null,
       provider: member.node_type === 'codex_vm' ? 'openai' : 'anthropic',
-      plan_tier: vm?.claude?.account_tier || vm?.account_tier || vm?.codex?.plan_type || null,
+      plan_tier: vm?.claude?.account_tier || vm?.account_tier || vm?.codex?.plan_type || vm?.plan_type || null,
       protocol: member.node_type === 'codex_vm' ? 'openai' : 'anthropic',
       dataplane: vm ? resolveKernelDataplane(vm) : null,
       runtime_kind: runtimeKindOfVm(vm),
@@ -581,9 +622,7 @@ function buildEnrichedMember(
       quota_util_7d_pct: unified['7d']?.utilization != null ? Number(unified['7d'].utilization) : null,
       healthy,
       schedulable,
-      unschedulable_reason: vm
-        ? vm.unschedulable || (vm.schedulable === false ? 'schedulable_false' : null)
-        : 'missing_vm',
+      unschedulable_reason: unschedReason,
       cooldown_until_ms: penalty?.cooldown_until_ms ?? null,
       cooldown_reason: penalty?.reason ?? null,
       sink_seq: 0,
@@ -848,10 +887,38 @@ export function createSchedulerPoolsHandler({
   poolScheduler = null,
   geminiScheduler = null,
   geminiSlotPrefs = null,
+  geminiOwnersRepo = null,
+  schedulerRuntime = null,
+  writeSSEHeaders = null,
   json,
   readBody,
 }) {
   const resolveDb = () => (typeof getDb === 'function' ? getDb() : apiKeyStore?.db)
+  const resolveRuntime = () => (typeof schedulerRuntime === 'function' ? schedulerRuntime() : schedulerRuntime)
+  const syncRuntimeConfig = async (reason) => {
+    const rt = resolveRuntime()
+    if (!rt || typeof rt.syncConfigNow !== 'function') return
+    try {
+      await rt.syncConfigNow(reason)
+    } catch {}
+  }
+  const sendSchedulerError = (res, err, fallbackCode = 'scheduler_error') => {
+    const mapped = formatSchedulerError(err)
+    if (mapped.headers) {
+      for (const [k, v] of Object.entries(mapped.headers)) {
+        res.setHeader(k, v)
+      }
+    }
+    return json(res, mapped.status, {
+      ok: false,
+      error: {
+        code: mapped.code || fallbackCode,
+        message: mapped.body?.error?.message || String(err?.message || err),
+        ...(mapped.retryAfterSec != null ? { retry_after_sec: mapped.retryAfterSec } : {}),
+        ...(mapped.explain ? { explain: mapped.explain } : {}),
+      },
+    })
+  }
   const loadVms = () => {
     if (typeof getVms === 'function') return getVms() || []
     if (cfg?.paths?.project) {
@@ -974,6 +1041,7 @@ export function createSchedulerPoolsHandler({
           }
         }
         const enriched = enrichPoolView(created, repo.listBoundKeySummariesByPool(created.id), liveCtx)
+        await syncRuntimeConfig('panel_pool_create')
         return json(res, 201, panel.ok({ pool: enriched, warnings }))
       } catch (e) {
         return json(res, httpStatusForPoolError(e), {
@@ -1051,6 +1119,7 @@ export function createSchedulerPoolsHandler({
           )
         } catch {}
         const enriched = enrichPoolView(updated, repo.listBoundKeySummariesByPool(id), liveCtx)
+        await syncRuntimeConfig('panel_pool_update')
         return json(res, 200, panel.ok({ pool: enriched, warnings }))
       } catch (e) {
         return json(res, httpStatusForPoolError(e), {
@@ -1094,6 +1163,7 @@ export function createSchedulerPoolsHandler({
           db.prepare('DELETE FROM vm_pools WHERE id = ?').run(id)
         } catch {}
         apiKeyStore?.reload?.()
+        await syncRuntimeConfig('panel_pool_delete')
         return json(res, 200, { ok: true, deleted: Boolean(deleted), id })
       } catch (e) {
         return json(res, httpStatusForPoolError(e), {
@@ -1122,6 +1192,7 @@ export function createSchedulerPoolsHandler({
         })
         const updated = repo.setMembers(id, members)
         const enriched = enrichPoolView(updated, repo.listBoundKeySummariesByPool(id), liveCtx)
+        await syncRuntimeConfig('panel_pool_update')
         return json(res, 200, panel.ok({ pool: enriched, warnings }))
       } catch (e) {
         return json(res, httpStatusForPoolError(e), {
@@ -1146,12 +1217,33 @@ export function createSchedulerPoolsHandler({
       let nodeType = body?.node_type ? String(body.node_type).trim() : null
       let nodeId = body?.node_id ? String(body.node_id).trim() : null
       if (!nodeType && !nodeId && body?.node_key) {
-        const idx = String(body.node_key).indexOf(':')
-        if (idx > 0) {
-          nodeType = String(body.node_key).slice(0, idx).trim()
-          nodeId = String(body.node_key)
-            .slice(idx + 1)
-            .trim()
+        const parsed = parseNodeKey(body.node_key)
+        if (parsed) {
+          nodeType = parsed.node_type
+          nodeId = parsed.node_id
+        }
+      }
+      const rt = resolveRuntime()
+      if (rt && typeof rt.deleteSticky === 'function') {
+        try {
+          const result = await rt.deleteSticky({
+            pool_id: id,
+            scope_kind: 'machine',
+            ...(nodeType && nodeId
+              ? { node_type: nodeType, node_id: nodeId, node_key: formatNodeKey(nodeType, nodeId) }
+              : {}),
+          })
+          const cleared = Number(result?.deleted) || 0
+          return json(res, 200, {
+            ok: true,
+            cleared,
+            count: cleared,
+            rust_deleted: result?.rust_deleted ?? 0,
+            db_deleted: result?.db_deleted ?? 0,
+            data: { cleared, count: cleared },
+          })
+        } catch (err) {
+          return sendSchedulerError(res, err, 'reset_machine_sticky_failed')
         }
       }
       const cleared = repo.resetMachineStickyForPool(id, { nodeType, nodeId })
@@ -1203,6 +1295,7 @@ export function createSchedulerPoolsHandler({
           } catch {}
         }
         apiKeyStore?.reload?.()
+        await syncRuntimeConfig('panel_pool_bind_key')
         return json(res, 200, panel.ok({ pool_id: id, api_key_id: apiKeyId, bindings }))
       }
     }
@@ -1236,39 +1329,482 @@ export function createSchedulerPoolsHandler({
         } catch {}
       }
       apiKeyStore?.reload?.()
+      await syncRuntimeConfig('panel_pool_unbind_key')
       return json(res, 200, panel.ok({ pool_id: id, api_key_id: apiKeyId, bindings }))
+    }
+
+    // POST /api/panel/scheduler/explain — read-only Rust dry-run sandbox (never acquires SessionGate)
+    if (req.method === 'POST' && p === '/api/panel/scheduler/explain') {
+      const rt = resolveRuntime()
+      if (!rt || typeof rt.explainDispatch !== 'function') {
+        return sendSchedulerError(
+          res,
+          new SchedulerUnavailableError('scheduler runtime is not available', { reason: 'runtime_missing' }),
+        )
+      }
+      const body = await readBody(req, 64 * 1024).catch(() => ({}))
+      const model = String(body?.model || '').trim()
+      if (!model) {
+        return json(res, 400, { ok: false, error: { code: 'missing_model', message: 'model 不能为空' } })
+      }
+      let apiKeyRecord = null
+      let apiKeyKind = 'master'
+      const reqApiKeyId = String(body?.api_key_id || '').trim()
+      const reqRawKey = String(body?.api_key || '').trim()
+      if (reqApiKeyId) {
+        apiKeyRecord = apiKeyStore?.getById?.(reqApiKeyId) || null
+        if (!apiKeyRecord) {
+          return json(res, 404, { ok: false, error: { code: 'api_key_not_found', message: 'API 密钥不存在' } })
+        }
+        apiKeyKind = 'managed'
+      } else if (reqRawKey) {
+        const auth = apiKeyStore?.authenticate?.(reqRawKey)
+        if (!auth?.ok || !auth.record) {
+          return json(res, 404, { ok: false, error: { code: 'api_key_not_found', message: 'API 密钥无效或不存在' } })
+        }
+        apiKeyRecord = auth.record
+        apiKeyKind = 'managed'
+      }
+
+      const requestedPoolId = String(body?.pool_id || '').trim() || null
+      const liveCtx = buildLiveContext(repo)
+      const ownerScope = apiKeyKind === 'master' ? PLATFORM_SCOPE : ownerScopeFromApiKey(apiKeyRecord, { apiKeyKind })
+      const geminiOwnerMap = geminiOwnersRepo?.ownerMap?.() || null
+      const geminiList = [...liveCtx.geminiById.values()]
+      const apiEndpoints = [...liveCtx.epById.values()]
+
+      let poolAccess = null
+      if (apiKeyRecord || requestedPoolId) {
+        poolAccess = resolvePoolAccessForKey({
+          key: apiKeyRecord,
+          apiKeyKind,
+          requestedPoolId,
+          model,
+          poolsRepo: repo,
+          vms: liveCtx.vms,
+          geminiEnvs: geminiList,
+          geminiOwnerMap,
+          apiEndpoints,
+          ownerScope,
+        })
+        if (!poolAccess.ok) {
+          return json(
+            res,
+            200,
+            panel.ok({
+              origin_pool_id: requestedPoolId || apiKeyRecord?.default_pool_id || null,
+              resolved_pool_id: null,
+              resolved_pool_name: null,
+              fallback_chain: [],
+              selected_node: null,
+              order: [],
+              excluded: [],
+              error: {
+                code: poolAccess.code || 'pool_unavailable',
+                message: poolAccess.message || '分组池不可用',
+              },
+            }),
+          )
+        }
+      }
+
+      const protocol = String(body?.protocol || '').trim()
+      const modelFamily = inferModelFamily(model, protocol)
+      const originPoolId =
+        poolAccess?.originPool?.id ||
+        requestedPoolId ||
+        resolveVirtualPoolId({ modelFamily, provider: body?.provider || null })
+
+      try {
+        const rustExplain = await rt.explainDispatch({
+          originPoolId,
+          poolAccess,
+          apiKeyRecord,
+          apiKeyKind,
+          ownerScope,
+          model,
+          modelFamily,
+          protocol,
+          machineId: body?.machine_id ? String(body.machine_id).trim() : null,
+          sessionId: body?.session_id ? String(body.session_id).trim() : undefined,
+          parentSessionId: body?.parent_session_id ? String(body.parent_session_id).trim() : null,
+        })
+        const exp = rustExplain?.explain || {}
+        const resolvedId = rustExplain?.resolved_pool_id || exp.resolved_pool_id || originPoolId
+        const resolvedPool = resolvedId ? repo.get(resolvedId) : null
+        const nodeLabelOf = (nk) => {
+          const parsed = parseNodeKey(nk)
+          if (!parsed) return nk
+          if (parsed.node_type === 'claude_vm' || parsed.node_type === 'codex_vm') {
+            return liveCtx.vmById.get(parsed.node_id)?.name || parsed.node_id
+          }
+          if (parsed.node_type === 'gemini_env') {
+            const env = liveCtx.geminiById.get(parsed.node_id)
+            return env?.name || env?.email || parsed.node_id
+          }
+          if (parsed.node_type === 'api_endpoint') {
+            return liveCtx.epById.get(parsed.node_id)?.name || parsed.node_id
+          }
+          return parsed.node_id
+        }
+        const selKey = rustExplain?.selected_node?.node_key || exp?.affinity?.selected_node || null
+        const selectedNode = rustExplain?.selected_node
+          ? {
+              ...rustExplain.selected_node,
+              name: nodeLabelOf(rustExplain.selected_node.node_key),
+              stood_in: Boolean(rustExplain.stood_in),
+            }
+          : null
+        const order = (exp.order || []).map((o) => {
+          const parsed = parseNodeKey(o.node)
+          const maxConc = Number(o.max_conc) || 0
+          const inFlight = Number(o.in_flight) || 0
+          return {
+            node_key: o.node,
+            node: o.node,
+            node_type: parsed?.node_type,
+            node_id: parsed?.node_id,
+            name: nodeLabelOf(o.node),
+            effective_weight_tier: o.tier,
+            tier: o.tier,
+            sub_weight: o.sub_weight,
+            sub_bucket: o.sub_bucket,
+            inflight: inFlight,
+            in_flight: inFlight,
+            max_concurrency: maxConc,
+            max_conc: maxConc,
+            active_sessions: o.active_sessions,
+            max_sessions: o.max_sessions,
+            load_ratio_bps: maxConc > 0 ? Math.round((inFlight * 10_000) / maxConc) : 0,
+            sink_seq: o.sunk ? 1 : 0,
+            sunk: Boolean(o.sunk),
+            selected: Boolean(selKey && o.node === selKey),
+          }
+        })
+        const excluded = (exp.excluded || []).map((ex) => ({
+          node_key: ex.node,
+          node: ex.node,
+          pool_id: ex.pool_id,
+          reason: ex.reason,
+          detail: ex.detail || '',
+        }))
+        const rawPrompt = rustExplain?.prompt_policy || exp.prompt_policy || null
+        const payload = {
+          origin_pool_id: exp.origin_pool_id || originPoolId,
+          resolved_pool_id: resolvedId,
+          resolved_pool_name: resolvedPool?.name || resolvedId,
+          fallback_chain: Array.isArray(exp.fallback_chain) ? exp.fallback_chain : [],
+          jev_profile: resolvedPool?.jev_profile || 'inherit_global',
+          config_version: exp.config_version ?? rt.configVersion,
+          decide_us: exp.decide_us ?? 0,
+          session_gate: {
+            key: body?.session_id ? `${originPoolId}:${modelFamily}:${body.session_id}` : null,
+            held: Boolean(exp.session_gate?.busy_at_peek),
+            queue_depth: Number(exp.session_gate?.queue_depth_at_peek) || 0,
+            queue_max: resolvedPool?.session_queue_max ?? 16,
+            would_wait: Boolean(exp.session_gate?.busy_at_peek),
+            busy_at_peek: Boolean(exp.session_gate?.busy_at_peek),
+            queue_depth_at_peek: Number(exp.session_gate?.queue_depth_at_peek) || 0,
+            wait_ms: Number(exp.session_gate?.wait_ms) || 0,
+          },
+          selected_node: selectedNode,
+          affinity: exp.affinity
+            ? {
+                why: exp.affinity.why ?? null,
+                target_node_key: exp.affinity.selected_node ?? exp.affinity.machine_home_node ?? null,
+                machine_home_node: exp.affinity.machine_home_node ?? null,
+                selected_node: exp.affinity.selected_node ?? null,
+                machine_id_present: Boolean(exp.affinity.machine_id_present),
+                session_id_source: exp.affinity.session_id_source ?? null,
+                stood_in: Boolean(rustExplain?.stood_in ?? exp.affinity.stood_in),
+                preserve_machine_home: Boolean(
+                  rustExplain?.preserve_machine_home ?? exp.affinity.preserve_machine_home,
+                ),
+                notes: (exp.affinity.notes || []).map((n) => ({
+                  why: n.why,
+                  node_key: n.node,
+                  node: n.node,
+                })),
+              }
+            : null,
+          prompt_policy: rawPrompt
+            ? {
+                mode: rawPrompt.mode,
+                preset: rawPrompt.preset ?? null,
+                text: rawPrompt.text ?? null,
+                client_system_policy: rawPrompt.client_system_policy ?? null,
+                source: rawPrompt.source,
+                applies: rawPrompt.source !== 'provider_exempt',
+              }
+            : null,
+          order,
+          excluded,
+          error:
+            rustExplain?.ok === false
+              ? {
+                  code: rustExplain.error_code || 'pool_exhausted',
+                  message: `调度模拟无可用节点 (${rustExplain.error_code || 'pool_exhausted'})`,
+                }
+              : null,
+        }
+        return json(res, 200, panel.ok(payload))
+      } catch (err) {
+        if (err instanceof SchedulerApiError && (err.status === 403 || err.status === 400 || err.status === 404)) {
+          return json(
+            res,
+            200,
+            panel.ok({
+              origin_pool_id: originPoolId,
+              resolved_pool_id: null,
+              resolved_pool_name: null,
+              fallback_chain: [],
+              selected_node: null,
+              order: [],
+              excluded: [],
+              error: { code: err.code, message: err.message },
+            }),
+          )
+        }
+        return sendSchedulerError(res, err, 'explain_failed')
+      }
+    }
+
+    // POST /api/panel/scheduler/nodes/:nodeKey/unrest
+    const unrestMatch = p.match(/^\/api\/panel\/scheduler\/nodes\/([^/]+)\/unrest$/)
+    if (req.method === 'POST' && unrestMatch) {
+      const rt = resolveRuntime()
+      if (!rt || typeof rt.unrestNode !== 'function') {
+        return sendSchedulerError(
+          res,
+          new SchedulerUnavailableError('scheduler runtime is not available', { reason: 'runtime_missing' }),
+        )
+      }
+      const nodeKey = decodeURIComponent(unrestMatch[1]).trim()
+      if (!parseNodeKey(nodeKey)) {
+        return json(res, 400, {
+          ok: false,
+          error: { code: 'invalid_node_key', message: 'node_key 格式应为 <node_type>:<node_id>' },
+        })
+      }
+      const body = await readBody(req, 16 * 1024).catch(() => ({}))
+      try {
+        const result = await rt.unrestNode(nodeKey, {
+          modelScope: body?.model_scope ? String(body.model_scope).trim() : null,
+        })
+        return json(
+          res,
+          200,
+          panel.ok({
+            unrested: true,
+            node_key: nodeKey,
+            cleared_cooldowns: Number(result?.cleared_cooldowns) || 0,
+            sink_cleared: Boolean(result?.sink_cleared),
+            db_cleared: Number(result?.db_cleared) || 0,
+          }),
+        )
+      } catch (err) {
+        return sendSchedulerError(res, err, 'unrest_failed')
+      }
+    }
+
+    // GET /api/panel/scheduler/events — SSE live routing/concurrency event stream proxy
+    if (req.method === 'GET' && p === '/api/panel/scheduler/events') {
+      const rt = resolveRuntime()
+      if (!rt || typeof rt.subscribeEvents !== 'function') {
+        return sendSchedulerError(
+          res,
+          new SchedulerUnavailableError('scheduler runtime is not available', { reason: 'runtime_missing' }),
+        )
+      }
+      const after = String(url?.searchParams?.get('after') || req.headers?.['last-event-id'] || '').trim() || undefined
+      const filterPoolId = String(url?.searchParams?.get('pool_id') || '').trim() || null
+      const ac = new AbortController()
+      let heartbeatTimer = null
+      let closed = false
+
+      const cleanup = () => {
+        if (closed) return
+        closed = true
+        if (heartbeatTimer) {
+          clearInterval(heartbeatTimer)
+          heartbeatTimer = null
+        }
+        try {
+          ac.abort()
+        } catch {}
+      }
+      req.once('close', cleanup)
+      res.once('close', cleanup)
+
+      const sub = rt.subscribeEvents({ after, signal: ac.signal })
+      try {
+        await sub.ready
+      } catch (err) {
+        cleanup()
+        if (err instanceof SchedulerApiError && err.status === 409) {
+          return json(res, 409, {
+            ok: false,
+            error: {
+              code: err.code || 'snapshot_required',
+              message: err.message || 'event cursor evicted; snapshot refresh required',
+              ...(err.currentEpoch !== undefined ? { current_epoch: err.currentEpoch } : {}),
+              ...(err.oldestSeq !== undefined ? { oldest_seq: err.oldestSeq } : {}),
+              ...(err.latestSeq !== undefined ? { latest_seq: err.latestSeq } : {}),
+            },
+          })
+        }
+        return sendSchedulerError(res, err, 'scheduler_events_unavailable')
+      }
+
+      if (closed || res.writableEnded || res.destroyed) {
+        sub.close()
+        return true
+      }
+
+      if (typeof writeSSEHeaders === 'function') {
+        writeSSEHeaders(res)
+      } else {
+        res.writeHead(200, {
+          'Content-Type': 'text/event-stream; charset=utf-8',
+          'Cache-Control': 'no-cache, no-transform',
+          Connection: 'keep-alive',
+          'X-Accel-Buffering': 'no',
+        })
+      }
+      res.write(': connected\n\n')
+
+      heartbeatTimer = setInterval(() => {
+        if (closed || res.writableEnded || res.destroyed) return
+        try {
+          res.write(': keep-alive\n\n')
+        } catch {
+          cleanup()
+          sub.close()
+        }
+      }, 15_000)
+      heartbeatTimer.unref?.()
+
+      try {
+        for await (const frame of sub) {
+          if (closed || res.writableEnded || res.destroyed) break
+          const raw = frame?.data && typeof frame.data === 'object' ? frame.data : {}
+          if (filterPoolId && raw.pool_id && String(raw.pool_id) !== filterPoolId) {
+            continue
+          }
+          // Strict field-whitelist sanitization (no internal secrets/tokens/bodies)
+          const evKind = String(raw.kind || frame?.event || 'event')
+          const sanitized = {
+            cursor: frame?.id || raw.cursor || null,
+            epoch: raw.epoch ?? null,
+            seq: raw.seq ?? null,
+            ts: raw.ts_ms ?? Date.now(),
+            ts_ms: raw.ts_ms ?? Date.now(),
+            kind: evKind,
+            type: evKind,
+            event_type: evKind,
+            ...(raw.pool_id != null ? { pool_id: String(raw.pool_id) } : {}),
+            ...(raw.node_key != null ? { node_key: String(raw.node_key) } : {}),
+            ...(raw.request_id != null ? { request_id: String(raw.request_id) } : {}),
+            ...(raw.detail != null ? { detail: String(raw.detail).slice(0, 256) } : {}),
+            ...(raw.code != null ? { code: String(raw.code) } : {}),
+            ...(raw.message != null ? { message: String(raw.message).slice(0, 256) } : {}),
+          }
+          const idLine = sanitized.cursor ? `id: ${sanitized.cursor}\n` : ''
+          res.write(`${idLine}event: ${evKind}\ndata: ${JSON.stringify(sanitized)}\n\n`)
+        }
+      } catch {
+        // Stream aborted or disconnected cleanly.
+      } finally {
+        cleanup()
+        sub.close()
+        if (!res.writableEnded && !res.destroyed) {
+          try {
+            res.end()
+          } catch {}
+        }
+      }
+      return true
     }
 
     // GET / DELETE /api/panel/scheduler/sticky
     if (p === '/api/panel/scheduler/sticky') {
+      const rt = resolveRuntime()
       if (req.method === 'GET') {
         const qs = url?.searchParams
-        const items = repo.queryStickyBindings({
+        const includeExpired = qs?.get('include_expired') === '1'
+        const filter = {
           pool_id: qs?.get('pool_id') || null,
           scope_kind: qs?.get('scope_kind') || null,
           model_family: qs?.get('model_family') || null,
           identity_id: qs?.get('identity_id') || null,
           machine_id: qs?.get('machine_id') || null,
           session_id: qs?.get('session_id') || null,
-          includeExpired: qs?.get('include_expired') === '1',
+          node_key: qs?.get('node_key') || null,
+        }
+        if (rt && typeof rt.querySticky === 'function' && !includeExpired) {
+          try {
+            const live = await rt.querySticky(filter)
+            const items = Array.isArray(live?.bindings) ? live.bindings : []
+            return json(res, 200, panel.ok({ items, bindings: items, total: items.length }))
+          } catch (err) {
+            return sendSchedulerError(res, err, 'query_sticky_failed')
+          }
+        }
+        const items = repo.queryStickyBindings({
+          ...filter,
+          includeExpired,
         })
-        return json(res, 200, panel.ok({ items, bindings: items }))
+        return json(res, 200, panel.ok({ items, bindings: items, total: items.length }))
       }
       if (req.method === 'DELETE') {
         const qs = url?.searchParams
         const body = await readBody(req, 16 * 1024).catch(() => ({}))
-        try {
-          const deleted = repo.deleteStickyBindings({
-            pool_id: qs?.get('pool_id') || body?.pool_id || null,
-            scope_kind: qs?.get('scope_kind') || body?.scope_kind || null,
-            model_family: qs?.get('model_family') || body?.model_family || null,
-            identity_id: qs?.get('identity_id') || body?.identity_id || null,
-            machine_id: qs?.get('machine_id') || body?.machine_id || null,
-            session_id: qs?.get('session_id') || body?.session_id || null,
-            node_type: qs?.get('node_type') || body?.node_type || null,
-            node_id: qs?.get('node_id') || body?.node_id || null,
-            allowAll: qs?.get('all') === '1' || body?.all === true,
+        const filter = {
+          pool_id: qs?.get('pool_id') || body?.pool_id || null,
+          scope_kind: qs?.get('scope_kind') || body?.scope_kind || null,
+          model_family: qs?.get('model_family') || body?.model_family || null,
+          identity_id: qs?.get('identity_id') || body?.identity_id || null,
+          machine_id: qs?.get('machine_id') || body?.machine_id || null,
+          session_id: qs?.get('session_id') || body?.session_id || null,
+          node_type: qs?.get('node_type') || body?.node_type || null,
+          node_id: qs?.get('node_id') || body?.node_id || null,
+          node_key: qs?.get('node_key') || body?.node_key || null,
+          allowAll: qs?.get('all') === '1' || body?.all === true,
+        }
+        const hasFilter = Boolean(
+          filter.pool_id ||
+            filter.scope_kind ||
+            filter.model_family ||
+            filter.identity_id ||
+            filter.machine_id ||
+            filter.session_id ||
+            filter.node_type ||
+            filter.node_id ||
+            filter.node_key,
+        )
+        if (!hasFilter && !filter.allowAll) {
+          return json(res, 400, {
+            ok: false,
+            error: { message: '删除粘性绑定至少需要一个过滤条件', code: 'sticky_filter_required' },
           })
+        }
+        if (rt && typeof rt.deleteSticky === 'function') {
+          try {
+            const result = await rt.deleteSticky(filter)
+            const deleted = Number(result?.deleted) || 0
+            return json(res, 200, {
+              ok: true,
+              deleted,
+              rust_deleted: result?.rust_deleted ?? 0,
+              db_deleted: result?.db_deleted ?? 0,
+              data: { deleted },
+            })
+          } catch (err) {
+            return sendSchedulerError(res, err, 'delete_sticky_failed')
+          }
+        }
+        try {
+          const deleted = repo.deleteStickyBindings(filter)
           return json(res, 200, { ok: true, deleted, data: { deleted } })
         } catch (e) {
           return json(res, httpStatusForPoolError(e), {

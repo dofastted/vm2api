@@ -859,6 +859,15 @@ export function createPanelHandler(ctx) {
     json,
     readRawBody,
   })
+  const resolveSchedulerRuntime = () => {
+    if (typeof ctx.getSchedulerRuntime === 'function') return ctx.getSchedulerRuntime()
+    return typeof ctx.schedulerRuntime === 'function' ? ctx.schedulerRuntime() : ctx.schedulerRuntime || null
+  }
+  const notifySchedulerConfigChanged = (reason) => {
+    const rt = resolveSchedulerRuntime()
+    if (!rt || typeof rt.syncConfigNow !== 'function') return
+    void rt.syncConfigNow(reason).catch(() => {})
+  }
   const handleSchedulerPools = createSchedulerPoolsHandler({
     getDb: () => apiKeyStore?.db || ctx.getDb?.() || getDb(),
     cfg,
@@ -868,6 +877,9 @@ export function createPanelHandler(ctx) {
     poolScheduler: () => ctx.poolScheduler,
     geminiScheduler: () => ctx.geminiScheduler,
     geminiSlotPrefs: ctx.geminiSlotPrefs || null,
+    geminiOwnersRepo: ctx.geminiOwnersRepo || null,
+    schedulerRuntime: resolveSchedulerRuntime,
+    writeSSEHeaders: ctx.writeSSEHeaders || null,
     json,
     readBody,
   })
@@ -1820,7 +1832,25 @@ export function createPanelHandler(ctx) {
     }
   }
 
-  return async function handlePanel(req, res, url) {
+  const shouldSyncSchedulerOnMutation = (method, pathname) => {
+    if (method === 'GET' || method === 'HEAD' || method === 'OPTIONS') return false
+    return (
+      pathname === '/admin/routing' ||
+      pathname === '/api/panel/routing' ||
+      pathname === '/api/panel/api-keys' ||
+      pathname.startsWith('/api/panel/api-keys/') ||
+      pathname === '/api/panel/api-endpoints' ||
+      pathname.startsWith('/api/panel/api-endpoints/') ||
+      pathname === '/api/panel/vms' ||
+      pathname.startsWith('/api/panel/vms/') ||
+      pathname === '/api/panel/refusal-guards' ||
+      pathname.startsWith('/api/panel/refusal-guards/') ||
+      pathname === '/api/panel/jev-intercept' ||
+      pathname.startsWith('/api/panel/jev-intercept/')
+    )
+  }
+
+  async function handlePanelInner(req, res, url) {
     const p = url.pathname
     if (!p.startsWith('/admin') && !p.startsWith('/api/panel')) return false
 
@@ -2178,8 +2208,14 @@ export function createPanelHandler(ctx) {
           }).body,
         )
       }
-      if (isGeminiPanelPath(p)) return geminiPanel(req, res, p)
-      if (p === '/api/panel/pools' || p.startsWith('/api/panel/pools/') || p === '/api/panel/scheduler/sticky') {
+      if (isGeminiPanelPath(p)) {
+        const out = await geminiPanel(req, res, p)
+        if (req.method !== 'GET' && req.method !== 'HEAD' && (res.statusCode || 200) < 400) {
+          notifySchedulerConfigChanged(`gemini:${req.method}:${p}`)
+        }
+        return out
+      }
+      if (p === '/api/panel/pools' || p.startsWith('/api/panel/pools/') || p.startsWith('/api/panel/scheduler/')) {
         const handled = await handleSchedulerPools(req, res, p, url)
         if (handled !== false) return
       }
@@ -2481,6 +2517,7 @@ export function createPanelHandler(ctx) {
           const allVms = listVms(cfg.paths.project)
           const pool = createVmPool(vmPoolsFor(apiKeyStore.db), body || {}, allVms)
           syncVmPoolToSchedulerPool(apiKeyStore.db, 'upsert', pool, allVms)
+          notifySchedulerConfigChanged('panel_vm_pool_create')
           return json(res, 201, panel.ok({ pool }))
         } catch (e) {
           return json(res, vmPoolHttpStatus(e.code), {
@@ -2497,6 +2534,7 @@ export function createPanelHandler(ctx) {
           const pool = updateVmPool(vmPoolsFor(apiKeyStore.db), id, body || {}, allVms)
           if (!pool) return json(res, 404, { ok: false, error: { message: '账号池不存在', code: 'vm_pool_not_found' } })
           syncVmPoolToSchedulerPool(apiKeyStore.db, 'upsert', pool, allVms)
+          notifySchedulerConfigChanged('panel_vm_pool_update')
           return json(res, 200, panel.ok({ pool }))
         } catch (e) {
           return json(res, vmPoolHttpStatus(e.code), {
@@ -2519,6 +2557,7 @@ export function createPanelHandler(ctx) {
           })
         }
         syncVmPoolToSchedulerPool(apiKeyStore.db, 'delete', { id })
+        notifySchedulerConfigChanged('panel_vm_pool_delete')
         return json(res, 200, { ok: true, deleted: id })
       }
       if (req.method === 'GET' && p === '/api/panel/api-keys') {
@@ -8420,6 +8459,14 @@ export function createPanelHandler(ctx) {
     }
 
     return false
+  }
+
+  return async function handlePanel(req, res, url) {
+    const out = await handlePanelInner(req, res, url)
+    if (out !== false && shouldSyncSchedulerOnMutation(req.method, url.pathname) && (res.statusCode || 200) < 400) {
+      notifySchedulerConfigChanged(`${req.method}:${url.pathname}`)
+    }
+    return out
   }
 }
 

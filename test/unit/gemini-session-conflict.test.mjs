@@ -4,6 +4,7 @@ import test from 'node:test'
 import { mapCragWorkerError } from '../../src/lib/gemini/direct-client.mjs'
 import { createGeminiScheduler } from '../../src/lib/gemini/scheduler.mjs'
 import { NATIVE_TUI_CAPABILITIES } from '../../src/lib/protocol/gemini-convert.mjs'
+import { SchedulerApiError } from '../../src/lib/transport/scheduler-client.mjs'
 
 const OAUTH_ENV = {
   id: 'env-sticky-a',
@@ -89,8 +90,41 @@ function makeCircuitPool() {
   return { pool, accountId, calls }
 }
 
+function makeMockGeminiRuntime() {
+  let seq = 0
+  return {
+    async acquireNode(params) {
+      const excluded = new Set(params.excludeNodes || [])
+      const allowed = Array.isArray(params.allowedNodeKeys) ? params.allowedNodeKeys : []
+      const key = allowed.find((k) => !excluded.has(k))
+      if (!key) {
+        throw new SchedulerApiError({
+          status: 429,
+          code: 'pool_exhausted',
+          message: 'No gemini environment available',
+          retryAfterSec: 5,
+        })
+      }
+      const id = key.split(':').slice(1).join(':')
+      return {
+        lease_id: `gem-lease-${++seq}`,
+        lease_ttl_ms: 30_000,
+        resolved_pool_id: params.originPoolId || '__default_gemini__',
+        selected_node: { node_type: 'gemini_env', node_id: id, node_key: key },
+        explain: { affinity: { why: 'balanced' } },
+      }
+    },
+    async switchNode(body) {
+      return this.acquireNode(body.next_attempt || {})
+    },
+    async commitLease() {},
+    async releaseLease() {},
+  }
+}
+
 function hostStub(environments, inferHandler) {
   return {
+    schedulerRuntime: makeMockGeminiRuntime(),
     callHost: async (op, payload) => {
       if (op === 'list') return { payload_state: 'installed', environments }
       if (op === 'get') {

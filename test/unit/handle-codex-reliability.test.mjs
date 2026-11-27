@@ -5,6 +5,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { handleCodexProtocol } from '../../src/lib/protocol/handle-codex.mjs'
 import { resetOpenAIAccountRuntime } from '../../src/lib/pool/openai-account-runtime.mjs'
+import { SchedulerApiError } from '../../src/lib/transport/scheduler-client.mjs'
 
 beforeEach(() => resetOpenAIAccountRuntime())
 
@@ -201,6 +202,28 @@ function fixture(t, { body = {}, headers = {}, protocol = 'openai.responses', ho
     },
     end() {},
   }
+  let leaseSeq = 0
+  const slotIds = ['gpt-a', 'gpt-b']
+  const mockSchedulerRuntime = {
+    async acquireNode(params) {
+      const excluded = new Set(params.excludeNodes || [])
+      const picked = slotIds.find((id) => !excluded.has(`codex_vm:${id}`) && !excluded.has(id))
+      if (!picked) {
+        throw new SchedulerApiError({ status: 503, code: 'pool_exhausted', message: 'No codex slot available' })
+      }
+      return {
+        lease_id: `codex-lease-${++leaseSeq}`,
+        lease_ttl_ms: 30_000,
+        resolved_pool_id: params.originPoolId || '__default_codex__',
+        selected_node: { node_type: 'codex_vm', node_id: picked, node_key: `codex_vm:${picked}` },
+      }
+    },
+    async switchNode(body) {
+      return this.acquireNode(body.next_attempt || {})
+    },
+    async commitLease() {},
+    async releaseLease() {},
+  }
   const args = {
     req: { headers, apiKeyKind: 'user' },
     res,
@@ -219,6 +242,7 @@ function fixture(t, { body = {}, headers = {}, protocol = 'openai.responses', ho
     },
     projectRoot: root,
     routing: {},
+    schedulerRuntime: mockSchedulerRuntime,
     ops: {
       writeCodexKernelConfig() {},
       ensureCodexKernel: async () => ({ ok: true }),

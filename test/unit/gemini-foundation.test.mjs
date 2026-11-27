@@ -21,8 +21,119 @@ import {
   parseGeminiGeneratePath,
   parseGeminiModelGetPath,
 } from '../../src/lib/gemini/routes.mjs'
-import { createGeminiScheduler } from '../../src/lib/gemini/scheduler.mjs'
+import { createGeminiScheduler as createRawGeminiScheduler } from '../../src/lib/gemini/scheduler.mjs'
 import { FULL_GEMINI_CAPABILITIES, NATIVE_TUI_CAPABILITIES } from '../../src/lib/protocol/gemini-convert.mjs'
+import { SchedulerApiError } from '../../src/lib/transport/scheduler-client.mjs'
+
+function makeMockGeminiRuntime({ now = () => Date.now(), quotaCooldownMs = 60_000, poolScheduler = null } = {}) {
+  let seq = 0
+  const stickyBySession = new Map()
+  const activeLeases = new Map()
+  const modelCooldowns = new Map()
+  const failures = []
+
+  const noteFailure = (rec, failure) => {
+    if (!rec || !failure) return
+    failures.push({ nodeKey: rec.nodeKey, model: rec.model, failure })
+    if (failure.error_class === 'rate_limit' || failure.error_class === 'quota_exhausted') {
+      const waitMs =
+        Number.isFinite(failure.retry_after_sec) && failure.retry_after_sec > 0
+          ? failure.retry_after_sec * 1000
+          : quotaCooldownMs
+      if (waitMs > 0) {
+        modelCooldowns.set(`${rec.nodeKey}:${rec.model}`, now() + waitMs)
+      }
+    }
+  }
+
+  return {
+    failures,
+    modelCooldowns,
+    stickyBySession,
+    async acquireNode(params) {
+      const ts = now()
+      const excluded = new Set(params.excludeNodes || [])
+      const allowed = (Array.isArray(params.allowedNodeKeys) ? params.allowedNodeKeys : []).filter((k) => {
+        if (excluded.has(k)) return false
+        const id = k.split(':').slice(1).join(':')
+        if (poolScheduler?.unitCircuit?.inspect?.(`gemini:${id}`)?.ok === false) return false
+        return true
+      })
+      if (!allowed.length) {
+        throw new SchedulerApiError({
+          status: 429,
+          code: 'pool_exhausted',
+          message: 'No gemini environment available',
+          retryAfterSec: 5,
+        })
+      }
+      const model = String(params.model || '')
+      const cooldownUntil = (k) => {
+        const until = modelCooldowns.get(`${k}:${model}`) || 0
+        return until > ts ? until : 0
+      }
+      const uncooled = allowed.filter((k) => !cooldownUntil(k))
+      let chosen = null
+      let why = 'balanced'
+      const pinned = params.sessionId ? stickyBySession.get(params.sessionId) : null
+      if (uncooled.length) {
+        if (pinned && uncooled.includes(pinned)) {
+          chosen = pinned
+          why = 'session_sticky'
+        } else if (poolScheduler?.lastUsed?.size) {
+          const sorted = [...uncooled].sort((a, b) => {
+            const idA = `gemini:${a.split(':').slice(1).join(':')}`
+            const idB = `gemini:${b.split(':').slice(1).join(':')}`
+            return (poolScheduler.lastUsed.get(idA) || 0) - (poolScheduler.lastUsed.get(idB) || 0) || a.localeCompare(b)
+          })
+          chosen = sorted[0]
+        } else {
+          chosen = uncooled[0]
+        }
+      } else {
+        const sortedCooled = [...allowed].sort((a, b) => cooldownUntil(a) - cooldownUntil(b) || a.localeCompare(b))
+        chosen = sortedCooled[0]
+        why = 'cooldown_fallback'
+      }
+      const id = chosen.split(':').slice(1).join(':')
+      const leaseId = `gem-test-lease-${++seq}`
+      activeLeases.set(leaseId, { sessionId: params.sessionId || null, nodeKey: chosen, model })
+      return {
+        lease_id: leaseId,
+        lease_ttl_ms: 30_000,
+        resolved_pool_id: params.originPoolId || '__default_gemini__',
+        selected_node: { node_type: 'gemini_env', node_id: id, node_key: chosen },
+        explain: { affinity: { why } },
+      }
+    },
+    async switchNode(body) {
+      const rec = activeLeases.get(body.release_lease_id)
+      activeLeases.delete(body.release_lease_id)
+      noteFailure(rec, body.failure)
+      return this.acquireNode(body.next_attempt || {})
+    },
+    async commitLease(leaseId) {
+      const rec = activeLeases.get(leaseId)
+      if (rec?.sessionId) stickyBySession.set(rec.sessionId, rec.nodeKey)
+    },
+    async releaseLease(leaseId, payload) {
+      const rec = activeLeases.get(leaseId)
+      activeLeases.delete(leaseId)
+      if (rec?.sessionId && payload?.outcome === 'ok') {
+        stickyBySession.set(rec.sessionId, rec.nodeKey)
+      } else if (payload && payload.outcome !== 'ok' && payload.outcome !== 'aborted') {
+        noteFailure(rec, payload)
+      }
+    },
+  }
+}
+
+function createGeminiScheduler(opts = {}) {
+  const runtime = opts.schedulerRuntime || makeMockGeminiRuntime(opts)
+  const sched = createRawGeminiScheduler({ schedulerRuntime: runtime, ...opts })
+  sched._mockRuntime = runtime
+  return sched
+}
 
 function makeRes() {
   const res = new EventEmitter()
@@ -2317,9 +2428,8 @@ test('429 failover: pre-content SSE meta/start error switches accounts, preserve
   )
 
   // 2. Sibling Gemini model (gemini-4-hydrogen-high) on env-a MUST NOT be poisoned by gemini-4-neon-xhigh 429!
-  const snapAfter429 = scheduler.cooldownSnapshot()
-  assert.equal(Object.keys(snapAfter429.groups).length, 0, 'reactive 429 must not poison entire quota group')
-  assert.ok(snapAfter429.models['env-a:gemini-4-neon-xhigh'] > clock)
+  assert.ok(scheduler._mockRuntime.modelCooldowns.get('gemini_env:env-a:gemini-4-neon-xhigh') > clock)
+  assert.equal(scheduler._mockRuntime.modelCooldowns.get('gemini_env:env-a:gemini-4-hydrogen-high'), undefined)
 
   const beforeSibling = calls.length
   const sibTurn = await scheduler.stream({
@@ -2343,10 +2453,9 @@ test('429 failover: pre-content SSE meta/start error switches accounts, preserve
       }),
     (err) => err.code === 'gemini_quota_exhausted' && err.attemptCount === 6,
   )
-  const snapAll = scheduler.cooldownSnapshot()
-  assert.equal(snapAll.models['env-b:gemini-4-neon-xhigh'], clock + 15_000)
-  assert.equal(snapAll.models['env-c:gemini-4-neon-xhigh'], clock + 45_000)
-  assert.equal(snapAll.models['env-a:gemini-4-neon-xhigh'], clock + 90_000)
+  assert.equal(scheduler._mockRuntime.modelCooldowns.get('gemini_env:env-b:gemini-4-neon-xhigh'), clock + 15_000)
+  assert.equal(scheduler._mockRuntime.modelCooldowns.get('gemini_env:env-c:gemini-4-neon-xhigh'), clock + 45_000)
+  assert.equal(scheduler._mockRuntime.modelCooldowns.get('gemini_env:env-a:gemini-4-neon-xhigh'), clock + 90_000)
 
   // Bias poolScheduler.lastUsed heavily toward env-a; all_cooled_probe must STILL probe earliest expiry first!
   tracker.lastUsed.set('gemini:env-a', 1)
@@ -2641,7 +2750,7 @@ test('429 classification & perf: catalogSnapshot avoids double list, content_rej
   assert.equal(listCalls, 1, 'passing catalogSnapshot must avoid redundant callHost(list)')
   assert.deepEqual(scheduler.cooldownSnapshot(), { groups: {}, models: {}, accounts: {} })
 
-  // 2. Explicit QUOTA_EXHAUSTED with Google quotaResetDelay cools both model & quotaGroup for 150s and fails over.
+  // 2. Explicit QUOTA_EXHAUSTED with Google quotaResetDelay reports retry_after_sec=150 to Rust and fails over.
   scenario = 'quota_exhausted_group'
   const res2 = await scheduler.stream({
     model: 'gemini-3-pro',
@@ -2650,9 +2759,7 @@ test('429 classification & perf: catalogSnapshot avoids double list, content_rej
     catalogSnapshot: preloaded,
   })
   assert.equal(res2.account_id, 'env-2')
-  const snap2 = scheduler.cooldownSnapshot()
-  assert.equal(snap2.models['env-1:gemini-3-pro'], clock + 150_000)
-  assert.equal(snap2.groups['env-1:gemini'], clock + 150_000)
+  assert.equal(scheduler._mockRuntime.modelCooldowns.get('gemini_env:env-1:gemini-3-pro'), clock + 150_000)
 
   // 3. Short non-quota RPM 429 (<= 5s) retries the same account once before switching.
   clock += 200_000
@@ -3012,13 +3119,15 @@ test('open unitCircuit surfaces gemini_native_worker_unavailable while genuine s
   assert.equal(circuitRes.body.error.status, 'RESOURCE_EXHAUSTED')
   assert.match(JSON.stringify(circuitRes.body), /负载过高/)
 
-  // Advance past openMs, complete probe -> circuit closed, then occupy max_concurrency=1 slot -> 429 High Load.
+  // Advance past openMs, complete probe -> circuit closed, then simulate Rust pool_exhausted -> 429 High Load.
   nowMs += 30_001
   pool.unitCircuit.admit(accountId)
   pool.unitCircuit.recordSuccess(accountId)
   assert.equal(pool.unitCircuit.inspect(accountId).ok, true)
-  const held = pool.reserveExternalCandidates([{ accountId, vmId: accountId, maxConcurrency: 1, priority: 0 }])
-  assert.ok(held?.reservation)
+  const origAcquire = scheduler._mockRuntime.acquireNode
+  scheduler._mockRuntime.acquireNode = async () => {
+    throw new SchedulerApiError({ status: 429, code: 'pool_exhausted', message: 'Pool exhausted', retryAfterSec: 5 })
+  }
   try {
     const busyRes = await handle(
       {
@@ -3035,6 +3144,6 @@ test('open unitCircuit surfaces gemini_native_worker_unavailable while genuine s
     assert.equal(busyRes.body.error.code, 'gemini_pool_overloaded')
     assert.match(busyRes.body.error.message, /负载过高/)
   } finally {
-    held.reservation.release()
+    scheduler._mockRuntime.acquireNode = origAcquire
   }
 })

@@ -6,6 +6,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { Readable } from 'node:stream'
 import test from 'node:test'
+import { fileURLToPath } from 'node:url'
 import { ApiKeyStore } from '../../src/lib/admin/api-keys.mjs'
 import { createGeminiPublicHandler } from '../../src/lib/gemini/routes.mjs'
 import { blockedRiskTool } from '../../src/lib/core/refusal-guard.mjs'
@@ -25,6 +26,53 @@ import {
   validatePoolPromptBytes,
 } from '../../src/lib/protocol/pool-prompt-policy.mjs'
 import { handleUserCountTokens } from '../../src/lib/protocol/user-count-tokens.mjs'
+import { createSchedulerRuntime } from '../../src/lib/scheduler/scheduler-runtime.mjs'
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
+const REPO_ROOT = path.resolve(__dirname, '../..')
+
+function resolveSchedulerBin() {
+  for (const candidate of [
+    process.env.KIN_SCHEDULER_BIN,
+    path.join(REPO_ROOT, 'bin', process.platform === 'win32' ? 'kin-scheduler.exe' : 'kin-scheduler'),
+    '/tmp/vm2api-sched-m3-target/release/kin-scheduler',
+    '/tmp/vm2api-sched-target/release/kin-scheduler',
+  ]) {
+    if (candidate && fs.existsSync(candidate)) return candidate
+  }
+  return null
+}
+
+async function startTestSchedulerRuntime(t, { root, poolsRepo, getVms, getRoutingConfig, settings = null }) {
+  const binPath = resolveSchedulerBin()
+  assert.ok(binPath, 'kin-scheduler binary must exist for scheduler-m1b-pool-prompt tests (set KIN_SCHEDULER_BIN)')
+  const schedDir = fs.mkdtempSync(path.join(os.tmpdir(), 'm1b-rust-sched-'))
+  const rt = createSchedulerRuntime({
+    cfg: { paths: { data: schedDir, project: root } },
+    getDb: () => poolsRepo?.db || null,
+    getVms,
+    getRoutingConfig,
+    settings,
+    telemetryIntervalMs: 0,
+    clientOptions: {
+      binPath,
+      socketPath: path.join(schedDir, 'run', 'scheduler.sock'),
+      tokenPath: path.join(schedDir, 'run', 'scheduler.token'),
+      capFile: path.join(schedDir, 'run', 'scheduler.cap.json'),
+      manageProcess: true,
+    },
+  })
+  t.after(async () => {
+    try {
+      await rt.shutdown({ drain: false, stopProcess: true })
+    } catch {}
+    fs.rmSync(schedDir, { recursive: true, force: true })
+  })
+  await rt.start({ waitMs: 5_000, startLoops: false })
+  await rt.syncConfigNow('m1b_test_init')
+  await rt.pushTelemetryNow()
+  return rt
+}
 
 function makeRes() {
   const res = new EventEmitter()
@@ -471,21 +519,28 @@ test('Concurrent Pool 1 (official vm1/2/3) vs Pool 2 (zero_inject vm4/5/6 with e
     members: ['vm4', 'vm5', 'vm6'].map((id) => ({ node_type: 'claude_vm', node_id: id })),
   })
 
+  const schedulerRuntime = await startTestSchedulerRuntime(t, {
+    root,
+    poolsRepo,
+    getVms: () => vmList,
+    getRoutingConfig: () => routing,
+  })
+
   const observed = []
-  let pickCursor = 0
   const runner = new FailoverRunner({
+    schedulerRuntime,
     scheduler: {
-      async selectAndReserve({ keyScope }) {
-        const allowed = Array.isArray(keyScope?.allowed_vms) ? keyScope.allowed_vms : []
-        assert.ok(allowed.length > 0, 'pool keyScope must carry allowed_vms')
-        const vmId = allowed[pickCursor++ % allowed.length]
-        const vm = vmList.find((v) => v.id === vmId)
+      resolveCandidateForNode(selectedNode, extra = {}) {
+        const vm = vmList.find((v) => v.id === selectedNode?.node_id)
+        if (!vm) return null
         return {
           ok: true,
           vmId: vm.id,
           accountId: vm.id,
           vm,
           exec: { vmId: vm.id, vm, homeDir: mockCrag.homeDir },
+          nodeKey: selectedNode.node_key,
+          ...extra,
           release() {},
         }
       },
@@ -510,6 +565,7 @@ test('Concurrent Pool 1 (official vm1/2/3) vs Pool 2 (zero_inject vm4/5/6 with e
       paths: { data: root, project: root },
     },
     poolsRepo,
+    schedulerRuntime,
     vms: vmList,
     requestLog: { start: () => ({ request_id: `req-${Math.random()}` }), finish() {} },
     stickyRouter: { extractPoolKey: () => null, collectPoolKeys: () => [] },
@@ -674,21 +730,35 @@ test('Step [2] pre-evaluation: strict_pool Fail-Closed, isPoolZeroInjectMode bef
     }
   })
 
+  const downgradeSettings = makeSettings({
+    jev_intercept: { enabled: true, base_url: jevUrl, hard_regex_enabled: false },
+    risk_audit_policy: { downgrade_pool: 'pool_dddd2222', route_margin: 0.15 },
+  })
+  const schedulerRuntime = await startTestSchedulerRuntime(t, {
+    root,
+    poolsRepo,
+    getVms: () => [vmA, vmD],
+    getRoutingConfig: () => routing,
+    settings: downgradeSettings,
+  })
+
   let selectCalls = 0
+  let dgReqSeq = 0
   const calls = []
   const runner = new FailoverRunner({
+    schedulerRuntime,
     scheduler: {
-      async selectAndReserve({ keyScope }) {
+      resolveCandidateForNode(selectedNode, extra = {}) {
         selectCalls += 1
-        const allowed = keyScope?.allowed_vms || []
-        const vmId = allowed[0]
-        const vm = vmId === 'vm-d1' ? vmD : vmA
+        const vm = selectedNode?.node_id === 'vm-d1' ? vmD : vmA
         return {
           ok: true,
           vmId: vm.id,
           accountId: vm.id,
           vm,
           exec: { vmId: vm.id, vm, homeDir: mockCrag.homeDir },
+          nodeKey: selectedNode.node_key,
+          ...extra,
           release() {},
         }
       },
@@ -704,10 +774,7 @@ test('Step [2] pre-evaluation: strict_pool Fail-Closed, isPoolZeroInjectMode bef
     writeSSEHeaders() {},
     readBody: async (req) => req.body,
     requireAuth: () => true,
-    settings: makeSettings({
-      jev_intercept: { enabled: true, base_url: jevUrl, hard_regex_enabled: false },
-      risk_audit_policy: { downgrade_pool: 'pool_dddd2222', route_margin: 0.15 },
-    }),
+    settings: downgradeSettings,
     cfg: {
       rewrite: { enabled: false },
       intercept: { rules: [] },
@@ -716,8 +783,9 @@ test('Step [2] pre-evaluation: strict_pool Fail-Closed, isPoolZeroInjectMode bef
       paths: { data: root, project: root },
     },
     poolsRepo,
+    schedulerRuntime,
     vms: [vmA, vmD],
-    requestLog: { start: () => ({ request_id: 'req-dg' }), finish() {} },
+    requestLog: { start: () => ({ request_id: `req-dg-${++dgReqSeq}` }), finish() {} },
     stickyRouter: { extractPoolKey: () => null, collectPoolKeys: () => [] },
     accountQuota: { ingestHeaders() {} },
     apiKeyStore: { acquire: () => ({ ok: true }), release() {}, recordUsage() {} },
@@ -1200,6 +1268,14 @@ test('PR-3 Review Blocker #1: /v1/alpha/search and /v1/images/* enforce strict_p
     members: [{ node_type: 'codex_vm', node_id: 'codex-free' }],
   })
 
+  const schedulerRuntime = await startTestSchedulerRuntime(t, {
+    root,
+    poolsRepo,
+    getVms: () => codexVms,
+    getRoutingConfig: () => routing,
+  })
+
+  let codexReqSeq = 0
   const searchPickedVms = []
   const imagePickedVms = []
   const handler = createHandleProtocol({
@@ -1216,8 +1292,9 @@ test('PR-3 Review Blocker #1: /v1/alpha/search and /v1/images/* enforce strict_p
       paths: { data: root, project: root },
     },
     poolsRepo,
+    schedulerRuntime,
     vms: codexVms,
-    requestLog: { start: () => ({ request_id: 'req-codex' }), finish() {} },
+    requestLog: { start: () => ({ request_id: `req-codex-${++codexReqSeq}` }), finish() {} },
     stickyRouter: { extractPoolKey: () => null, collectPoolKeys: () => [] },
     accountQuota: { ingestHeaders() {} },
     apiKeyStore: { acquire: () => ({ ok: true }), release() {}, recordUsage() {} },
