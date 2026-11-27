@@ -553,6 +553,7 @@ export function createHandleProtocol(deps) {
       isOfficialClaudeCodeTraffic(req.headers, inbound) ||
       isOfficialClaudeClient(fp.client_class) ||
       (detectProxiedOfficialCcFromRoutingFile(routingConfigPath) && isProxiedOfficialClaudeCode(inbound, req.headers))
+    const classifier = classifyClaudeRequestPurpose(inbound, { officialTraffic: official })
     const interceptSession = interceptSessionKey ? peekInterceptSession(interceptSessionKey) : null
     const decision = await runProtocolIntercept({
       inbound,
@@ -560,6 +561,7 @@ export function createHandleProtocol(deps) {
       headers: req.headers,
       identity,
       official,
+      classifier,
       zeroInject: isZeroInjectMode(),
       distillRules: cfg.distill,
       policy: riskState.policy,
