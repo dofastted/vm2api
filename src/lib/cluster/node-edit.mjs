@@ -2,6 +2,7 @@
 import { inspectContainerOrNull, sshDocker } from './docker-remote.mjs'
 import { shellQuote } from './remote-fs.mjs'
 import { ClusterError, execCollect } from './ssh-link.mjs'
+import { slotHome } from '../vm/slot-identity.mjs'
 
 const EDIT_FIELDS = new Set([
   'label',
@@ -148,7 +149,7 @@ export async function verifyNodeRuntimes(client, host, vms, previousHost) {
     const dir = `${host.root}/vms/${vm.id}`
     if (
       !mountMatches(info, `${dir}/run`, kvm ? '/slot/run' : '/run/kin') ||
-      !mountMatches(info, `${dir}/cli-home`, kvm ? '/slot/home' : '/home/kincli')
+      !mountMatches(info, `${dir}/cli-home`, kvm ? '/slot/home' : slotHome(vm))
     )
       throw runtimeMismatch()
     const check = await execCollect(

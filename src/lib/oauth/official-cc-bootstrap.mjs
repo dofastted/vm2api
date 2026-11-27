@@ -29,6 +29,7 @@ import {
 } from '../vm/vm-runtime.mjs'
 import { slotMemory } from '../vm/machine-spec.mjs'
 import { isKvmRuntime } from '../vm/runtime-kind.mjs'
+import { isCustomKvmMode } from '../vm/custom-os-runtime.mjs'
 import { slotExecArgv } from '../vm/slot-exec.mjs'
 import { reloadSlotReady } from '../vm/slot-runtime.mjs'
 import {
@@ -52,7 +53,9 @@ import {
   REMOTE_CRAG_CLAUDE,
   normalizeOfficialCcInference,
   resolveOfficialCcInference,
+  slotLocalCragClaude,
 } from '../vm/slot-engine.mjs'
+import { slotHome, slotUser } from '../vm/slot-identity.mjs'
 import { getVm } from '../vm/vm-registry.mjs'
 import { guardUsageTier } from '../pool/claude-tier.mjs'
 import { slotHost } from '../vm/slot-host.mjs'
@@ -303,22 +306,41 @@ export function restoreSlotMemoryAfterOfficialCc(vmId, idleMemory, { keepCli = f
   return applyContainerMemory(vmId, idleMemory || slotIdleMemory(vm), vm)
 }
 
-export function startOfficialCcResidentProcess({ vmId, projectRoot, uid, gid, timezone, locale, vm }) {
-  const script = path.join(scriptsDir(), 'official-cc-resident.py')
-  const runDir = officialCcRunDir(projectRoot, vmId)
-  fs.mkdirSync(runDir, { recursive: true, mode: 0o700 })
-  const pidFile = officialCcPidPath(projectRoot, vmId, 'resident')
-  const host = slotHost(vm || { id: vmId })
-  const bin = host.bakedKernel ? REMOTE_CRAG_CLAUDE : LOCAL_CRAG_CLAUDE
-  const execArgv = slotExecArgv(vm || { id: vmId }, [bin], {
-    user: `${uid}:${gid}`,
+function resolveOfficialCcExecUser(targetVm, host, uid, gid) {
+  if (isKvmRuntime(targetVm) && isCustomKvmMode({ vm: targetVm })) {
+    const guestUser = host.execUser(targetVm)
+    if (guestUser) return guestUser
+  }
+  return `${uid}:${gid}`
+}
+
+function splitUidGid(spec, fallbackUid, fallbackGid) {
+  const [rawUid, rawGid] = String(spec || '').split(':')
+  return {
+    uid: rawUid || String(fallbackUid),
+    gid: rawGid || String(fallbackGid),
+  }
+}
+
+export function buildOfficialCcResidentLaunch({ vmId, uid, gid, timezone, locale, vm }) {
+  const targetVm = vm || { id: vmId }
+  const host = slotHost(targetVm)
+  const userHome = slotHome(targetVm)
+  const userName = slotUser(targetVm)
+  const execUser = resolveOfficialCcExecUser(targetVm, host, uid, gid)
+  const execIds = splitUidGid(execUser, uid, gid)
+  const bin = host.bakedKernel ? REMOTE_CRAG_CLAUDE : slotLocalCragClaude(targetVm)
+  const execArgv = slotExecArgv(targetVm, [bin], {
+    user: execUser,
     env: [
-      'HOME=/home/kincli',
-      'TMPDIR=/home/kincli/.cache/tmp',
+      `HOME=${userHome}`,
+      `USER=${userName}`,
+      `LOGNAME=${userName}`,
+      `TMPDIR=${userHome}/.cache/tmp`,
       `TZ=${timezone || 'UTC'}`,
       `LANG=${locale || 'en_US.UTF-8'}`,
       `LC_ALL=${locale || 'en_US.UTF-8'}`,
-      'PATH=/home/kincli/.local/bin:/usr/bin:/bin',
+      `PATH=${userHome}/.local/bin:/usr/bin:/bin`,
       'CLAUDE_CODE_HOST_REFRESH=1',
       'USER_TYPE=external',
       OFFICIAL_CC_MARKER,
@@ -330,21 +352,40 @@ export function startOfficialCcResidentProcess({ vmId, projectRoot, uid, gid, ti
       'ANTHROPIC_API_KEY=',
       'ANTHROPIC_AUTH_TOKEN=',
     ],
-    workdir: '/home/kincli',
+    workdir: userHome,
     interactive: true,
     tty: true,
   })
+  return {
+    execUser,
+    execUid: execIds.uid,
+    execGid: execIds.gid,
+    userHome,
+    userName,
+    bin,
+    execArgv,
+  }
+}
+
+export function startOfficialCcResidentProcess({ vmId, projectRoot, uid, gid, timezone, locale, vm }) {
+  const script = path.join(scriptsDir(), 'official-cc-resident.py')
+  const runDir = officialCcRunDir(projectRoot, vmId)
+  fs.mkdirSync(runDir, { recursive: true, mode: 0o700 })
+  const pidFile = officialCcPidPath(projectRoot, vmId, 'resident')
+  const launch = buildOfficialCcResidentLaunch({ vmId, uid, gid, timezone, locale, vm })
   const child = spawn('python3', [script], {
     env: {
       ...process.env,
       KIN_CONTAINER: containerName(vmId),
-      KIN_UID: String(uid),
-      KIN_GID: String(gid),
-      KIN_CLI_BIN: bin,
+      KIN_UID: launch.execUid,
+      KIN_GID: launch.execGid,
+      KIN_SLOT_HOME: launch.userHome,
+      KIN_SLOT_USER: launch.userName,
+      KIN_CLI_BIN: launch.bin,
       TZ: timezone || 'UTC',
       LANG: locale || 'en_US.UTF-8',
       LC_ALL: locale || 'en_US.UTF-8',
-      KIN_DOCKER_ARGV: JSON.stringify(execArgv),
+      KIN_DOCKER_ARGV: JSON.stringify(launch.execArgv),
     },
     detached: true,
     stdio: 'ignore',
@@ -838,10 +879,14 @@ export function buildOfficialCcDockerArgs({
 }) {
   const text = String(prompt || '').trim() || DEFAULT_PLAN_PROMPT
   const slash = isOfficialCcSlashPrompt(text)
-  const host = slotHost(vm || { id: vmId })
-  const bin = host.bakedKernel ? REMOTE_CRAG_CLAUDE : LOCAL_CRAG_CLAUDE
+  const targetVm = vm || { id: vmId }
+  const host = slotHost(targetVm)
+  const userHome = slotHome(targetVm)
+  const userName = slotUser(targetVm)
+  const execUser = resolveOfficialCcExecUser(targetVm, host, uid, gid)
+  const bin = host.bakedKernel ? REMOTE_CRAG_CLAUDE : slotLocalCragClaude(targetVm)
   return slotExecArgv(
-    vm || { id: vmId },
+    targetVm,
     [
       bin,
       ...(slash
@@ -849,14 +894,16 @@ export function buildOfficialCcDockerArgs({
         : ['-p', text, '--permission-mode', 'bypassPermissions', '--output-format', 'json']),
     ],
     {
-      user: `${uid}:${gid}`,
+      user: execUser,
       env: [
-        'HOME=/home/kincli',
-        'TMPDIR=/home/kincli/.cache/tmp',
+        `HOME=${userHome}`,
+        `USER=${userName}`,
+        `LOGNAME=${userName}`,
+        `TMPDIR=${userHome}/.cache/tmp`,
         `TZ=${timezone}`,
         `LANG=${locale}`,
         `LC_ALL=${locale}`,
-        'PATH=/home/kincli/.local/bin:/usr/bin:/bin',
+        `PATH=${userHome}/.local/bin:/usr/bin:/bin`,
         'CLAUDE_CODE_HOST_REFRESH=1',
         OFFICIAL_CC_MARKER,
         'USER_TYPE=external',
@@ -868,7 +915,7 @@ export function buildOfficialCcDockerArgs({
         'ANTHROPIC_API_KEY=',
         'ANTHROPIC_AUTH_TOKEN=',
       ],
-      workdir: '/home/kincli',
+      workdir: userHome,
     },
   )
 }
@@ -1202,7 +1249,7 @@ export async function runOfficialCcBootstrap(rawOpts = {}) {
     })
 
     const host = slotHost(vm)
-    const bin = host.bakedKernel ? REMOTE_CRAG_CLAUDE : LOCAL_CRAG_CLAUDE
+    const bin = host.bakedKernel ? REMOTE_CRAG_CLAUDE : slotLocalCragClaude(vm)
     const staged = ensureOfficialCcNativeCli(projectRoot, vm, homeDir, { uid, gid })
     if (!host.bakedKernel && !fs.existsSync(staged)) {
       const status = writeOfficialCcStatus(homeDir, {

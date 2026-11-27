@@ -338,7 +338,12 @@ import {
   takenFingerprintKeys,
   writeGuestMachineIdFile,
 } from '../identity/workstation-fingerprint.mjs'
-import { assignComputerFingerprint } from '../identity/slot-computer.mjs'
+import {
+  assignComputerFingerprint,
+  fingerprintDir,
+  pushLiveSlotTimezoneSync,
+  syncSlotIdentityTimezoneAndPreset,
+} from '../identity/slot-computer.mjs'
 import { runFleetUpdate, fleetStatus } from '../vm/fleet-update.mjs'
 import {
   captureWrapSample,
@@ -4854,17 +4859,30 @@ export function createPanelHandler(ctx) {
             if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
           }
           if (hasTimezone) {
+            const prevZone = currentVm.timezone || ''
             const vm = persistVmTimezone(cfg.paths.project, id, timezoneSync.timezone, { source: 'manual' })
             if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
             const kernel = projectSlotKernelConfig(vm)
             timezoneSync.applied = true
             timezoneSync.kernel_hot = kernel?.changed === true
+            const freshVm = getVm(cfg.paths.project, id)
+            if (freshVm?.status === 'running') {
+              if (freshVm.runtime?.type === 'kvm') {
+                await pushLiveSlotTimezoneSync(cfg.paths.project, freshVm).catch(() => null)
+              } else if (prevZone !== timezoneSync.timezone) {
+                timezoneSync.restart_recommended_for_tz = true
+              }
+            }
           } else if (followProxyTz) {
             const synced = await syncVmTimezoneFromProxy(cfg.paths.project, proxyPool, id, { force: true })
             timezoneSync = { applied: synced.applied, timezone: synced.timezone, source: 'proxy_geo' }
             if (synced.applied) {
               const kernel = projectSlotKernelConfig({ id })
               timezoneSync.kernel_hot = kernel?.changed === true
+              const freshVm = getVm(cfg.paths.project, id)
+              if (freshVm?.status === 'running' && freshVm.runtime?.type !== 'kvm') {
+                timezoneSync.restart_recommended_for_tz = true
+              }
             }
           }
           if (nextName != null && nextName !== String(currentVm.name || '')) {
@@ -5723,6 +5741,18 @@ export function createPanelHandler(ctx) {
           vm.seed_policy = next
           vm.updated_at = new Date().toISOString()
           atomicWriteJson(vmPath, vm, { mode: 0o600 })
+          if (fs.existsSync(fingerprintDir(cfg.paths.project, id))) {
+            try {
+              const tzSync = syncSlotIdentityTimezoneAndPreset(cfg.paths.project, vm, {
+                timezone: vm.timezone,
+                locale: vm.locale,
+                telemetryEnabled: isTelemetryEnabled(next),
+              })
+              if (tzSync?.ok && vm.status === 'running' && vm.runtime?.type === 'kvm') {
+                await pushLiveSlotTimezoneSync(cfg.paths.project, vm, tzSync).catch(() => null)
+              }
+            } catch {}
+          }
           let service
           if (unsupported) {
             service = await withVmLock(`seed-publication:${vmPath}`, async () => {

@@ -13,6 +13,7 @@ import crypto from 'node:crypto'
 import { WebSocketServer } from 'ws'
 import { execCapture, execDetached, inspectExec, openExecTty, resizeExec } from '../cluster/docker-remote.mjs'
 import { slotHost } from './slot-host.mjs'
+import { DEFAULT_SLOT_HOME, slotClaudeDir, slotHome, slotUser } from './slot-identity.mjs'
 import { isCodexVm } from './vm-kind.mjs'
 import { isKvmRuntime } from './runtime-kind.mjs'
 import { slotExecCmd, slotExecContainer } from './slot-exec.mjs'
@@ -254,9 +255,11 @@ const SYSTEM_FACTS_RC = [
 export const terminalClaudeBin = resolveAuthLoginClaude
 
 /** @returns {{ cmd: string[], rc: string }} */
-export function panelShellLaunch(cliBin) {
+export function panelShellLaunch(cliBin, { homeDir = DEFAULT_SLOT_HOME } = {}) {
   const bin = String(cliBin || '')
   if (!bin.startsWith('/') || /[\n\r\0]/.test(bin)) throw new Error('invalid Claude CLI path')
+  const safeHome = String(homeDir || DEFAULT_SLOT_HOME)
+  if (!safeHome.startsWith('/') || /[\n\r\0'"$\\`]/.test(safeHome)) throw new Error('invalid slot home path')
   const q = `'${bin.replace(/'/g, `'\\''`)}'`
   const rc = [
     'if [ -n "${BASH_VERSION:-}" ]; then [ -f /etc/bash.bashrc ] && . /etc/bash.bashrc; [ -f ~/.bashrc ] && . ~/.bashrc; fi',
@@ -264,13 +267,13 @@ export function panelShellLaunch(cliBin) {
     // Official CLI reads ~/.claude/.credentials.json and, unless CLAUDE_CONFIG_DIR
     // is set, ~/.claude.json. Slot tokens already live in .claude; point the
     // session there and expose the nested account file at the home path.
-    'export HOME="${HOME:-/home/kincli}"',
+    `export HOME="\${HOME:-${safeHome}}"`,
     'export CLAUDE_CONFIG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"',
     'unset CLAUDE_CODE_VERSION CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC ANTHROPIC_BASE_URL ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CODE_OAUTH_REFRESH_TOKEN',
     'export USER_TYPE=external',
     'mkdir -p "$CLAUDE_CONFIG_DIR"',
     'if [ ! -e "$HOME/.claude.json" ] && [ -f "$CLAUDE_CONFIG_DIR/.claude.json" ]; then ln -s .claude/.claude.json "$HOME/.claude.json" 2>/dev/null || true; fi',
-    `claude() { case "$1:$2" in auth:login|setup-token:*) echo "请在面板账号页完成换票，再使用 /sync 同步凭证" >&2; return 2 ;; esac; export HOME="\${HOME:-/home/kincli}"; export CLAUDE_CONFIG_DIR="\${CLAUDE_CONFIG_DIR:-\$HOME/.claude}"; if [ -x ${q} ]; then ${q} "$@"; else echo "原生 Claude Code 未安装，请同步客户端" >&2; return 127; fi; }`,
+    `claude() { case "$1:$2" in auth:login|setup-token:*) echo "请在面板账号页完成换票，再使用 /sync 同步凭证" >&2; return 2 ;; esac; export HOME="\${HOME:-${safeHome}}"; export CLAUDE_CONFIG_DIR="\${CLAUDE_CONFIG_DIR:-\$HOME/.claude}"; if [ -x ${q} ]; then ${q} "$@"; else echo "原生 Claude Code 未安装，请同步客户端" >&2; return 127; fi; }`,
     'cc() { claude "$@"; }',
     'usage() { claude /usage "$@"; }',
     'if [ -n "${BASH_VERSION:-}" ]; then eval \'/usage() { usage "$@"; }\'; fi',
@@ -433,7 +436,7 @@ export function createSlotShell({
       }
     }
     const resize = (cols, rows) => {
-      resizeExec(connect, session.execId, { cols, rows }).catch(() => { })
+      resizeExec(connect, session.execId, { cols, rows }).catch(() => {})
     }
     // Listen before the exec opens: input/resize sent during the Docker round
     // trip would otherwise be dropped (ws does not buffer unhandled messages).
@@ -502,17 +505,24 @@ export function createSlotShell({
         release()
         return
       }
-      const launch = size.login ? nativeLoginLaunch(sessionCli, configDir) : panelShellLaunch(sessionCli)
+      const userHome = slotHome(vm)
+      const userName = slotUser(vm)
+      const claudeDir = slotClaudeDir(vm)
+      const launch = size.login
+        ? nativeLoginLaunch(sessionCli, configDir)
+        : panelShellLaunch(sessionCli, { homeDir: userHome })
       const env = [
         'TERM=xterm-256color',
-        'HOME=/home/kincli',
+        `HOME=${userHome}`,
+        `USER=${userName}`,
+        `LOGNAME=${userName}`,
         `${SESSION_ENV}=${token}`,
-        ...(size.login ? launch.env : ['CLAUDE_CONFIG_DIR=/home/kincli/.claude', `${RC_ENV}=${launch.rc}`]),
+        ...(size.login ? launch.env : [`CLAUDE_CONFIG_DIR=${claudeDir}`, `${RC_ENV}=${launch.rc}`]),
       ]
       const kvm = isKvmRuntime(vm)
       const { Cmd, User } = slotExecCmd(vm, launch.cmd, {
         env: kvm ? env : undefined,
-        workdir: '/home/kincli',
+        workdir: userHome,
         interactive: true,
         tty: true,
         user: host.execUser(vm),
@@ -520,7 +530,7 @@ export function createSlotShell({
       session = await openExecTty(connect, container, {
         cmd: Cmd,
         env: kvm ? [] : env,
-        workingDir: kvm ? undefined : '/home/kincli',
+        workingDir: kvm ? undefined : userHome,
         user: User,
         cols: size.cols,
         rows: size.rows,
