@@ -36,6 +36,14 @@ class GeminiMaintenanceRuntimeFilesTests(unittest.TestCase):
             module.RUNTIME_FILES[kin_idx + 1], "scripts/gemini_host_apparmor.py"
         )
 
+    def test_runtime_files_includes_agy_patch_helper_after_apparmor(self):
+        self.assertIn("scripts/gemini_agy_patch.py", module.RUNTIME_FILES)
+        agy_patch = ROOT / "scripts/gemini_agy_patch.py"
+        self.assertTrue(agy_patch.is_file(), "agy patch helper must exist in repo")
+        apparmor_idx = module.RUNTIME_FILES.index("scripts/gemini_host_apparmor.py")
+        agy_patch_idx = module.RUNTIME_FILES.index("scripts/gemini_agy_patch.py")
+        self.assertGreater(agy_patch_idx, apparmor_idx)
+
 
 if __name__ == "__main__":
     unittest.main()

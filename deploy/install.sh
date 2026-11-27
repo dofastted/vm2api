@@ -1155,7 +1155,7 @@ PY
     return 1
   fi
   bundle="$(mktemp -d "${root}/bundles/bundle-${tag}.XXXXXX")" || return 1
-  local -a files=(scripts/gemini-maintenance.py scripts/gemini_host_apparmor.py deploy/gemini-maintenance.service.example
+  local -a files=(scripts/gemini-maintenance.py scripts/gemini_host_apparmor.py scripts/gemini_agy_patch.py deploy/gemini-maintenance.service.example
     scripts/gemini-host.py scripts/gemini_host_account.py scripts/gemini_host_inference.py
     scripts/gemini_host_native.py scripts/gemini-host-egress.sh scripts/fetch-default-gemini.py
     scripts/install-gemini-payload.mjs src/lib/gemini/payload.mjs deploy/payload.json deploy/gemini-host.service.example)
@@ -1191,7 +1191,7 @@ if not match:
 (bundle / 'catalog.json').write_text(json.dumps([{'id': tag, 'version': match[1], 'cli_version': '1.5.9'}]) + '\n')
 (bundle / 'maintenance-config.json').write_text(json.dumps({'install_dir': str(install), 'bundle_dir': str(bundle)}) + '\n')
 PY
-  for file in "$config" "$root/scripts/gemini-maintenance.py" "$root/scripts/gemini_host_apparmor.py" "$unit"; do
+  for file in "$config" "$root/scripts/gemini-maintenance.py" "$root/scripts/gemini_host_apparmor.py" "$root/scripts/gemini_agy_patch.py" "$unit"; do
     if [ -e "$file" ] || [ -L "$file" ]; then
       [ ! -L "$file" ] && [ -f "$file" ] && [ "$(stat -c '%u:%h' "$file")" = 0:1 ] || { err "拒绝覆盖不受信的维护文件"; return 1; }
       local permissions
@@ -1229,10 +1229,12 @@ PY
   [ ! -f "$config" ] || install -m 600 "$config" "$backup/config.json" || return 1
   [ ! -f "$root/scripts/gemini-maintenance.py" ] || install -m 644 "$root/scripts/gemini-maintenance.py" "$backup/daemon.py" || return 1
   [ ! -f "$root/scripts/gemini_host_apparmor.py" ] || install -m 644 "$root/scripts/gemini_host_apparmor.py" "$backup/apparmor.py" || return 1
+  [ ! -f "$root/scripts/gemini_agy_patch.py" ] || install -m 644 "$root/scripts/gemini_agy_patch.py" "$backup/agy_patch.py" || return 1
   [ ! -f "$unit" ] || install -m 644 "$unit" "$backup/service" || return 1
   if atomic_maintenance_file "$bundle/maintenance-config.json" "$config" 600 &&
     atomic_maintenance_file "$bundle/scripts/gemini-maintenance.py" "$root/scripts/gemini-maintenance.py" 644 &&
     atomic_maintenance_file "$bundle/scripts/gemini_host_apparmor.py" "$root/scripts/gemini_host_apparmor.py" 644 &&
+    atomic_maintenance_file "$bundle/scripts/gemini_agy_patch.py" "$root/scripts/gemini_agy_patch.py" 644 &&
     atomic_maintenance_file "$bundle/deploy/gemini-maintenance.service.example" "$unit" 644 &&
     systemctl daemon-reload && systemctl enable vm2api-gemini-maintenance.service && systemctl restart vm2api-gemini-maintenance.service; then
     ok "Gemini 维护服务已就绪，可在设置 → Gemini 维护 操作"
@@ -1242,6 +1244,7 @@ PY
   if [ -f "$backup/config.json" ]; then atomic_maintenance_file "$backup/config.json" "$config" 600 || restored=0; else rm -f -- "$config" || restored=0; fi
   if [ -f "$backup/daemon.py" ]; then atomic_maintenance_file "$backup/daemon.py" "$root/scripts/gemini-maintenance.py" 644 || restored=0; else rm -f -- "$root/scripts/gemini-maintenance.py" || restored=0; fi
   if [ -f "$backup/apparmor.py" ]; then atomic_maintenance_file "$backup/apparmor.py" "$root/scripts/gemini_host_apparmor.py" 644 || restored=0; else rm -f -- "$root/scripts/gemini_host_apparmor.py" || restored=0; fi
+  if [ -f "$backup/agy_patch.py" ]; then atomic_maintenance_file "$backup/agy_patch.py" "$root/scripts/gemini_agy_patch.py" 644 || restored=0; else rm -f -- "$root/scripts/gemini_agy_patch.py" || restored=0; fi
   if [ -f "$backup/service" ]; then atomic_maintenance_file "$backup/service" "$unit" 644 || restored=0; else rm -f -- "$unit" || restored=0; fi
   systemctl daemon-reload || restored=0
   [ "$was_enabled" = 1 ] || systemctl disable vm2api-gemini-maintenance.service || warn "无法恢复维护服务的启用状态"
@@ -1385,7 +1388,7 @@ prepare_gemini_host() (
     use_apparmor=1
   fi
 
-  local -a files=(deploy/gemini-host.service.example scripts/gemini-host.py scripts/gemini_host_apparmor.py
+  local -a files=(deploy/gemini-host.service.example scripts/gemini-host.py scripts/gemini_host_apparmor.py scripts/gemini_agy_patch.py
     scripts/gemini_host_account.py scripts/gemini_host_inference.py scripts/gemini_host_native.py
     scripts/gemini-host-egress.sh scripts/install-gemini-payload.mjs src/lib/gemini/payload.mjs)
   for file in "${files[@]}"; do
@@ -1539,7 +1542,8 @@ PY
   # install.sh upgrade actually advance CRAGGemini to the latest pinned version.
   local swapped_old=""
   if [ "$use_default" = 1 ] && [ "$installed" = 1 ] && [ ! -L "$current" ] && [ -d "$current" ] &&
-    { [ ! -f "${current}/manifest.json" ] || ! cmp -s -- "${current}/manifest.json" "${default_source}/manifest.json"; }; then
+    { [ ! -f "${current}/manifest.json" ] || ! cmp -s -- "${current}/manifest.json" "${default_source}/manifest.json" ||
+      ! python3 -I "${staging}/scripts/gemini_agy_patch.py" status --require-patched --path "${current}/agy" >/dev/null 2>&1; }; then
     if [ -e /var/lib/vm2api-gemini/maintenance.pending ] || [ -L /var/lib/vm2api-gemini/maintenance.pending ]; then
       err "Gemini 上次维护未完成；请先在面板恢复后再升级载荷"
       return 1
@@ -1578,6 +1582,25 @@ PY
       return 1
     fi
     swapped_old="$staged_payload"
+  elif [ "$installed" = 1 ] && [ ! -L "$current" ] && [ -f "${current}/agy" ] && [ ! -L "${current}/agy" ]; then
+    local agy_patch_rc=0
+    python3 -I "${staging}/scripts/gemini_agy_patch.py" status --require-patched --path "${current}/agy" >/dev/null 2>&1 || agy_patch_rc=$?
+    if [ "$agy_patch_rc" -eq 1 ]; then
+      local staged_agy
+      staged_agy="$(mktemp "${current}/.agy-patch.XXXXXX")" || return 1
+      if ! cp -p -- "${current}/agy" "$staged_agy" ||
+        ! python3 -I "${staging}/scripts/gemini_agy_patch.py" patch --no-backup --path "$staged_agy" >/dev/null; then
+        rm -f -- "$staged_agy"
+        err "无法为已安装的 Antigravity CLI (agy) 自动应用资格补丁，已保留原文件"
+        return 1
+      fi
+      systemctl stop vm2api-gemini.service 2>/dev/null || true
+      if ! chmod 755 "$staged_agy" || ! mv -f -- "$staged_agy" "${current}/agy"; then
+        rm -f -- "$staged_agy"
+        err "无法原子替换已打补丁的 Antigravity CLI (agy)"
+        return 1
+      fi
+    fi
   fi
 
   local unit_backup=""
@@ -1637,6 +1660,14 @@ PY
       ok "Gemini 签名载荷 ${version} 已安装，尚待兑换；请在管理面板输入兑换码激活"
     else
       ok "Gemini 签名载荷 ${version} 已安装；CLI 出口状态请在面板检查"
+    fi
+    if [ -f "${current}/agy" ] && [ ! -L "${current}/agy" ]; then
+      if python3 -I "${host_dir}/scripts/gemini_agy_patch.py" status --require-patched --path "${current}/agy" >/dev/null 2>&1; then
+        ok "Antigravity CLI (agy) 资格补丁已验证生效"
+      else
+        err "Antigravity CLI (agy) 资格补丁校验未通过，请检查 ${current}/agy 后重试 prepare-gemini"
+        return 1
+      fi
     fi
   else
     ok "Gemini 控制 socket 已就绪；签名载荷与 CLI 出口状态请在面板检查"

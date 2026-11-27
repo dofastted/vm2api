@@ -472,11 +472,18 @@ export function createDirectCragClient({ callHost, now = () => Date.now() }) {
     }
   }
 
-  const resolveTarget = async ({ id, proxyId, proxyUrl, proxySha256, model }) => {
+  const resolveTarget = async ({ id, proxyId, proxyUrl, proxySha256, egressOptions = null, model }) => {
     const ts = now()
     if (ts < unsupportedUntil) return null
+    const egressKey = egressOptions && typeof egressOptions === 'object' ? JSON.stringify(egressOptions) : ''
     const cached = targets.get(id)
-    if (cached && cached.expiresAt > ts && cached.proxyId === proxyId && cached.proxySha256 === (proxySha256 || '')) {
+    if (
+      cached &&
+      cached.expiresAt > ts &&
+      cached.proxyId === proxyId &&
+      cached.proxySha256 === (proxySha256 || '') &&
+      (cached.egressKey || '') === egressKey
+    ) {
       return cached.target
     }
     let response
@@ -486,6 +493,7 @@ export function createDirectCragClient({ callHost, now = () => Date.now() }) {
         proxy_id: proxyId,
         proxy_url: proxyUrl,
         ...(proxySha256 ? { proxy_sha256: proxySha256 } : {}),
+        ...(egressOptions ? { egress_options: egressOptions } : {}),
         model,
       })
     } catch (err) {
@@ -505,6 +513,7 @@ export function createDirectCragClient({ callHost, now = () => Date.now() }) {
       target,
       proxyId,
       proxySha256: proxySha256 || '',
+      egressKey,
       expiresAt: now() + target.ttlMs,
     })
     return target

@@ -16,6 +16,7 @@ export const geminiCheckLabels: Record<string, string> = {
   runtime_service: 'Gemini 运行服务',
   maintenance: '维护状态完整性',
   signed_payload: 'CRAGGemini 签名载荷',
+  agy_patch: 'Antigravity CLI 资格补丁',
   pinned_egress: '固定出口代理（kin-egress）',
   runtime_tools: '运行工具依赖',
   ipv4_forwarding: 'IPv4 转发',
@@ -98,6 +99,14 @@ const MAINTENANCE_ERROR_LABELS: Record<string, string> = {
     '固定出口（kin-egress）文件缺失或校验不通过',
   gemini_maintenance_egress_pin_mismatch:
     '宿主 kin-egress 摘要与发行清单不一致，请先更新控制面与宿主维护服务',
+  gemini_maintenance_agy_patch_missing:
+    '检测到 Antigravity CLI（agy）尚未应用资格补丁，请执行「修复安装」或在宿主机运行 prepare-gemini 自动补丁',
+  gemini_maintenance_agy_patch_unknown:
+    '无法识别当前 Antigravity CLI（agy）的资格补丁签名（可能版本不匹配），未修改二进制文件',
+  gemini_maintenance_agy_patch_unverified:
+    '尚未完成 Antigravity CLI（agy）资格补丁检查',
+  gemini_maintenance_agy_patch_failed:
+    '应用 Antigravity CLI（agy）资格补丁失败，原文件未改动',
   gemini_maintenance_ipv4_forwarding_disabled:
     '宿主机未开启 IPv4 转发（net.ipv4.ip_forward=0）',
   gemini_sandbox_apparmor_restricted:

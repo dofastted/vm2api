@@ -501,4 +501,19 @@ describe('CragGeminiKernelRow', () => {
       expect(btn.disabled).toBe(true)
     }
   })
+
+  it('surfaces agy_patch failure warning and quick repair button when unpatched', () => {
+    state.maintenance = baseSnapshot({
+      checks: [
+        {
+          id: 'agy_patch',
+          state: 'fail',
+          code: 'gemini_maintenance_agy_patch_missing',
+        },
+      ],
+    })
+    const html = renderRow()
+    expect(html).toContain('尚未应用资格补丁')
+    expect(html).toContain('修复补丁')
+  })
 })

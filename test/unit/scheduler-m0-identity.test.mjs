@@ -670,7 +670,7 @@ test('handleProtocol extracts identity before sanitizeInboundBody, strips upstre
       'x-kin-device-id': 'hdr-kin-dev',
     },
     apiKeyKind: 'managed',
-    apiKeyRecord: { id: 'key_e2e', default_pool_id: 'pool_e2e', group_type: 'anthropic' },
+    apiKeyRecord: { id: 'key_e2e', group_type: 'anthropic' },
     body: {
       model: 'claude-sonnet-4-6',
       max_tokens: 128,
