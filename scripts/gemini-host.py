@@ -37,6 +37,13 @@ _SCRIPT_DIR = Path(__file__).resolve().parent
 if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
+from gemini_agy_patch import (
+    AGY_ALLOWED_SHA256S,
+    AGY_PATCHED_SHA256,
+    AGY_UNPATCHED_SHA256,
+    file_sha256 as agy_file_sha256,
+    inspect_agy_patch,
+)
 from gemini_host_apparmor import (
     active_host_root,
     managed_bwrap_entry_configured,
@@ -361,7 +368,7 @@ def reconcile_craggemini_license_status(
                 "message": "The CRAGGemini license payload key does not match the installed package.",
             }
     return status
-AGY_SHA256 = "39816d49d5ab92229952987225c23ea3fed7580699dcb4a444e0388e0ac1ce43"
+AGY_SHA256 = AGY_UNPATCHED_SHA256
 INFERENCE_MODULE = ROOT / "scripts/gemini_host_inference.py"
 MODEL = re.compile(r"[a-z0-9][a-z0-9._-]{0,99}\Z")
 INFER_REQUEST_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
@@ -2229,7 +2236,7 @@ class NativeAgy(Agy):
             "internal_token": self.native_token,
             "session_id": self.attempt,
             "model": self.model,
-            "agy_sha256": AGY_SHA256,
+            "agy_sha256": self.host.installed_agy_sha256(),
             "timeout_ms": pol["timeout_ms"],
             "first_byte_timeout_ms": pol["first_byte_timeout_ms"],
             "idle_timeout_ms": pol["idle_timeout_ms"],
@@ -2987,7 +2994,7 @@ class CragDaemonShard:
             "internal_token": self.native_token,
             "session_id": self.attempt,
             "model": default_model,
-            "agy_sha256": AGY_SHA256,
+            "agy_sha256": self.host.installed_agy_sha256(),
             "timeout_ms": pol["timeout_ms"],
             "first_byte_timeout_ms": pol["first_byte_timeout_ms"],
             "idle_timeout_ms": pol["idle_timeout_ms"],
@@ -4616,6 +4623,87 @@ class Host:
         except (OSError, RuntimeError, ValueError, RecursionError):
             return False
 
+    def _inspect_installed_agy(self):
+        payload_dir = getattr(self, "payload", None)
+        if payload_dir is None:
+            return None, {
+                "state": "missing",
+                "arch": None,
+                "offset": None,
+                "gate": None,
+                "error": "payload path unavailable",
+            }
+        agy_path = Path(payload_dir) / "agy"
+        try:
+            info = agy_path.lstat()
+        except OSError:
+            return None, {
+                "state": "missing",
+                "arch": None,
+                "offset": None,
+                "gate": None,
+                "error": "file not found",
+            }
+        if not stat.S_ISREG(info.st_mode):
+            return None, {
+                "state": "unknown",
+                "arch": None,
+                "offset": None,
+                "gate": None,
+                "error": "not a regular file",
+            }
+        stat_key = (
+            info.st_dev,
+            info.st_ino,
+            info.st_size,
+            info.st_ctime_ns,
+            info.st_mtime_ns,
+        )
+        cached = getattr(self, "_agy_inspect_cache", None)
+        if cached is not None and cached[0] == stat_key:
+            return cached[1], cached[2]
+        patch_info = inspect_agy_patch(agy_path)
+        try:
+            digest = agy_file_sha256(agy_path)
+        except (OSError, ValueError):
+            digest = None
+        self._agy_inspect_cache = (stat_key, digest, patch_info)
+        return digest, patch_info
+
+    def installed_agy_sha256(self):
+        digest, _ = self._inspect_installed_agy()
+        if isinstance(digest, str) and digest in AGY_ALLOWED_SHA256S:
+            return digest
+        return AGY_SHA256
+
+    def agy_patch_status(self):
+        _, patch_info = self._inspect_installed_agy()
+        return patch_info
+
+    def _log_agy_patch_status(self):
+        _, patch_info = self._inspect_installed_agy()
+        cache = getattr(self, "_agy_inspect_cache", None)
+        log_key = (cache[0] if cache is not None else None, patch_info["state"])
+        if getattr(self, "_agy_patch_logged_key", None) == log_key:
+            return
+        self._agy_patch_logged_key = log_key
+        state = patch_info["state"]
+        if state == "patched":
+            print(
+                f"Gemini agy CLI eligibility patch verified (patched @ 0x{patch_info['offset']:x})",
+                file=sys.stderr,
+            )
+        elif state == "unpatched":
+            print(
+                "WARNING: Gemini agy CLI eligibility patch is NOT applied; run maintenance repair or prepare-gemini",
+                file=sys.stderr,
+            )
+        elif state == "unknown":
+            print(
+                f"WARNING: Gemini agy CLI eligibility patch status unknown ({patch_info.get('error') or 'unrecognized binary'})",
+                file=sys.stderr,
+            )
+
     def load_payload(
         self, *, materialize=False, verify_again=False, legacy_install=False
     ):
@@ -4667,6 +4755,8 @@ class Host:
             self.payload_mode = mode
             self.set_payload_version(version)
             self.payload_issue = None
+            if self.payload_state in ("installed", "awaiting_redemption"):
+                self._log_agy_patch_status()
             return verifier
         except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
             if self.payload_issue != "gemini_payload_invalid":

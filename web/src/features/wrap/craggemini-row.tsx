@@ -388,6 +388,10 @@ export function CragGeminiKernelRow({
         (jobStatus === 'failed' || trackedJobId.current === jobId)))
 
   const payloadReady = payload?.state === 'installed'
+  const agyPatchCheck = snapshot?.checks.find((item) => item.id === 'agy_patch')
+  const agyPatchMissing =
+    agyPatchCheck?.state === 'fail' &&
+    agyPatchCheck.code === 'gemini_maintenance_agy_patch_missing'
   const payloadLabel = payload
     ? (geminiPayloadLabels[payload.state] ?? payload.state)
     : null
@@ -511,6 +515,35 @@ export function CragGeminiKernelRow({
           <p className='mt-2 text-base break-words text-destructive sm:text-sm'>
             状态码：{payload.issue}
           </p>
+        ) : null}
+
+        {agyPatchCheck && agyPatchCheck.state === 'fail' ? (
+          <div className='mt-2 flex flex-wrap items-center gap-2 text-sm text-destructive'>
+            <TriangleAlert aria-hidden='true' className='size-4 shrink-0' />
+            <span className='min-w-0 break-words'>
+              {geminiMaintenanceCodeLabel(agyPatchCheck.code) ??
+                `Antigravity CLI 资格补丁状态异常（${agyPatchCheck.code ?? 'unknown'}）`}
+            </span>
+            {agyPatchMissing ? (
+              <Button
+                type='button'
+                size='sm'
+                variant='outline'
+                disabled={!canEdit || busy || !snapshot}
+                onClick={() =>
+                  openConfirm({
+                    request: { action: 'repair' },
+                    title: '为 Antigravity CLI（agy）自动应用资格补丁并重启服务？',
+                    description:
+                      '宿主机维护服务将复制当前 agy、验证并应用 4 字节资格补丁、原子切换目录并重启 vm2api-gemini.service，同时保留上一版以供回滚。',
+                    confirmText: '应用补丁并重启',
+                  })
+                }
+              >
+                修复补丁
+              </Button>
+            ) : null}
+          </div>
         ) : null}
 
         {outdatedBrokerPinNotice ? (
