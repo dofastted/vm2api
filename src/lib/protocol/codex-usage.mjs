@@ -205,6 +205,32 @@ export function extraToCodexSnapshot(extra = {}) {
   }
 }
 
+/**
+ * Synthesize the claude-shaped `unified` view the usage probe monitor reasons
+ * over, from a codex slot's extra. Codex quota lives on the slot file, not in
+ * the accounts repo, so without this the monitor is blind to codex windows:
+ * an elapsed 5h/7d reset never schedules the one /usage hop that would
+ * refresh the stale snapshot (claude slots get this via `account.unified`).
+ *
+ * Only the fields the monitor reads: per-window `reset` for liveness, and the
+ * newest sample time (`codex_usage_updated_at` is stamped by both sampling
+ * paths — live `x-codex-*` headers and the usage endpoint).
+ */
+export function codexUnifiedForUsageProbe(extra = {}) {
+  if (!extra || typeof extra !== 'object' || Object.keys(extra).length === 0) return {}
+  const limits = normalizeCodexLimits(extraToCodexSnapshot(extra))
+  const sampled = extra.codex_usage_updated_at || extra.updated_at || null
+  const window = (reset) => (reset ? { reset } : null)
+  return {
+    headers: {
+      sampled_at: sampled,
+      '5h': window(limits.reset_5h_at),
+      '7d': window(limits.reset_7d_at),
+    },
+    last_probe: sampled ? { at: sampled } : null,
+  }
+}
+
 function emptySnapshot() {
   return {
     primary_used_percent: null,
