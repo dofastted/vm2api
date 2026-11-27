@@ -68,6 +68,39 @@ export function cragConsumesModelDirective(health) {
 
 export const CRAG_PRINT_PROMPT_MAX_BYTES = 64 * 1024
 const BILLING_LINE = /^x-anthropic-billing-header:/i
+const EMPTY_REPLACE_CAPS = Object.freeze(['prompt_replace_empty', 'prompt_replace_empty_v3'])
+
+/**
+ * Check whether the CRAG worker advertises explicit empty `replace:""` support
+ * (CRAG 3.1.25+ `prompt_replace_empty` / `prompt_replace_empty_v3`).
+ */
+export function cragSupportsEmptyReplace(capabilities, health = null) {
+  if (Array.isArray(capabilities) && capabilities.some((cap) => EMPTY_REPLACE_CAPS.includes(cap))) {
+    return true
+  }
+  if (Array.isArray(health?.capabilities) && health.capabilities.some((cap) => EMPTY_REPLACE_CAPS.includes(cap))) {
+    return true
+  }
+  return false
+}
+
+export function cragEmptyReplaceUnsupportedError() {
+  const message =
+    'CRAG worker lacks prompt_replace_empty capability and is not statically configured as zero persona; refusing to silently fall back to official prompt'
+  const error = new Error(message)
+  error.status = 503
+  error.code = 'crag_prompt_replace_empty_unsupported'
+  error.body = {
+    type: 'error',
+    error: {
+      type: 'overloaded_error',
+      code: 'crag_prompt_replace_empty_unsupported',
+      message,
+      details: { retryable: false },
+    },
+  }
+  return error
+}
 
 export function normalizeCragPersonaPreset(value) {
   const raw = String(value ?? '')
@@ -434,9 +467,39 @@ function foldSummarySystemTurns(messages) {
   return { messages: [...folded.messages, ...tail], outputConfig }
 }
 
+function applyPoolSystemForCrag(callerSystem, promptPolicy, officialPassthrough) {
+  if (!promptPolicy?.applies) return callerSystem
+  const poolText = typeof promptPolicy.text === 'string' ? promptPolicy.text : ''
+  const poolBlocks = poolText ? [{ type: 'text', text: poolText }] : []
+  if (promptPolicy.mode === 'append') {
+    if (!poolBlocks.length) return callerSystem
+    if (officialPassthrough) return poolBlocks
+    const clientBlocks = systemBlocks(callerSystem)
+      .map((b) =>
+        typeof b === 'string' ? (b ? { type: 'text', text: b } : null) : b && typeof b === 'object' ? { ...b } : null,
+      )
+      .filter(Boolean)
+    return [...clientBlocks, ...poolBlocks]
+  }
+  if (promptPolicy.mode === 'override') {
+    const policy = String(promptPolicy.clientSystemPolicy || 'prepend_pool')
+      .trim()
+      .toLowerCase()
+    if (policy === 'replace_client') return poolBlocks
+    const clientBlocks = systemBlocks(callerSystem)
+      .map((b) =>
+        typeof b === 'string' ? (b ? { type: 'text', text: b } : null) : b && typeof b === 'object' ? { ...b } : null,
+      )
+      .filter(Boolean)
+    if (policy === 'append_pool') return [...clientBlocks, ...poolBlocks]
+    return [...poolBlocks, ...clientBlocks]
+  }
+  return callerSystem
+}
+
 /**
  * @param {object} body caller body, before cli-node persona injection
- * @param {{ preset?: 'official_full' | 'zero', officialPassthrough?: boolean, capabilities?: string[], agentSummary?: boolean, foldSystemMessages?: boolean }} [options]
+ * @param {{ preset?: 'official_full' | 'zero', officialPassthrough?: boolean, capabilities?: string[], health?: object | null, promptPolicy?: object | null, agentSummary?: boolean, foldSystemMessages?: boolean }} [options]
  */
 export function prepareCragPrintBody(
   body,
@@ -444,6 +507,8 @@ export function prepareCragPrintBody(
     preset = 'official_full',
     officialPassthrough = false,
     capabilities,
+    health = null,
+    promptPolicy = null,
     agentSummary = false,
     foldSystemMessages = true,
   } = {},
@@ -465,7 +530,11 @@ export function prepareCragPrintBody(
     })
   }
   if (agentSummary) out.messages = readOnlySummaryResults(out.messages)
+  const poolApplied = Boolean(promptPolicy?.applies)
   if (needsCragProviderCompatibility(out, capabilities)) {
+    if (poolApplied && (promptPolicy.mode === 'override' || promptPolicy.mode === 'append')) {
+      out.system = applyPoolSystemForCrag(body?.system, promptPolicy, officialPassthrough)
+    }
     stripCallerPromptAlias(out)
     return out
   }
@@ -478,17 +547,45 @@ export function prepareCragPrintBody(
         ...folded.outputConfig,
       }
   }
-  const mode = preset === 'zero' ? 'replace' : 'append'
+  if (poolApplied && promptPolicy.mode === 'passthrough') {
+    stripCallerPromptAlias(out)
+    return out
+  }
+  const mode = poolApplied
+    ? promptPolicy.mode === 'zero_inject' || promptPolicy.mode === 'override'
+      ? 'replace'
+      : 'append'
+    : preset === 'zero'
+      ? 'replace'
+      : 'append'
+  const effectiveOfficialPassthrough = poolApplied
+    ? promptPolicy.mode === 'official'
+      ? officialPassthrough
+      : false
+    : officialPassthrough
+  const effectiveSystem = poolApplied
+    ? applyPoolSystemForCrag(body?.system, promptPolicy, officialPassthrough)
+    : body?.system
+  const healthPreset = String(health?.persona_preset || '')
+    .trim()
+    .toLowerCase()
+  const staticZeroHealth = healthPreset === 'zero'
+  const staticNonZeroHealth = Boolean(healthPreset && healthPreset !== 'zero')
+
   delete out.system
   stripCallerPromptAlias(out)
-  if (capabilities !== undefined && (!Array.isArray(capabilities) || !capabilities.includes(`prompt_${mode}`)))
+  if (capabilities !== undefined && (!Array.isArray(capabilities) || !capabilities.includes(`prompt_${mode}`))) {
+    if (mode === 'replace' && poolApplied && !staticZeroHealth) {
+      throw cragEmptyReplaceUnsupportedError()
+    }
     return out
+  }
   const textCache = nativeV3 && capabilities.includes('system_text_cache_v3')
   if (
     nativeV3 &&
-    !officialPassthrough &&
-    Array.isArray(body?.system) &&
-    body.system.some(
+    !effectiveOfficialPassthrough &&
+    Array.isArray(effectiveSystem) &&
+    effectiveSystem.some(
       (block) =>
         typeof block !== 'string' &&
         (!block ||
@@ -513,11 +610,34 @@ export function prepareCragPrintBody(
       },
     })
   }
-  const skipRelocatedPlaceholder = !officialPassthrough && isOnlyOfficialCliIdentitySystem(body?.system)
-  const tail = officialPassthrough || skipRelocatedPlaceholder ? '' : callerSystemTail(body?.system)
-  if (!tail) return out
+  const skipRelocatedPlaceholder =
+    !effectiveOfficialPassthrough && !poolApplied && isOnlyOfficialCliIdentitySystem(effectiveSystem)
+  const tail = effectiveOfficialPassthrough || skipRelocatedPlaceholder ? '' : callerSystemTail(effectiveSystem)
+  if (!tail) {
+    if (skipRelocatedPlaceholder) return out
+    if (mode === 'replace') {
+      if (cragSupportsEmptyReplace(capabilities, health)) {
+        out.crag_prompt = { mode: 'replace', text: '' }
+        return out
+      }
+      if (staticZeroHealth) {
+        return out
+      }
+      // Fail-Closed whenever an explicit pool policy requires zero/replace OR
+      // worker health advertises a non-zero static persona, so we never
+      // silently fall back to the official prompt.
+      if (poolApplied || staticNonZeroHealth) {
+        throw cragEmptyReplaceUnsupportedError()
+      }
+    }
+    return out
+  }
+  if (!nativeV3 && poolApplied && (promptPolicy.mode === 'override' || promptPolicy.mode === 'append')) {
+    const poolBytes = Buffer.byteLength(String(promptPolicy.text || ''), 'utf8')
+    if (poolBytes > CRAG_PRINT_PROMPT_MAX_BYTES) throw cragPromptTooLarge(poolBytes)
+  }
   if (textCache && mode === 'append') {
-    out.system = body.system
+    out.system = effectiveSystem
     return out
   }
   if (!nativeV3 && mode === 'replace' && Buffer.byteLength(tail, 'utf8') > CRAG_PRINT_PROMPT_MAX_BYTES) {
@@ -525,7 +645,7 @@ export function prepareCragPrintBody(
   }
   out.crag_prompt = { mode, text: tail }
   if (textCache) {
-    const blocks = callerSystemBlocks(body?.system)
+    const blocks = callerSystemBlocks(effectiveSystem)
     if (blocks.some((block) => block.cache_control != null)) out.crag_prompt.blocks = blocks
   }
   return out

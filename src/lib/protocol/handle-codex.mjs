@@ -1690,6 +1690,7 @@ export async function handleCodexSearch({
   projectRoot,
   stickyRouter = null,
   ops = {},
+  keyScope = null,
   ownerScope = null,
 }) {
   logBag.via = 'codex-search'
@@ -1718,7 +1719,7 @@ export async function handleCodexSearch({
     : null
   if (redaction) Object.assign(outbound, await maskJson(outbound, redaction))
   const post = ops.postCodexSearch || postCodexSearch
-  const pickOpts = { stickyRouter, sessions: null, body: outbound, excluded: new Set(), routing, ownerScope }
+  const pickOpts = { stickyRouter, sessions: null, body: outbound, keyScope, excluded: new Set(), routing, ownerScope }
   const deadline = Date.now() + codexWaitTimeoutMs(routing)
   const gone = clientGoneSignal(req, res)
   let last = null
@@ -1831,6 +1832,7 @@ export async function handleCodexImages({
   projectRoot,
   stickyRouter = null,
   ops = {},
+  keyScope = null,
   ownerScope = null,
 }) {
   logBag.via = 'codex-images'
@@ -1858,10 +1860,13 @@ export async function handleCodexImages({
       )
     }
   }
+  const effectiveKeyScope = keyScope || keyScopeFromRequest(req)
   const excluded = new Set()
   let usable = 0
   for (const item of listVms(projectRoot)) {
     if (!isCodexVm(item)) continue
+    if (!keyAllowsVm(effectiveKeyScope, item)) continue
+    if (ownerScope && !vmMatchesOwnerScope(item, ownerScope)) continue
     if (isFreePlanSlot(projectRoot, getVm(projectRoot, item.id) || item)) excluded.add(item.id)
     else usable += 1
   }
@@ -1888,7 +1893,7 @@ export async function handleCodexImages({
   const post = ops.postCodexJson || postCodexJson
   // Selection-only body: the turn id becomes the sticky session; the upstream body is untouched.
   const pickBody = { model: model || null, ...(imageTurnId ? { session_id: `codex-image-turn:${imageTurnId}` } : {}) }
-  const pickOpts = { stickyRouter, sessions: null, body: pickBody, excluded, routing, ownerScope }
+  const pickOpts = { stickyRouter, sessions: null, body: pickBody, keyScope, excluded, routing, ownerScope }
   const deadline = Date.now() + codexWaitTimeoutMs(routing)
   const gone = clientGoneSignal(req, res)
   let last = null

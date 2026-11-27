@@ -293,13 +293,82 @@ export class SchedulerPoolsRepo {
     this._bindingsByKey = db.prepare(
       'SELECT * FROM api_key_pool_bindings WHERE api_key_id = ? ORDER BY is_default DESC, pool_id',
     )
+    this._allBindings = db.prepare('SELECT * FROM api_key_pool_bindings ORDER BY api_key_id, is_default DESC, pool_id')
+    this._boundKeySummariesByPool = db.prepare(`
+      SELECT
+        b.api_key_id,
+        b.pool_id,
+        b.is_default,
+        b.created_at,
+        k.name,
+        k.key_prefix,
+        k.status,
+        k.pool_binding_mode,
+        k.max_concurrency,
+        k.rpm,
+        k.requests
+      FROM api_key_pool_bindings b
+      INNER JOIN api_keys k ON k.id = b.api_key_id
+      WHERE b.pool_id = ? AND k.deleted_at IS NULL
+      ORDER BY b.is_default DESC, k.created_at, b.api_key_id
+    `)
+    this._allBoundKeySummaries = db.prepare(`
+      SELECT
+        b.api_key_id,
+        b.pool_id,
+        b.is_default,
+        b.created_at,
+        k.name,
+        k.key_prefix,
+        k.status,
+        k.pool_binding_mode,
+        k.max_concurrency,
+        k.rpm,
+        k.requests
+      FROM api_key_pool_bindings b
+      INNER JOIN api_keys k ON k.id = b.api_key_id
+      WHERE k.deleted_at IS NULL
+      ORDER BY b.pool_id, b.is_default DESC, k.created_at, b.api_key_id
+    `)
     this._countKeysByPool = db.prepare('SELECT COUNT(*) AS n FROM api_key_pool_bindings WHERE pool_id = ?')
+    this._countNonDeletedKeysByPool = db.prepare(`
+      SELECT COUNT(*) AS n
+      FROM api_key_pool_bindings b
+      INNER JOIN api_keys k ON k.id = b.api_key_id
+      WHERE b.pool_id = ? AND k.deleted_at IS NULL
+    `)
+    this._countActiveKeysByPool = db.prepare(`
+      SELECT COUNT(*) AS n
+      FROM api_key_pool_bindings b
+      INNER JOIN api_keys k ON k.id = b.api_key_id
+      WHERE b.pool_id = ? AND k.deleted_at IS NULL AND k.status = 'active'
+    `)
     this._clearKeyBindings = db.prepare('DELETE FROM api_key_pool_bindings WHERE api_key_id = ?')
+    this._clearBindingsForPool = db.prepare('DELETE FROM api_key_pool_bindings WHERE pool_id = ?')
     this._insertKeyBinding = db.prepare(`
       INSERT INTO api_key_pool_bindings (api_key_id, pool_id, is_default, created_at)
       VALUES (?, ?, ?, ?)
     `)
+    this._insertKeyBindingIgnore = db.prepare(`
+      INSERT INTO api_key_pool_bindings (api_key_id, pool_id, is_default, created_at)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT (api_key_id, pool_id) DO NOTHING
+    `)
+    this._promoteBindingDefault = db.prepare(
+      'UPDATE api_key_pool_bindings SET is_default = 1 WHERE api_key_id = ? AND pool_id = ?',
+    )
+    this._clearFallbackRef = db.prepare('UPDATE scheduler_pools SET fallback_pool_id = NULL WHERE fallback_pool_id = ?')
+    this._clearStickyForPool = db.prepare('DELETE FROM scheduler_sticky_bindings WHERE pool_id = ?')
+    this._resetMachineStickyPool = db.prepare(
+      "DELETE FROM scheduler_sticky_bindings WHERE scope_kind = 'machine' AND pool_id = ?",
+    )
+    this._resetMachineStickyPoolNode = db.prepare(
+      "DELETE FROM scheduler_sticky_bindings WHERE scope_kind = 'machine' AND pool_id = ? AND node_type = ? AND node_id = ?",
+    )
     this._updateKeyDefaultPool = db.prepare('UPDATE api_keys SET default_pool_id = ? WHERE id = ?')
+    this._updateKeyDefaultAndVmPool = db.prepare(
+      "UPDATE api_keys SET default_pool_id = ?, vm_pool_id = CASE WHEN group_type = 'gemini' THEN vm_pool_id ELSE ? END WHERE id = ?",
+    )
     this._updateKeyDefaultAndMode = db.prepare(
       'UPDATE api_keys SET default_pool_id = ?, pool_binding_mode = ? WHERE id = ?',
     )
@@ -532,8 +601,214 @@ export class SchedulerPoolsRepo {
     return this._bindingsByKey.all(apiKeyId).map(rowToBinding)
   }
 
+  listAllBindings() {
+    return this._allBindings.all().map(rowToBinding)
+  }
+
+  listBoundKeySummariesByPool(poolId) {
+    return this._boundKeySummariesByPool.all(poolId).map((row) => ({
+      api_key_id: row.api_key_id,
+      pool_id: row.pool_id,
+      name: row.name ?? null,
+      key_prefix: row.key_prefix ?? null,
+      status: row.status ?? 'active',
+      is_default: Boolean(Number(row.is_default)),
+      pool_binding_mode: row.pool_binding_mode === 'strict_pool' ? 'strict_pool' : 'legacy_scope',
+      max_concurrency: Number(row.max_concurrency) || 0,
+      rpm: Number(row.rpm) || 0,
+      requests: Number(row.requests) || 0,
+    }))
+  }
+
+  listAllBoundKeySummaries() {
+    return this._allBoundKeySummaries.all().map((row) => ({
+      api_key_id: row.api_key_id,
+      pool_id: row.pool_id,
+      name: row.name ?? null,
+      key_prefix: row.key_prefix ?? null,
+      status: row.status ?? 'active',
+      is_default: Boolean(Number(row.is_default)),
+      pool_binding_mode: row.pool_binding_mode === 'strict_pool' ? 'strict_pool' : 'legacy_scope',
+      max_concurrency: Number(row.max_concurrency) || 0,
+      rpm: Number(row.rpm) || 0,
+      requests: Number(row.requests) || 0,
+    }))
+  }
+
   countKeys(poolId) {
     return Number(this._countKeysByPool.get(poolId)?.n) || 0
+  }
+
+  countBoundKeys(poolId) {
+    return Number(this._countNonDeletedKeysByPool.get(poolId)?.n) || 0
+  }
+
+  countActiveKeys(poolId) {
+    return Number(this._countActiveKeysByPool.get(poolId)?.n) || 0
+  }
+
+  deleteBindingsForKey(apiKeyId) {
+    const info = this._clearKeyBindings.run(String(apiKeyId))
+    return Number(info.changes) || 0
+  }
+
+  /**
+   * Force-delete a pool, either migrating bound keys to `migrateToPoolId` or
+   * unbinding them while preserving `strict_pool` Fail-Closed semantics.
+   */
+  forceRemove(id, { migrateToPoolId = null } = {}) {
+    if (!this._getPool.get(id)) return false
+    const targetId = migrateToPoolId ? String(migrateToPoolId).trim() : null
+    if (targetId && (targetId === id || !this._getPool.get(targetId))) {
+      throw Object.assign(new Error('迁移目标分组池不存在或无效'), { code: 'invalid_migrate_target', status: 400 })
+    }
+    const now = nowIso()
+    return withTransaction(this.db, () => {
+      const boundRows = this._bindingsByPool.all(id)
+      const legacyPoolId = (pid) => (pid && /^pool_[a-f0-9]{8}$/.test(pid) ? pid : null)
+      if (targetId) {
+        const legacyTarget = legacyPoolId(targetId)
+        for (const row of boundRows) {
+          this._insertKeyBindingIgnore.run(row.api_key_id, targetId, Number(row.is_default) ? 1 : 0, now)
+          if (Number(row.is_default)) {
+            this._promoteBindingDefault.run(row.api_key_id, targetId)
+            this._updateKeyDefaultAndVmPool.run(targetId, legacyTarget, row.api_key_id)
+          }
+        }
+        this._clearBindingsForPool.run(id)
+      } else {
+        this._clearBindingsForPool.run(id)
+        for (const row of boundRows) {
+          if (Number(row.is_default)) {
+            const remaining = this._bindingsByKey.all(row.api_key_id)
+            const nextDefault = remaining[0]?.pool_id ?? null
+            if (nextDefault) this._promoteBindingDefault.run(row.api_key_id, nextDefault)
+            this._updateKeyDefaultAndVmPool.run(nextDefault, legacyPoolId(nextDefault), row.api_key_id)
+          }
+        }
+      }
+      this._clearFallbackRef.run(id)
+      this._clearStickyForPool.run(id)
+      const info = this._deletePool.run(id)
+      return Number(info.changes) > 0
+    })
+  }
+
+  resetMachineStickyForPool(poolId, { nodeType = null, nodeId = null } = {}) {
+    if (nodeType && nodeId) {
+      const info = this._resetMachineStickyPoolNode.run(String(poolId), String(nodeType), String(nodeId))
+      return Number(info.changes) || 0
+    }
+    const info = this._resetMachineStickyPool.run(String(poolId))
+    return Number(info.changes) || 0
+  }
+
+  queryStickyBindings({
+    pool_id = null,
+    scope_kind = null,
+    model_family = null,
+    identity_id = null,
+    machine_id = null,
+    session_id = null,
+    includeExpired = false,
+    nowMs = Date.now(),
+    limit = 500,
+  } = {}) {
+    const clauses = []
+    const params = []
+    if (!includeExpired) {
+      clauses.push('expires_at_ms > ?')
+      params.push(Number(nowMs))
+    }
+    if (pool_id) {
+      clauses.push('pool_id = ?')
+      params.push(String(pool_id))
+    }
+    if (scope_kind) {
+      clauses.push('scope_kind = ?')
+      params.push(String(scope_kind))
+    }
+    if (model_family) {
+      clauses.push('model_family = ?')
+      params.push(String(model_family))
+    }
+    if (identity_id) {
+      clauses.push('identity_id = ?')
+      params.push(String(identity_id))
+    }
+    if (machine_id) {
+      clauses.push("((scope_kind = 'machine' AND identity_id = ?) OR machine_id = ?)")
+      params.push(String(machine_id), String(machine_id))
+    }
+    if (session_id) {
+      clauses.push("(scope_kind = 'session' AND identity_id = ?)")
+      params.push(String(session_id))
+    }
+    const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : ''
+    const cap = Math.max(1, Math.min(2000, Number(limit) || 500))
+    const rows = this.db
+      .prepare(`SELECT * FROM scheduler_sticky_bindings ${where} ORDER BY last_seen_ms DESC LIMIT ?`)
+      .all(...params, cap)
+    return rows.map((row) => {
+      const item = rowToSticky(row)
+      return { ...item, node_key: `${item.node_type}:${item.node_id}` }
+    })
+  }
+
+  deleteStickyBindings({
+    pool_id = null,
+    scope_kind = null,
+    model_family = null,
+    identity_id = null,
+    machine_id = null,
+    session_id = null,
+    node_type = null,
+    node_id = null,
+    allowAll = false,
+  } = {}) {
+    const clauses = []
+    const params = []
+    if (pool_id) {
+      clauses.push('pool_id = ?')
+      params.push(String(pool_id))
+    }
+    if (scope_kind) {
+      clauses.push('scope_kind = ?')
+      params.push(String(scope_kind))
+    }
+    if (model_family) {
+      clauses.push('model_family = ?')
+      params.push(String(model_family))
+    }
+    if (identity_id) {
+      clauses.push('identity_id = ?')
+      params.push(String(identity_id))
+    }
+    if (machine_id) {
+      clauses.push("((scope_kind = 'machine' AND identity_id = ?) OR machine_id = ?)")
+      params.push(String(machine_id), String(machine_id))
+    }
+    if (session_id) {
+      clauses.push("(scope_kind = 'session' AND identity_id = ?)")
+      params.push(String(session_id))
+    }
+    if (node_type) {
+      clauses.push('node_type = ?')
+      params.push(String(node_type))
+    }
+    if (node_id) {
+      clauses.push('node_id = ?')
+      params.push(String(node_id))
+    }
+    if (!clauses.length && !allowAll) {
+      throw Object.assign(new Error('删除粘性绑定至少需要一个过滤条件'), {
+        code: 'sticky_filter_required',
+        status: 400,
+      })
+    }
+    const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : ''
+    const info = this.db.prepare(`DELETE FROM scheduler_sticky_bindings ${where}`).run(...params)
+    return Number(info.changes) || 0
   }
 
   setKeyBindings(apiKeyId, poolIds = [], { defaultPoolId = null, bindingMode = null } = {}) {
