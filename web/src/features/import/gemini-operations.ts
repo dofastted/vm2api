@@ -44,15 +44,29 @@ export const geminiProxyOptions = queryOptions({
 
 const GEMINI_PROXY_KINDS = new Set(['socks5', 'socks5h', 'http'])
 
-export function isGeminiProxy(proxy: GeminiProxy) {
+export function isGeminiProxy(
+  proxy: GeminiProxy,
+  options?: { ownerUserId?: string | null; allowFail?: boolean }
+) {
+  const kind = String(proxy.kind || '')
+    .trim()
+    .toLowerCase()
+  const targetOwner = options?.ownerUserId?.trim() || null
+  const proxyOwner = proxy.owner_user_id?.trim() || null
+  // Mirror `src/lib/gemini/routes.mjs` (`proxyFor`):
+  // - Platform Gemini environments (`targetOwner == null`) may only use platform proxies.
+  // - Tenant-owned Gemini environments may use platform proxies OR their own tenant proxies.
+  const ownerAllowed = targetOwner
+    ? !proxyOwner || proxyOwner === targetOwner
+    : !proxyOwner
   return (
     proxy.enabled &&
-    GEMINI_PROXY_KINDS.has(proxy.kind) &&
+    GEMINI_PROXY_KINDS.has(kind) &&
     proxy.address_family !== 6 &&
-    !proxy.owner_user_id &&
+    ownerAllowed &&
     !proxy.blocked_reason &&
     proxy.status !== 'dead' &&
-    proxy.status !== 'fail'
+    (options?.allowFail ? true : proxy.status !== 'fail')
   )
 }
 
