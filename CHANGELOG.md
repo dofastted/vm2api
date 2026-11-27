@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.4.235 — 2026-11-27 · JEV 降误封热修：豁免 Claude Code `auto_mode_classifier`、内置题库 v2.1 与置信度分层封禁
+
+- **前置审查豁免 Claude Code `auto_mode_classifier` 旁路请求**：
+  - `applyProtocolIntercept` 提前识别 `classifyClaudeRequestPurpose(inbound, { officialTraffic: official })`，对 `auto_mode_classifier` 旁路安全自检请求保留既有已封禁会话/设备拦阻，但跳过 `blocked_tool`、`system_prompt_rewrite`、硬正则、拒答缓存与 JEV 评审（标记 `by: 'classifier'` /「内置分类器豁免」），与后置 `refusalSessionBlockDecision` 保持一致，避免将审查模板误判并永久封死主编码会话。
+- **内置题库升级至 v2.1 并自动无感迁移**：
+  - `USAGE_POLICY_INSTRUCTION` 补充豁免 Claude Code 自动安全审查模板（`<transcript>`、`err on the side of blocking`、`<block>`）与本地测试账号/密码脚本；`NSFW_INSTRUCTION` 明确放行不含露骨性内容或性器官描写的日常情感安慰与普通恋爱拥抱对话。
+  - 将 `1.4.234` v2 内置文案纳入 `LEGACY_BUILTIN_INSTRUCTIONS` / `LEGACY_SAFETY_INSTRUCTIONS`，未手改面板文案升级后自动刷新生效。
+- **JEV 封禁置信度分层（拦截与三振封禁解耦）**：
+  - 新增 `JEV_BAN_CONFIDENCE_FLOOR = 0.25` 与 `shouldEscalateJevBan()`：单题非 `nsfw` 处于中等区间（`0.25 <= score < threshold - 0.08`）时仅返回单次 `429`（`Retry-After: 60`、`error_details.ban_skipped = 'borderline_score'`），不再永久封禁会话或累加设备违规；高置信命中（`< 0.25`）、任意 `nsfw` 命中或多题同时命中仍执行原有「封会话 + `[10, 10, 0]` 三振设备封禁」。
+- 部署说明：本次改动仅涉及控制面（`src/lib/protocol/`），零数据库迁移，无前端、`bin/` 或 `deploy/payload.json` 变更。预期 **`SLOT_SYNC=skip`**，重启 `vm2api` 一次即可生效。
+
 ## 1.4.234 — 2026-11-27 · JEV 题库 v2 与分级封禁/429 伪装闭环、上游 4xx 四分桶与风控日志诊断面板、CRAG 订阅异步并发探测、Codex 用量窗口巡检、按档透传 usage 与 CRAGGemini 维护行修复
 
 - **JEV 内置题库 v2 与会话/设备分级封禁闭环（#1958）**：
