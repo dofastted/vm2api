@@ -91,6 +91,7 @@ sync_shared() {
   ensure_bin kin-worker
   ensure_bin kin-api-kernel
   ensure_bin kin-redact
+  ensure_bin kin-scheduler
   ensure_bin kin-codex-kernel
   ensure_bin kin-oauth-auth
   ensure_bin kin-computer
@@ -102,6 +103,11 @@ sync_shared() {
   API_KERNEL="${KIN_API_KERNEL_BIN:-$ROOT/bin/kin-api-kernel}"
   if [ ! -x "$API_KERNEL" ]; then
     echo "vm2api: $API_KERNEL missing or not executable after image-bin copy. Rebuild the control-plane image so kin-api-kernel is staged in image-bin." >&2
+    exit 1
+  fi
+  SCHEDULER="${KIN_SCHEDULER_BIN:-$ROOT/bin/kin-scheduler}"
+  if [ ! -x "$SCHEDULER" ]; then
+    echo "vm2api: $SCHEDULER missing or not executable after image-bin copy. Rebuild the control-plane image so kin-scheduler is staged in image-bin." >&2
     exit 1
   fi
   mkdir -p "$ROOT/share/wrap-cli"

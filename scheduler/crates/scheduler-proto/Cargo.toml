@@ -1,0 +1,12 @@
+[package]
+name = "scheduler-proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+compact_str.workspace = true
+serde.workspace = true
+serde_json.workspace = true
