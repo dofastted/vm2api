@@ -25,10 +25,10 @@ import { RefusalGuardsRepo } from '../db/repos/refusal-guards-repo.mjs'
 import { RefusalDeviceBlocksRepo } from '../db/repos/refusal-device-blocks-repo.mjs'
 import { RefusalSessionBlocksRepo } from '../db/repos/refusal-session-blocks-repo.mjs'
 import { SettingsRepo } from '../db/repos/settings-repo.mjs'
-import { findAccount } from '../admin/panel-api.mjs'
 import { makeApiKeyGateError } from '../admin/api-keys.mjs'
-import { readJevConfig, scopeAccountFromVm } from './jev-intercept.mjs'
-import { observeUpstreamRisk, runProtocolIntercept, upstreamRiskClientError } from './intercept-gate.mjs'
+import { readJevConfig } from './jev-intercept.mjs'
+import { observeUpstreamRisk, upstreamRiskClientError } from './intercept-gate.mjs'
+import { isTrustedGateDecision, projectCandidateAccounts, runUnifiedPreDispatch } from './unified-pre-dispatch.mjs'
 import {
   toClaudeMessages,
   isClientStream,
@@ -530,6 +530,47 @@ export function createHandleProtocol(deps) {
     }
   }
 
+  function applyGateDecisionToLogBag(decision, logBag, { mandatoryOnly = false } = {}) {
+    if (!decision) return
+    if (!mandatoryOnly && decision.intercept) logBag.intercept = decision.intercept
+    if (decision.action === 'downgrade' && decision.route) logBag.risk_route = decision.route
+    if (decision.action === 'downgrade' && decision.jev_downgrade_pool_id) {
+      logBag.jev_downgrade_pool_id = decision.jev_downgrade_pool_id
+    }
+    if (!mandatoryOnly) logBag.risk_wait = false
+    if (decision.jev_passed) {
+      logBag._jevPassed = true
+      if (decision.jev_state) logBag._jevPassState = decision.jev_state
+      if (decision.scores) logBag._jevPassScores = decision.scores
+    }
+  }
+
+  function writeGateBlockResponse(decision, { res, logBag }) {
+    stats.errors++
+    logBag.via = decision.via
+    logBag.attempt_count = 0
+    logBag.final_state = decision.final_state
+    logBag.error_code = decision.error_code || decision.error?.body?.error?.code || null
+    logBag.error_message = decision.message || decision.error?.body?.error?.message || null
+    if (decision.error_details) {
+      logBag.error_details = { ...(logBag.error_details || {}), ...decision.error_details }
+    }
+    logBag.intercept = decision.intercept || null
+    logBag.jev_state = decision.jev_state || null
+    const errPayload = decision.error?.body || {
+      type: 'error',
+      error: { type: 'policy_error', code: decision.error_code, message: decision.message },
+    }
+    if (res.headersSent && logBag.protocol === 'anthropic.messages') {
+      res.write(buildAnthropicSseError(errPayload.error))
+      res.end()
+    } else {
+      const retryAfter = decision.retry_after_sec || decision.error?.retryAfterSec
+      if (retryAfter) res.setHeader?.('retry-after', String(retryAfter))
+      json(res, decision.status || decision.error?.status || 400, errPayload)
+    }
+  }
+
   async function applyProtocolIntercept({
     req,
     inbound,
@@ -540,6 +581,11 @@ export function createHandleProtocol(deps) {
     res,
     account = null,
     scopeMatched = false,
+    candidateAccounts = null,
+    poolJevProfile = null,
+    channel = 'anthropic',
+    skipDistill = undefined,
+    enforceHardAndJev = undefined,
     bodyCtx = null,
     interceptSessionKey = null,
     identity,
@@ -549,13 +595,35 @@ export function createHandleProtocol(deps) {
     apiPlatform,
     riskState,
   }) {
+    // Reuse a trusted frame-level pre-dispatch verdict (e.g. Responses WebSocket)
+    // only when its evaluated backend matches the resolved inference backend and
+    // an API endpoint-level review requirement was not skipped upstream.
+    const prevDecision = req?._preDispatchDecision
+    let prevInterceptBy = ''
+    if (typeof prevDecision?.intercept === 'string' && prevDecision.intercept) {
+      try {
+        prevInterceptBy = String(JSON.parse(prevDecision.intercept)?.by || '')
+      } catch {
+        prevInterceptBy = ''
+      }
+    }
+    const canReusePreDispatch =
+      isTrustedGateDecision(prevDecision) &&
+      prevDecision.action !== 'block' &&
+      (!backend || !prevDecision.backend || prevDecision.backend === backend) &&
+      !(backend === 'api' && scopeMatched && ['scope', 'platform', 'unchecked'].includes(prevInterceptBy))
+    if (canReusePreDispatch) {
+      applyGateDecisionToLogBag(prevDecision, logBag, { mandatoryOnly })
+      return false
+    }
     const official =
       isOfficialClaudeCodeTraffic(req.headers, inbound) ||
       isOfficialClaudeClient(fp.client_class) ||
       (detectProxiedOfficialCcFromRoutingFile(routingConfigPath) && isProxiedOfficialClaudeCode(inbound, req.headers))
     const classifier = classifyClaudeRequestPurpose(inbound, { officialTraffic: official })
     const interceptSession = interceptSessionKey ? peekInterceptSession(interceptSessionKey) : null
-    const decision = await runProtocolIntercept({
+    const decision = await runUnifiedPreDispatch({
+      req,
       inbound,
       body,
       headers: req.headers,
@@ -572,6 +640,11 @@ export function createHandleProtocol(deps) {
       requestId,
       account,
       scopeMatched,
+      candidateAccounts,
+      poolJevProfile: poolJevProfile || req.poolJevProfile || req.apiKeyRecord?.jev_profile || null,
+      channel,
+      skipDistill,
+      enforceHardAndJev,
       bodyCtx,
       interceptSession,
       mandatoryOnly,
@@ -580,34 +653,11 @@ export function createHandleProtocol(deps) {
       openaiPlatform: apiPlatform,
     })
     if (!decision || decision.action !== 'block') {
-      if (!mandatoryOnly && decision?.intercept) logBag.intercept = decision.intercept
-      if (decision?.route) logBag.risk_route = decision.route
-      if (!mandatoryOnly) logBag.risk_wait = decision.wait === true
-      if (decision?.jevPassed) {
-        logBag._jevPassed = true
-        if (decision.jevState) logBag._jevPassState = decision.jevState
-        if (decision.jevScores) logBag._jevPassScores = decision.jevScores
-      }
+      applyGateDecisionToLogBag(decision, logBag, { mandatoryOnly })
+      if (!mandatoryOnly && req) req._preDispatchDecision = decision
       return false
     }
-    stats.errors++
-    logBag.via = decision.via
-    logBag.attempt_count = 0
-    logBag.final_state = decision.final_state
-    logBag.error_code = decision.logErrorCode || decision.error?.body?.error?.code || null
-    logBag.error_message = decision.errorMessage || decision.error?.body?.error?.message || null
-    if (decision.errorDetails) {
-      logBag.error_details = { ...(logBag.error_details || {}), ...decision.errorDetails }
-    }
-    logBag.intercept = decision.intercept || null
-    logBag.jev_state = decision.jevState || null
-    if (res.headersSent && logBag.protocol === 'anthropic.messages') {
-      res.write(buildAnthropicSseError(decision.error.body.error))
-      res.end()
-    } else {
-      if (decision.error?.retryAfterSec) res.setHeader?.('retry-after', String(decision.error.retryAfterSec))
-      json(res, decision.error.status, decision.error.body)
-    }
+    writeGateBlockResponse(decision, { res, logBag })
     return true
   }
 
@@ -825,10 +875,6 @@ export function createHandleProtocol(deps) {
       return
     }
 
-    if (protocol === 'anthropic.messages' && req.apiKeyRecord?.group_type === 'gemini') {
-      return deps.handleGeminiMessages(req, res, { logBag, logCtx })
-    }
-
     let inbound
     try {
       inbound = await readBody(req, inboundBodyLimit(getRouting(), cfg.limits.max_body_bytes))
@@ -874,6 +920,32 @@ export function createHandleProtocol(deps) {
     )
     logBag.inbound_device_id = sessionIdForLog(auditIdentity.deviceId)
     logBag.reasoning_effort = reasoningEffortOf(inbound)
+    const fp = fingerprintRequest(req, inbound)
+    const riskState = { policy: refusalPolicy(), repo: refusalRepo(), devices: deviceRepo(), sessions: sessionRepo() }
+    const gateArgs = { req, inbound, fp, logBag, requestId: logCtx.request_id, res, identity: auditIdentity, riskState }
+
+    // Bypass #3 closed: `/v1/messages` with a Gemini-scoped key must pass the
+    // unified pre-dispatch JEV gate BEFORE delegating to handleGeminiMessages.
+    if (protocol === 'anthropic.messages' && req.apiKeyRecord?.group_type === 'gemini') {
+      if (
+        await applyProtocolIntercept({
+          ...gateArgs,
+          body: inbound,
+          channel: 'gemini',
+          enforceHardAndJev: true,
+          backend: 'oauth',
+          apiPlatform: false,
+        })
+      ) {
+        return
+      }
+      req.body = inbound
+      return deps.handleGeminiMessages(req, res, {
+        logBag,
+        logCtx,
+        preDispatchDecision: req._preDispatchDecision || null,
+      })
+    }
 
     const rawInboundBackend = resolveInferenceBackend(req)
     const inboundKeyPolicy = req.apiKeyKind === 'managed' ? keyTierPolicyFromRecord(req.apiKeyRecord) : null
@@ -927,16 +999,30 @@ export function createHandleProtocol(deps) {
         }
       }
       if (!preferGeminiApiChannel) {
+        // Bypass #4 closed: `all` key + Antigravity model must pass unified
+        // pre-dispatch JEV BEFORE delegating to handleGeminiPublic.
+        if (
+          await applyProtocolIntercept({
+            ...gateArgs,
+            body: inbound,
+            channel: 'gemini',
+            enforceHardAndJev: true,
+            backend: 'oauth',
+            apiPlatform: false,
+          })
+        ) {
+          return
+        }
         req.body = inbound
         return (deps.handleGeminiPublic || deps.handleGeminiMessages)(req, res, {
           logBag,
           logCtx,
+          preDispatchDecision: req._preDispatchDecision || null,
           ...(preloadedGeminiCatalog ? { catalogSnapshot: preloadedGeminiCatalog } : {}),
         })
       }
     }
 
-    const fp = fingerprintRequest(req, inbound)
     // Before the health probe: its synthesized or fail-closed replies would otherwise answer
     // probe-shaped third-party traffic, and with the switch on no probe is answered at all.
     // Official Claude Code only ever speaks Messages, so other inbound protocols on a Claude
@@ -974,8 +1060,6 @@ export function createHandleProtocol(deps) {
     }
     // After the Desktop sign-in probe, which runs no model.
     if (rejectKeyModel(req, res, protocol, inbound?.model, logBag)) return
-    const riskState = { policy: refusalPolicy(), repo: refusalRepo(), devices: deviceRepo(), sessions: sessionRepo() }
-    const gateArgs = { req, inbound, fp, logBag, requestId: logCtx.request_id, res, identity: auditIdentity, riskState }
     if (await applyProtocolIntercept({ ...gateArgs, body: inbound, mandatoryOnly: true })) return
     if (
       claudeCodeOnlyFromRouting(routingNow) &&
@@ -1253,7 +1337,6 @@ export function createHandleProtocol(deps) {
       logBag.error_message = errorResult.body?.error?.message || null
       return json(res, 403, errorResult.body)
     }
-    if (imageModel) return serveImageModelTurn({ req, res, protocol, body: ctx.body, logBag })
     if (platform.platform === 'anthropic') {
       try {
         validateImageDimensions(ctx.body)
@@ -1268,8 +1351,9 @@ export function createHandleProtocol(deps) {
       }
     }
     // Codex returns before conversion. Distill does not apply to OpenAI platform models; the rest
-    // of the gate scans them only when jev.openai_platform_enabled is on.
+    // of the gate scans them only when jev.openai_platform_enabled is on or pool/scope matches.
     if (
+      !imageModel &&
       platform.platform !== 'openai' &&
       inferenceBackend !== 'api' &&
       protocol === 'anthropic.messages' &&
@@ -1295,20 +1379,43 @@ export function createHandleProtocol(deps) {
     }
     const auditBody = ctx.body
     const earlyBodyCtx = createRequestBodyContext(auditBody)
+    const candidateAccounts =
+      inferenceBackend === 'api' || imageModel
+        ? null
+        : projectCandidateAccounts({
+            projectRoot: cfg.paths?.project,
+            keyScope,
+            ownerScope: reqOwnerScope,
+            platform: platform.platform,
+            accountQuota,
+          })
+    const gateChannel = imageModel
+      ? 'images'
+      : protocol === 'google.gemini' || platform.platform === 'gemini'
+        ? 'gemini'
+        : platform.platform === 'openai'
+          ? 'openai'
+          : 'anthropic'
     if (
       preReviewEnabled &&
       (await applyProtocolIntercept({
         ...gateArgs,
         body: auditBody,
         scopeMatched: apiRiskReview,
+        candidateAccounts,
+        poolJevProfile: req.poolJevProfile || keyScope.jev_profile || null,
+        channel: gateChannel,
+        enforceHardAndJev: imageModel || gateChannel === 'gemini',
+        skipDistill: Boolean(imageModel),
         bodyCtx: earlyBodyCtx,
         skipMandatory: true,
         backend: inferenceBackend,
-        apiPlatform: apiPicked ? apiOpenAI : undefined,
+        apiPlatform: imageModel ? false : apiPicked ? apiOpenAI : undefined,
       }))
     ) {
       return
     }
+    if (imageModel) return serveImageModelTurn({ req, res, protocol, body: ctx.body, logBag })
     let observedHop = false
     const afterHop = (result) => {
       observedHop = true
@@ -1340,7 +1447,6 @@ export function createHandleProtocol(deps) {
       }
       return reason
     }
-    const scopedRiskGate = logBag.risk_wait === true
     const route = logBag.risk_route
     if (route) {
       const unavailable = () => {
@@ -1419,17 +1525,7 @@ export function createHandleProtocol(deps) {
         keyScope,
         afterHop,
       }
-      // Account scope needs the slot, so the Codex hop runs the same gate again
-      // once a candidate is claimed. Without a scope the pre-hop verdict stands.
-      const accountGate = !scopedRiskGate
-        ? null
-        : (account) =>
-            applyProtocolIntercept({
-              ...gateArgs,
-              body: auditBody,
-              account,
-              skipMandatory: true,
-            })
+      // Pre-dispatch JEV has already run before slot admission (zero Phase-3 inversion).
       if (protocol === 'anthropic.messages') {
         const codex = normalizeCodexRouting(routing.codex)
         return runWithCodexKey(req, res, logBag, () =>
@@ -1456,7 +1552,7 @@ export function createHandleProtocol(deps) {
             },
             projectRoot: cfg.paths.project,
             captureOutbound: logCtx.capture_outbound === true,
-            accountGate,
+            preDispatchDecision: req._preDispatchDecision || null,
             ops: deps.codexOps || {},
             ...codexSticky,
           }),
@@ -1476,7 +1572,7 @@ export function createHandleProtocol(deps) {
           routing,
           projectRoot: cfg.paths.project,
           captureOutbound: logCtx.capture_outbound === true,
-          accountGate,
+          preDispatchDecision: req._preDispatchDecision || null,
           ops: deps.codexOps || {},
           ...codexSticky,
         }),
@@ -2317,21 +2413,6 @@ export function createHandleProtocol(deps) {
               ? `slot:${selected.slotIndex ?? 'x'}:${attemptStartedAt}`
               : `${attemptStartedAt}:${selected.vmId || extra.attemptNo || ''}`,
           })
-          if (scopedRiskGate) {
-            const blocked = await applyProtocolIntercept({
-              ...gateArgs,
-              body: auditBody,
-              account: scopeAccountFromVm(selected?.vm, findAccount(accountQuota, selected?.vm)?.unified),
-              bodyCtx: earlyBodyCtx,
-              skipMandatory: true,
-              interceptSessionKey: attemptSessionId ? `${selected.accountId}:${attemptSessionId}` : null,
-            })
-            if (blocked) {
-              const error = new Error('response already sent')
-              error.code = 'response_sent'
-              throw error
-            }
-          }
           const identity = loadVmIdentity(selected.exec)
           if (identity && attemptSessionId) identity.callerSessionId = attemptSessionId
           const credMode = credentialModeFromOauth(selected.vm?.claude || {})
@@ -3214,6 +3295,38 @@ export function createHandleProtocol(deps) {
     logBag.model = typeof body?.model === 'string' ? body.model : null
     logBag.inbound_summary = summarizeBody(body)
     if (rejectKeyModel(req, res, protocol, body?.model, logBag)) return
+    const searchIdentity = refusalAuditIdentity({
+      inbound: body,
+      body,
+      headers: req.headers,
+      principal: riskPrincipal(req),
+    })
+    const searchRiskState = {
+      policy: refusalPolicy(),
+      repo: refusalRepo(),
+      devices: deviceRepo(),
+      sessions: sessionRepo(),
+    }
+    if (
+      await applyProtocolIntercept({
+        req,
+        inbound: body,
+        body,
+        fp: fingerprintRequest(req, body),
+        logBag,
+        requestId: logCtx.request_id,
+        res,
+        identity: searchIdentity,
+        riskState: searchRiskState,
+        channel: 'search',
+        enforceHardAndJev: true,
+        skipDistill: true,
+        backend: 'oauth',
+        apiPlatform: false,
+      })
+    ) {
+      return
+    }
     return runWithCodexKey(req, res, logBag, () =>
       handleCodexSearch({
         req,
@@ -3430,6 +3543,38 @@ export function createHandleProtocol(deps) {
     logBag.inbound_summary = summarizeImagesBody(body)
     // No model means the upstream default, which a limited key cannot name.
     if (rejectKeyModel(req, res, protocol, body?.model, logBag)) return
+    const imagesIdentity = refusalAuditIdentity({
+      inbound: body,
+      body,
+      headers: req.headers,
+      principal: riskPrincipal(req),
+    })
+    const imagesRiskState = {
+      policy: refusalPolicy(),
+      repo: refusalRepo(),
+      devices: deviceRepo(),
+      sessions: sessionRepo(),
+    }
+    if (
+      await applyProtocolIntercept({
+        req,
+        inbound: body,
+        body,
+        fp: fingerprintRequest(req, body),
+        logBag,
+        requestId: logCtx.request_id,
+        res,
+        identity: imagesIdentity,
+        riskState: imagesRiskState,
+        channel: 'images',
+        enforceHardAndJev: true,
+        skipDistill: true,
+        backend: 'oauth',
+        apiPlatform: false,
+      })
+    ) {
+      return
+    }
     return runWithCodexKey(req, res, logBag, () =>
       handleCodexImages({
         req,

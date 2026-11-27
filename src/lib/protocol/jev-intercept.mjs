@@ -1223,6 +1223,88 @@ function pushPromptContent(raw, content) {
   }
 }
 
+function pushGeminiParts(raw, parts) {
+  if (typeof parts === 'string') {
+    raw.push(parts)
+    return
+  }
+  if (!Array.isArray(parts)) return
+  for (const part of parts) {
+    if (typeof part === 'string') raw.push(part)
+    else if (typeof part?.text === 'string') raw.push(part.text)
+  }
+}
+
+function pushGeminiInstruction(raw, instruction) {
+  if (!instruction) return
+  if (typeof instruction === 'string') {
+    raw.push(instruction)
+    return
+  }
+  if (Array.isArray(instruction)) {
+    for (const item of instruction) pushGeminiInstruction(raw, item)
+    return
+  }
+  if (typeof instruction === 'object') {
+    if (typeof instruction.text === 'string') raw.push(instruction.text)
+    if (Array.isArray(instruction.parts)) pushGeminiParts(raw, instruction.parts)
+  }
+}
+
+/** Extract user-authored turns from Gemini `contents` (roleless or role==='user'). */
+function extractGeminiUserTexts(src) {
+  if (!src || typeof src !== 'object') return []
+  const out = []
+  const contents = Array.isArray(src.contents) ? src.contents : []
+  for (const item of contents) {
+    if (typeof item === 'string') {
+      if (item.trim()) out.push(item)
+      continue
+    }
+    if (!item || typeof item !== 'object') continue
+    const role = String(item.role || '')
+      .trim()
+      .toLowerCase()
+    if (role && role !== 'user') continue
+    const pieces = []
+    if (Array.isArray(item.parts)) pushGeminiParts(pieces, item.parts)
+    else if (typeof item.text === 'string') pieces.push(item.text)
+    else if (typeof item.content === 'string') pieces.push(item.content)
+    const joined = pieces.filter(Boolean).join('\n').trim()
+    if (joined) out.push(joined)
+  }
+  return out
+}
+
+/** Extract search queries from `/v1/alpha/search` payloads (`query`, `q`, `queries`, `commands.search_query`). */
+function extractSearchQueryTexts(src) {
+  if (!src || typeof src !== 'object') return []
+  const out = []
+  const add = (value) => {
+    if (typeof value === 'string') {
+      const trimmed = value.trim()
+      if (trimmed) out.push(trimmed)
+      return
+    }
+    if (value && typeof value === 'object') {
+      if (typeof value.q === 'string' && value.q.trim()) out.push(value.q.trim())
+      if (typeof value.query === 'string' && value.query.trim()) out.push(value.query.trim())
+    }
+  }
+  add(src.query)
+  add(src.q)
+  if (Array.isArray(src.queries)) {
+    for (const item of src.queries) add(item)
+  }
+  if (src.commands && typeof src.commands === 'object' && !Array.isArray(src.commands)) {
+    const searchList = Array.isArray(src.commands.search_query) ? src.commands.search_query : []
+    for (const item of searchList) add(item)
+    const openList = Array.isArray(src.commands.open) ? src.commands.open : []
+    for (const item of openList) add(item)
+  }
+  return out
+}
+
 /** Caller prompt fields. Official template bodies are removed before return. */
 function promptPieces(src, keepReminders) {
   if (!src || typeof src !== 'object') return []
@@ -1230,6 +1312,8 @@ function promptPieces(src, keepReminders) {
   pushPromptContent(raw, src.system)
   pushPromptContent(raw, src.instructions)
   pushPromptContent(raw, src.developer)
+  pushGeminiInstruction(raw, src.systemInstruction)
+  pushGeminiInstruction(raw, src.system_instruction)
   const messages = Array.isArray(src.messages) ? src.messages : []
   for (const message of messages) {
     if (!['system', 'developer'].includes(String(message?.role || '').toLowerCase())) continue
@@ -1240,6 +1324,11 @@ function promptPieces(src, keepReminders) {
     const role = String(item?.role || '').toLowerCase()
     if (role !== 'system' && role !== 'developer') continue
     pushPromptContent(raw, item.content ?? item.text)
+  }
+  const contents = Array.isArray(src.contents) ? src.contents : []
+  for (const item of contents) {
+    if (String(item?.role || '').toLowerCase() !== 'system') continue
+    pushGeminiParts(raw, item.parts ?? item.text)
   }
   return raw.map((text) => stripOfficialPromptWhitelist(text, keepReminders)).filter(Boolean)
 }
@@ -1258,7 +1347,19 @@ export function jevDocument(
   })
   const seen = new Set()
   const prompts = []
+  const extraUsers = []
+  const seenExtra = new Set()
+  const pushExtra = (text) => {
+    const cleaned = cleanUserAsk(text)
+    const norm = normalizeText(cleaned)
+    if (!norm || seenExtra.has(norm)) return
+    seenExtra.add(norm)
+    extraUsers.push(cleaned)
+  }
   for (const src of inbound === body ? [inbound] : [inbound, body]) {
+    if (typeof src?.prompt === 'string') pushExtra(src.prompt)
+    for (const text of extractGeminiUserTexts(src)) pushExtra(text)
+    for (const text of extractSearchQueryTexts(src)) pushExtra(text)
     for (const piece of promptPieces(src, keepPromptReminders)) {
       const norm = normalizeText(piece)
       if (!norm || seen.has(norm)) continue
@@ -1266,7 +1367,7 @@ export function jevDocument(
       prompts.push(norm)
     }
   }
-  return [users, cleanUserAsk(inbound?.prompt), prompts.join('\n')].filter(Boolean).join('\n')
+  return [users, extraUsers.join('\n'), prompts.join('\n')].filter(Boolean).join('\n')
 }
 
 /** User text only. System prompts, env blocks, and tool payloads are not the ask. */
@@ -1308,7 +1409,7 @@ export function jevCurrentAsk(document) {
   if (!text) return ''
   const marked = text.split('\n[current ask]\n')
   const block = marked.length > 1 ? marked[marked.length - 1] : text
-  return block.replace(/^\[user (?:message|input) \d+\]\n/, '').trim()
+  return block.replace(/^\[(?:user (?:message|input)|gemini content|search query) \d+\]\n/, '').trim()
 }
 
 function buildJevModelParts(inbound, body = inbound, { interceptSession = null, ctx = null } = {}) {
@@ -1340,8 +1441,8 @@ function buildJevModelParts(inbound, body = inbound, { interceptSession = null, 
       if (role !== 'user') return
       push(`user message ${index + 1}`, jevModelContentText(message?.content))
     })
-    const input = typeof src?.input === 'string' ? [src.input] : Array.isArray(src?.input) ? src.input : []
     if (messageStart > 0) continue
+    const input = typeof src?.input === 'string' ? [src.input] : Array.isArray(src?.input) ? src.input : []
     input.forEach((item, index) => {
       if (typeof item === 'string') {
         push(`user input ${index + 1}`, cleanUserAsk(item))
@@ -1351,6 +1452,14 @@ function buildJevModelParts(inbound, body = inbound, { interceptSession = null, 
       const role = String(item?.role || 'user').toLowerCase()
       if (role !== 'user' && role !== '') return
       push(`user input ${index + 1}`, jevModelContentText(item?.content ?? item))
+    })
+    const geminiContents = extractGeminiUserTexts(src)
+    geminiContents.forEach((text, index) => {
+      push(`gemini content ${index + 1}`, cleanUserAsk(text))
+    })
+    const searchQueries = extractSearchQueryTexts(src)
+    searchQueries.forEach((text, index) => {
+      push(`search query ${index + 1}`, cleanUserAsk(text))
     })
   }
   if (!parts.length) return { parts, seen: [...seen], text: '' }
