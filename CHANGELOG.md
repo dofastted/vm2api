@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.4.238 — 2026-11-27 · 统一调度中心基建（M0–M2 与 `/pools` 工作台）、钉选 CRAG 3.1.25 与 CRAGGemini 0.5.1 载荷及 Gemini 代理/OAuth 优化
+## 1.4.238 — 2026-11-27 · 统一调度中心基建（M0–M2 与 `/pools` 工作台）、钉选 CRAG 3.1.25 与 CRAGGemini 0.5.2 载荷、Gemini 代理/OAuth 优化及 `agy` CLI 资格门禁自动修补
 
 - **统一调度中心 M0–M2 与独立 `/pools` 号池工作台（#1979、#1980、#1981、#1982、#1986）**：
   - **M0 增量数据模型与身份链（#1979）**：新增纯增量迁移 `src/lib/db/migrations/071_scheduler_center.sql`（SQLite）与 `src/lib/db/pg/pg-migrations/008_scheduler_center.sql`（PostgreSQL 对等），创建 `scheduler_pools`、`scheduler_pool_members`、`api_key_pool_bindings`、`scheduler_sticky_bindings`、`scheduler_node_penalties` 并为 `api_keys` 补充池绑定列；`src/lib/db/repos/scheduler-pools-repo.mjs` 提供启动期幂等回填；完善 `src/lib/identity/identity-rewrite.mjs` 官方身份链处理。
@@ -10,9 +10,9 @@
   - **M2 Rust `kin-scheduler` 核心与 UDS 桥接（#1982）**：新增 `scheduler/` Rust 工作区（`scheduler-proto`、`scheduler-core`、`scheduler-daemon`）、Node UDS 客户端 `src/lib/transport/scheduler-client.mjs`、Docker/CI 构建集成及 SIGTERM 优雅退出连接清理。
 - **钉选 CRAG `3.1.25` 延续载荷（#1983）**：
   - `deploy/payload.json` 的 `crag_release` 升级至 `payload-2026.11.27-crag-3.1.25`（支持 `prompt_replace_empty`），并在 `src/lib/admin/kernel-catalog.mjs` 注册 `3.1.25`。
-- **Gemini 代理与 OAuth 默认项优化并钉选 CRAGGemini `0.5.1` 载荷（#1984）**：
-  - `deploy/payload.json` 的 `geminiDefaultLinuxAmd64.tag` 升级至 `payload-2026.11.27-gemini-0.5.1`；更新 `scripts/gemini-host.py`、`scripts/gemini-maintenance.py`、`scripts/gemini_host_account.py`、`scripts/gemini-host-egress.sh` 及控制面/前端 Gemini 路由与操作逻辑，优化代理出口与 OAuth 默认配置。
-- 部署说明：本次改动涉及控制面（`src/`）、前端（`web/src/`）、数据库纯增量迁移（SQLite `071` / PostgreSQL `008`，在线无重写）、`deploy/payload.json`（CRAG `3.1.25`、CRAGGemini `0.5.1`）与 Gemini 宿主/维护脚本；`release`（`payload-2026.11.26-kernel-advisor-iterations`）与 `bin/` / `share/wrap-cli` 相对 `1.4.237` 未变，预期 **`SLOT_SYNC=skip`**，无需执行 `wrap-cli/sync` 或重启既有 Claude/Codex 槽位，重启 `vm2api` 一次即可自动完成迁移并生效；Gemini 宿主机按需同步宿主脚本并切换 `0.5.1` 载荷后重启 `vm2api-gemini`。
+- **Gemini 代理/OAuth 默认项优化、`agy` CLI 资格门禁自动修补并钉选 CRAGGemini `0.5.2` 载荷（#1984、#1990）**：
+  - `deploy/payload.json` 的 `geminiDefaultLinuxAmd64.tag` 升级至 `payload-2026.11.27-gemini-0.5.2`；更新 `scripts/gemini-host.py`、`scripts/gemini-maintenance.py`、`scripts/gemini_host_account.py`、`scripts/gemini-host-egress.sh`、新增 `scripts/gemini_agy_patch.py` 及控制面/前端 Gemini 路由、维护检查与操作逻辑，优化代理出口与 OAuth 默认配置并自动修补 `agy` CLI 资格门禁。
+- 部署说明：本次改动涉及控制面（`src/`）、前端（`web/src/`）、数据库纯增量迁移（SQLite `071` / PostgreSQL `008`，在线无重写）、`deploy/payload.json`（CRAG `3.1.25`、CRAGGemini `0.5.2`）与 Gemini 宿主/维护脚本；`release`（`payload-2026.11.26-kernel-advisor-iterations`）与 `bin/` / `share/wrap-cli` 相对 `1.4.237` 未变，预期 **`SLOT_SYNC=skip`**，无需执行 `wrap-cli/sync` 或重启既有 Claude/Codex 槽位，重启 `vm2api` 一次即可自动完成迁移并生效；Gemini 宿主机按需同步宿主脚本并切换 `0.5.2` 载荷后重启 `vm2api-gemini`。
 
 ## 1.4.237 — 2026-11-27 · craggemini---性能优化
 
