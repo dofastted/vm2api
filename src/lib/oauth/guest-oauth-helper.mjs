@@ -2,6 +2,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { slotHost } from '../vm/slot-host.mjs'
+import { slotUser } from '../vm/slot-identity.mjs'
 import { isCustomKvmMode } from '../vm/custom-os-runtime.mjs'
 import { isKvmRuntime } from '../vm/runtime-kind.mjs'
 import { syncCustomKvmSlotFiles } from '../vm/kvm-slot-agent-client.mjs'
@@ -151,12 +152,15 @@ export async function runGuestOAuthAuthService(
       )
     }
   }
+  const guestUser = slotUser(exec.vm)
   const argv = slotExecArgv(exec.vm, [bin], {
     interactive: true,
     user: host.execUser(exec.vm),
     workdir: home,
     env: {
       HOME: home,
+      USER: guestUser,
+      LOGNAME: guestUser,
       CLAUDE_CONFIG_DIR: configDir,
       // The worker config (`worker.json`) carries vm_id/proxy_url/egress_mode and
       // is what `kin-worker oauth session-code` needs; the kernel config does not.

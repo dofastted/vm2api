@@ -70,6 +70,12 @@ fi
 
 inner=''
 
+# When dropping from root ssh into a slot uid, clear root's MAIL and seed USER/LOGNAME/HOME
+# from /etc/passwd first so callers omitting -e do not inherit root's environment. Explicit -e wins.
+if [ -n "$uid" ]; then
+  inner="${inner}unset MAIL; _pw_u=''; _pw_h=''; if [ -r /etc/passwd ]; then while IFS=: read -r _pn _pp _pu _pg _pc _ph _ps; do if [ \"\$_pu\" = $(posix_quote "$uid") ]; then _pw_u=\$_pn; _pw_h=\$_ph; break; fi; done < /etc/passwd; fi; if [ -n \"\$_pw_u\" ]; then export USER=\"\$_pw_u\" LOGNAME=\"\$_pw_u\"; fi; if [ -n \"\$_pw_h\" ]; then export HOME=\"\$_pw_h\"; fi; "
+fi
+
 # Build the remote script without a pipe so we keep the current shell.
 if [ -n "$env_exports" ]; then
   inner="${inner}${env_exports}"
