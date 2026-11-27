@@ -43,7 +43,7 @@ import { spawnSync } from 'node:child_process'
 import { Worker } from 'node:worker_threads'
 import { getDb, getDbEngine, getDbPath, getPgConfig, getPgPool, closeDatabase, openDatabase } from '../db/database.mjs'
 import { buildPgConnectionString } from '../db/pg/config.mjs'
-import { pgRestoreAvailable, sha256File } from './backup-core.mjs'
+import { pgRestoreAvailable, queryPgServerMajorVersion, sha256File } from './backup-core.mjs'
 import { getCacheRuntime } from '../cache/index.mjs'
 import { SettingsRepo } from '../db/repos/settings-repo.mjs'
 import { BackupRepo } from '../db/repos/backup-repo.mjs'
@@ -106,7 +106,14 @@ export class BackupService {
     this.tmpDir = tmpDir || path.join(dataDir, 'tmp')
     this.checkIntervalMs = checkIntervalMs
     this._getDbEngine = typeof getEngine === 'function' ? getEngine : getDbEngine
-    this._pgRestoreAvailable = typeof isPgRestoreAvailable === 'function' ? isPgRestoreAvailable : pgRestoreAvailable
+    this._pgRestoreAvailable =
+      typeof isPgRestoreAvailable === 'function'
+        ? isPgRestoreAvailable
+        : async () => {
+            const serverMajor = await queryPgServerMajorVersion(getPgPool())
+            const connectionString = buildPgConnectionString(getPgConfig())
+            return pgRestoreAvailable({ serverMajor, connectionString })
+          }
     this.isRestoring = false
     this._running = false
     this._timer = null
