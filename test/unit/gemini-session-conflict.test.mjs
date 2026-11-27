@@ -42,6 +42,34 @@ function sseOk(text) {
   return stream
 }
 
+const TOOL_CONT_CONV = 'conv_tool_cont_stuck_42'
+const TOOL_CONT_CALL = 'call_tool_cont_probe_1'
+
+function sseAwaitingToolCall(convId = TOOL_CONT_CONV, callId = TOOL_CONT_CALL) {
+  const stream = new Readable({ read() {} })
+  stream.statusCode = 200
+  stream.headers = { 'content-type': 'text/event-stream; charset=utf-8' }
+  process.nextTick(() => {
+    stream.push(
+      `data: ${JSON.stringify({
+        craggeminiMeta: { conversation_id: convId, awaiting_tool_results: true },
+        candidates: [
+          {
+            content: {
+              role: 'model',
+              parts: [{ functionCall: { id: callId, name: 'probe_tool', args: {} } }],
+            },
+            finishReason: 'STOP',
+          },
+        ],
+        usageMetadata: { promptTokenCount: 8, candidatesTokenCount: 4, totalTokenCount: 12 },
+      })}\n\n`,
+    )
+    stream.push(null)
+  })
+  return stream
+}
+
 function makeCircuitPool() {
   const calls = { success: [], failure: [], probe: [] }
   const accountId = `gemini:${OAUTH_ENV.id}`
@@ -160,6 +188,105 @@ test('gemini_session_conflict retries on same account with fresh conversation_id
   assert.equal(turn.attempts?.[0]?.action, 'session_retry')
 })
 
+test('gemini_session_conflict on tool continuation retries with new conv (mas=3)', async () => {
+  const inferCalls = []
+  let inferNo = 0
+
+  const scheduler = createGeminiScheduler({
+    ...hostStub([OAUTH_ENV], async (_op, payload) => {
+      inferNo += 1
+      inferCalls.push({ n: inferNo, convId: payload.body?.conversation_id })
+      if (inferNo === 1) return sseAwaitingToolCall()
+      if (inferNo === 2) {
+        return jsonInferError(409, { code: 'tool_continuation_aborted', error: 'aborted' })
+      }
+      return sseOk('continuation recovered')
+    }),
+  })
+
+  const apiKey = { id: 'key-test', group_type: 'gemini' }
+  const userBody = { contents: [{ role: 'user', parts: [{ text: 'after tool' }] }] }
+
+  await scheduler.stream({
+    model: 'gemini-3-pro',
+    geminiBody: { contents: [{ role: 'user', parts: [{ text: 'emit tool' }] }] },
+    stickyKey: 'key:test:tool-cont-mas3',
+    apiKeyRecord: apiKey,
+  })
+
+  const turn = await scheduler.stream({
+    model: 'gemini-3-pro',
+    geminiBody: userBody,
+    stickyKey: 'key:test:tool-cont-mas3',
+    continuationCallIds: [TOOL_CONT_CALL],
+    apiKeyRecord: apiKey,
+  })
+
+  assert.equal(turn.text, 'continuation recovered')
+  assert.equal(inferCalls.length, 3)
+  assert.equal(inferCalls[1].convId, TOOL_CONT_CONV)
+  assert.notEqual(inferCalls[2].convId, TOOL_CONT_CONV, 'session conflict retry must not reuse continuation conv id')
+})
+
+test('gemini_session_conflict on tool continuation clears binding when mas=0', async () => {
+  const inferCalls = []
+  let inferNo = 0
+
+  const scheduler = createGeminiScheduler({
+    ...hostStub([OAUTH_ENV], async (_op, payload) => {
+      inferNo += 1
+      inferCalls.push({ convId: payload.body?.conversation_id })
+      if (inferNo === 1) return sseAwaitingToolCall()
+      if (inferNo === 2) {
+        return jsonInferError(409, { code: 'tool_continuation_aborted', error: 'aborted' })
+      }
+      return sseOk('fresh binding')
+    }),
+    getRoutingConfig: () => ({
+      gemini: {
+        sticky: { enabled: true, ttl_seconds: 3600 },
+        pool: { strategy: 'balanced', max_concurrency_per_account: 4, timeout_ms: 120_000 },
+        failover: { max_account_switches: 0 },
+      },
+    }),
+  })
+
+  const apiKey = { id: 'key-test', group_type: 'gemini' }
+  const userBody = { contents: [{ role: 'user', parts: [{ text: 'after tool' }] }] }
+
+  await scheduler.stream({
+    model: 'gemini-3-pro',
+    geminiBody: { contents: [{ role: 'user', parts: [{ text: 'emit tool' }] }] },
+    stickyKey: 'key:test:tool-cont-mas0',
+    apiKeyRecord: apiKey,
+  })
+
+  try {
+    await scheduler.stream({
+      model: 'gemini-3-pro',
+      geminiBody: userBody,
+      stickyKey: 'key:test:tool-cont-mas0',
+      continuationCallIds: [TOOL_CONT_CALL],
+      apiKeyRecord: apiKey,
+    })
+    assert.fail('expected gemini_session_conflict')
+  } catch (err) {
+    assert.equal(err.code, 'gemini_session_conflict')
+    assert.equal(err.attemptCount, 1)
+  }
+  assert.equal(inferCalls[1].convId, TOOL_CONT_CONV)
+
+  const third = await scheduler.stream({
+    model: 'gemini-3-pro',
+    geminiBody: userBody,
+    stickyKey: 'key:test:tool-cont-mas0',
+    continuationCallIds: [TOOL_CONT_CALL],
+    apiKeyRecord: apiKey,
+  })
+  assert.equal(third.text, 'fresh binding')
+  assert.notEqual(inferCalls[2].convId, TOOL_CONT_CONV, 'cleared tool continuation must not reuse stuck conv id')
+})
+
 test('gemini_session_conflict clears sticky when max_account_switches is 0 (no retry)', async () => {
   const inferCalls = []
   let attempt = 0
@@ -218,11 +345,7 @@ test('gemini_session_conflict clears sticky when max_account_switches is 0 (no r
     apiKeyRecord: apiKey,
   })
   assert.equal(third.text, 'after clear')
-  assert.notEqual(
-    inferCalls[2].convId,
-    boundConv,
-    'sticky clear must drop bound conversation after session conflict',
-  )
+  assert.notEqual(inferCalls[2].convId, boundConv, 'sticky clear must drop bound conversation after session conflict')
 })
 
 test('gemini_session_conflict is only retried once (no infinite retry)', async () => {

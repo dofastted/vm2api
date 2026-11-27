@@ -574,7 +574,8 @@ test('error handling: circuit breaker, pre-stream vs mid-stream errors, and disc
   assert.equal(res429.statusCode, 429)
   assert.equal(res429.jsonBody().error.code, 'gemini_quota_exhausted')
   assert.equal(tracker.calls.failure.length, 0)
-  assert.equal(tracker.calls.probe.length, 1)
+  // 429 actively retries once on the same account with restart_resume before giving up (2 probes, 0 failures).
+  assert.equal(tracker.calls.probe.length, 2)
 
   // 2. HTTP 502 DOES record circuit breaker failure
   mode = 'http502'
@@ -1440,15 +1441,21 @@ test('CRAGGemini resume keeps conversation_id on same account and always remints
     { role: 'user', content: 'Add step 3 after failover' },
   ])
   const t3Attempts = calls.slice(callsBeforeT3)
-  assert.equal(t3Attempts.length, 2, 'intra-request failover should try env-a then env-b')
+  assert.equal(
+    t3Attempts.length,
+    3,
+    'intra-request 429 failover retries env-a once with restart_resume then switches to env-b',
+  )
   assert.equal(t3Attempts[0].id, 'env-a')
   assert.equal(t3Attempts[0].convId, c1)
-  assert.equal(t3Attempts[1].id, 'env-b')
-  const c2 = t3Attempts[1].convId
+  assert.equal(t3Attempts[1].id, 'env-a')
+  assert.equal(t3Attempts[1].convId, c1, 'same-account 429 retry keeps conv id for agy resume')
+  assert.equal(t3Attempts[2].id, 'env-b')
+  const c2 = t3Attempts[2].convId
   assert.match(c2, /^gc_[a-f0-9]{24}$/)
   assert.notEqual(c2, c1, 'account switch env-a -> env-b must mint a new conversation_id')
   assert.notEqual(c2, callerConv)
-  assert.equal(t3Attempts[1].body.contents.length, 5, 'failover target must receive full history for continuity')
+  assert.equal(t3Attempts[2].body.contents.length, 5, 'failover target must receive full history for continuity')
 
   // Turn 4: stays on env-b and resumes with C2.
   const r4 = await postChat([
@@ -1696,15 +1703,17 @@ test('CRAGGemini suspended MCP tool continuation remints conversation_id and cle
     },
     { role: 'tool', tool_call_id: callId, content: '{"temp_c":24}' },
   ])
-  assert.equal(calls.length, 3)
+  assert.equal(calls.length, 4)
   assert.equal(calls[1].id, 'env-a')
   assert.equal(calls[1].convId, 'conv_mcp_orig_7', 'first attempt should target suspended env-a with original conv id')
-  assert.equal(calls[2].id, 'env-b')
-  const envBConvId = calls[2].convId
+  assert.equal(calls[2].id, 'env-a')
+  assert.equal(calls[2].convId, 'conv_mcp_orig_7', '429 restart_resume retry stays on env-a with same conv id')
+  assert.equal(calls[3].id, 'env-b')
+  const envBConvId = calls[3].convId
   assert.match(envBConvId, /^gc_[a-f0-9]{24}$/)
   assert.notEqual(envBConvId, 'conv_mcp_orig_7', 'failover account must never inherit suspended account conv id')
   assert.notEqual(envBConvId, calls[0].convId)
-  assert.equal(calls[2].body.contents.length, 3, 'failover account must receive full tool history')
+  assert.equal(calls[3].body.contents.length, 3, 'failover account must receive full tool history')
 
   // Turn 3: follow-up turn after tool failover (carrying historical tool_result in messages) MUST stay on env-b
   // with envBConvId and NOT bounce back to env-a!
@@ -2171,13 +2180,13 @@ test('Gemini scheduler fails over pre-output 502/504, falls back to reactive-coo
   })
   assert.equal(t4.account_id, 'env-a')
   assert.equal(t4.text, 'a-recovered-from-cooldown')
-  assert.equal(t4.attempt_count, 2)
+  assert.equal(t4.attempt_count, 3)
   assert.deepEqual(
     calls.slice(beforeFb).map((c) => c.id),
-    ['env-b', 'env-a'],
-    'must try uncooled env-b first, then fall back to reactive-cooled env-a, never touching 0% env-zero',
+    ['env-b', 'env-b', 'env-a'],
+    'must try uncooled env-b (with 1 restart_resume retry on 429) first, then fall back to reactive-cooled env-a, never touching 0% env-zero',
   )
-  assert.equal(t4.attempts[1].selection_reason, 'cooldown_fallback')
+  assert.equal(t4.attempts[2].selection_reason, 'cooldown_fallback')
 })
 
 test('429 failover: pre-content SSE meta/start error switches accounts, preserves earliest-expiry order in all_cooled_probe, honors retry_after_ms, and scopes cooldown per model', async () => {
@@ -2303,8 +2312,8 @@ test('429 failover: pre-content SSE meta/start error switches accounts, preserve
   assert.match(res1.bodyText(), /ok-from-env-b/)
   assert.deepEqual(
     calls.map((c) => c.id),
-    ['env-a', 'env-b'],
-    'pre-content start/meta SSE 429 must seamlessly switch from env-a to env-b',
+    ['env-a', 'env-a', 'env-b'],
+    'pre-content start/meta SSE 429 retries env-a once with restart_resume then switches to env-b',
   )
 
   // 2. Sibling Gemini model (gemini-4-hydrogen-high) on env-a MUST NOT be poisoned by gemini-4-neon-xhigh 429!
@@ -2332,7 +2341,7 @@ test('429 failover: pre-content SSE meta/start error switches accounts, preserve
         geminiBody: { contents: [{ role: 'user', parts: [{ text: 'cool all' }] }] },
         apiKeyRecord: { id: 'k1', group_type: 'gemini' },
       }),
-    (err) => err.code === 'gemini_quota_exhausted' && err.attemptCount === 3,
+    (err) => err.code === 'gemini_quota_exhausted' && err.attemptCount === 6,
   )
   const snapAll = scheduler.cooldownSnapshot()
   assert.equal(snapAll.models['env-b:gemini-4-neon-xhigh'], clock + 15_000)
@@ -2998,11 +3007,12 @@ test('open unitCircuit surfaces gemini_native_worker_unavailable while genuine s
     },
     { setHeader() {}, once() {} },
   )
-  assert.equal(circuitRes.status, 503)
-  assert.doesNotMatch(JSON.stringify(circuitRes.body), /此 Gemini 环境正在执行其他操作/)
-  assert.match(JSON.stringify(circuitRes.body), /CRAGGemini 原生常驻内核未就绪/)
+  assert.equal(circuitRes.status, 429)
+  assert.equal(circuitRes.body.error.code, 429)
+  assert.equal(circuitRes.body.error.status, 'RESOURCE_EXHAUSTED')
+  assert.match(JSON.stringify(circuitRes.body), /负载过高/)
 
-  // Advance past openMs, complete probe -> circuit closed, then occupy max_concurrency=1 slot -> genuine pool-busy 503.
+  // Advance past openMs, complete probe -> circuit closed, then occupy max_concurrency=1 slot -> 429 High Load.
   nowMs += 30_001
   pool.unitCircuit.admit(accountId)
   pool.unitCircuit.recordSuccess(accountId)
@@ -3021,9 +3031,9 @@ test('open unitCircuit surfaces gemini_native_worker_unavailable while genuine s
       },
       { setHeader() {}, once() {} },
     )
-    assert.equal(busyRes.status, 503)
-    assert.equal(busyRes.body.error.code, 'gemini_operation_busy')
-    assert.equal(busyRes.body.error.message, '当前可用 Gemini 账号并发繁忙，请稍后重试')
+    assert.equal(busyRes.status, 429)
+    assert.equal(busyRes.body.error.code, 'gemini_pool_overloaded')
+    assert.match(busyRes.body.error.message, /负载过高/)
   } finally {
     held.reservation.release()
   }

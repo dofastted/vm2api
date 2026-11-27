@@ -138,15 +138,129 @@ def get_json(proxy_url, url, header=None, body=None, *, timeout=6):
             env=ENV,
         )
         if output.returncode != 0:
-            return 0, {}
+            stderr_msg = output.stderr.decode("utf-8", errors="replace").strip()[:200]
+            return 0, {"_transport_error": stderr_msg or f"curl exit {output.returncode}"}
         raw, _, status = output.stdout.rpartition(b"\n")
         status = int(status)
         if status != 200:
-            return status, {}
+            err_data = {}
+            try:
+                parsed = json.loads(raw[:16384])
+                if isinstance(parsed, dict):
+                    err_data = parsed
+            except ValueError:
+                snippet = raw[:240].decode("utf-8", errors="replace").strip()
+                if snippet:
+                    err_data = {"_raw_error": snippet}
+            return status, err_data
         data = json.loads(raw)
         return (status, data) if isinstance(data, dict) else (0, {})
     except (OSError, subprocess.SubprocessError, ValueError):
-        return 0, {}
+        return 0, {"_transport_error": "request failed or timed out"}
+
+
+def _sanitize_error_message(raw, limit=220):
+    if not isinstance(raw, str):
+        return None
+    cleaned = re.sub(r"\s+", " ", raw).strip()
+    if not cleaned:
+        return None
+    return cleaned[:limit]
+
+
+def classify_http_error(status, payload, *, default_code="gemini_inference_failed"):
+    err_obj = payload.get("error") if isinstance(payload, dict) and isinstance(payload.get("error"), dict) else {}
+    raw_msg = (
+        err_obj.get("message")
+        or (payload.get("error_description") if isinstance(payload, dict) else None)
+        or (payload.get("message") if isinstance(payload, dict) else None)
+        or (payload.get("_transport_error") if isinstance(payload, dict) else None)
+        or (payload.get("_raw_error") if isinstance(payload, dict) else None)
+    )
+    msg = _sanitize_error_message(raw_msg)
+    reason = None
+    validation_url = None
+    details = err_obj.get("details") if isinstance(err_obj.get("details"), list) else []
+    for item in details:
+        if not isinstance(item, dict):
+            continue
+        if not reason and isinstance(item.get("reason"), str) and item.get("reason").strip():
+            reason = item["reason"].strip().upper()
+        meta = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+        for key in ("validation_url", "validationUrl", "verification_url", "verificationUrl", "url"):
+            candidate = safe_google_validation_url(meta.get(key))
+            if candidate and not validation_url:
+                validation_url = candidate
+        if not validation_url and isinstance(item.get("links"), list):
+            for link in item["links"]:
+                if isinstance(link, dict):
+                    candidate = safe_google_validation_url(link.get("url"))
+                    if candidate:
+                        validation_url = candidate
+                        break
+
+    eligibility = None
+    if status == 0:
+        return {
+            "error_code": "gemini_proxy_error",
+            "error_message": msg or "无法通过绑定代理连接 Google 上游",
+            "http_status": 0,
+        }
+    if status == 401:
+        return {
+            "error_code": "gemini_oauth_required",
+            "error_message": msg or "Google OAuth 凭证已失效或被吊销 (401)",
+            "http_status": 401,
+        }
+    if status == 403:
+        if reason == "VALIDATION_REQUIRED" or validation_url:
+            eligibility = "verification_required"
+            code = "gemini_account_verification_required"
+            fallback_msg = "Google 要求完成账号身份验证 (403 VALIDATION_REQUIRED)"
+        elif reason == "UNSUPPORTED_REGION":
+            eligibility = "location_unsupported"
+            code = "gemini_location_unsupported"
+            fallback_msg = "当前账号或代理出口地区不受支持 (403 UNSUPPORTED_REGION)"
+        elif reason == "UNSUPPORTED_CLIENT":
+            eligibility = "client_unsupported"
+            code = "gemini_client_unsupported"
+            fallback_msg = "客户端版本或标识被拒绝 (403 UNSUPPORTED_CLIENT)"
+        else:
+            eligibility = "ineligible"
+            code = "gemini_account_ineligible"
+            fallback_msg = f"Google 拒绝账号资格 ({reason or '403'})"
+        out = {
+            "error_code": code,
+            "error_message": msg or fallback_msg,
+            "http_status": 403,
+            "eligibility": eligibility,
+        }
+        if validation_url:
+            out["validation_url"] = validation_url
+        return out
+    if status == 429:
+        return {
+            "error_code": "gemini_quota_exhausted",
+            "error_message": msg or "账号配额已用尽 (429)",
+            "http_status": 429,
+        }
+    if status == 502:
+        return {
+            "error_code": "gemini_proxy_error",
+            "error_message": msg or "上游网关返回 502 错误",
+            "http_status": 502,
+        }
+    if status == 503:
+        return {
+            "error_code": "gemini_upstream_unavailable",
+            "error_message": msg or "Google 上游服务暂时不可用 (503)",
+            "http_status": 503,
+        }
+    return {
+        "error_code": default_code,
+        "error_message": msg or f"Google 上游返回 HTTP {status}",
+        "http_status": status if isinstance(status, int) else 0,
+    }
 
 
 def post_form_json(proxy_url, url, form_fields, *, timeout=10):
@@ -590,13 +704,30 @@ def probe_api_key(proxy_url, api_key, *, chat_only=False):
             "partial" if data.get("nextPageToken") else "ok",
             models=models(data, is_api_key=True, chat_only=chat_only),
         )
-    return checked("reauth_required" if status in (400, 401, 403) else "error")
+    err_info = classify_http_error(
+        status,
+        data,
+        default_code="gemini_api_key_invalid" if status in (400, 401, 403) else "gemini_inference_failed",
+    )
+    if status in (400, 401, 403):
+        err_info["error_code"] = "gemini_api_key_invalid"
+    return checked(
+        "reauth_required" if status in (400, 401, 403) else "error",
+        error_code=err_info["error_code"],
+        error_message=err_info["error_message"],
+        http_status=err_info["http_status"],
+    )
 
 
 def probe_oauth(proxy_url, profile):
     token = read_token(profile)
     if token is None:
-        return checked("error")
+        return checked(
+            "reauth_required",
+            error_code="gemini_oauth_required",
+            error_message="缺少本地 OAuth 凭证文件，请重新完成授权",
+            http_status=401,
+        )
     return probe_oauth_token(proxy_url, token)
 
 
@@ -670,9 +801,31 @@ def probe_oauth_token(proxy_url, token, *, imported=False):
     if imported:
         email = user_data.get("email")
         if user_status in (401, 403) or assist_status in (401, 403):
-            return checked("reauth_required")
+            failed_status, failed_data = (
+                (assist_status, assist_data)
+                if assist_status in (401, 403)
+                else (user_status, user_data)
+            )
+            err_info = classify_http_error(failed_status, failed_data)
+            return checked(
+                "reauth_required",
+                error_code=err_info["error_code"],
+                error_message=err_info["error_message"],
+                http_status=err_info["http_status"],
+            )
         if user_status != 200 or assist_status != 200 or not text(email, 254):
-            return checked("error")
+            failed_status, failed_data = (
+                (assist_status, assist_data)
+                if assist_status != 200
+                else (user_status, user_data)
+            )
+            err_info = classify_http_error(failed_status, failed_data)
+            return checked(
+                "error",
+                error_code=err_info["error_code"],
+                error_message=err_info["error_message"],
+                http_status=err_info["http_status"],
+            )
     onboard_project = None
     if assist_status == 200 and not imported:
         onboard_tier = select_onboard_tier(assist_data)
@@ -757,6 +910,7 @@ def probe_oauth_token(proxy_url, token, *, imported=False):
             if isinstance(entry, dict)
         ]
     model_status = None
+    model_data = {}
     if assist_status == 200:
         project_body = {"project": project} if project else {}
         with ThreadPoolExecutor(max_workers=2) as executor:
@@ -778,14 +932,14 @@ def probe_oauth_token(proxy_url, token, *, imported=False):
                 if project
                 else None
             )
-            model_status, data = model_result.result()
+            model_status, model_data = model_result.result()
             if summary is not None:
                 summary_status, summary_data = summary.result()
                 if summary_status == 200:
                     account["quota_groups"] = quota_groups(summary_data)
         if model_status == 200:
-            account["models"], account["quotas"] = models(data)
-            catalog = model_catalog(data)
+            account["models"], account["quotas"] = models(model_data)
+            catalog = model_catalog(model_data)
             if catalog:
                 account["model_catalog"] = catalog
             if (
@@ -800,6 +954,26 @@ def probe_oauth_token(proxy_url, token, *, imported=False):
         state = "reauth_required"
     elif user_status != 200 and assist_status != 200:
         state = "error"
+    if state != "ok":
+        failed_pair = None
+        for st, payload in (
+            (assist_status, assist_data),
+            (model_status, model_data),
+            (user_status, user_data),
+        ):
+            if st is not None and st != 200:
+                failed_pair = (st, payload)
+                if st in (401, 403):
+                    break
+        if failed_pair is not None:
+            err_info = classify_http_error(failed_pair[0], failed_pair[1])
+            account["error_code"] = err_info["error_code"]
+            account["error_message"] = err_info["error_message"]
+            account["http_status"] = err_info["http_status"]
+            if err_info.get("eligibility") and not account.get("eligibility"):
+                account["eligibility"] = err_info["eligibility"]
+            if err_info.get("validation_url") and not account.get("validation_url"):
+                account["validation_url"] = err_info["validation_url"]
     return checked(state, **account)
 
 

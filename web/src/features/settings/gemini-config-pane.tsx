@@ -92,6 +92,7 @@ const GEMINI_DEFAULTS = {
     circuit_failure_threshold: 3,
     circuit_open_ms: 30_000,
     eligibility_probe_interval_secs: 180,
+    account_check_interval_secs: 300,
   },
   sticky: {
     enabled: true,
@@ -101,6 +102,7 @@ const GEMINI_DEFAULTS = {
     max_account_switches: 3,
     quota_cooldown_ms: 60_000,
     account_cooldown_ms: 300_000,
+    unschedulable_on_502: true,
   },
   shm: {
     require_shm: true,
@@ -450,6 +452,11 @@ export function GeminiConfigPane({
     'eligibility_probe_interval_secs',
     GEMINI_DEFAULTS.pool.eligibility_probe_interval_secs
   )
+  const accountCheckInterval = numOf(
+    pool,
+    'account_check_interval_secs',
+    GEMINI_DEFAULTS.pool.account_check_interval_secs
+  )
   const idleTtlSecs = numOf(
     pool,
     'session_idle_ttl_secs',
@@ -503,6 +510,7 @@ export function GeminiConfigPane({
     'account_cooldown_ms',
     GEMINI_DEFAULTS.failover.account_cooldown_ms
   )
+  const unschedulableOn502 = failover.unschedulable_on_502 !== false
   const shmReqMb = numOf(shm, 'request_mb', GEMINI_DEFAULTS.shm.request_mb)
   const shmRespMb = numOf(shm, 'response_mb', GEMINI_DEFAULTS.shm.response_mb)
   const perfTier = resolveGeminiPerformanceTier(shmReqMb, shmRespMb)
@@ -1002,6 +1010,43 @@ export function GeminiConfigPane({
           </div>
 
           <div className='border-t pt-4'>
+            <SettingRow
+              label='502 自动打入不可调度'
+              desc='请求触发上游/代理 502 错误时自动将该 Gemini 账号置为不可调度（类似 Codex 不可调度态），避免 502→503 死循环；恢复可点「恢复状态」或刷新账号。'
+            >
+              <Switch
+                id='gemini-unschedulable-502'
+                checked={unschedulableOn502}
+                disabled={saving}
+                onCheckedChange={(unschedulable_on_502) =>
+                  updateFailover({ unschedulable_on_502 })
+                }
+              />
+            </SettingRow>
+          </div>
+
+          <div className='grid gap-4 border-t pt-4 sm:grid-cols-2'>
+            <SliderSetting
+              id='gemini-account-check-interval'
+              label='账号定时状态检查间隔'
+              desc='定期巡检所有已启用 Gemini 账号的凭证、资格与额度状态，自动刷新错误归因并在额度恢复时解除冷却（0 表示关闭）。'
+              value={accountCheckInterval}
+              min={0}
+              max={3600}
+              step={60}
+              format={(s) => (s === 0 ? '关闭' : fmtDuration(s * 1000))}
+              fallback={GEMINI_DEFAULTS.pool.account_check_interval_secs}
+              presets={[60, 300, 600, 1800]}
+              onChange={(account_check_interval_secs) =>
+                updatePool({
+                  account_check_interval_secs:
+                    account_check_interval_secs > 0 &&
+                    account_check_interval_secs < 60
+                      ? 60
+                      : account_check_interval_secs,
+                })
+              }
+            />
             <SliderSetting
               id='gemini-eligibility-probe'
               label='资格警告定时探测间隔'

@@ -118,6 +118,8 @@ describe('settings Gemini entry & scheduling config pane', () => {
     expect(html).toContain('调度策略与粘性会话')
     expect(html).toContain('单 CRAGGemini 多账号接管与并发')
     expect(html).toContain('单账号默认会话上限')
+    expect(html).toContain('502 自动打入不可调度')
+    expect(html).toContain('账号定时状态检查间隔')
     expect(html).toContain('资格警告定时探测间隔')
     expect(html).toContain('CRAGGemini 性能配置')
     expect(html).toContain('aria-label="CRAGGemini 性能配置"')

@@ -39,10 +39,7 @@ export const RECOVERABLE_GEMINI_SEAT_CODES = new Set([
   'license_payload_key_mismatch',
 ])
 
-export const GEMINI_SANDBOX_ERROR_CODES = new Set([
-  'gemini_sandbox_apparmor_restricted',
-  'gemini_sandbox_unavailable',
-])
+export const GEMINI_SANDBOX_ERROR_CODES = new Set(['gemini_sandbox_apparmor_restricted', 'gemini_sandbox_unavailable'])
 
 export const GEMINI_SANDBOX_MESSAGES = {
   gemini_sandbox_apparmor_restricted:
@@ -477,9 +474,7 @@ export function createGeminiCragSubscription({
       return saved
     }
     let raw = null
-    const machineIdCandidates = machineIdFile
-      ? [machineIdFile]
-      : [HOST_ID_MOUNT, '/etc/machine-id']
+    const machineIdCandidates = machineIdFile ? [machineIdFile] : [HOST_ID_MOUNT, '/etc/machine-id']
     for (const candidate of machineIdCandidates) {
       try {
         const text = fs.readFileSync(candidate, 'utf8').trim().toLowerCase().replaceAll('-', '')
@@ -1189,8 +1184,7 @@ export function createGeminiCragSubscription({
           message: GEMINI_SANDBOX_MESSAGES[licCode],
         }
       }
-      const code =
-        licCode && Object.hasOwn(GEMINI_LICENSE_MESSAGES, licCode) ? licCode : 'license_required'
+      const code = licCode && Object.hasOwn(GEMINI_LICENSE_MESSAGES, licCode) ? licCode : 'license_required'
       return {
         ok: false,
         status: code === 'gemini_subscription_sync_pending' ? 503 : 403,
