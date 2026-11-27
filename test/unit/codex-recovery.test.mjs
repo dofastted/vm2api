@@ -152,22 +152,25 @@ test('tryStartAfterPreheat honors injected quotaPolicy on soft gate', () => {
     codex: {
       extra: {
         ...freshExtra(),
-        codex_secondary_used_percent: 50,
-        codex_primary_used_percent: 50,
+        codex_secondary_used_percent: 80,
+        codex_primary_used_percent: 80,
       },
     },
   })
-  const tight = { limit_5h: 0.2, limit_7d: 0.2 }
-  const started = store.tryStartAfterPreheat({
+  const loose = { limit_5h: 0.85, limit_7d: 0.9 }
+  const tight = { limit_5h: 0.7, limit_7d: 0.7 }
+  const args = {
     vmId: 'vm-a',
     result: { ok: true },
     schedule: { mode: 'preheat', recovery_cooldown_minutes: 15 },
     beforeResets: { reset5h: Date.parse(NEW_RESET) - 3600_000 },
     vm,
-    quotaPolicy: tight,
     at: NOW,
-  })
-  assert.equal(started.reason, 'above_soft_limit')
+  }
+  assert.equal(store.tryStartAfterPreheat({ ...args, quotaPolicy: loose }).started, true)
+  const tightResult = store.tryStartAfterPreheat({ ...args, quotaPolicy: tight })
+  assert.equal(tightResult.started, false)
+  assert.equal(tightResult.reason, 'above_soft_limit')
 })
 
 test('tryStartAfterPreheat above_soft_limit when over quota gate', () => {
@@ -334,6 +337,68 @@ test('recordRateLimit no-op when slot not in recovery', () => {
   assert.equal(store.recordRateLimit('missing', NOW), false)
 })
 
+test('ingestCodexHop 429 does not create recovery when slot not cooling', () => {
+  const settings = new MemorySettings()
+  const store = createCodexRecoveryStore({ settingsRepo: settings, now: () => NOW })
+  setCodexRecoveryStore(store)
+  const beforeSets = settings.setCalls
+  ingestCodexHop(
+    '/tmp',
+    'vm-a',
+    { ok: false, status: 429, body: { error: { code: 'usage_limit_reached' } }, headers: {} },
+    NOW,
+  )
+  assert.equal(store.get('vm-a', NOW).state, null)
+  assert.equal(store.recordRateLimit('vm-a', NOW), false)
+  assert.equal(settings.setCalls, beforeSets)
+})
+
+test('readAll hydrates from settings when cache is cold', () => {
+  const settings = new MemorySettings()
+  settings.set('codex_recovery_state', {
+    'vm-a': { until: NOW + 60_000, minutes: 15, rate_limited: false, extended: 0 },
+  })
+  const store = createCodexRecoveryStore({ settingsRepo: settings, now: () => NOW })
+  assert.equal(store.get('vm-a', NOW).active, true)
+  assert.ok(settings.getCalls >= 1)
+})
+
+test('recordRateLimit stops growing past four minute windows', () => {
+  const store = createCodexRecoveryStore({ now: () => NOW })
+  store.put(
+    'vm-a',
+    { until: NOW + 15 * 60_000, started_at: NOW, minutes: 15, rate_limited: false, extended: 0 },
+    { force: true },
+  )
+  const hardCap = NOW + 15 * 60_000 * 4
+  for (const stepMin of [0, 15, 30, 45, 60]) {
+    const at = NOW + stepMin * 60_000
+    store.recordRateLimit('vm-a', at)
+    assert.ok(store.get('vm-a', at).state.until <= hardCap)
+  }
+  assert.equal(store.get('vm-a', NOW).state.until, hardCap)
+  store.recordRateLimit('vm-a', NOW + 90 * 60_000)
+  assert.equal(store.get('vm-a', NOW).state.until, hardCap)
+})
+
+test('recordRateLimit throttles duplicate 429 bumps within write window', () => {
+  const store = createCodexRecoveryStore({ now: () => NOW })
+  store.put(
+    'vm-a',
+    { until: NOW + 60_000, started_at: NOW, minutes: 15, rate_limited: false, extended: 0 },
+    { force: true },
+  )
+  assert.equal(store.recordRateLimit('vm-a', NOW), true)
+  const afterFirst = store.get('vm-a', NOW).state
+  assert.equal(afterFirst.rate_limited, true)
+  assert.equal(afterFirst.extended, 1)
+  store.recordRateLimit('vm-a', NOW + 500)
+  store.recordRateLimit('vm-a', NOW + 1000)
+  const afterBurst = store.get('vm-a', NOW).state
+  assert.equal(afterBurst.extended, afterFirst.extended)
+  assert.equal(afterBurst.until, afterFirst.until)
+})
+
 test('settings read cache limits hot-path get() churn', () => {
   const settings = new MemorySettings()
   const store = createCodexRecoveryStore({ settingsRepo: settings, now: () => NOW })
@@ -367,18 +432,20 @@ test('recovery overlay preserves base_level on candidate priority', () => {
   assert.equal(level.base_level, 8)
 })
 
-test('pickCodexSlots ranks higher manual P above recovering home overlay', () => {
+test('pickCodexSlots sorts by recovery overlay level not raw manual P', () => {
   const store = createCodexRecoveryStore({ now: () => NOW })
   setCodexRecoveryStore(store)
   store.put(
-    'vm-home',
-    { until: NOW + 60_000, minutes: 15, base_level: 8, base_mode: 'manual', rate_limited: false, extended: 0 },
+    'vm-hot',
+    { until: NOW + 60_000, minutes: 15, base_level: 9, base_mode: 'manual', rate_limited: false, extended: 0 },
     { force: true },
   )
-  const home = gpt('vm-home')
-  const better = gpt('vm-high', { schedule_level_manual: 9, policy: { priority: 9, weight: 1 } })
-  const picked = pickCodexSlots([home, better], { now: NOW, quotaPolicy: QUOTA })
-  assert.equal(picked.ids[0], 'vm-high')
+  const recoveringP9 = gpt('vm-hot', { schedule_level_manual: 9, policy: { priority: 9, weight: 1 } })
+  const steadyP8 = gpt('vm-cool', { schedule_level_manual: 8, policy: { priority: 8, weight: 1 } })
+  assert.equal(codexScheduleLevel(recoveringP9, NOW, undefined, { quotaPolicy: QUOTA }).level, RECOVERY_LEVEL)
+  assert.equal(codexScheduleLevel(steadyP8, NOW, undefined, { quotaPolicy: QUOTA }).level, 8)
+  const picked = pickCodexSlots([recoveringP9, steadyP8], { now: NOW, quotaPolicy: QUOTA })
+  assert.deepEqual(picked.ids, ['vm-cool', 'vm-hot'])
 })
 
 test('normalizeCodexRouting sticky_keep_session true only when configured', () => {
