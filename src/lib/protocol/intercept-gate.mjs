@@ -131,6 +131,14 @@ function recordBan(decision, { devices, policy, requestId, now = Date.now() }) {
 
 const OVER_REFUSAL_SAFE_FLOOR = 0.85
 
+/**
+ * Single non-NSFW JEV hits at or above this floor refuse only the current
+ * request without permanently banning the session or adding a device strike.
+ * NSFW hits, multi-question hits, and scores strictly below this floor still
+ * escalate to session + 3-strike device bans.
+ */
+export const JEV_BAN_CONFIDENCE_FLOOR = 0.25
+
 /** Flatten JEV per-question scores into scalar error_details fields (`jev_score_<id>`). */
 export function jevScoreDetails(scores) {
   if (!scores || typeof scores !== 'object') return {}
@@ -151,6 +159,31 @@ function minJevScore(scores) {
     .map(Number)
     .filter((n) => Number.isFinite(n) && n >= 0 && n <= 1)
   return vals.length ? Math.min(...vals) : null
+}
+
+function lowestHitScore(verdict) {
+  const hitScores = Array.isArray(verdict?.hits)
+    ? verdict.hits.map((h) => Number(h?.score)).filter((n) => Number.isFinite(n) && n >= 0 && n <= 1)
+    : []
+  if (hitScores.length) return Math.min(...hitScores)
+  const raw = Number(verdict?.score)
+  if (Number.isFinite(raw) && raw >= 0 && raw <= 1) return raw
+  return minJevScore(verdict?.scores)
+}
+
+export function shouldEscalateJevBan(verdict, jev = null) {
+  if (!verdict || verdict.action !== 'block' || verdict.reason === 'unavailable') return false
+  if (jev?.block_if_below === false) return true
+  const categories =
+    Array.isArray(verdict.categories) && verdict.categories.length
+      ? verdict.categories
+      : verdict.category
+        ? [verdict.category]
+        : []
+  if (categories.includes('nsfw') || categories.length >= 2) return true
+  const score = lowestHitScore(verdict)
+  if (score === null) return true
+  return score < JEV_BAN_CONFIDENCE_FLOOR
 }
 
 function mergeLogErrorDetails(logBag, patch) {
@@ -356,6 +389,7 @@ export async function evaluateProtocolIntercept({
   headers,
   identity = refusalAuditIdentity({ inbound, body, headers }),
   official = false,
+  classifier = null,
   zeroInject = false,
   distillRules,
   policy,
@@ -376,6 +410,7 @@ export async function evaluateProtocolIntercept({
   now = Date.now(),
 } = {}) {
   const audit = policy?.risk_audit
+  const isAutoModeClassifier = classifier?.purpose === 'auto_mode_classifier'
   const rootSessionId = refusalSessionId({ inbound, body, headers }) || identity.sessionId || ''
   const effectiveIdentity =
     rootSessionId && rootSessionId !== identity.sessionId ? { ...identity, sessionId: rootSessionId } : identity
@@ -425,6 +460,11 @@ export async function evaluateProtocolIntercept({
         intercept: gateVerdict({ kind: 'block', by: 'refusal', keyword: banned.subject_kind }),
       })
     }
+    // Claude Code's built-in auto-mode classifier is a safety side-request
+    // wrapping `<transcript>` + review prompt. Pre-existing session/device bans
+    // still apply above, but it must never trigger new keyword/JEV blocks or
+    // kill the main coding session (matching `refusalSessionBlockDecision`).
+    if (isAutoModeClassifier) return pass(mandatoryOnly ? 'unchecked' : 'classifier')
     const tool = blockedRiskTool(inbound, body, audit?.blocked_tools)
     if (tool) {
       const error = hardPolicyError(requestId, 'risk_tool_blocked', tool.message, { tool: tool.name })
@@ -460,6 +500,7 @@ export async function evaluateProtocolIntercept({
       }
     }
   }
+  if (isAutoModeClassifier) return pass(mandatoryOnly ? 'unchecked' : 'classifier')
   const routeTarget = backend === 'api' ? audit?.downgrade_endpoint : audit?.downgrade_pool
   const routeConfigured = !!(jev?.enabled && (routeTarget || audit?.downgrade_model))
   let outside = ''
@@ -626,17 +667,27 @@ export async function evaluateProtocolIntercept({
         })
       }
       const category = verdict.category || 'safety'
+      const escalateBan = shouldEscalateJevBan(verdict, jev)
       const steps = policy?.risk_audit?.ban_steps || DEFAULT_BAN_STEPS
       const firstMinutes = Number(steps[0]) > 0 ? Number(steps[0]) : 10
-      const error = makePolicyOverloadError({ requestId, retryAfterSec: firstMinutes * 60 })
+      const error = makePolicyOverloadError({
+        requestId,
+        retryAfterSec: escalateBan ? firstMinutes * 60 : 60,
+      })
       return reject({
         kind: 'jev',
         via: 'jev',
         final_state: 'policy_blocked',
         error,
         logErrorCode: 'policy_blocked',
-        errorDetails: { reason: `jev:${category}`, ...jevScoreDetails(verdict.scores) },
-        errorMessage: `${POLICY_BLOCK_MESSAGE}: ${category}`,
+        errorDetails: {
+          reason: `jev:${category}`,
+          ...(!escalateBan ? { ban_skipped: 'borderline_score' } : {}),
+          ...jevScoreDetails(verdict.scores),
+        },
+        errorMessage: escalateBan
+          ? `${POLICY_BLOCK_MESSAGE}: ${category}`
+          : `${POLICY_BLOCK_MESSAGE}: ${category}（单次拦截，未达封禁置信线，未封禁会话/设备）`,
         intercept: gateVerdict({
           kind: 'block',
           by: 'jev',
@@ -648,9 +699,9 @@ export async function evaluateProtocolIntercept({
         sessionId: rootSessionId,
         model: body?.model || inbound?.model || '',
         preview: refusalPreview(body, inbound),
-        banSession: true,
-        banDevice: true,
-        forceDeviceBan: true,
+        banSession: escalateBan,
+        banDevice: escalateBan,
+        forceDeviceBan: escalateBan,
         reason: `jev:${category}`,
       })
     }
