@@ -333,7 +333,7 @@ function Tile({
 }
 
 /**
- * VM 内的「调度」块：席位、并发、RPM、调度优先级与配额闸的生效值；
+ * VM 内的「调度」块：执行位、并发、RPM、调度优先级与配额闸的生效值；
  * 本槽覆盖的项高亮，悬停看全局值，一个弹窗改全部。
  */
 export function VmSchedulingBlock({
@@ -380,7 +380,7 @@ export function VmSchedulingBlock({
       {codex ? null : (
         <div className='space-y-1' title={seatTitle(vm)}>
           <div className='flex items-baseline justify-between gap-2 text-xs'>
-            <span className='text-muted-foreground'>席位</span>
+            <span className='text-muted-foreground'>执行位</span>
             <span className='tabular-nums'>
               {seatsUsed}/{seatsMax}
               {vm.seats_grace ? ` · 交接 ${vm.seats_grace}` : ''}
@@ -430,7 +430,7 @@ export function VmSchedulingBlock({
         />
         {codex ? null : (
           <Tile
-            label='席位上限'
+            label='执行位上限'
             value={vm.session_slots ?? '—'}
             own={vm.session_slots_override}
             title={
@@ -448,7 +448,7 @@ export function VmSchedulingBlock({
             title={
               vm.max_primary_sessions_override
                 ? `本槽钉住；全局 ${inherited?.max_primary_sessions ?? seatsMax}`
-                : '跟随全局；未设置全局时等于席位上限'
+                : '跟随全局；未设置全局时等于执行位上限'
             }
           />
         )}
@@ -456,7 +456,7 @@ export function VmSchedulingBlock({
           <div className='col-span-2'>
             <Tile
               label='每会话子代理上限'
-              value={vm.max_subagents_per_session ?? '关闭(子代理各占一个席位)'}
+              value={vm.max_subagents_per_session ?? '关闭(子代理各占一个执行位)'}
               own={vm.max_subagents_per_session_override}
               title={
                 vm.max_subagents_per_session_override
@@ -698,12 +698,12 @@ export function VmSchedulingEditor({ vm }: { vm: Vm }) {
           <div className='space-y-4'>
             <section className='space-y-2'>
               <h4 className='text-xs font-medium text-muted-foreground'>
-                席位与流量
+                执行位与流量
               </h4>
               {codex ? null : (
                 <KnobRow
-                  label='席位上限'
-                  desc='默认控制同时占用的客户端会话席位数（回合结束即让位）；开启家族模式时，主会话与子代理共同占用本 VM 的物理执行位。'
+                  label='执行位上限'
+                  desc='默认控制同时占用的物理执行位数（回合结束即让位）；开启家族模式时，主会话与子代理共同占用本 VM 的物理执行位。'
                   inheritedText={String(inherited?.session_slots ?? '—')}
                   own={draft.seats.own}
                   onOwnChange={(own) =>
@@ -712,7 +712,7 @@ export function VmSchedulingEditor({ vm }: { vm: Vm }) {
                   disabled={pending}
                 >
                   <ChipGroup
-                    label='席位上限'
+                    label='执行位上限'
                     value={draft.seats.value}
                     options={withCurrent(
                       SEAT_CAP_STEPS.map((n): [number, string] => [
@@ -736,7 +736,7 @@ export function VmSchedulingEditor({ vm }: { vm: Vm }) {
               {codex ? null : (
                 <KnobRow
                   label='主会话上限'
-                  desc='家族模式下每台 VM 同时占用的根会话席位数。留空全局时默认跟随物理席位上限。'
+                  desc='家族模式下每台 VM 同时占用的根会话（主会话）数。留空全局时默认跟随执行位上限。'
                   inheritedText={String(
                     inherited?.max_primary_sessions ?? vm.session_slots ?? '—'
                   )}
@@ -767,7 +767,7 @@ export function VmSchedulingEditor({ vm }: { vm: Vm }) {
                   desc='开启家族模式后限制每个主会话并发的子代理数；0 表示子代理在根 VM 排队直至超时，全局留空时默认关闭家族模式。'
                   inheritedText={
                     inherited?.max_subagents_per_session == null
-                      ? '关闭(子代理各占一个席位)'
+                      ? '关闭(子代理各占一个执行位)'
                       : String(inherited.max_subagents_per_session)
                   }
                   own={draft.subagents.own}
