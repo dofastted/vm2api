@@ -262,11 +262,13 @@ function SlotTable({
                   <Button
                     variant='ghost'
                     size='sm'
-                    disabled={!vm.node_id || vm.runtime_type !== 'kvm'}
+                    disabled={vm.runtime_type !== 'kvm'}
                     title={
-                      !vm.node_id || vm.runtime_type !== 'kvm'
-                        ? '首版仅支持远程 Linux KVM 槽'
-                        : '迁移到其他节点，或在原节点扩内存'
+                      vm.runtime_type !== 'kvm'
+                        ? '仅支持 KVM 槽'
+                        : vm.node_id
+                          ? '迁移到其他节点，或在原节点扩内存'
+                          : '本机槽原地扩内存'
                     }
                     onClick={() => onMigrate(vm)}
                   >

@@ -1344,7 +1344,13 @@ async function startVmRuntimeAdmitted(
   if (zone) vm.timezone = zone
   vm.locale = vm.locale || STANDARD_LOCALE
   const mem = slotMemory(vm, resolvedRouting)
-  const image = kvm ? kvmImageForKernel(kernel) : imageForKernel(kernel)
+  // A slot resized in place keeps booting the exact base image it was created on
+  // (vm.machine.kvm_image_id): a different backing image can reset its qcow overlay.
+  const pinnedKvmImage =
+    kvm && !vm.node_id && /^sha256:[a-f0-9]{64}$/.test(String(vm.machine?.kvm_image_id || ''))
+      ? vm.machine.kvm_image_id
+      : null
+  const image = pinnedKvmImage || (kvm ? kvmImageForKernel(kernel) : imageForKernel(kernel))
   const home = path.join(projectRoot, 'vms', vm.id, 'cli-home')
   fs.mkdirSync(home, { recursive: true })
   try {
@@ -1475,8 +1481,13 @@ async function startVmRuntimeAdmitted(
   if (!kvm && !computer?.mac) return { ok: false, error: 'computer MAC missing' }
   host = computer.hostname
 
-  const img = await ensureSlotImage(kernel, { projectRoot, runtime: runtimeKind(vm) })
-  if (!img.ok) return img
+  if (pinnedKvmImage) {
+    if (!sh(['docker', 'image', 'inspect', pinnedKvmImage], { timeout: 15_000 }).ok)
+      return { ok: false, code: 'kvm_pinned_image_missing', error: '槽位锁定的基础镜像不存在' }
+  } else {
+    const img = await ensureSlotImage(kernel, { projectRoot, runtime: runtimeKind(vm) })
+    if (!img.ok) return img
+  }
 
   try {
     fs.rmSync(worker.socket, { force: true })
