@@ -72,14 +72,23 @@ import { ensureSlotSubscriptionType } from './lib/oauth/oauth-credentials.mjs'
 import { ensureRemoteOfficialCredentialLink } from './lib/cluster/remote-slot-files.mjs'
 import { createCliNodeGuard } from './lib/vm/cli-node-guard.mjs'
 
-import { createSlotBridgeHealer, powerOnSlot, reviveDownSlots } from './lib/vm/slot-recovery.mjs'
-import { resumePendingKernelInstalls } from './lib/vm/kernel-install.mjs'
+import { createSlotBridgeHealer, powerOnSlot, recoverSlot, reviveDownSlots } from './lib/vm/slot-recovery.mjs'
+import {
+  createCragZombieGuard,
+  isCragZombieGuardSchedulable,
+  isCragZombieGuardTarget,
+  normalizeCragZombieGuardConfig,
+} from './lib/vm/crag-zombie-guard.mjs'
+import { kernelFaults, rustKernelHealth } from './lib/transport/rust-kernel-client.mjs'
+import { slotExec } from './lib/vm/slot-runtime.mjs'
+import { fillVmTimezoneFromExit } from './lib/vm/proxy-timezone.mjs'
+import { releaseKernelInstallSafetyHold, resumePendingKernelInstalls } from './lib/vm/kernel-install.mjs'
 import { createUsageProbeMonitor, normalizeUsageProbeConfig } from './lib/oauth/usage-probe-monitor.mjs'
 import { createCatalogMonitor } from './lib/admin/catalog-monitor.mjs'
 import { normalizeOfficialCcConfig } from './lib/oauth/official-cc-bootstrap.mjs'
 import { invalidateLiveCredentialCache } from './lib/admin/panel-live-credentials.mjs'
 import { normalizeHealthProbeConfig, createHealthProbeMonitor, HEALTH_REAL_HEADER } from './lib/admin/health-probe.mjs'
-import { normalizeNotifyConfig, createNotifyMonitor } from './lib/admin/notify.mjs'
+import { normalizeNotifyConfig, createNotifyMonitor, dispatchNotify } from './lib/admin/notify.mjs'
 import { snapshotVmConnectivity } from './lib/admin/vm-connectivity.mjs'
 import { runVmTestChat } from './lib/admin/vm-test-chat.mjs'
 import { VmTestScheduleRunner } from './lib/admin/vm-test-schedule.mjs'
@@ -106,6 +115,7 @@ import {
   listVms,
   getVm,
   getActiveVmId,
+  markUnschedulable,
   reconcileProxyScheduleHold,
   isCodexVm,
   syncCodexQuotaSchedule,
@@ -147,7 +157,7 @@ import { ClusterError } from './lib/cluster/ssh-link.mjs'
 import { nodeEgressProxyUrl, startNodeEgressSocks } from './lib/cluster/node-egress-socks.mjs'
 import { createSlotShell } from './lib/vm/slot-shell.mjs'
 import { createSlotDesktop } from './lib/vm/slot-desktop.mjs'
-import { vmLockBusy } from './lib/vm/vm-file.mjs'
+import { vmLockBusy, withVmLock } from './lib/vm/vm-file.mjs'
 import { slotImageSpec } from './lib/cluster/slot-image.mjs'
 import { OS_CATALOG } from './lib/vm/os-catalog.mjs'
 import { isKvmRuntime } from './lib/vm/runtime-kind.mjs'
@@ -384,6 +394,7 @@ let healthMonitor = null
 let credentialRefreshMonitor = null
 let kernelWatchdog = null
 let cliNodeGuard = null
+let cragZombieGuard = null
 let usageProbeMonitor = null
 let catalogMonitor = null
 let notifyMonitor = null
@@ -443,6 +454,9 @@ const routingRt = createRoutingRuntime({
   get usageProbeMonitor() {
     return usageProbeMonitor
   },
+  get cragZombieGuard() {
+    return cragZombieGuard
+  },
 
   get notifyMonitor() {
     return notifyMonitor
@@ -496,6 +510,7 @@ if (routingConfig.official_cc) {
 }
 routingConfig.health_probe = normalizeHealthProbeConfig(routingConfig.health_probe)
 routingConfig.usage_probe = normalizeUsageProbeConfig(routingConfig.usage_probe)
+routingConfig.crag_zombie_guard = normalizeCragZombieGuardConfig(routingConfig.crag_zombie_guard)
 routingConfig.notify = normalizeNotifyConfig(routingConfig.notify)
 routingConfig.tiers = normalizeTiers(routingConfig.tiers, routingConfig.quota, routingConfig.concurrency)
 syncTierDefaultsIntoRouting()
@@ -898,6 +913,7 @@ backupService.onRestored(async (db) => {
   }
   routingConfig.health_probe = normalizeHealthProbeConfig(routingConfig.health_probe)
   routingConfig.usage_probe = normalizeUsageProbeConfig(routingConfig.usage_probe)
+  routingConfig.crag_zombie_guard = normalizeCragZombieGuardConfig(routingConfig.crag_zombie_guard)
   routingConfig.notify = normalizeNotifyConfig(routingConfig.notify)
   routingConfig.tiers = normalizeTiers(routingConfig.tiers, routingConfig.quota, routingConfig.concurrency)
   syncTierDefaultsIntoRouting()
@@ -915,6 +931,7 @@ backupService.onRestored(async (db) => {
   healthMonitor?.setConfig(routingConfig.health_probe)
   credentialRefreshMonitor?.setConfig(normalizeCredentialRefreshConfig(routingConfig.credential_refresh))
   kernelWatchdog?.setConfig(normalizeKernelWatchdogConfig(routingConfig.kernel_watchdog))
+  cragZombieGuard?.setConfig(routingConfig.crag_zombie_guard)
   configureSlotCapacity(routingConfig.slot_capacity)
   usageProbeMonitor?.setConfig(routingConfig.usage_probe)
   notifyMonitor?.setConfig(routingConfig.notify)
@@ -1349,6 +1366,48 @@ cliNodeGuard = createCliNodeGuard({
   listTargets: () => listVms(cfg.paths.project),
   liveTokens: () => slotShell.liveShellTokens?.() || [],
 })
+// Opt-in (routing.crag_zombie_guard.enabled): power-cycles idle CRAG slots whose
+// gateway worker left unreaped claude children, through the panel 恢复服务 path.
+cragZombieGuard = createCragZombieGuard({
+  config: routingConfig.crag_zombie_guard,
+  listTargets: () => listVms(cfg.paths.project),
+  getRouting: () => routingConfig,
+  getVm: (id) => getVm(cfg.paths.project, id),
+  inflight: (id) => poolScheduler?.vmInflight?.get(id) || 0,
+  nativeHealth: (vm) => rustKernelHealth(slotExec(cfg.paths.project, vm), { timeoutMs: 2000 }),
+  isFaulted: (id) => kernelFaults.has(id),
+  lockBusy: (id) => vmLockBusy(path.join(cfg.paths.project, 'vms', `${id}.json`)),
+  recover: (vm, { beforeStop = null, verifyAfter = null } = {}) =>
+    withVmLock(path.join(cfg.paths.project, 'vms', `${vm.id}.json`), async () => {
+      const fresh = getVm(cfg.paths.project, vm.id)
+      if (!fresh || !isCragZombieGuardTarget(fresh, routingConfig) || !isCragZombieGuardSchedulable(fresh)) {
+        return { ok: false, code: 'slot_state_changed' }
+      }
+      const result = await recoverSlot({
+        projectRoot: cfg.paths.project,
+        id: vm.id,
+        proxyPool,
+        routing: routingConfig,
+        fillTimezone: (id) => fillVmTimezoneFromExit(cfg.paths.project, proxyPool, id),
+        watchdog: kernelWatchdog,
+        poolScheduler,
+        internal: true,
+        clearUnschedulable: false,
+        beforeStop,
+        verifyAfter,
+      })
+      if (result.ok && result.report?.ok === true && result.post_verify?.ok !== false) {
+        panel.resetVmCircuit({ cfg, poolScheduler, id: vm.id })
+        releaseKernelInstallSafetyHold(cfg.paths.project, vm.id, kernelWatchdog)
+      }
+      return result
+    }),
+  park: (id, detail) => markUnschedulable(cfg.paths.project, id, 'maintenance_failed', detail),
+  notify: (message) =>
+    routingConfig.notify?.enabled
+      ? dispatchNotify(routingConfig.notify, message)
+      : Promise.resolve({ ok: false, skipped: 'disabled' }),
+})
 for (const vm of listVms(cfg.paths.project)) {
   if (isCodexVm(vm)) continue
   try {
@@ -1487,6 +1546,9 @@ const handlePanel = createPanelHandler({
   get usageProbeMonitor() {
     return usageProbeMonitor
   },
+  get cragZombieGuard() {
+    return cragZombieGuard
+  },
   get notifyMonitor() {
     return notifyMonitor
   },
@@ -1581,6 +1643,9 @@ function stopLeaderJobs() {
   } catch {}
   try {
     cliNodeGuard?.stop?.()
+  } catch {}
+  try {
+    cragZombieGuard?.stop?.()
   } catch {}
   try {
     usageProbeMonitor?.stop?.()
@@ -2428,6 +2493,11 @@ server.listen(cfg.port, cfg.host, () => {
       cliNodeGuard?.start?.({ immediate: true })
     } catch (e) {
       console.warn('[cli-node-guard] start failed', e?.message || e)
+    }
+    try {
+      cragZombieGuard?.start?.()
+    } catch (e) {
+      console.warn('[crag-zombie-guard] start failed', e?.message || e)
     }
     try {
       usageProbeMonitor?.start?.({ immediate: true })
