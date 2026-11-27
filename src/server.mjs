@@ -60,6 +60,7 @@ import {
 import { loadModelPolicy } from './lib/protocol/model-policy.mjs'
 import { loadGeminiModelPolicy } from './lib/protocol/gemini-model-policy.mjs'
 import { gatewayModelCatalog } from './lib/protocol/models.mjs'
+import { codexUnifiedForUsageProbe } from './lib/protocol/codex-usage.mjs'
 import {
   createCredentialRefreshMonitor,
   normalizeCredentialRefreshConfig,
@@ -817,7 +818,14 @@ const slotCapacityReconciler = createSlotCapacityReconciler({
 usageProbeMonitor = createUsageProbeMonitor({
   config: routingConfig.usage_probe,
   listTargets: () => listVms(cfg.paths.project),
-  accountForVm: accountForUsageProbe,
+  // Codex quota lives on the slot file (vm.codex.extra), not in the accounts
+  // repo, and summarization drops the extra while keeping the built view — so
+  // synthesize from vm.codex_usage. Elapsed codex windows then get the same
+  // one-shot /usage hop claude slots get.
+  accountForVm: (vm) =>
+    isCodexVm(vm)
+      ? { vm_id: vm.id, unified: codexUnifiedForUsageProbe(vm?.codex_usage || {}) }
+      : accountForUsageProbe(vm),
   isActive: usageProbeActive,
   reconcile: (vm, account) => {
     const id = account?.account_id || vm?.claude?.account_uuid || vm?.account_uuid || vm?.id

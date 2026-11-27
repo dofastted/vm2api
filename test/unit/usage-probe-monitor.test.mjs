@@ -6,6 +6,7 @@ import {
   normalizeUsageProbeConfig,
   createUsageProbeMonitor,
 } from '../../src/lib/oauth/usage-probe-monitor.mjs'
+import { codexUnifiedForUsageProbe, buildCodexUsageView, extraToCodexSnapshot } from '../../src/lib/protocol/codex-usage.mjs'
 
 const live = {
   id: 'vm-13',
@@ -253,4 +254,87 @@ test('#163 A18: a failed hop keeps the old sample and backs off instead of retry
   const second = await monitor.probeNow('vm-13')
   assert.equal(second.reason, 'probe_backoff')
   assert.equal(calls, 1)
+})
+
+test('codex extra: an elapsed 5h reset schedules the one /usage hop', () => {
+  const now = Date.parse('2026-11-26T12:22:00.000Z')
+  const unified = codexUnifiedForUsageProbe({
+    codex_5h_used_percent: 100,
+    codex_5h_window_minutes: 300,
+    codex_5h_reset_at: '2026-11-26T11:59:33.000Z',
+    codex_7d_used_percent: 67,
+    codex_7d_window_minutes: 10080,
+    codex_7d_reset_at: '2026-12-02T03:13:55.000Z',
+    codex_usage_updated_at: '2026-11-26T11:34:32.601Z',
+  })
+  assert.deepEqual(isUsageProbeDue({ unified }, { now }), { due: true, reason: 'extra_window_elapsed' })
+})
+
+test('codex extra: a fresh sample after the reset holds for the gap', () => {
+  const now = Date.parse('2026-11-26T12:22:00.000Z')
+  const unified = codexUnifiedForUsageProbe({
+    codex_5h_used_percent: 2,
+    codex_5h_window_minutes: 300,
+    codex_5h_reset_at: '2026-11-26T11:59:33.000Z',
+    codex_usage_updated_at: '2026-11-26T12:07:36.000Z',
+  })
+  assert.equal(isUsageProbeDue({ unified }, { now }).due, false)
+})
+
+test('codex extra: a window still in the future stays passive', () => {
+  const now = Date.parse('2026-11-26T12:22:00.000Z')
+  const unified = codexUnifiedForUsageProbe({
+    codex_5h_used_percent: 40,
+    codex_5h_window_minutes: 300,
+    codex_5h_reset_at: '2026-11-26T16:00:00.000Z',
+    codex_usage_updated_at: '2026-11-26T12:00:00.000Z',
+  })
+  assert.deepEqual(isUsageProbeDue({ unified }, { now }), { due: false, reason: 'list_passive_only' })
+})
+
+test('codex extra: empty extra degrades to the never-sampled hop', () => {
+  assert.deepEqual(isUsageProbeDue({ unified: codexUnifiedForUsageProbe({}) }, { now: 0 }), {
+    due: true,
+    reason: 'never_sampled_official',
+  })
+})
+
+test('codex extra: primary/secondary aliases classify into the 5h/7d windows', () => {
+  const unified = codexUnifiedForUsageProbe({
+    codex_primary_window_minutes: 10080,
+    codex_primary_reset_at: '2026-12-02T03:13:55.000Z',
+    codex_secondary_window_minutes: 300,
+    codex_secondary_reset_at: '2026-11-26T11:59:33.000Z',
+    codex_usage_updated_at: '2026-11-26T11:34:32.601Z',
+  })
+  assert.equal(unified.headers['5h'].reset, '2026-11-26T11:59:33.000Z')
+  assert.equal(unified.headers['7d'].reset, '2026-12-02T03:13:55.000Z')
+  assert.equal(unified.headers.sampled_at, '2026-11-26T11:34:32.601Z')
+  assert.equal(unified.last_probe.at, '2026-11-26T11:34:32.601Z')
+})
+
+test('codex extra: the summarized slot shape (codex_usage view, no extra) drives the elapsed hop', () => {
+  // listVms() summarizes: the slot-file extra is dropped, the built view stays.
+  // The monitor must work from exactly that shape, not only from raw extra.
+  const now = Date.parse('2026-11-26T12:22:00.000Z')
+  const view = buildCodexUsageView(
+    extraToCodexSnapshot({
+      codex_5h_used_percent: 100,
+      codex_5h_window_minutes: 300,
+      codex_5h_reset_at: '2026-11-26T11:59:33.000Z',
+      codex_7d_used_percent: 67,
+      codex_7d_window_minutes: 10080,
+      codex_7d_reset_at: '2026-12-02T03:13:55.000Z',
+      codex_usage_updated_at: '2026-11-26T11:34:32.601Z',
+    }),
+  )
+  const unified = codexUnifiedForUsageProbe(view)
+  assert.deepEqual(isUsageProbeDue({ unified }, { now }), { due: true, reason: 'extra_window_elapsed' })
+})
+
+test('codex extra: a summarized slot without codex_usage stays never-sampled', () => {
+  assert.deepEqual(isUsageProbeDue({ unified: codexUnifiedForUsageProbe(null) }, { now: 0 }), {
+    due: true,
+    reason: 'never_sampled_official',
+  })
 })
