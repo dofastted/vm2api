@@ -65,22 +65,192 @@ export function tarAvailable() {
   }
 }
 
-export function pgDumpAvailable() {
+export function parsePgMajorVersion(output) {
+  const text = String(output || '')
+  const m = text.match(/\(PostgreSQL\)\s+(\d+)/i) || text.match(/\b(\d+)\.\d+/)
+  return m ? Number(m[1]) : null
+}
+
+export function isPgVersionMismatchStderr(stderr) {
+  return /server version mismatch/i.test(String(stderr || ''))
+}
+
+export async function queryPgServerMajorVersion(pool) {
+  if (!pool) return null
   try {
-    const r = spawnSync('pg_dump', ['--version'], { stdio: 'ignore' })
-    return r.status === 0
+    const res = await pool.query('SHOW server_version_num')
+    const num = Number(res?.rows?.[0]?.server_version_num)
+    if (Number.isFinite(num) && num >= 10000) return Math.floor(num / 10000)
+  } catch {}
+  return null
+}
+
+function isLocalPgDsn(dsn) {
+  if (!dsn) return false
+  try {
+    const host = new URL(dsn).hostname.toLowerCase().replace(/^\[|\]$/g, '')
+    return host === '127.0.0.1' || host === 'localhost' || host === '::1'
   } catch {
     return false
   }
 }
 
-export function pgRestoreAvailable() {
+/** Rewrite a local PG DSN for execution inside the managed PostgreSQL container (port 5432). */
+export function buildDockerPgUri(dsn) {
+  const { uri, env } = buildPgToolInvocation(dsn)
+  if (!uri) return { uri: '', env }
   try {
-    const r = spawnSync('pg_restore', ['--version'], { stdio: 'ignore' })
-    return r.status === 0
+    const u = new URL(uri)
+    u.hostname = '127.0.0.1'
+    u.port = '5432'
+    return { uri: u.toString(), env }
   } catch {
-    return false
+    return { uri, env }
   }
+}
+
+function versionSatisfies(clientMajor, serverMajor) {
+  if (!serverMajor) return true
+  return clientMajor != null && clientMajor >= serverMajor
+}
+
+function probeBinaryVersion(bin, spawnImpl) {
+  try {
+    const r = spawnImpl(bin, ['--version'], { stdio: 'pipe', encoding: 'utf8' })
+    if (r?.status !== 0) return null
+    return { ok: true, major: parsePgMajorVersion(r.stdout || r.stderr) }
+  } catch {
+    return null
+  }
+}
+
+function probeDockerToolVersion(container, tool, spawnImpl) {
+  try {
+    const r = spawnImpl('docker', ['exec', container, tool, '--version'], { stdio: 'pipe', encoding: 'utf8' })
+    if (r?.status !== 0) return null
+    return { ok: true, major: parsePgMajorVersion(r.stdout || r.stderr) }
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Resolve a version-compatible `pg_dump` or `pg_restore` runner:
+ *   1. Explicit env override (`KIN_PG_DUMP_BIN` / `KIN_PG_RESTORE_BIN`)
+ *   2. Host PATH binary (`pg_dump` / `pg_restore`)
+ *   3. Versioned Linux PGDG binaries (`/usr/lib/postgresql/<N>/bin/<tool>`, highest major first)
+ *   4. Managed local Docker container (`docker exec <container> <tool>`) when DSN targets loopback
+ *
+ * Returns `{ mode: 'binary', bin, major }` or `{ mode: 'docker', container, tool, major }`, or `null`.
+ */
+export function resolvePgTool(
+  tool,
+  {
+    serverMajor = null,
+    connectionString = '',
+    env = process.env,
+    spawnImpl = spawnSync,
+    readdirImpl = fs.readdirSync,
+  } = {},
+) {
+  const envKey = tool === 'pg_dump' ? 'KIN_PG_DUMP_BIN' : 'KIN_PG_RESTORE_BIN'
+  const explicitBin = String(env?.[envKey] || '').trim()
+  if (explicitBin) {
+    const probed = probeBinaryVersion(explicitBin, spawnImpl)
+    if (probed && versionSatisfies(probed.major, serverMajor)) {
+      return { mode: 'binary', bin: explicitBin, major: probed.major }
+    }
+  }
+
+  const hostProbe = probeBinaryVersion(tool, spawnImpl)
+  if (hostProbe && versionSatisfies(hostProbe.major, serverMajor)) {
+    return { mode: 'binary', bin: tool, major: hostProbe.major }
+  }
+
+  // Scan PGDG multi-version install directories (e.g. /usr/lib/postgresql/18/bin/pg_dump).
+  try {
+    const dirs = readdirImpl('/usr/lib/postgresql')
+      .filter((d) => /^\d+$/.test(String(d)))
+      .map(Number)
+      .sort((a, b) => b - a)
+    for (const ver of dirs) {
+      if (serverMajor && ver < serverMajor) break
+      const candidate = `/usr/lib/postgresql/${ver}/bin/${tool}`
+      const probed = probeBinaryVersion(candidate, spawnImpl)
+      if (probed && versionSatisfies(probed.major, serverMajor)) {
+        return { mode: 'binary', bin: candidate, major: probed.major }
+      }
+    }
+  } catch {}
+
+  if (isLocalPgDsn(connectionString)) {
+    const container = String(env?.VM2API_PG_CONTAINER || 'vm2api-postgres').trim()
+    if (container) {
+      const probed = probeDockerToolVersion(container, tool, spawnImpl)
+      if (probed && versionSatisfies(probed.major, serverMajor)) {
+        return { mode: 'docker', container, tool, major: probed.major }
+      }
+    }
+  }
+
+  return null
+}
+
+export function pgDumpAvailable(opts = {}) {
+  return resolvePgTool('pg_dump', opts) !== null
+}
+
+export function pgRestoreAvailable(opts = {}) {
+  return resolvePgTool('pg_restore', opts) !== null
+}
+
+function execPgDump(runner, { dsn, dumpArgs, outFile, spawnImpl = spawnSync }) {
+  if (runner.mode === 'docker') {
+    const { uri, env } = buildDockerPgUri(dsn)
+    const args = [
+      'exec',
+      ...(env.PGPASSWORD ? ['-e', 'PGPASSWORD'] : []),
+      runner.container,
+      'pg_dump',
+      ...dumpArgs,
+      uri,
+    ]
+    const outFd = fs.openSync(outFile, 'w', 0o600)
+    try {
+      return spawnImpl('docker', args, { stdio: ['ignore', outFd, 'pipe'], env })
+    } finally {
+      try {
+        fs.closeSync(outFd)
+      } catch {}
+    }
+  }
+  const { uri, env } = buildPgToolInvocation(dsn)
+  return spawnImpl(runner.bin, [...dumpArgs, `--file=${outFile}`, uri], { stdio: 'pipe', env })
+}
+
+function execPgRestore(runner, { connectionString, restoreArgs, dbFile, spawnImpl = spawnSync }) {
+  if (runner.mode === 'docker') {
+    const { uri, env } = buildDockerPgUri(connectionString)
+    const args = [
+      'exec',
+      '-i',
+      ...(env.PGPASSWORD ? ['-e', 'PGPASSWORD'] : []),
+      runner.container,
+      'pg_restore',
+      ...restoreArgs,
+      `--dbname=${uri}`,
+    ]
+    const inFd = fs.openSync(dbFile, 'r')
+    try {
+      return spawnImpl('docker', args, { stdio: [inFd, 'pipe', 'pipe'], env })
+    } finally {
+      try {
+        fs.closeSync(inFd)
+      } catch {}
+    }
+  }
+  const { uri, env } = buildPgToolInvocation(connectionString)
+  return spawnImpl(runner.bin, [...restoreArgs, `--dbname=${uri}`, dbFile], { stdio: 'pipe', env })
 }
 
 function mkdtempOnDataVolume({ tmpDir }) {
@@ -288,14 +458,25 @@ async function dumpPgLogicalNdjsonGz(pool, outFile) {
  * async `TRUNCATE ... AccessExclusiveLock` transaction and any main-thread timer
  * issuing a synchronous `PgSyncDb` (`Atomics.wait`) query.
  */
-export async function restorePgSnapshotJob({ pool, connectionString, dbFile }) {
+export async function restorePgSnapshotJob({
+  pool,
+  connectionString,
+  dbFile,
+  resolveToolImpl = resolvePgTool,
+  spawnImpl = spawnSync,
+}) {
   if (dbFile.endsWith('.pgdump')) {
-    if (!pgRestoreAvailable()) {
-      throw Object.assign(new Error('pg_restore binary is required to restore custom PostgreSQL dumps'), {
-        code: 'pg_restore_missing',
-      })
+    const serverMajor = await queryPgServerMajorVersion(pool)
+    const runner = resolveToolImpl('pg_restore', { serverMajor, connectionString, spawnImpl })
+    if (!runner) {
+      const verHint = serverMajor ? ` (>= ${serverMajor})` : ''
+      throw Object.assign(
+        new Error(`compatible pg_restore binary${verHint} is required to restore custom PostgreSQL dumps`),
+        {
+          code: 'pg_restore_missing',
+        },
+      )
     }
-    const { uri, env } = buildPgToolInvocation(connectionString)
     const restoreArgs = ['--clean', '--if-exists', '--no-owner', '--no-privileges']
     if (pool) {
       try {
@@ -306,8 +487,7 @@ export async function restorePgSnapshotJob({ pool, connectionString, dbFile }) {
         }
       } catch {}
     }
-    restoreArgs.push(`--dbname=${uri}`, dbFile)
-    const r = spawnSync('pg_restore', restoreArgs, { stdio: 'pipe', env })
+    const r = execPgRestore(runner, { connectionString, restoreArgs, dbFile, spawnImpl })
     if (r.status !== 0) {
       throw new Error(`pg_restore failed: ${String(r.stderr || '').slice(0, 300)}`)
     }
@@ -432,12 +612,14 @@ export async function runPgBackupJob(ctx, { id, createdAt, kind = 'manual', note
     let dbRelPath
     let pgFormat
     const dsn = buildPgConnectionString(pgConfig)
+    const serverMajor = await queryPgServerMajorVersion(pool)
+    const dumpRunner = dsn ? resolvePgTool('pg_dump', { serverMajor, connectionString: dsn }) : null
 
-    if (pgDumpAvailable() && dsn) {
+    let dumpedCustom = false
+    if (dumpRunner && dsn) {
       dbSnap = path.join(dbDir, 'kin.pgdump')
       dbRelPath = 'db/kin.pgdump'
       pgFormat = 'pg_dump_custom'
-      const { uri, env } = buildPgToolInvocation(dsn)
       const dumpArgs = ['--format=custom', '--no-owner', '--no-privileges']
       if (pool) {
         try {
@@ -448,18 +630,30 @@ export async function runPgBackupJob(ctx, { id, createdAt, kind = 'manual', note
           }
         } catch {}
       }
-      dumpArgs.push(`--file=${dbSnap}`, uri)
-      const r = spawnSync('pg_dump', dumpArgs, { stdio: 'pipe', env })
-      if (r.status !== 0) {
-        throw new Error(`pg_dump failed: ${String(r.stderr || '').slice(0, 300)}`)
+      const r = execPgDump(dumpRunner, { dsn, dumpArgs, outFile: dbSnap })
+      if (r.status === 0) {
+        dumpedCustom = true
+      } else {
+        try {
+          fs.rmSync(dbSnap, { force: true })
+        } catch {}
+        const stderr = String(r.stderr || '').slice(0, 300)
+        if (pool && isPgVersionMismatchStderr(stderr)) {
+          console.warn(`[backup] pg_dump version mismatch, falling back to logical NDJSON dump: ${stderr}`)
+        } else {
+          throw new Error(`pg_dump failed: ${stderr}`)
+        }
       }
-    } else if (pool) {
-      dbSnap = path.join(dbDir, 'kin.pg.ndjson.gz')
-      dbRelPath = 'db/kin.pg.ndjson.gz'
-      pgFormat = 'pg_logical_ndjson_gz'
-      await dumpPgLogicalNdjsonGz(pool, dbSnap)
-    } else {
-      throw new Error('PostgreSQL pool unavailable for backup')
+    }
+    if (!dumpedCustom) {
+      if (pool) {
+        dbSnap = path.join(dbDir, 'kin.pg.ndjson.gz')
+        dbRelPath = 'db/kin.pg.ndjson.gz'
+        pgFormat = 'pg_logical_ndjson_gz'
+        await dumpPgLogicalNdjsonGz(pool, dbSnap)
+      } else {
+        throw new Error('PostgreSQL pool unavailable for backup')
+      }
     }
 
     const dbBytes = fs.statSync(dbSnap).size
