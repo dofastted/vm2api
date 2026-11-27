@@ -730,8 +730,21 @@ SANDBOX_ERROR_CODES = frozenset(
     {
         "gemini_sandbox_apparmor_restricted",
         "gemini_sandbox_unavailable",
+        "gemini_host_resource_exhausted",
     }
 )
+
+_LICENSE_HOST_RESOURCE_ERRNOS = frozenset({errno.EMFILE, errno.ENFILE})
+
+
+def classify_craggemini_license_host_error(exc):
+    if isinstance(exc, OSError) and exc.errno in _LICENSE_HOST_RESOURCE_ERRNOS:
+        return 503, "gemini_host_resource_exhausted"
+    if isinstance(exc, subprocess.SubprocessError):
+        for err in (exc.__cause__, exc.__context__):
+            if isinstance(err, OSError) and err.errno in _LICENSE_HOST_RESOURCE_ERRNOS:
+                return 503, "gemini_host_resource_exhausted"
+    return None
 SAFE_AUTH_REASON = re.compile(
     r"\A(?:timeout|os_error|failed|exited|exit_code=-?[0-9]{1,5}|signal=[0-9]{1,3})\Z"
 )
@@ -6894,7 +6907,11 @@ class Host:
             return data
         except Failure:
             raise
-        except (OSError, subprocess.SubprocessError, ValueError):
+        except (OSError, subprocess.SubprocessError, ValueError) as error:
+            classified = classify_craggemini_license_host_error(error)
+            if classified is not None:
+                status_code, error_code = classified
+                raise Failure(status_code, error_code) from None
             raise Failure(503, "license_unconfigured") from None
         finally:
             if staging_dir is not None:
