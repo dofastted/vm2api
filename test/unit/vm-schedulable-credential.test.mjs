@@ -90,3 +90,16 @@ test('Claude seat with an expired ticket and a bare refresh_failed is not schedu
   }
   assert.equal(vmHasSchedulableCredential(vm), false)
 })
+
+test('expired Claude seat with setup errors (proxy_required / config_failed) remains schedulable after proxy repair', () => {
+  const expired = Math.floor((Date.now() - 86400_000) / 1000)
+  for (const code of ['proxy_required', 'config_failed', 'worker_upgrade_required']) {
+    const vm = {
+      id: 'vm-03',
+      platform: 'anthropic',
+      family: 'claude',
+      claude: { has_access: true, has_refresh: true, expires_at: expired, refresh_error: code },
+    }
+    assert.equal(vmHasSchedulableCredential(vm), true, code)
+  }
+})

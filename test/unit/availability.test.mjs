@@ -645,7 +645,14 @@ test('a bare refresh_failed does not eject a ticket that is still live', () => {
   const now = Date.now()
   const live = now + 3600_000
   const av = evaluateAccount({
-    vm: { claude: { has_access: true, has_refresh: true, expires_at: Math.floor(live / 1000), refresh_error: 'refresh_failed' } },
+    vm: {
+      claude: {
+        has_access: true,
+        has_refresh: true,
+        expires_at: Math.floor(live / 1000),
+        refresh_error: 'refresh_failed',
+      },
+    },
     schedulable: true,
     lastProbe: usageOk,
     workerCredential: { has_access: true, has_refresh: true, needs_refresh: false, expires_at: live },
@@ -688,4 +695,52 @@ test('a fresher worker expiry outvotes a stale record with refresh_failed', () =
     now,
   })
   assert.notEqual(av.reason, 'credential_refresh_failed')
+})
+
+test('expired access with pre-exchange setup errors (proxy_required / config_failed / worker_upgrade_required) stays recoverable', () => {
+  const now = Date.now()
+  const expired = now - 86400_000
+  for (const code of ['proxy_required', 'config_failed', 'worker_upgrade_required', 'upstream_transport_error']) {
+    const av = evaluateAccount({
+      vm: {
+        claude: {
+          has_access: true,
+          has_refresh: true,
+          expires_at: Math.floor(expired / 1000),
+          refresh_error: code,
+        },
+      },
+      schedulable: true,
+      lastProbe: usageOk,
+      workerCredential: { has_access: true, has_refresh: true, needs_refresh: true, expires_at: expired },
+      quota: { utilization_5h: 0.1, status_5h: 'allowed' },
+      now,
+    })
+    assert.notEqual(av.reason, 'credential_refresh_failed', code)
+    assert.equal(av.accept, true, code)
+  }
+})
+
+test('expired access with oauth_refresh_failed or refresh_outcome_unknown is 无效凭证', () => {
+  const now = Date.now()
+  const expired = now - 86400_000
+  for (const code of ['oauth_refresh_failed', 'refresh_outcome_unknown']) {
+    const av = evaluateAccount({
+      vm: {
+        claude: {
+          has_access: true,
+          has_refresh: true,
+          expires_at: Math.floor(expired / 1000),
+          refresh_error: code,
+        },
+      },
+      schedulable: true,
+      workerCredential: { has_access: true, has_refresh: true, needs_refresh: true, expires_at: expired },
+      quota: { utilization_5h: 0.1, status_5h: 'allowed' },
+      now,
+    })
+    assert.equal(av.key, 'bad', code)
+    assert.equal(av.reason, 'credential_refresh_failed', code)
+    assert.equal(av.accept, false, code)
+  }
 })

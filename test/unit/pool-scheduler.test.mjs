@@ -980,6 +980,97 @@ test('scheduler hard-excludes worker refresh failure', async (t) => {
   selected.release()
 })
 
+test('scheduler consults live state.worker_status.credential before ejecting stale refresh_failed vm record', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const expiredSec = Math.floor((Date.now() - 2 * 86400_000) / 1000)
+  const freshMs = Date.now() + 3600_000
+  const file = path.join(root, 'vms', 'vm-01.json')
+  const vm = JSON.parse(fs.readFileSync(file, 'utf8'))
+  vm.claude = {
+    ...vm.claude,
+    has_access: true,
+    has_refresh: true,
+    expires_at: expiredSec,
+    refresh_error: 'refresh_failed',
+  }
+  fs.writeFileSync(file, JSON.stringify(vm))
+
+  const account = { account_id: 'account-1', status: 'active', unified: { status_5h: 'allowed', utilization_5h: 0.1 } }
+  const runtimeRepo = new RuntimeRepo(new Map([['account-1', account]]))
+  const freshStatus = {
+    ok: true,
+    credential: { generation: 2, has_access: true, has_refresh: true, needs_refresh: false, expires_at: freshMs },
+  }
+  runtimeRepo.upsert({
+    account_id: 'account-1',
+    vm_id: 'vm-01',
+    status: 'ready',
+    worker_status: freshStatus,
+  })
+  let liveHealth = freshStatus
+  const pool = new PoolScheduler({
+    projectRoot: root,
+    runtimeRepo,
+    accountQuota: {
+      canAccept: () => ({ ok: true }),
+      repo: { get: (id) => (id === 'account-1' ? account : null) },
+    },
+    workerHealth: async () => liveHealth,
+    config: { fallback_wait_timeout_ms: 5, sticky_wait_timeout_ms: 5 },
+  })
+  // Direct checkEligibility without knownHealth exercises state.worker_status.credential.
+  const directCheck = await pool.checkEligibility({
+    vm,
+    account,
+    state: runtimeRepo.get('account-1'),
+    model: 'claude-test',
+  })
+  assert.equal(directCheck.ok, true)
+
+  const selected = await pool.selectAndReserve({
+    model: 'claude-test',
+    excluded: new Set(['account-2']),
+    allowWait: false,
+  })
+  assert.equal(selected.ok, true)
+  assert.equal(selected.vmId, 'vm-01')
+  selected.release()
+
+  const staleStatus = {
+    ok: true,
+    credential: {
+      generation: 1,
+      has_access: true,
+      has_refresh: true,
+      needs_refresh: true,
+      expires_at: expiredSec * 1000,
+    },
+  }
+  liveHealth = staleStatus
+  runtimeRepo.upsert({
+    account_id: 'account-1',
+    vm_id: 'vm-01',
+    status: 'ready',
+    worker_status: staleStatus,
+  })
+  pool.healthCache.clear()
+  const directRejected = await pool.checkEligibility({
+    vm,
+    account,
+    state: runtimeRepo.get('account-1'),
+    model: 'claude-test',
+  })
+  assert.equal(directRejected.ok, false)
+  assert.equal(directRejected.reason, 'credential_refresh_failed')
+  const rejected = await pool.selectAndReserve({
+    model: 'claude-test',
+    excluded: new Set(['account-2']),
+    allowWait: false,
+  })
+  assert.equal(rejected.ok, false)
+})
+
 test('maxConcurrency 0 does not fall back to 20', async (t) => {
   const root = project()
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
