@@ -27,7 +27,7 @@ export const REFUSAL_DEVICE_BLOCK_SETTING = 'refusal_device_block_enabled'
 export const REFUSAL_SESSION_BLOCK_SETTING = 'refusal_session_block_enabled'
 export const REFUSAL_SIMILARITY_CHOICES = Object.freeze([80, 85, 90, 95])
 export const RISK_AUDIT_SETTING = 'risk_audit_policy'
-export const DEFAULT_BAN_STEPS = Object.freeze([10, 1440, 0])
+export const DEFAULT_BAN_STEPS = Object.freeze([10, 10, 0])
 const DEFAULT_RISK_POLICY = Object.freeze({
   ban_steps: DEFAULT_BAN_STEPS,
   blocked_tools: [],
@@ -258,6 +258,14 @@ function refusalBlockSuffix(match) {
     }
   }
   if (match.kind === 'session') {
+    const jevBlocked = String(match.row?.reason || '').startsWith('jev:')
+    if (jevBlocked) {
+      return {
+        message: '此会话已封禁，请开启新会话。',
+        standalone: true,
+        details: { reason: 'session', ban_reason: String(match.row.reason).slice(0, 80) },
+      }
+    }
     return {
       message: ' 这个会话此前被上游拒答，已永久停止转发；请开启新会话。',
       details: { reason: 'session' },
@@ -403,10 +411,10 @@ function validateRiskPolicy(policy) {
         !Number.isInteger(minutes) ||
         minutes < 0 ||
         minutes > 525600 ||
-        (index < steps.length - 1 && (minutes === 0 || (index > 0 && minutes <= steps[index - 1]))),
+        (index < steps.length - 1 && (minutes === 0 || (index > 0 && minutes < steps[index - 1]))),
     )
   ) {
-    problems.push('封禁阶梯必须为递增的整数分钟，末项为 0（永久），最多十级')
+    problems.push('封禁阶梯必须为非递减的整数分钟，末项为 0（永久），最多十级')
   }
   if (
     !Array.isArray(policy.blocked_tools) ||

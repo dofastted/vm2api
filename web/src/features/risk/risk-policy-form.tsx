@@ -100,7 +100,7 @@ export function RiskPolicyForm({
   const validSteps = draft.ban_steps.every(
     (minutes, index, steps) =>
       index === steps.length - 1 ||
-      (minutes > 0 && (index === 0 || minutes > steps[index - 1]))
+      (minutes > 0 && (index === 0 || minutes >= steps[index - 1]))
   )
   const validMargins = draft.model_margin <= draft.route_margin
   const validTools = draft.blocked_tools.every((rule) => rule.message.trim())
@@ -209,14 +209,14 @@ export function RiskPolicyForm({
             <>
               <Group
                 title='分级封禁'
-                hint='按违规次数从短到长；最后一级为永久。会话始终单独封禁。'
+                hint='按违规次数非递减配置；最后一级为永久。会话始终单独封禁。'
                 action={
                   <Button
                     type='button'
                     size='sm'
                     variant='ghost'
                     className='cursor-pointer'
-                    onClick={() => change('ban_steps', [10, 1440, 0])}
+                    onClick={() => change('ban_steps', [10, 10, 0])}
                   >
                     恢复默认阶梯
                   </Button>
@@ -265,7 +265,7 @@ export function RiskPolicyForm({
                 </div>
                 {!validSteps && (
                   <p className='text-xs text-destructive' role='alert'>
-                    封禁时长必须逐级增加。
+                    封禁时长不能小于上一级。
                   </p>
                 )}
                 <Button

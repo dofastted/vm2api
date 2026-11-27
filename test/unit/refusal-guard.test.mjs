@@ -58,8 +58,8 @@ test('strikes escalate after expiry; offending sessions stay blocked and device 
     assert.equal(devices.findBan(next, start + 600_000), null)
     const escalated = devices.recordViolation(next, { steps, now: start + 600_000 })
     assert.equal(escalated.violations, 2)
-    assert.equal(escalated.expires_at, '2026-11-18T00:10:00.000Z')
-    const permanent = devices.recordViolation(third, { steps, now: start + 600_000 + 86_400_000 })
+    assert.equal(escalated.expires_at, '2026-11-17T00:20:00.000Z')
+    const permanent = devices.recordViolation(third, { steps, now: start + 1_200_000 })
     assert.equal(permanent.violations, 3)
     assert.equal(permanent.expires_at, null)
     assert.equal(devices.findBan({ ...third, principal: 'user:b' }), null)
@@ -345,6 +345,7 @@ test('policy editor rejects ambiguous keywords and invalid punishments before wr
     false,
   )
   assert.equal(saved.size, 0)
+  assert.equal(applyRefusalGuardPatch(saved, { risk_audit: { ...policy, ban_steps: [10, 10, 0] } }).ok, true)
   assert.equal(applyRefusalGuardPatch(saved, { risk_audit: { ...policy, ban_steps: [5, 30, 60, 0] } }).ok, true)
   assert.equal(
     applyRefusalGuardPatch(saved, { risk_audit: { ...policy, block_system_prompt_rewrite: false } }).ok,

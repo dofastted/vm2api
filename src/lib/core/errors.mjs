@@ -249,6 +249,27 @@ const REFUSAL_GUARD_MESSAGES = Object.freeze({
   upstream: 'Anthropic refused this request under its usage policy. Do not retry this request.',
 })
 
+/**
+ * Disguised overload response (HTTP 429 + Retry-After) used for temporary
+ * JEV risk-control cooldowns so clients back off without probing the gate.
+ */
+export function makePolicyOverloadError({ requestId, retryAfterSec = 600 } = {}) {
+  const secs =
+    Number.isFinite(Number(retryAfterSec)) && Number(retryAfterSec) > 0
+      ? Math.max(1, Math.ceil(Number(retryAfterSec)))
+      : 600
+  return {
+    ...makeError({
+      type: ErrorType.OVERLOADED,
+      code: ErrorCode.POOL_OVERLOADED,
+      message: CLIENT_POOL_BUSY_MESSAGE,
+      status: 429,
+      request_id: requestId,
+    }),
+    retryAfterSec: secs,
+  }
+}
+
 /** Policy refusals are request rejections, not login failures or transient service failures. */
 export function makeRefusalGuardError({
   requestId,
@@ -741,8 +762,7 @@ function terminalRelayDetails(status, body) {
   // submission; mark non-retryable so SDKs stop auto-retrying (x-should-retry: false).
   if (
     status === 409 &&
-    (body?.error?.type === 'refused_continuation_conflict' ||
-      body?.error?.type === 'tool_continuation_account_changed')
+    (body?.error?.type === 'refused_continuation_conflict' || body?.error?.type === 'tool_continuation_account_changed')
   ) {
     return { retryable: false }
   }
