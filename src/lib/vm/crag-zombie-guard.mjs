@@ -127,6 +127,13 @@ export function isCragZombieGuardTarget(vm, routing = {}) {
   return resolveKernelDataplane(vm, routing) === 'crag' && resolveCragKernelVersion(vm, routing) === 'v2'
 }
 
+export function isCragZombieGuardSchedulable(vm, { ignoreMaintenanceHold = false } = {}) {
+  if (!vm) return false
+  if (vm.schedule_off === true || vm.unschedulable) return false
+  if (vm.schedule_hold && !(ignoreMaintenanceHold && vm.schedule_hold.reason === 'maintenance')) return false
+  return true
+}
+
 /** Default scan: the same in-slot exec the panel shell and cli-node guard use. */
 export async function scanSlotZombies(vm, { hostFor = slotHost, capture = execCapture, timeoutMs = 8000 } = {}) {
   const host = hostFor(vm)
@@ -146,12 +153,20 @@ export async function scanSlotZombies(vm, { hostFor = slotHost, capture = execCa
 /** true = busy, false = proven idle, null = could not read the counters. */
 export function nativeKernelBusy(report) {
   if (!report || report.ok === false || (report.status != null && report.status !== 200)) return null
-  const keys = ['active_requests', 'continuations', 'queued', 'active', 'waiting'].filter(
+  if (report.recovering === true) return true
+  const keys = ['active_requests', 'continuations', 'queued', 'active', 'waiting', 'cleaning'].filter(
     (key) => report[key] !== undefined,
   )
   if (!keys.includes('active_requests')) return null
   if (keys.some((key) => !Number.isSafeInteger(report[key]) || report[key] < 0)) return null
   if (keys.some((key) => report[key] > 0)) return true
+  if (report.idle !== undefined) {
+    if (!Number.isSafeInteger(report.idle) || report.idle < 0) return null
+    // CRAG v2 retains up to IDLE_MOST warm processes in state.runs and reports
+    // their PIDs in `pids`. Only PIDs above `idle` indicate non-idle transitions.
+    if (Array.isArray(report.pids) && report.pids.length > report.idle) return true
+    return false
+  }
   if (Array.isArray(report.pids) && report.pids.length > 0) return true
   return false
 }
@@ -161,7 +176,6 @@ function egressFingerprint(vm) {
   if (!proxy) return null
   return JSON.stringify([proxy.id ?? null, proxy.host ?? null, proxy.port ?? null, proxy.url ?? null])
 }
-
 
 export function createCragZombieGuard({
   config: initial = {},
@@ -176,6 +190,7 @@ export function createCragZombieGuard({
   recover,
   park = null,
   notify = null,
+  postScanRetryDelayMs = 1500,
   now = () => Date.now(),
   logger = console,
 } = {}) {
@@ -199,6 +214,7 @@ export function createCragZombieGuard({
       Promise.resolve()
         .then(() =>
           notify({
+            eventType: 'vm_down',
             title: `CRAG 槽位自动维护失败：${vm.name || vm.id}`,
             text: `槽位 ${vm.name || vm.id}（${vm.id}）僵尸进程自动重启后检查未通过（${code}），已设为不可调度，请在面板「恢复服务」后确认。`,
           }),
@@ -211,7 +227,7 @@ export function createCragZombieGuard({
   async function checkVm(vm, routing) {
     const at = now()
     const row = { id: vm.id, action: 'skip' }
-    if (vm.schedule_off === true || vm.unschedulable || vm.schedule_hold) return { ...row, reason: 'not_schedulable' }
+    if (!isCragZombieGuardSchedulable(vm)) return { ...row, reason: 'not_schedulable' }
     if (lastCycleAt.has(vm.id) && at - lastCycleAt.get(vm.id) < config.cooldown_sec * 1000)
       return { ...row, reason: 'cooldown' }
     if (lockBusy(vm.id)) return { ...row, reason: 'locked' }
@@ -241,17 +257,73 @@ export function createCragZombieGuard({
     if (busy === null && !faulted) return { ...row, reason: 'native_unknown' }
     if ((Number(inflight(vm.id)) || 0) > 0) return { ...row, reason: 'inflight' }
     const reason = overThreshold ? `zombies=${counts.zombies}` : 'kernel_fault'
-    const egressBefore = egressFingerprint(vm)
+    let egressBefore = egressFingerprint(vm)
+    let postChecked = false
+    let postOutcome = null
+    const verifyBeforeStop = async (fresh) => {
+      const current = fresh || (typeof getVm === 'function' ? getVm(vm.id) : null)
+      if (current) {
+        if (!isCragZombieGuardTarget(current, routing)) return { ok: false, code: 'target_changed' }
+        if (!isCragZombieGuardSchedulable(current, { ignoreMaintenanceHold: true }))
+          return { ok: false, code: 'slot_state_changed' }
+        egressBefore = egressFingerprint(current)
+      }
+      if (typeof nativeHealth === 'function') {
+        let liveBusy = null
+        try {
+          liveBusy = nativeKernelBusy(await nativeHealth(current || vm))
+        } catch {
+          liveBusy = null
+        }
+        if (liveBusy === true) return { ok: false, code: 'native_busy' }
+        if (liveBusy === null && !faulted) return { ok: false, code: 'native_unknown' }
+      }
+      if ((Number(inflight(vm.id)) || 0) > 0) return { ok: false, code: 'inflight' }
+      return { ok: true }
+    }
+    const runPostChecks = async (afterVm = null) => {
+      postChecked = true
+      const after = afterVm || (typeof getVm === 'function' ? getVm(vm.id) : null) || vm
+      if (egressFingerprint(after) !== egressBefore) {
+        reportFailure(vm, 'egress_changed', { trigger: reason })
+        postOutcome = { ok: false, code: 'egress_changed' }
+        return postOutcome
+      }
+      let recheck = null
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          recheck = await scan(after, { timeoutMs: config.scan_timeout_ms })
+        } catch {
+          recheck = null
+        }
+        if (recheck) break
+        if (attempt === 0 && postScanRetryDelayMs > 0) {
+          await new Promise((resolve) => setTimeout(resolve, postScanRetryDelayMs))
+        }
+      }
+      if (!recheck || recheck.gateway < 1 || recheck.zombies >= config.zombie_threshold) {
+        reportFailure(vm, 'post_check_failed', {
+          trigger: reason,
+          gateway: recheck?.gateway ?? null,
+          zombies: recheck?.zombies ?? null,
+        })
+        postOutcome = { ok: false, code: 'post_check_failed' }
+        return postOutcome
+      }
+      log(`${vm.id} power cycle ok; zombies now ${recheck.zombies}`)
+      postOutcome = { ok: true, zombies_after: recheck.zombies }
+      return postOutcome
+    }
     log(`${vm.id} power cycle: ${reason}${counts ? ` (gateway=${counts.gateway} total=${counts.total})` : ''}`)
     lastCycleAt.set(vm.id, at)
     let result
     try {
-      result = await recover(vm, { reason })
+      result = await recover(vm, { reason, faulted, beforeStop: verifyBeforeStop, verifyAfter: runPostChecks })
     } catch (error) {
       result = { ok: false, code: 'recover_threw', error: String(error?.message || error) }
     }
     // recover() returns an outer ok:false only before stop/start ran (busy, drain timeout,
-    // license, admission): the hold was rolled back and the slot still serves. Retry later.
+    // license, admission, beforeStop abort): the hold was rolled back and the slot still serves.
     // A thrown recover() may have stopped the slot, so it goes down the failure path.
     if (result?.ok === false && result.code !== 'recover_threw') {
       lastCycleAt.delete(vm.id)
@@ -265,25 +337,8 @@ export function createCragZombieGuard({
       reportFailure(vm, 'recover_failed', { step: failed?.id || null, step_code: code, trigger: reason })
       return { ...cycled, ok: false, code: 'recover_failed' }
     }
-    const after = (typeof getVm === 'function' ? getVm(vm.id) : null) || vm
-    if (egressFingerprint(after) !== egressBefore) {
-      reportFailure(vm, 'egress_changed', { trigger: reason })
-      return { ...cycled, ok: false, code: 'egress_changed' }
-    }
-    let recheck = null
-    try {
-      recheck = await scan(after, { timeoutMs: config.scan_timeout_ms })
-    } catch {}
-    if (!recheck || recheck.gateway < 1 || recheck.zombies >= config.zombie_threshold) {
-      reportFailure(vm, 'post_check_failed', {
-        trigger: reason,
-        gateway: recheck?.gateway ?? null,
-        zombies: recheck?.zombies ?? null,
-      })
-      return { ...cycled, ok: false, code: 'post_check_failed' }
-    }
-    log(`${vm.id} power cycle ok; zombies now ${recheck.zombies}`)
-    return { ...cycled, ok: true, zombies_after: recheck.zombies }
+    const outcome = postChecked ? postOutcome : await runPostChecks()
+    return { ...cycled, ...outcome }
   }
 
   async function tick() {

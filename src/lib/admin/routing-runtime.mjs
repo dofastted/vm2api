@@ -63,6 +63,7 @@ import { isCodexVm } from '../vm/vm-kind.mjs'
 import { syncCodexQuotaSchedule } from '../vm/vm-registry.mjs'
 import { wakeOpenAIWaiter } from '../pool/openai-account-runtime.mjs'
 import { normalizeVmConfig } from '../vm/machine-spec.mjs'
+import { normalizeCragZombieGuardConfig } from '../vm/crag-zombie-guard.mjs'
 import { applyNativeTelemetry } from '../vm/fleet-update.mjs'
 import {
   telemetryDefaultEnabled,
@@ -83,6 +84,7 @@ export function createRoutingRuntime(ctx) {
   }
   const getHealth = () => (typeof ctx.getHealthMonitor === 'function' ? ctx.getHealthMonitor() : ctx.healthMonitor)
   const getUsage = () => ctx.usageProbeMonitor
+  const getCragZombieGuard = () => ctx.cragZombieGuard
   const getNotify = () => ctx.notifyMonitor
   const setRuntimeRepo = (next) => {
     if (typeof ctx.setRuntimeRepo === 'function') ctx.setRuntimeRepo(next)
@@ -395,6 +397,16 @@ export function createRoutingRuntime(ctx) {
     getUsage()?.setConfig(routingConfig.usage_probe)
   }
 
+  function applyCragZombieGuardRoutingBody(body, previous = null) {
+    if (!body || typeof body !== 'object' || body.crag_zombie_guard == null) return
+    const routingConfig = getRouting()
+    routingConfig.crag_zombie_guard = normalizeCragZombieGuardConfig({
+      ...(previous && typeof previous === 'object' ? previous : {}),
+      ...(body.crag_zombie_guard && typeof body.crag_zombie_guard === 'object' ? body.crag_zombie_guard : {}),
+    })
+    getCragZombieGuard()?.setConfig(routingConfig.crag_zombie_guard)
+  }
+
   function applyNotifyRoutingBody(body, previous = null) {
     if (!body || typeof body !== 'object' || body.notify == null) return
     const routingConfig = getRouting()
@@ -520,6 +532,7 @@ export function createRoutingRuntime(ctx) {
     const prevOfficialCc = routingConfig.official_cc
     const prevHealthProbe = routingConfig.health_probe
     const prevUsageProbe = routingConfig.usage_probe
+    const prevCragZombieGuard = routingConfig.crag_zombie_guard
     const prevNotify = routingConfig.notify
     const prevTiers = routingConfig.tiers
     const prevIdleMs = streamIdleTimeoutMs(routingConfig)
@@ -599,6 +612,7 @@ export function createRoutingRuntime(ctx) {
     applyOfficialCcRoutingBody(body, prevOfficialCc)
     applyHealthProbeRoutingBody(body, prevHealthProbe)
     applyUsageProbeRoutingBody(body, prevUsageProbe)
+    applyCragZombieGuardRoutingBody(body, prevCragZombieGuard)
     applyNotifyRoutingBody(body, prevNotify)
     routingConfig.tiers = normalizeTiers(
       body.tiers ? mergeTierMaps(prevTiers, body.tiers) : prevTiers,

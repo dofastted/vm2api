@@ -71,7 +71,12 @@ import { ensureRemoteOfficialCredentialLink } from './lib/cluster/remote-slot-fi
 import { createCliNodeGuard } from './lib/vm/cli-node-guard.mjs'
 
 import { createSlotBridgeHealer, powerOnSlot, recoverSlot, reviveDownSlots } from './lib/vm/slot-recovery.mjs'
-import { createCragZombieGuard } from './lib/vm/crag-zombie-guard.mjs'
+import {
+  createCragZombieGuard,
+  isCragZombieGuardSchedulable,
+  isCragZombieGuardTarget,
+  normalizeCragZombieGuardConfig,
+} from './lib/vm/crag-zombie-guard.mjs'
 import { kernelFaults, rustKernelHealth } from './lib/transport/rust-kernel-client.mjs'
 import { slotExec } from './lib/vm/slot-runtime.mjs'
 import { fillVmTimezoneFromExit } from './lib/vm/proxy-timezone.mjs'
@@ -447,6 +452,9 @@ const routingRt = createRoutingRuntime({
   get usageProbeMonitor() {
     return usageProbeMonitor
   },
+  get cragZombieGuard() {
+    return cragZombieGuard
+  },
 
   get notifyMonitor() {
     return notifyMonitor
@@ -500,6 +508,7 @@ if (routingConfig.official_cc) {
 }
 routingConfig.health_probe = normalizeHealthProbeConfig(routingConfig.health_probe)
 routingConfig.usage_probe = normalizeUsageProbeConfig(routingConfig.usage_probe)
+routingConfig.crag_zombie_guard = normalizeCragZombieGuardConfig(routingConfig.crag_zombie_guard)
 routingConfig.notify = normalizeNotifyConfig(routingConfig.notify)
 routingConfig.tiers = normalizeTiers(routingConfig.tiers, routingConfig.quota, routingConfig.concurrency)
 syncTierDefaultsIntoRouting()
@@ -895,6 +904,7 @@ backupService.onRestored(async (db) => {
   }
   routingConfig.health_probe = normalizeHealthProbeConfig(routingConfig.health_probe)
   routingConfig.usage_probe = normalizeUsageProbeConfig(routingConfig.usage_probe)
+  routingConfig.crag_zombie_guard = normalizeCragZombieGuardConfig(routingConfig.crag_zombie_guard)
   routingConfig.notify = normalizeNotifyConfig(routingConfig.notify)
   routingConfig.tiers = normalizeTiers(routingConfig.tiers, routingConfig.quota, routingConfig.concurrency)
   syncTierDefaultsIntoRouting()
@@ -1358,8 +1368,12 @@ cragZombieGuard = createCragZombieGuard({
   nativeHealth: (vm) => rustKernelHealth(slotExec(cfg.paths.project, vm), { timeoutMs: 2000 }),
   isFaulted: (id) => kernelFaults.has(id),
   lockBusy: (id) => vmLockBusy(path.join(cfg.paths.project, 'vms', `${id}.json`)),
-  recover: (vm) =>
+  recover: (vm, { beforeStop = null, verifyAfter = null } = {}) =>
     withVmLock(path.join(cfg.paths.project, 'vms', `${vm.id}.json`), async () => {
+      const fresh = getVm(cfg.paths.project, vm.id)
+      if (!fresh || !isCragZombieGuardTarget(fresh, routingConfig) || !isCragZombieGuardSchedulable(fresh)) {
+        return { ok: false, code: 'slot_state_changed' }
+      }
       const result = await recoverSlot({
         projectRoot: cfg.paths.project,
         id: vm.id,
@@ -1369,15 +1383,21 @@ cragZombieGuard = createCragZombieGuard({
         watchdog: kernelWatchdog,
         poolScheduler,
         internal: true,
+        clearUnschedulable: false,
+        beforeStop,
+        verifyAfter,
       })
-      if (result.ok && result.report?.ok === true) {
+      if (result.ok && result.report?.ok === true && result.post_verify?.ok !== false) {
         panel.resetVmCircuit({ cfg, poolScheduler, id: vm.id })
         releaseKernelInstallSafetyHold(cfg.paths.project, vm.id, kernelWatchdog)
       }
       return result
     }),
   park: (id, detail) => markUnschedulable(cfg.paths.project, id, 'maintenance_failed', detail),
-  notify: (message) => dispatchNotify(routingConfig.notify, message),
+  notify: (message) =>
+    routingConfig.notify?.enabled
+      ? dispatchNotify(routingConfig.notify, message)
+      : Promise.resolve({ ok: false, skipped: 'disabled' }),
 })
 for (const vm of listVms(cfg.paths.project)) {
   if (isCodexVm(vm)) continue
@@ -1514,6 +1534,9 @@ const handlePanel = createPanelHandler({
   },
   get usageProbeMonitor() {
     return usageProbeMonitor
+  },
+  get cragZombieGuard() {
+    return cragZombieGuard
   },
   get notifyMonitor() {
     return notifyMonitor
@@ -2438,7 +2461,6 @@ server.listen(cfg.port, cfg.host, () => {
     }
     try {
       cragZombieGuard?.start?.()
-      onLeaderStop(() => cragZombieGuard?.stop?.())
     } catch (e) {
       console.warn('[crag-zombie-guard] start failed', e?.message || e)
     }

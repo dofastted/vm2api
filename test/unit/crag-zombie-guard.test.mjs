@@ -7,6 +7,7 @@ import test from 'node:test'
 import {
   ZOMBIE_SCAN_SCRIPT,
   createCragZombieGuard,
+  isCragZombieGuardSchedulable,
   isCragZombieGuardTarget,
   nativeKernelBusy,
   normalizeCragZombieGuardConfig,
@@ -14,6 +15,7 @@ import {
   scanSlotZombies,
 } from '../../src/lib/vm/crag-zombie-guard.mjs'
 import { KVM_GUEST_EXEC } from '../../src/lib/vm/slot-exec.mjs'
+import { recoverSlot } from '../../src/lib/vm/slot-recovery.mjs'
 import { stateOfReason } from '../../src/lib/pool/schedule-state.mjs'
 
 const quiet = { warn() {} }
@@ -107,6 +109,12 @@ test('targets only running CRAG v2 slots', () => {
 
 test('nativeKernelBusy only reports idle on complete counters', () => {
   assert.equal(nativeKernelBusy(IDLE), false)
+  // CRAG v2 keeps warm idle processes in state.runs and lists their PIDs in `pids`.
+  assert.equal(nativeKernelBusy({ ...IDLE, idle: 2, pids: [412, 415] }), false)
+  assert.equal(nativeKernelBusy({ ...IDLE, idle: 1, pids: [412, 499] }), true)
+  assert.equal(nativeKernelBusy({ ...IDLE, idle: -1, pids: [] }), null)
+  assert.equal(nativeKernelBusy({ ...IDLE, recovering: true }), true)
+  assert.equal(nativeKernelBusy({ ...IDLE, cleaning: 1 }), true)
   assert.equal(nativeKernelBusy({ ...IDLE, continuations: 1 }), true)
   assert.equal(nativeKernelBusy({ ...IDLE, pids: [12] }), true)
   assert.equal(nativeKernelBusy({ ok: false }), null)
@@ -162,6 +170,7 @@ function harness(over = {}) {
     },
     park: (id, detail) => state.parked.push({ id, ...detail }),
     notify: async (msg) => state.notified.push(msg),
+    postScanRetryDelayMs: 0,
     now: () => state.now,
     logger: quiet,
   })
@@ -324,4 +333,140 @@ test('any outer recover refusal is retried; a thrown recover parks', async () =>
   ;({ results } = await guard.tick())
   assert.equal(results[0].code, 'recover_failed')
   assert.equal(h.state.parked.length, 1)
+})
+
+test('beforeStop re-checks live state and native busyness inside maintenance before stopping', async () => {
+  let stopCalled = false
+  let freshVm = cragVm()
+  let healthSeq = [
+    { ...IDLE, idle: 1, pids: [412] },
+    { ...IDLE, continuations: 1 },
+  ]
+  const guard = createCragZombieGuard({
+    config: { enabled: true },
+    listTargets: () => [cragVm()],
+    getVm: () => freshVm,
+    scan: async () => ({ gateway: 1, zombies: 5, total: 5, comms: ['claude'] }),
+    nativeHealth: async () => (healthSeq.length > 1 ? healthSeq.shift() : healthSeq[0]),
+    recover: async (_vm, { beforeStop }) => {
+      const check = await beforeStop(freshVm)
+      if (!check.ok) return { ok: false, code: check.code }
+      stopCalled = true
+      return { ok: true, report: { ok: true } }
+    },
+    postScanRetryDelayMs: 0,
+    logger: quiet,
+  })
+  // 1) Continuation starts between initial nativeHealth and maintenance hold -> refused before stop.
+  let out = await guard.tick()
+  assert.equal(stopCalled, false)
+  assert.equal(out.results[0].action, 'refused')
+  assert.equal(out.results[0].reason, 'native_busy')
+
+  // 2) Slot becomes unschedulable (e.g. oauth_revoked) during scan -> refused before stop.
+  healthSeq = [{ ...IDLE, idle: 1, pids: [412] }]
+  freshVm = cragVm({ unschedulable: { reason: 'oauth_revoked' } })
+  out = await guard.tick()
+  assert.equal(stopCalled, false)
+  assert.equal(out.results[0].action, 'refused')
+  assert.equal(out.results[0].reason, 'slot_state_changed')
+
+  // 3) Slot stopped by operator during scan -> refused before stop.
+  freshVm = cragVm({ status: 'stopped' })
+  out = await guard.tick()
+  assert.equal(stopCalled, false)
+  assert.equal(out.results[0].action, 'refused')
+  assert.equal(out.results[0].reason, 'target_changed')
+
+  // 4) Helper allows our own maintenance hold only when ignoreMaintenanceHold is set.
+  assert.equal(isCragZombieGuardSchedulable(cragVm({ schedule_hold: { reason: 'maintenance' } })), false)
+  assert.equal(
+    isCragZombieGuardSchedulable(cragVm({ schedule_hold: { reason: 'maintenance' } }), { ignoreMaintenanceHold: true }),
+    true,
+  )
+  assert.equal(
+    isCragZombieGuardSchedulable(cragVm({ schedule_hold: { reason: 'proxy_cooldown' } }), {
+      ignoreMaintenanceHold: true,
+    }),
+    false,
+  )
+})
+
+test('a single transient null post-cycle scan retries once before parking', async () => {
+  const { guard, state } = harness({ zombies: [5, null, 0] })
+  const { results } = await guard.tick()
+  assert.equal(results[0].ok, true)
+  assert.equal(results[0].zombies_after, 0)
+  assert.equal(state.parked.length, 0)
+})
+
+test('recoverSlot respects beforeStop, clearUnschedulable:false, and runs verifyAfter while maintenance hold is active', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'crag-zombie-recover-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  fs.mkdirSync(path.join(root, 'vms'), { recursive: true })
+  const vmPath = path.join(root, 'vms', 'vm-c1.json')
+  const writeVm = (over = {}) =>
+    fs.writeFileSync(
+      vmPath,
+      JSON.stringify({
+        id: 'vm-c1',
+        status: 'running',
+        dataplane: 'cc',
+        schedulable: true,
+        proxy: PROXY,
+        claude: { has_access: true, has_refresh: true },
+        ...over,
+      }),
+    )
+
+  // Case 1: beforeStop aborts cleanly before stopSlot runs and rolls back maintenance hold.
+  writeVm()
+  let stopped = false
+  const aborted = await recoverSlot({
+    projectRoot: root,
+    id: 'vm-c1',
+    proxyPool: { ensureBoundToVm: () => PROXY },
+    beforeStop: async () => ({ ok: false, code: 'native_busy' }),
+    ops: {
+      stopSlot: async () => {
+        stopped = true
+        return { ok: true, action: 'stopped' }
+      },
+      settleMs: 0,
+    },
+  })
+  assert.equal(aborted.ok, false)
+  assert.equal(aborted.code, 'native_busy')
+  assert.equal(stopped, false)
+  assert.equal(JSON.parse(fs.readFileSync(vmPath, 'utf8')).schedule_hold, undefined)
+
+  // Case 2: clearUnschedulable:false preserves unschedulable AND verifyAfter runs while HOLD_MAINTENANCE is held.
+  writeVm({
+    schedulable: false,
+    schedule_disabled_reason: 'oauth_revoked',
+    unschedulable: { reason: 'oauth_revoked', detail: null, at: new Date().toISOString() },
+  })
+  let holdDuringVerify = null
+  const res = await recoverSlot({
+    projectRoot: root,
+    id: 'vm-c1',
+    proxyPool: { ensureBoundToVm: () => PROXY },
+    clearUnschedulable: false,
+    verifyAfter: async (current) => {
+      holdDuringVerify = current?.schedule_hold?.reason || null
+      return { ok: true }
+    },
+    ops: {
+      stopSlot: async () => ({ ok: true, action: 'stopped' }),
+      powerOn: async () => ({ ok: true, boot: { ok: true } }),
+      diagnose: async () => ({ ok: true, checks: [] }),
+      settleMs: 0,
+    },
+  })
+  assert.equal(res.ok, true)
+  assert.equal(res.report.ok, true)
+  assert.equal(holdDuringVerify, 'maintenance')
+  const saved = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
+  assert.equal(saved.unschedulable?.reason, 'oauth_revoked')
+  assert.equal(saved.schedule_hold, undefined)
 })
