@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest'
 import {
   reconcileSchedule,
+  scheduleAutoRenewFrom,
+  scheduleModeFrom,
+  scheduleModePayload,
   type FormState,
   type TestSchedule,
 } from './vm-test-schedule'
@@ -32,12 +35,43 @@ const formOf = (s: TestSchedule, over: Partial<FormState> = {}): FormState => ({
     weekdays: [1],
     timezone: s.timezone,
   },
+  mode: scheduleModeFrom(s.mode),
+  autoRenew: scheduleAutoRenewFrom(s),
   model: s.model,
   prompt: s.prompt,
   maxTokens: s.max_tokens ?? 0,
   reasoningEffort: '',
   codex: false,
   ...over,
+})
+
+describe('vm test schedule mode fields', () => {
+  it('missing mode and auto_renew default to test and unchecked', () => {
+    expect(scheduleModeFrom(undefined)).toBe('test')
+    expect(scheduleAutoRenewFrom({})).toBe(false)
+    expect(scheduleAutoRenewFrom({ auto_renew: true })).toBe(false)
+  })
+
+  it('reads preheat and auto_renew from stored plans', () => {
+    const plan = stored({ mode: 'preheat', auto_renew: true })
+    expect(scheduleModeFrom(plan.mode)).toBe('preheat')
+    expect(scheduleAutoRenewFrom(plan)).toBe(true)
+  })
+
+  it('save payloads only send auto_renew in preheat mode', () => {
+    expect(scheduleModePayload('test', true)).toEqual({
+      mode: 'test',
+      auto_renew: false,
+    })
+    expect(scheduleModePayload('preheat', true)).toEqual({
+      mode: 'preheat',
+      auto_renew: true,
+    })
+    expect(scheduleModePayload('preheat', false)).toEqual({
+      mode: 'preheat',
+      auto_renew: false,
+    })
+  })
 })
 
 describe('scheduled test form follows changes made elsewhere', () => {

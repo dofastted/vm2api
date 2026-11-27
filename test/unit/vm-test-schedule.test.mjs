@@ -207,16 +207,29 @@ test('sync overwrites schedule only and creates disabled plans with default dial
   assert.equal(created.reasoning_effort, 'medium')
 })
 
-test('default template persists schedule structure only', () => {
+test('default template persists schedule structure and preheat fields', () => {
   const { schedule } = runner()
   const saved = schedule.saveDefaultTemplate({
     frequency: 'weekly',
     time: '10:15',
     weekdays: [5],
     timezone: 'Asia/Shanghai',
+    mode: 'preheat',
+    auto_renew: true,
   })
   assert.equal(saved.frequency, 'weekly')
+  assert.equal(saved.mode, 'preheat')
+  assert.equal(saved.auto_renew, true)
   assert.deepEqual(schedule.getDefaultTemplate(), saved)
+  const plain = schedule.saveDefaultTemplate({
+    frequency: 'daily',
+    time: '08:00',
+    timezone: 'UTC',
+    mode: 'test',
+    auto_renew: true,
+  })
+  assert.equal(plain.mode, 'test')
+  assert.equal(plain.auto_renew, false)
   schedule.clearDefaultTemplate()
   assert.equal(schedule.getDefaultTemplate(), null)
 })

@@ -293,6 +293,8 @@ function normalizeSyncTest(test, structure) {
       prompt: test.prompt,
       max_tokens: test.max_tokens ?? null,
       reasoning_effort: test.reasoning_effort ?? null,
+      ...(Object.hasOwn(test, 'mode') ? { mode: test.mode } : {}),
+      ...(Object.hasOwn(test, 'auto_renew') ? { auto_renew: test.auto_renew } : {}),
     },
     { platform: codex ? 'openai' : 'anthropic' },
   )
@@ -457,7 +459,10 @@ export class VmTestScheduleRunner {
     const raw = this._settings().get(VM_TEST_SCHEDULE_DEFAULT_KEY)
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
     try {
-      return normalizeScheduleStructure(raw)
+      const structure = normalizeScheduleStructure(raw)
+      const mode = SCHEDULE_MODES.has(String(raw.mode)) ? String(raw.mode) : 'test'
+      const auto_renew = mode === 'preheat' && raw.auto_renew === true
+      return { ...structure, mode, auto_renew }
     } catch {
       return null
     }
@@ -466,8 +471,13 @@ export class VmTestScheduleRunner {
   saveDefaultTemplate(input) {
     const structure = normalizeScheduleStructure(input)
     compileStructuredSchedule(structure)
-    this._settings().set(VM_TEST_SCHEDULE_DEFAULT_KEY, structure)
-    return structure
+    let mode = input.mode == null ? 'test' : String(input.mode)
+    if (!SCHEDULE_MODES.has(mode)) mode = 'test'
+    let auto_renew = input.auto_renew === true
+    if (auto_renew && mode !== 'preheat') auto_renew = false
+    const saved = { ...structure, mode, auto_renew }
+    this._settings().set(VM_TEST_SCHEDULE_DEFAULT_KEY, saved)
+    return saved
   }
 
   clearDefaultTemplate() {
@@ -566,12 +576,16 @@ export class VmTestScheduleRunner {
       dialog = defaultDialogParams(vm)
     }
     const enabled = previous.enabled === true
+    const modeOverrides = {}
+    if (Object.hasOwn(structure, 'mode')) modeOverrides.mode = structure.mode
+    if (Object.hasOwn(structure, 'auto_renew')) modeOverrides.auto_renew = structure.auto_renew
     const config = normalizeVmTestSchedule(
       mergeVmTestSchedulePreserve(
         {
           enabled,
           ...normalized,
           ...dialog,
+          ...modeOverrides,
         },
         previous,
       ),
