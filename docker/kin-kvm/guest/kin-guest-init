@@ -1,0 +1,475 @@
+#!/bin/sh
+# Minimal PID 1 init for Custom Debian 13 (Trixie) EROFS KVM slots.
+# Zero cloud-init, zero systemd, zero virtio-9p, zero kin-crag-apparmor.
+#
+# Mounts:
+#   - /proc, /sys, /dev, /dev/pts, /sys/fs/cgroup
+#   - Isolated tmpfs: /run, /tmp, /run/kin/bridge, /run/kin/work, /run/kin/crag-native-assets, /run/kin-guest
+#   - Root-private volatile tmpfs: /run/vm2api-crag (0700) -> RO bind to /run/kin/crag-{license,host}
+#   - Per-slot exclusive ext4 state disk (LABEL=kinstate / /dev/vdb) -> /var/lib/kin-slot
+#     with RO bind /var/lib/kin-slot/machine-id -> /etc/machine-id & /var/lib/dbus/machine-id
+#   - Read-only shared store: virtiofs kinstore (fallback virtio-blk kinstore) -> /opt/kin/store
+#
+# Processes:
+#   - Root: /usr/local/sbin/kin-slot-agent (authenticated single-direction RPC over vsock/virtio-serial)
+#   - Fallback only (KIN_AGENT_TRANSPORT != vsock): /usr/local/sbin/kin-kernel-relay (TCP -> /run/kin-guest/kernel.sock)
+#   - kincli (999:987): crag-v2 supervised cleanly after /run/kin/kernel.json arrives.
+set -eu
+
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+KINCLI_UID=999
+KINCLI_GID=987
+STATE_DIR=/var/lib/kin-slot
+STORE_DIR=/opt/kin/store
+CRAG_TMPFS=/run/vm2api-crag
+RUN_KIN=/run/kin
+RUN_GUEST=/run/kin-guest
+AGENT_BIN=/usr/local/sbin/kin-slot-agent
+RELAY_BIN=/usr/local/sbin/kin-kernel-relay
+SSHD_BIN=/usr/sbin/sshd
+SSHD_CFG=/etc/ssh/sshd_config.kin
+AGENT_PID=''
+RELAY_PID=''
+SSHD_PID=''
+CRAG_PID=''
+SHUTTING_DOWN=0
+
+log() {
+  printf 'kin-guest-init: %s\n' "$*" >&2
+}
+
+die() {
+  log "FATAL: $*"
+  sleep 2
+  exit 1
+}
+
+mount_if_needed() {
+  fstype=$1
+  src=$2
+  dest=$3
+  opts=$4
+  [ -d "$dest" ] || mkdir -p "$dest"
+  if ! grep -Fq " $dest " /proc/mounts 2>/dev/null; then
+    mount -t "$fstype" -o "$opts" "$src" "$dest"
+  fi
+}
+
+bind_ro() {
+  src=$1
+  dest=$2
+  mount --bind "$src" "$dest"
+  mount -o remount,bind,ro,nosuid,nodev,noexec "$dest"
+}
+
+parse_cmdline() {
+  KIN_VM_ID=''
+  KIN_HOSTNAME=''
+  KIN_STORE_MODE='auto'
+  KIN_AGENT_TRANSPORT='auto'
+  KIN_VSOCK_PORT='7070'
+  KIN_AGENT_VSOCK_PORT='7071'
+  KIN_TZ='America/Los_Angeles'
+  KIN_LANG='en_US.UTF-8'
+  [ -r /proc/cmdline ] || return 0
+  for tok in $(cat /proc/cmdline); do
+    case "$tok" in
+      kin.vm_id=*) KIN_VM_ID=${tok#kin.vm_id=} ;;
+      kin.hostname=*) KIN_HOSTNAME=${tok#kin.hostname=} ;;
+      kin.store_mode=*) KIN_STORE_MODE=${tok#kin.store_mode=} ;;
+      kin.agent_transport=*) KIN_AGENT_TRANSPORT=${tok#kin.agent_transport=} ;;
+      kin.vsock_port=*) KIN_VSOCK_PORT=${tok#kin.vsock_port=} ;;
+      kin.agent_vsock_port=*) KIN_AGENT_VSOCK_PORT=${tok#kin.agent_vsock_port=} ;;
+      kin.tz=*) KIN_TZ=${tok#kin.tz=} ;;
+      kin.lang=*) KIN_LANG=${tok#kin.lang=} ;;
+    esac
+  done
+}
+
+mount_base_filesystems() {
+  for d in /proc /sys /dev /run /tmp; do
+    [ -d "$d" ] || mkdir -p "$d"
+  done
+  mount -t proc -o nosuid,nodev,noexec proc /proc 2>/dev/null || true
+  mount -t sysfs -o nosuid,nodev,noexec sysfs /sys 2>/dev/null || true
+  mount -t devtmpfs -o mode=0755,nosuid devtmpfs /dev 2>/dev/null || true
+  mkdir -p /dev/pts /dev/shm
+  mount -t devpts -o gid=5,mode=0620,nosuid,noexec devpts /dev/pts 2>/dev/null || true
+  mount -t tmpfs -o mode=1777,nosuid,nodev tmpfs /dev/shm 2>/dev/null || true
+  mount -t cgroup2 -o nosuid,nodev,noexec cgroup2 /sys/fs/cgroup 2>/dev/null || true
+
+  # Isolated volatile tmpfs layers (decoupled from /tmp).
+  mount_if_needed tmpfs tmpfs /run "mode=0755,nosuid,nodev"
+  mount_if_needed tmpfs tmpfs /tmp "mode=1777,nosuid,nodev"
+
+  mkdir -p \
+    "$RUN_KIN" \
+    "$RUN_KIN/bridge" \
+    "$RUN_KIN/work" \
+    "$RUN_KIN/crag-native-assets" \
+    "$RUN_KIN/crag-license" \
+    "$RUN_KIN/crag-host" \
+    "$RUN_GUEST"
+  chmod 0755 "$RUN_KIN"
+  mount_if_needed tmpfs tmpfs "$RUN_KIN/bridge" "mode=0750,uid=${KINCLI_UID},gid=${KINCLI_GID},nosuid,nodev,noexec"
+  mount_if_needed tmpfs tmpfs "$RUN_KIN/work" "mode=0750,uid=${KINCLI_UID},gid=${KINCLI_GID},nosuid,nodev"
+  chown "${KINCLI_UID}:${KINCLI_GID}" "$RUN_KIN/crag-native-assets" "$RUN_GUEST"
+  chmod 0700 "$RUN_KIN/crag-native-assets"
+  chmod 0770 "$RUN_GUEST"
+
+  # Root-private volatile tmpfs (f_type == 0x01021994) projected RO to /run/kin/crag-{license,host}.
+  mkdir -p "$CRAG_TMPFS"
+  mount_if_needed tmpfs tmpfs "$CRAG_TMPFS" "mode=0700,uid=0,gid=0,nosuid,nodev,noexec"
+  chmod 0700 "$CRAG_TMPFS"
+  mkdir -p "$CRAG_TMPFS/license" "$CRAG_TMPFS/host"
+  chown "${KINCLI_UID}:${KINCLI_GID}" "$CRAG_TMPFS/license"
+  chmod 0700 "$CRAG_TMPFS/license"
+  chmod 0755 "$CRAG_TMPFS/host"
+  bind_ro "$CRAG_TMPFS/license" "$RUN_KIN/crag-license"
+  bind_ro "$CRAG_TMPFS/host" "$RUN_KIN/crag-host"
+}
+
+find_state_dev() {
+  for cand in /dev/disk/by-label/kinstate /dev/disk/by-id/virtio-kinstate /dev/vdb; do
+    if [ -b "$cand" ]; then
+      printf '%s' "$cand"
+      return 0
+    fi
+  done
+  return 1
+}
+
+mount_state_ext4() {
+  [ -d "$STATE_DIR" ] || mkdir -p "$STATE_DIR"
+  state_dev=$(find_state_dev) || die "exclusive ext4 state disk (kinstate / /dev/vdb) not found"
+  mount -t ext4 -o rw,nosuid,nodev "$state_dev" "$STATE_DIR" || die "failed to mount $state_dev on $STATE_DIR"
+  mkdir -p "$STATE_DIR/home/.claude" "$STATE_DIR/run" "$STATE_DIR/managed-settings.d" "$STATE_DIR/ssh"
+  # Backward-compatible migration if an older slot-state.ext4 stored credentials under $STATE_DIR/claude.
+  if [ -d "$STATE_DIR/claude" ] && [ ! -L "$STATE_DIR/claude" ]; then
+    cp -a "$STATE_DIR/claude/." "$STATE_DIR/home/.claude/" 2>/dev/null || true
+  fi
+  if [ ! -e "$STATE_DIR/home/.claude.json" ] && [ ! -L "$STATE_DIR/home/.claude.json" ]; then
+    ln -s .claude/.claude.json "$STATE_DIR/home/.claude.json"
+  fi
+  chown 0:0 "$STATE_DIR" "$STATE_DIR/ssh"
+  chmod 0755 "$STATE_DIR"
+  chmod 0700 "$STATE_DIR/ssh"
+  if [ -f "$STATE_DIR/ssh/authorized_keys" ]; then
+    chown 0:0 "$STATE_DIR/ssh/authorized_keys"
+    chmod 0600 "$STATE_DIR/ssh/authorized_keys"
+  fi
+  chown "${KINCLI_UID}:${KINCLI_GID}" "$STATE_DIR/home" "$STATE_DIR/home/.claude" "$STATE_DIR/run"
+  chown -h "${KINCLI_UID}:${KINCLI_GID}" "$STATE_DIR/home/.claude.json" 2>/dev/null || true
+  chmod 0750 "$STATE_DIR/home" "$STATE_DIR/run"
+  chmod 0700 "$STATE_DIR/home/.claude"
+
+  # Immutable machine-id: RO bind to /etc/machine-id and /var/lib/dbus/machine-id (zero drift).
+  [ -f "$STATE_DIR/machine-id" ] || die "missing immutable $STATE_DIR/machine-id"
+  chmod 0444 "$STATE_DIR/machine-id" 2>/dev/null || true
+  if [ -e /etc/machine-id ]; then
+    bind_ro "$STATE_DIR/machine-id" /etc/machine-id
+  fi
+  if [ -e /var/lib/dbus/machine-id ] && [ ! -L /var/lib/dbus/machine-id ]; then
+    bind_ro "$STATE_DIR/machine-id" /var/lib/dbus/machine-id
+  fi
+
+  # Persistent writable $HOME on local ext4 block disk; mountpoint must be pre-baked in RO EROFS.
+  [ -d /home/kincli ] || die "missing pre-baked RO mountpoint /home/kincli"
+  mount --bind "$STATE_DIR/home" /home/kincli
+
+  # Read-only per-slot managed-settings.d projection.
+  if [ -d /etc/claude-code/managed-settings.d ]; then
+    bind_ro "$STATE_DIR/managed-settings.d" /etc/claude-code/managed-settings.d
+  fi
+
+  host_val=$KIN_HOSTNAME
+  if [ -z "$host_val" ] && [ -f "$STATE_DIR/hostname" ]; then
+    host_val=$(tr -d '[:space:]' < "$STATE_DIR/hostname")
+  fi
+  if [ -n "$host_val" ]; then
+    KIN_HOSTNAME=$host_val
+    if [ -w /proc/sys/kernel/hostname ]; then
+      printf '%s\n' "$host_val" > /proc/sys/kernel/hostname
+    fi
+  fi
+}
+
+mount_shared_store() {
+  [ -d "$STORE_DIR" ] || mkdir -p "$STORE_DIR"
+  store_type='none'
+  if [ "$KIN_STORE_MODE" != virtio-blk ]; then
+    modprobe virtiofs 2>/dev/null || true
+    if mount -t virtiofs -o ro kinstore "$STORE_DIR" 2>/dev/null; then
+      store_type='virtiofs'
+    fi
+  fi
+  if [ "$store_type" = none ]; then
+    for cand in /dev/disk/by-id/virtio-kinstore /dev/vdc; do
+      if [ -b "$cand" ]; then
+        if mount -o ro,nosuid,nodev "$cand" "$STORE_DIR" 2>/dev/null; then
+          store_type='virtio-blk'
+          break
+        fi
+      fi
+    done
+  fi
+  [ "$store_type" != none ] || die "failed to mount read-only shared store on $STORE_DIR"
+  printf '%s\n' "$store_type" > "$RUN_KIN/store-mount-type"
+  chmod 0644 "$RUN_KIN/store-mount-type"
+  log "mounted shared store ($store_type) at $STORE_DIR"
+}
+
+find_net_iface() {
+  for p in /sys/class/net/*; do
+    [ -e "$p" ] || continue
+    name=${p##*/}
+    [ "$name" = lo ] && continue
+    printf '%s' "$name"
+    return 0
+  done
+  return 1
+}
+
+setup_network() {
+  modprobe virtio_net 2>/dev/null || true
+  ip link set lo up 2>/dev/null || true
+  iface=''
+  i=0
+  while [ "$i" -lt 20 ]; do
+    if [ -e /sys/class/net/eth0 ]; then
+      iface=eth0
+      break
+    fi
+    if cand=$(find_net_iface); then
+      iface=$cand
+      break
+    fi
+    sleep 0.1 2>/dev/null || sleep 1
+    i=$((i + 1))
+  done
+  if [ -n "$iface" ]; then
+    ip addr replace 10.0.2.15/24 dev "$iface" 2>/dev/null || ip addr add 10.0.2.15/24 dev "$iface" 2>/dev/null || true
+    ip link set "$iface" up 2>/dev/null || true
+    ip route replace default via 10.0.2.2 dev "$iface" 2>/dev/null || true
+    log "network ready iface=$iface addr=10.0.2.15/24 gw=10.0.2.2"
+  else
+    log "WARNING: no non-loopback network interface found after 2s"
+  fi
+  printf 'nameserver 8.8.8.8\noptions use-vc\n' > "$RUN_KIN/resolv.conf"
+  chmod 0644 "$RUN_KIN/resolv.conf"
+  if [ -f /etc/resolv.conf ] && [ ! -L /etc/resolv.conf ]; then
+    mount --bind "$RUN_KIN/resolv.conf" /etc/resolv.conf 2>/dev/null || true
+  fi
+  host_entry=$(printf '%s' "${KIN_HOSTNAME:-}" | tr -cd 'A-Za-z0-9.-')
+  {
+    printf '127.0.0.1 localhost\n'
+    printf '::1 localhost ip6-localhost ip6-loopback\n'
+    if [ -n "$host_entry" ]; then
+      printf '127.0.1.1 %s\n' "$host_entry"
+    fi
+  } > "$RUN_KIN/hosts"
+  chmod 0644 "$RUN_KIN/hosts"
+  if [ -f /etc/hosts ] && [ ! -L /etc/hosts ]; then
+    mount --bind "$RUN_KIN/hosts" /etc/hosts 2>/dev/null || true
+  fi
+}
+
+configure_locale() {
+  if [ -z "${KIN_LANG:-}" ]; then
+    KIN_LANG='en_US.UTF-8'
+  fi
+  if [ -f /usr/lib/locale/locale-archive ] || [ -d /usr/lib/locale/en_US.utf8 ]; then
+    LANG="$KIN_LANG"
+  else
+    LANG='C.UTF-8'
+  fi
+  export LANG
+}
+
+start_sshd() {
+  if [ ! -x "$SSHD_BIN" ] || [ ! -f "$SSHD_CFG" ]; then
+    log "sshd unavailable ($SSHD_BIN / $SSHD_CFG); skipping"
+    return 0
+  fi
+  mkdir -p /run/sshd
+  chown 0:0 /run/sshd
+  chmod 0755 /run/sshd
+  host_key="$STATE_DIR/ssh/ssh_host_ed25519_key"
+  if [ ! -f "$host_key" ]; then
+    mkdir -p "$STATE_DIR/ssh"
+    chown 0:0 "$STATE_DIR/ssh"
+    chmod 0700 "$STATE_DIR/ssh"
+    ssh-keygen -q -t ed25519 -N '' -f "$host_key" || {
+      log "WARNING: failed to generate per-slot SSH host key $host_key"
+      return 0
+    }
+  fi
+  chown 0:0 "$host_key" 2>/dev/null || true
+  chmod 0600 "$host_key" 2>/dev/null || true
+  "$SSHD_BIN" -D -e -f "$SSHD_CFG" &
+  SSHD_PID=$!
+  log "started sshd pid=$SSHD_PID cfg=$SSHD_CFG"
+}
+
+start_slot_agent() {
+  modprobe vsock 2>/dev/null || true
+  modprobe vmw_vsock_virtio_transport 2>/dev/null || true
+  modprobe virtio_console 2>/dev/null || true
+  [ -x "$AGENT_BIN" ] || die "missing $AGENT_BIN"
+  "$AGENT_BIN" \
+    --transport "$KIN_AGENT_TRANSPORT" \
+    --vsock-port "$KIN_AGENT_VSOCK_PORT" \
+    --virtio-serial /dev/virtio-ports/kin.agent.0 \
+    --token-file "$STATE_DIR/.agent-token" \
+    --state-dir "$STATE_DIR" \
+    --claude-dir "$STATE_DIR/home/.claude" \
+    --run-dir "$RUN_KIN" \
+    --crag-root "$CRAG_TMPFS" \
+    --managed-preset-dir "$STATE_DIR/managed-settings.d" \
+    --store-dir "$STORE_DIR" \
+    --machine-id-file "$STATE_DIR/machine-id" \
+    --crag-pid-file "$RUN_KIN/crag.pid" \
+    --kincli-uid "$KINCLI_UID" \
+    --kincli-gid "$KINCLI_GID" &
+  AGENT_PID=$!
+  log "started kin-slot-agent pid=$AGENT_PID transport=$KIN_AGENT_TRANSPORT"
+}
+
+start_kernel_relay() {
+  [ "$KIN_AGENT_TRANSPORT" != vsock ] || return 0
+  [ -x "$RELAY_BIN" ] || die "missing fallback TCP relay $RELAY_BIN"
+  KIN_RELAY_PORT="$KIN_VSOCK_PORT" \
+  KIN_RELAY_UNIX="$RUN_GUEST/kernel.sock" \
+  "$RELAY_BIN" --port "$KIN_VSOCK_PORT" --unix "$RUN_GUEST/kernel.sock" &
+  RELAY_PID=$!
+  log "started fallback kin-kernel-relay pid=$RELAY_PID port=$KIN_VSOCK_PORT"
+}
+
+find_crag_bin() {
+  for cand in \
+    "$STORE_DIR/crag/current/crag-v2" \
+    "$STORE_DIR/crag/crag-v2" \
+    /usr/local/bin/crag-v2
+  do
+    if [ -x "$cand" ]; then
+      printf '%s' "$cand"
+      return 0
+    fi
+  done
+  return 1
+}
+
+proc_alive() {
+  pid=$1
+  [ -n "$pid" ] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  if [ -r "/proc/$pid/status" ]; then
+    while IFS= read -r _line; do
+      case "$_line" in
+        State:*)
+          # shellcheck disable=SC2086
+          set -- $_line
+          case "${2:-}" in
+            Z|X)
+              wait "$pid" 2>/dev/null || true
+              return 1
+              ;;
+          esac
+          break
+          ;;
+      esac
+    done < "/proc/$pid/status"
+  fi
+  return 0
+}
+
+supervise_crag_once() {
+  [ -f "$RUN_KIN/kernel.json" ] || return 0
+  if [ -n "$CRAG_PID" ]; then
+    if proc_alive "$CRAG_PID"; then
+      return 0
+    fi
+    wait "$CRAG_PID" 2>/dev/null || true
+    log "crag-v2 pid=$CRAG_PID exited; restarting"
+    CRAG_PID=''
+    rm -f "$RUN_KIN/crag.pid"
+  fi
+  crag_bin=$(find_crag_bin) || return 0
+  HOME=/home/kincli \
+  CLAUDE_CONFIG_DIR=/home/kincli/.claude \
+  TZ="$KIN_TZ" \
+  LANG="${LANG:-en_US.UTF-8}" \
+  LC_ALL="${LANG:-en_US.UTF-8}" \
+  setpriv --reuid="$KINCLI_UID" --regid="$KINCLI_GID" --clear-groups -- \
+    "$crag_bin" --gateway-worker --config "$RUN_KIN/kernel.json" &
+  CRAG_PID=$!
+  printf '%s\n' "$CRAG_PID" > "$RUN_KIN/.crag.pid.tmp"
+  chmod 0644 "$RUN_KIN/.crag.pid.tmp"
+  mv -f "$RUN_KIN/.crag.pid.tmp" "$RUN_KIN/crag.pid"
+  log "started crag-v2 pid=$CRAG_PID bin=$crag_bin"
+}
+
+shutdown_guest() {
+  SHUTTING_DOWN=1
+  log "shutdown signal received"
+  if [ -n "$CRAG_PID" ] && kill -0 "$CRAG_PID" 2>/dev/null; then
+    kill -TERM "$CRAG_PID" 2>/dev/null || true
+  fi
+  if [ -n "$SSHD_PID" ] && kill -0 "$SSHD_PID" 2>/dev/null; then
+    kill -TERM "$SSHD_PID" 2>/dev/null || true
+  fi
+  if [ -n "$RELAY_PID" ] && kill -0 "$RELAY_PID" 2>/dev/null; then
+    kill -TERM "$RELAY_PID" 2>/dev/null || true
+  fi
+  if [ -n "$AGENT_PID" ] && kill -0 "$AGENT_PID" 2>/dev/null; then
+    kill -TERM "$AGENT_PID" 2>/dev/null || true
+  fi
+  sleep 1
+  sync
+  umount /home/kincli 2>/dev/null || true
+  umount "$STATE_DIR" 2>/dev/null || true
+  if [ "$$" = 1 ]; then
+    poweroff -f 2>/dev/null || {
+      printf '%s\n' 1 > /proc/sys/kernel/sysrq 2>/dev/null || true
+      printf '%s\n' o > /proc/sysrq-trigger 2>/dev/null || true
+    }
+    exit 0
+  fi
+  exit 0
+}
+
+trap shutdown_guest TERM INT PWR
+
+mount_base_filesystems
+parse_cmdline
+configure_locale
+mount_state_ext4
+mount_shared_store
+setup_network
+start_sshd
+start_slot_agent
+start_kernel_relay
+
+log "guest ready vm_id=${KIN_VM_ID:-unknown} host=${KIN_HOSTNAME:-unknown} lang=${LANG:-C.UTF-8}"
+
+while [ "$SHUTTING_DOWN" = 0 ]; do
+  if [ -n "$SSHD_PID" ] && ! proc_alive "$SSHD_PID"; then
+    wait "$SSHD_PID" 2>/dev/null || true
+    log "sshd exited; restarting"
+    start_sshd
+  fi
+  if [ -n "$AGENT_PID" ] && ! proc_alive "$AGENT_PID"; then
+    wait "$AGENT_PID" 2>/dev/null || true
+    log "kin-slot-agent exited; restarting"
+    start_slot_agent
+  fi
+  if [ "$KIN_AGENT_TRANSPORT" != vsock ] && [ -n "$RELAY_PID" ] && ! proc_alive "$RELAY_PID"; then
+    wait "$RELAY_PID" 2>/dev/null || true
+    log "kin-kernel-relay exited; restarting"
+    start_kernel_relay
+  fi
+  supervise_crag_once
+  sleep 1
+done

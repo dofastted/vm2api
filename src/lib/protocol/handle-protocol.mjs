@@ -110,6 +110,7 @@ import {
 } from './pool-prompt-policy.mjs'
 import { keyModelError } from '../admin/key-models.mjs'
 import {
+  isHeadlessBridgeCaps,
   resolveInferenceEngine,
   resolveOfficialCcInference,
   resolveSlotPersonaPreset,
@@ -119,6 +120,7 @@ import { readJsonParsedCached } from '../vm/vm-file.mjs'
 import {
   makeError,
   mapUpstreamError,
+  passthroughUpstreamError,
   rewritePoolErrorForClient,
   validateRequestBody,
   mapModelError,
@@ -144,9 +146,11 @@ import {
   prepareCragPrintBody,
   projectCallerSystem,
   readSlotKernelConfig,
+  resolveCragCustomTemplate,
   resolveCragPrintPersona,
   trackCallerSystemBlock,
 } from './crag-print-prompt.mjs'
+import { sanitizeCragEnv } from './crag-whitelist.mjs'
 import { repairAnthropicRequest } from '../pool/upstream-error-policy.mjs'
 import { profileForPreset } from '../identity/official-profiles.mjs'
 import { loadVmIdentity, OFFICIAL_CLI_VERSION } from '../identity/vm-identity.mjs'
@@ -180,6 +184,8 @@ import {
 } from '../pool/batch-group.mjs'
 import {
   applyCrsUnofficialPersona,
+  configuredTimezone,
+  cragStrictPassthroughEnabled,
   detectProxiedOfficialCcFromRoutingFile,
   billingIndexesFromMessages,
   ccEntrypointFromRouting,
@@ -193,7 +199,7 @@ import {
   standingUsageFromRoutingFile,
   personaModeFromRoutingFile,
 } from '../identity/crs-persona.mjs'
-import { presetFlagEnabled } from '../identity/persona-template.mjs'
+import { canonicalPersonaCompat, presetFlagEnabled } from '../identity/persona-template.mjs'
 import {
   claudeCodeOnlyError,
   claudeCodeOnlyFromRouting,
@@ -239,13 +245,14 @@ import { jevInterceptSessionCache } from './jev-intercept.mjs'
 import { ensureClaudeWebSearch, shouldInjectClaudeWebSearch } from './web-search.mjs'
 import { dispatchStreamInference, prepareInferenceHop } from '../transport/kernel-router.mjs'
 import { syncClaudeKernelConfigsFromFile } from '../transport/rust-kernel-supervisor.mjs'
-import { ensureWorkerCredential } from '../transport/go-worker-client.mjs'
+import { ensureWorkerCredential, isNativeCragV3Plus } from '../transport/go-worker-client.mjs'
 import { formatPoolSelectionSummary } from '../pool/pool-scheduler.mjs'
 import { extraHeadersFromLimitError, isAccountQuotaExhausted } from '../pool/quota-window.mjs'
 import {
   cragForeignThinkingMode,
   dropForeignThinkingForCrag,
   filterThinkingForAccount,
+  inspectForeignThinking,
   recordThinkingOwners,
   thinkingOwners as defaultThinkingOwners,
 } from '../pool/thinking-owner.mjs'
@@ -563,7 +570,7 @@ export function createHandleProtocol(deps) {
     }
   }
 
-  function mapProtocolClientError(result, logBag, fallbackCode) {
+  function mapProtocolClientError(result, logBag, fallbackCode, { strictPassthrough = false } = {}) {
     const opaqueCrag429 = result?.policy?.reason === 'crag_opaque_429'
     const explicitCode = opaqueCrag429 ? result.policy.reason : result?.body?.error?.code || null
     const originalMessage = result?.body?.error?.message || null
@@ -625,10 +632,12 @@ export function createHandleProtocol(deps) {
       !opaqueCrag429 && logBag.risk_upstream_reason && logBag.risk_upstream_reason !== 'upstream:billing_refusal'
     const mapped = policyRefusal
       ? upstreamRiskClientError(logBag.risk_upstream_reason, logBag.risk_request_id)
-      : rewritePoolErrorForClient(
-          mapUpstreamError(result?.status || 503, result?.body, result?.headers || {}),
-          result?.body,
-        )
+      : strictPassthrough
+        ? passthroughUpstreamError(result?.status || 503, result?.body, result?.headers || {})
+        : rewritePoolErrorForClient(
+            mapUpstreamError(result?.status || 503, result?.body, result?.headers || {}),
+            result?.body,
+          )
     if (mapped.body.error.code === ErrorCode.POOL_OVERLOADED && result?.poolReason === 'subagent_limit') {
       mapped.body.error.details = { reason: result.poolReason }
     }
@@ -672,12 +681,20 @@ export function createHandleProtocol(deps) {
     if (!policyRefusal && Number(result?.retryAfterSec) > 0) {
       mapped.retryAfterSec = Math.max(1, Math.ceil(Number(result.retryAfterSec)))
     }
+    if (!policyRefusal && result?.headers && typeof result.headers === 'object') {
+      mapped.headers = result.headers
+    }
     return mapped
   }
 
   function sendMapped(res, mapped) {
-    if (mapped.retryAfterSec) res.setHeader?.('retry-after', String(mapped.retryAfterSec))
-    return json(res, mapped.status, mapped.body)
+    const forwardHeaders = mapped.headers && typeof mapped.headers === 'object' ? { ...mapped.headers } : {}
+    const hasRetryAfter = Object.keys(forwardHeaders).some((k) => k.toLowerCase() === 'retry-after')
+    if (mapped.retryAfterSec) {
+      if (!hasRetryAfter) forwardHeaders['retry-after'] = String(mapped.retryAfterSec)
+      res.setHeader?.('retry-after', String(mapped.retryAfterSec))
+    }
+    return json(res, mapped.status, mapped.body, forwardHeaders)
   }
 
   function acceptAssistantHop(result) {
@@ -1050,6 +1067,9 @@ export function createHandleProtocol(deps) {
     preparedHop = null,
     callerCwd = null,
     repaired = false,
+    dropSampling = false,
+    strictPassthrough = false,
+    safeguardsSanitized = false,
     requestContext = null,
     routing = {},
     noGoFallback = false,
@@ -1057,6 +1077,7 @@ export function createHandleProtocol(deps) {
     onOutboundHeaders = null,
     redactionPrincipal = '',
     redactionSession = '',
+    cancelSessionId = '',
     tenantId = '',
     gatewayRequestId = null,
   }) {
@@ -1080,6 +1101,9 @@ export function createHandleProtocol(deps) {
       preparedHop,
       callerCwd,
       repaired,
+      dropSampling,
+      strictPassthrough,
+      safeguardsSanitized,
       requestContext,
       slotWaitMs: candidate.slotWaitMs,
       slotWaitDeadlineMs: candidate.slotWaitDeadlineMs,
@@ -1089,6 +1113,7 @@ export function createHandleProtocol(deps) {
       ensureCredential: (exec) => ensureWorkerCredential(exec),
       redactionPrincipal,
       redactionSession,
+      cancelSessionId,
       onEnvelope,
       onOutboundHeaders,
       onEvent: async (line) => {
@@ -2130,8 +2155,8 @@ export function createHandleProtocol(deps) {
     const rememberPublic = (content) => {
       if (replayScope && Array.isArray(content)) issuedTools.remember(replayScope, inbound.messages, content)
     }
-    const sendPublicJson = (message) => {
-      const sent = json(res, 200, message)
+    const sendPublicJson = (message, upstreamHeaders = null) => {
+      const sent = json(res, 200, message, upstreamHeaders)
       if (message?.role === 'assistant' && message.type === 'message') rememberPublic(message.content)
       return sent
     }
@@ -2219,6 +2244,11 @@ export function createHandleProtocol(deps) {
         })
         .catch(() => {})
     }
+    const strictPassthroughAtIngress =
+      inferenceBackend !== 'api' &&
+      !requestContext &&
+      protocol === 'anthropic.messages' &&
+      cragStrictPassthroughEnabled(officialPassthrough, getRouting())
     let converted
     try {
       if (pfMode === 'go' && !apiGemini && !apiOpenAI && pfCompile) {
@@ -2252,6 +2282,7 @@ export function createHandleProtocol(deps) {
                 rewrite: rewriteEnabled,
                 model_map: false,
                 preserve_content_shape: officialPassthrough,
+                strict_passthrough: strictPassthroughAtIngress,
                 onSystemBlock:
                   inferenceBackend !== 'api' && !officialPassthrough
                     ? trackCallerSystemBlock(ctx.body?.system, callerEnvironment)
@@ -2310,7 +2341,9 @@ export function createHandleProtocol(deps) {
       ) {
         ctx.body = { ...ctx.body, thinking: { type: 'disabled' } }
       }
-      ctx.body = applyMinMaxTokens(ctx.body, getRouting()?.compatibility?.min_max_tokens)
+      if (!strictPassthroughAtIngress) {
+        ctx.body = applyMinMaxTokens(ctx.body, getRouting()?.compatibility?.min_max_tokens)
+      }
     }
     let inboundToolReverse = {}
     const deferToolNameRewrite =
@@ -2328,7 +2361,7 @@ export function createHandleProtocol(deps) {
         ctx.body = standard.body
         inboundToolReverse = standard.reverse
       }
-      if (!apiGemini) {
+      if (!apiGemini && !strictPassthroughAtIngress) {
         validateBetweenToolsThinking(ctx.body)
         validateToolChoice(ctx.body)
       }
@@ -2339,7 +2372,7 @@ export function createHandleProtocol(deps) {
       logBag.error_message = error.body.error.message
       return json(res, error.status, error.body)
     }
-    if (!requestContext && officialPassthrough) {
+    if (!requestContext && officialPassthrough && !strictPassthroughAtIngress) {
       ctx.body = repairCacheBreakpoints(ctx.body, {
         limit: Number(getRouting()?.compatibility?.cache_control_limit) || 4,
         fallbackTtl: cacheTtlFromRouting(getRouting()),
@@ -2520,7 +2553,7 @@ export function createHandleProtocol(deps) {
     }
     // After OpenAI→Anthropic conversion so function tools already have input_schema;
     // leftover OpenAI-shaped tools are still marked (rewrite / mixed inbound).
-    if (!apiNonAnthropic) ctx.body = applyEagerToolStreaming(ctx.body, getRouting())
+    if (!apiNonAnthropic && !strictPassthroughAtIngress) ctx.body = applyEagerToolStreaming(ctx.body, getRouting())
     // Fill omitted TTLs from the resolved Web/session default before rendering,
     // retaining explicit caller 5m/1h (and legal 1h → 5m). Official passthrough
     // and caller-policy API endpoints leave caller omissions untouched.
@@ -2556,6 +2589,8 @@ export function createHandleProtocol(deps) {
     })
     const poolOwnsSystemDirectly =
       preRelocatePoolPrompt.applies && ['zero_inject', 'override', 'passthrough'].includes(preRelocatePoolPrompt.mode)
+    const preRelocateBody = ctx.body
+    const preRelocateCragSystem = cragSystem
     let cragRelocated = null
     if (
       !apiNonAnthropic &&
@@ -3014,10 +3049,10 @@ export function createHandleProtocol(deps) {
                 converted.responseTools,
               )
       }
-      return sendPublicJson(output)
+      return sendPublicJson(output, result?.headers)
     }
 
-    const canonicalBody = officialMessagesBody(ctx.body)
+    const canonicalBody = strictPassthroughAtIngress ? ctx.body : officialMessagesBody(ctx.body)
     const streamKeepaliveMs = Number(
       getRouting()?.failover?.stream_keepalive_ms ?? cfg.limits.stream_keepalive_ms ?? 15_000,
     )
@@ -3042,6 +3077,7 @@ export function createHandleProtocol(deps) {
     const anthropicSseErrorRemapper =
       clientStream && protocol === 'anthropic.messages'
         ? createAnthropicSseErrorRemapper({
+            strictPassthrough: strictPassthroughAtIngress,
             isStarted: () => streamTracker?.hasStarted() === true,
             // The client is told to retry, so the real cause has to survive here or
             // it survives nowhere: this relay path sets no other logBag fields, and
@@ -3182,16 +3218,18 @@ export function createHandleProtocol(deps) {
         allowQueue,
         signal: clientAbort.signal,
         applyAttempt: async (body, selected, extra = {}) => {
-          // Only this account's own thinking replays as thinking. Another
-          // account's signature, or one with no record, goes out as text.
-          const owned = filterThinkingForAccount(body, selected.accountId, thinkingOwnerStore)
-          body = owned.body
-          if (owned.kept || owned.converted || owned.dropped) {
-            const { kept, converted, dropped, unknown } = owned
-            logBag.hop_meta = {
-              ...logBag.hop_meta,
-              thinking_owner: { account_id: selected.accountId, kept, converted, dropped, unknown },
+          const applyAccountThinkingFilter = (target) => {
+            // Only this account's own thinking replays as thinking on non-CRAG
+            // paths. Another account's signature, or one with no record, goes out as text.
+            const owned = filterThinkingForAccount(target, selected.accountId, thinkingOwnerStore)
+            if (owned.kept || owned.converted || owned.dropped) {
+              const { kept, converted, dropped, unknown } = owned
+              logBag.hop_meta = {
+                ...logBag.hop_meta,
+                thinking_owner: { account_id: selected.accountId, kept, converted, dropped, unknown },
+              }
             }
+            return owned.body
           }
           const attemptStartedAt = extra.attemptStartedAt ?? Date.now()
           // The runner snapshots after this session's queue turn, before VM prebinding.
@@ -3285,20 +3323,41 @@ export function createHandleProtocol(deps) {
                   ? attemptPoolPrompt.cragPreset
                   : resolveCragPrintPersona(selected.vm, routingNow)
               const caps = preparedHop.ready.health?.capabilities
+              const headlessBridge = isHeadlessBridgeCaps(caps)
+              const strictPassthrough =
+                !requestContext &&
+                protocol === 'anthropic.messages' &&
+                cragStrictPassthroughEnabled(officialPassthrough, routingNow)
               const preserveToolNames = deferToolNameRewrite && caps?.includes('generation_controls_v3')
-              const cragInput = cragRelocated || (hasCragSystem ? { ...personaIn, system: cragSystem } : personaIn)
+              const customCragTemplate =
+                headlessBridge && !officialPassthrough && !strictPassthrough
+                  ? resolveCragCustomTemplate(selected.vm, routingNow, cragPersona)
+                  : null
+              const attemptPoolOwnsSystemDirectly =
+                attemptPoolPrompt.applies && ['zero_inject', 'override', 'passthrough'].includes(attemptPoolPrompt.mode)
+              const usePreRelocate =
+                headlessBridge &&
+                !officialPassthrough &&
+                (cragPersona === 'zero' || customCragTemplate != null || attemptPoolOwnsSystemDirectly)
+              const cragInput = strictPassthrough
+                ? personaIn
+                : usePreRelocate
+                  ? hasCragSystem
+                    ? { ...preRelocateBody, system: preRelocateCragSystem }
+                    : preRelocateBody
+                  : cragRelocated || (hasCragSystem ? { ...personaIn, system: cragSystem } : personaIn)
               const reuseHistory = !officialPassthrough && !repaired && !extra.repairs?.length
               const reuseIngress =
                 reuseHistory &&
                 preserveToolNames &&
-                caps.includes('linux_tui_native_queue') &&
+                isNativeCragV3Plus(caps) &&
                 !hasCragSystem &&
                 !summarySession &&
                 !toolPruneAttempt &&
-                personaIn.thread == null &&
-                (!Array.isArray(personaIn.system) ||
-                  !personaIn.system.some((block) => /x-anthropic-billing-header:/i.test(block?.text || ''))) &&
-                canReuseCanonicalHistory(personaIn.messages)
+                cragInput.thread == null &&
+                (!Array.isArray(cragInput.system) ||
+                  !cragInput.system.some((block) => /x-anthropic-billing-header:/i.test(block?.text || ''))) &&
+                canReuseCanonicalHistory(cragInput.messages)
               const scrubOptions = {
                 official: officialTraffic === true,
                 rewriteTools: routingNow?.compatibility?.tool_name_rewrite !== false,
@@ -3306,8 +3365,8 @@ export function createHandleProtocol(deps) {
                 shareUnchanged: reuseHistory,
               }
               let toolNames = inboundToolReverse
-              let source = cragInput
-              if (!reuseIngress) {
+              let source = strictPassthrough ? shallowCopyBody(cragInput) : cragInput
+              if (!strictPassthrough && !reuseIngress) {
                 const standard = toStandardAnthropicBody(cragInput, {
                   ...scrubOptions,
                   reuseCanonicalHistory: reuseHistory,
@@ -3318,48 +3377,100 @@ export function createHandleProtocol(deps) {
               // The CRAG kernel fingerprints the public stream it already sent,
               // including thinking. Rewriting an unrecorded signature into text
               // makes the tool continuation fail with tool_result history mismatch.
-              // routing.compatibility.crag_drop_foreign_thinking (default off): signed
-              // blocks this account did not mint (another account's, or never
-              // recorded) never came from this kernel; drop them before the hop
-              // instead of waiting for the 400. 'foreign_only' narrows that to
-              // blocks recorded against another account, so an incomplete record
-              // no longer costs the caller its own thinking.
+              // Single SQLite pass per CRAG hop: when crag_drop_foreign_thinking is
+              // enabled, dropForeignThinkingForCrag handles both dropping and foreign
+              // signature counting; when 'off' (and not strictPassthrough),
+              // inspectForeignThinking checks ownership read-only without cloning.
               const cragForeignMode = cragForeignThinkingMode(routingNow?.compatibility?.crag_drop_foreign_thinking)
-              const cragOwned =
-                cragForeignMode === 'off'
-                  ? { body: source }
-                  : dropForeignThinkingForCrag(source, selected.accountId, thinkingOwnerStore, {
+              let cragOwned = { body: source, foreign: 0 }
+              let foreignThinking = false
+              if (cragForeignMode !== 'off') {
+                cragOwned = dropForeignThinkingForCrag(source, selected.accountId, thinkingOwnerStore, {
+                  mode: cragForeignMode,
+                })
+                source = cragOwned.body
+                foreignThinking = !strictPassthrough && cragOwned.foreign > 0
+                if (cragOwned.dropped || cragOwned.bailed) {
+                  const { kept, unknownKept, dropped, droppedTurns, openLoop, thinkingOff, bailed } = cragOwned
+                  logBag.hop_meta = {
+                    ...logBag.hop_meta,
+                    thinking_owner_crag: {
+                      account_id: selected.accountId,
                       mode: cragForeignMode,
-                    })
-              source = cragOwned.body
-              if (cragOwned.dropped || cragOwned.bailed) {
-                const { kept, unknownKept, dropped, droppedTurns, openLoop, thinkingOff, bailed } = cragOwned
-                logBag.hop_meta = {
-                  ...logBag.hop_meta,
-                  thinking_owner_crag: {
-                    account_id: selected.accountId,
-                    mode: cragForeignMode,
-                    kept,
-                    unknown_kept: unknownKept,
-                    dropped,
-                    dropped_turns: droppedTurns,
-                    open_loop: openLoop,
-                    thinking_off: thinkingOff,
-                    bailed,
-                  },
+                      kept,
+                      unknown_kept: unknownKept,
+                      dropped,
+                      dropped_turns: droppedTurns,
+                      open_loop: openLoop,
+                      thinking_off: thinkingOff,
+                      bailed,
+                    },
+                  }
+                }
+              } else if (!strictPassthrough) {
+                const inspected = inspectForeignThinking(source, selected.accountId, thinkingOwnerStore)
+                foreignThinking = inspected.foreign > 0
+                if (inspected.kept || inspected.foreign) {
+                  logBag.hop_meta = {
+                    ...logBag.hop_meta,
+                    thinking_owner: {
+                      account_id: selected.accountId,
+                      kept: inspected.kept,
+                      converted: 0,
+                      dropped: 0,
+                      unknown: inspected.unknown,
+                      foreign: inspected.foreign,
+                    },
+                  }
                 }
               }
-              for (const policy of extra.repairs || []) source = repairAnthropicRequest(source, policy)
+              if (!strictPassthrough) {
+                for (const policy of extra.repairs || []) source = repairAnthropicRequest(source, policy)
+              }
               hopBody = prepareCragPrintBody(source, {
                 preset: cragPersona,
-                officialPassthrough: officialPassthrough && !cacheControlRepaired,
+                officialPassthrough: headlessBridge
+                  ? officialPassthrough
+                  : officialPassthrough && !cacheControlRepaired,
                 capabilities: Array.isArray(caps) ? caps : [],
                 health: preparedHop.ready.health || null,
                 promptPolicy: attemptPoolPrompt.applies ? attemptPoolPrompt : null,
                 agentSummary: !!summarySession,
-                foldSystemMessages: routingNow?.compatibility?.crag_fold_history_system !== false,
+                foldSystemMessages:
+                  strictPassthrough || headlessBridge
+                    ? false
+                    : routingNow?.compatibility?.crag_fold_history_system !== false,
+                strictPassthrough,
+                routing: officialPassthrough ? null : routingNow,
+                vm: selected.vm,
+                identity,
+                sessionId: attemptSessionId,
+                entrypoint: entrypointNow,
+                cacheTtl: requestedCacheTtl,
               })
-              if (cacheControlRepaired && needsCragProviderCompatibility(hopBody, caps)) {
+              if (headlessBridge && !strictPassthrough && !officialPassthrough) {
+                const compat = canonicalPersonaCompat(routingNow?.compatibility || {})
+                const envEnabled = presetFlagEnabled(compat, 'persona_env_presets', resolvedPersona)
+                const tzEnabled = envEnabled && presetFlagEnabled(compat, 'persona_timezone_presets', resolvedPersona)
+                const localeEnabled = envEnabled && presetFlagEnabled(compat, 'persona_locale_presets', resolvedPersona)
+                const tz = tzEnabled ? configuredTimezone(selected.vm, {}) || configuredTimezone(identity, {}) : ''
+                const loc = localeEnabled
+                  ? String(
+                      selected.vm?.locale ||
+                        selected.vm?.fingerprint?.locale ||
+                        identity?.locale ||
+                        identity?.fingerprint?.locale ||
+                        '',
+                    ).trim()
+                  : ''
+                const cragEnv = sanitizeCragEnv({
+                  ...(tz ? { timezone: tz } : {}),
+                  ...(loc ? { locale: loc } : {}),
+                  inject_if_missing: envEnabled,
+                })
+                if (cragEnv) hopBody.crag_env = cragEnv
+              }
+              if (!strictPassthrough && cacheControlRepaired && needsCragProviderCompatibility(hopBody, caps)) {
                 hopBody = repairCacheBreakpoints(
                   applyCacheBreakpoints(hopBody, {
                     ttl: requestedCacheTtl,
@@ -3371,13 +3482,15 @@ export function createHandleProtocol(deps) {
                   },
                 )
               }
-              const materialized = await materializeRemoteImageSources(hopBody)
-              if (materialized !== hopBody) {
-                validateImageDimensions(materialized)
-                hopBody = materialized
+              if (!strictPassthrough) {
+                const materialized = await materializeRemoteImageSources(hopBody)
+                if (materialized !== hopBody) {
+                  validateImageDimensions(materialized)
+                  hopBody = materialized
+                }
               }
-              const nativeCragV3 = caps?.includes('generation_controls_v3') && caps?.includes('linux_tui_native_queue')
-              if (identity && !nativeCragV3) {
+              const nativeCragV3 = isNativeCragV3Plus(caps)
+              if (!strictPassthrough && identity && !nativeCragV3) {
                 hopBody = applyCrsIdentityReplace(hopBody, identity, inbound, outboundReqHeaders, {
                   officialClient: officialTraffic,
                   sessionId: attemptSessionId,
@@ -3390,6 +3503,7 @@ export function createHandleProtocol(deps) {
                 })
               }
               if (
+                !strictPassthrough &&
                 caps?.includes('generation_controls_v3') &&
                 hopBody.cache_ttl == null &&
                 hopBody.crag_options?.cache_ttl == null
@@ -3397,7 +3511,7 @@ export function createHandleProtocol(deps) {
                 // Carry the resolved session/menu default separately from usage accounting.
                 hopBody.cache_ttl = requestedCacheTtl
               }
-              preserveCacheBreakpoints = officialPassthrough && !cacheControlRepaired
+              preserveCacheBreakpoints = strictPassthrough || (officialPassthrough && !cacheControlRepaired)
               cacheTtl = null
               personaHideTokens = 0
               logBag.inference_engine = resolveInferenceEngine(selected.vm, routingNow)
@@ -3405,14 +3519,15 @@ export function createHandleProtocol(deps) {
               logBag.crag_print = {
                 transport: preparedHop.ready.health?.transport,
                 persona: cragPersona,
-                prompt_mode: hopBody.crag_prompt?.mode || 'default',
+                prompt_mode: hopBody.crag_prompt?.mode || hopBody.crag_persona_preset || 'default',
                 ...(attemptPoolPrompt.applies ? { pool_prompt_mode: attemptPoolPrompt.mode } : {}),
+                strict_passthrough: strictPassthrough,
                 safeguards_stripped: Boolean(personaIn.safeguards != null && hopBody.safeguards == null),
                 ...(cacheControlRepaired ? { cache_control_repaired: true } : {}),
               }
               logBag.official_cc_inference = 'crag-print'
               logBag.provider = 'local_cli'
-              hopBody = noteCachePrefix(selected, attemptSessionId, hopBody)
+              if (!strictPassthrough) hopBody = noteCachePrefix(selected, attemptSessionId, hopBody)
               logBag.outbound_summary = summarizeBody(hopBody)
               logBag.outbound_session_id = sessionIdForLog(sessionIdFromOutboundBody(hopBody) || attemptSessionId)
               return {
@@ -3422,9 +3537,11 @@ export function createHandleProtocol(deps) {
                   sessionId: attemptSessionId,
                   cliHop: true,
                   cragPrint: true,
+                  strictPassthrough,
+                  safeguardsSanitized: !strictPassthrough,
                   // CRAG replays caller thinking unfiltered; signatures this pool never
                   // issued make an "Invalid signature" 400 safe to strip and retry.
-                  foreignThinking: owned.converted + owned.dropped > 0,
+                  foreignThinking,
                   callerCwd: callerEnvironment?.cwd,
                   preparedHop,
                   transportRouting,
@@ -3436,6 +3553,7 @@ export function createHandleProtocol(deps) {
                 },
               }
             }
+            hopBody = applyAccountThinkingFilter(body)
             // The front rewrite already produces the official two-block shape.
             const cliPoolPassthrough = attemptPoolPrompt.applies && attemptPoolPrompt.mode === 'passthrough'
             const effectiveOfficialPassthrough =
@@ -3572,6 +3690,7 @@ export function createHandleProtocol(deps) {
             }
           }
 
+          hopBody = applyAccountThinkingFilter(body)
           const effectiveHttpOfficialPassthrough =
             attemptPoolPrompt.applies && attemptPoolPrompt.mode !== 'official' ? false : officialPassthrough
           preserveCacheBreakpoints = effectiveHttpOfficialPassthrough && !cacheControlRepaired
@@ -3724,6 +3843,8 @@ export function createHandleProtocol(deps) {
               preparedHop: attemptMeta?.preparedHop,
               repaired: attemptMeta?.repaired === true,
               dropSampling: attemptMeta?.dropSampling === true,
+              strictPassthrough: attemptMeta?.strictPassthrough === true,
+              safeguardsSanitized: attemptMeta?.safeguardsSanitized === true,
               requestContext: attemptMeta?.requestContext || requestContext,
               want1m,
               routing: attemptMeta?.transportRouting ?? getRouting(),
@@ -3732,12 +3853,14 @@ export function createHandleProtocol(deps) {
               onOutboundHeaders: noteOutboundHeaders,
               redactionPrincipal: req.apiKeyRecord?.id || (req.apiKeyKind === 'master' ? 'master' : ''),
               redactionSession: String(req.headers?.['x-claude-code-session-id'] || ''),
+              cancelSessionId: String(req.headers?.['x-claude-code-session-id'] || ''),
               tenantId,
               gatewayRequestId: logCtx.request_id,
             })
           }
           const publicStream = replayScope ? createIssuedToolStream() : null
           const geminiCrossSseLines = protocol === 'google.gemini' ? [] : null
+          let sseUpstreamHeaders = null
           let state
           if (protocol === 'openai.chat') {
             state = createOpenAIChatStreamState(inbound.model || body.model, candidate.vmId)
@@ -3754,7 +3877,7 @@ export function createHandleProtocol(deps) {
               protocol,
               write: (chunk) => {
                 if (res.writableEnded || res.destroyed) return
-                if (!res.headersSent) writeSSEHeaders(res)
+                if (!res.headersSent) writeSSEHeaders(res, sseUpstreamHeaders)
                 res.write(chunk)
               },
             })
@@ -3772,6 +3895,8 @@ export function createHandleProtocol(deps) {
               preparedHop: attemptMeta?.preparedHop,
               repaired: attemptMeta?.repaired === true,
               dropSampling: attemptMeta?.dropSampling === true,
+              strictPassthrough: attemptMeta?.strictPassthrough === true,
+              safeguardsSanitized: attemptMeta?.safeguardsSanitized === true,
               requestContext: attemptMeta?.requestContext || requestContext,
               body,
               reqHeaders: outboundReqHeaders,
@@ -3790,10 +3915,12 @@ export function createHandleProtocol(deps) {
               ensureCredential: (exec) => ensureWorkerCredential(exec),
               redactionPrincipal: req.apiKeyRecord?.id || (req.apiKeyKind === 'master' ? 'master' : ''),
               redactionSession: String(req.headers?.['x-claude-code-session-id'] || ''),
+              cancelSessionId: String(req.headers?.['x-claude-code-session-id'] || ''),
               onEnvelope: noteOutboundEnvelope,
               onOutboundHeaders: noteOutboundHeaders,
-              onCommit: () => {
-                if (protocol === 'anthropic.messages' && !res.headersSent) writeSSEHeaders(res)
+              onCommit: (upstreamHeaders) => {
+                if (upstreamHeaders && typeof upstreamHeaders === 'object') sseUpstreamHeaders = upstreamHeaders
+                if (protocol === 'anthropic.messages' && !res.headersSent) writeSSEHeaders(res, sseUpstreamHeaders)
                 onCommit()
               },
               onEvent: async (line) => {
@@ -3803,7 +3930,7 @@ export function createHandleProtocol(deps) {
                 keepalive.observeLine(line)
                 if (protocol === 'anthropic.messages') {
                   streamTracker?.observe(line)
-                  if (!res.headersSent) writeSSEHeaders(res)
+                  if (!res.headersSent) writeSSEHeaders(res, sseUpstreamHeaders)
                   const outbound = anthropicSseErrorRemapper ? anthropicSseErrorRemapper.remapLine(line) : line
                   res.write(String(outbound).endsWith('\n') ? String(outbound) : String(outbound) + '\n')
                   publicStream?.observe(outbound)
@@ -3811,7 +3938,7 @@ export function createHandleProtocol(deps) {
                 }
                 const writeChunks = (chunks) => {
                   if (!chunks.length) return
-                  if (!res.headersSent) writeSSEHeaders(res)
+                  if (!res.headersSent) writeSSEHeaders(res, sseUpstreamHeaders)
                   for (const chunk of chunks) {
                     const event = protocol === 'openai.responses' ? `event: ${chunk.type}\n` : ''
                     res.write(`${event}data: ${JSON.stringify(chunk)}\n\n`)
@@ -3997,7 +4124,9 @@ export function createHandleProtocol(deps) {
     if (clientStream) {
       if (isClientCancelledResult(result)) return finishClientCancel(res, result, logBag)
       if (!res.headersSent) {
-        const mapped = mapProtocolClientError(result, logBag, result?.body?.error?.code || 'upstream_error')
+        const mapped = mapProtocolClientError(result, logBag, result?.body?.error?.code || 'upstream_error', {
+          strictPassthrough: strictPassthroughAtIngress,
+        })
         if (!isClientCancelledResult(result) && mapped.body?.error?.code !== 'client_cancelled') stats.errors++
         return sendMapped(res, mapped)
       }
@@ -4038,29 +4167,44 @@ export function createHandleProtocol(deps) {
           }
           return res.end()
         }
-        const closing = isRecoverableTruncation(result) && !res.writableEnded ? streamTracker?.closingEvents() : null
+        const closing =
+          !strictPassthroughAtIngress && isRecoverableTruncation(result) && !res.writableEnded
+            ? streamTracker?.closingEvents()
+            : null
         if (closing) res.write(closing)
         else if (protocol === 'anthropic.messages' && !res.writableEnded && !streamTracker?.isFinished()) {
-          const mapped = mapProtocolClientError(result, logBag, logBag.error_code)
+          const mapped = mapProtocolClientError(result, logBag, logBag.error_code, {
+            strictPassthrough: strictPassthroughAtIngress,
+          })
           const mappedErr = mapped.body?.error || {}
-          const retryableStartedHandoff =
-            result?.nativeHandoff === true &&
-            streamTracker?.hasStarted() === true &&
-            mapped.status >= 500 &&
-            mappedErr.type === 'upstream_error' &&
-            !/timeout/i.test(`${logBag.error_code || ''} ${mappedErr.type || ''} ${logBag.error_message || ''}`)
-          if (retryableStartedHandoff || (result?.nativeHandoff !== true && streamTracker?.hasStarted() === true)) {
-            // Started but not closable: ask the client to retry instead of
-            // dropping the connection. error_code/error_message keep the cause.
-            logBag.client_error_type = 'rate_limit_error'
-            logBag.truncation_reason = retryableStartedHandoff
-              ? 'native_handoff_incomplete'
-              : truncationReason(result, streamTracker)
-            res.write(buildRetryableTruncationError())
+          if (strictPassthroughAtIngress) {
+            res.write(
+              buildAnthropicSseError(mappedErr, result?.poolReason, {
+                requestId:
+                  mapped.body?.request_id || result?.body?.request_id || result?.headers?.['request-id'] || null,
+                strictPassthrough: true,
+              }),
+            )
           } else {
-            // Unstarted streams (or non-retryable strict handoff failures like
-            // 4xx/timeout/policy) keep the mapped SSE error.
-            res.write(buildAnthropicSseError(mappedErr, result?.poolReason))
+            const retryableStartedHandoff =
+              result?.nativeHandoff === true &&
+              streamTracker?.hasStarted() === true &&
+              mapped.status >= 500 &&
+              mappedErr.type === 'upstream_error' &&
+              !/timeout/i.test(`${logBag.error_code || ''} ${mappedErr.type || ''} ${logBag.error_message || ''}`)
+            if (retryableStartedHandoff || (result?.nativeHandoff !== true && streamTracker?.hasStarted() === true)) {
+              // Started but not closable: ask the client to retry instead of
+              // dropping the connection. error_code/error_message keep the cause.
+              logBag.client_error_type = 'rate_limit_error'
+              logBag.truncation_reason = retryableStartedHandoff
+                ? 'native_handoff_incomplete'
+                : truncationReason(result, streamTracker)
+              res.write(buildRetryableTruncationError())
+            } else {
+              // Unstarted streams (or non-retryable strict handoff failures like
+              // 4xx/timeout/policy) keep the mapped SSE error.
+              res.write(buildAnthropicSseError(mappedErr, result?.poolReason))
+            }
           }
         }
       }
@@ -4070,7 +4214,9 @@ export function createHandleProtocol(deps) {
     if (!result?.ok || logBag.risk_upstream_reason || isIncompleteAssistantMessage(result)) {
       if (isClientCancelledResult(result)) return finishClientCancel(res, result, logBag)
       const failed = isIncompleteAssistantMessage(result) ? incompleteAssistantClientError(result) : result
-      const mapped = mapProtocolClientError(failed, logBag, failed?.body?.error?.code || 'upstream_error')
+      const mapped = mapProtocolClientError(failed, logBag, failed?.body?.error?.code || 'upstream_error', {
+        strictPassthrough: strictPassthroughAtIngress,
+      })
       if (mapped.body?.error?.code !== 'client_cancelled') stats.errors++
       return sendMapped(res, mapped)
     }
@@ -4105,7 +4251,7 @@ export function createHandleProtocol(deps) {
       output = fromClaudeToResponses(clientBody, inbound.model, result.vmId, converted.mode, converted.responseTools)
     }
     ctx = applyIntercept(cfg.intercept.rules, 'before_client', { ...ctx, body: output })
-    return sendPublicJson(ctx.body)
+    return sendPublicJson(ctx.body, result?.headers)
   }
 
   /** POST /v1/alpha/search (Codex web search): same logging, auth and body handling as handleProtocol. */

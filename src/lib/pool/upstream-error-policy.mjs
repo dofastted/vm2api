@@ -438,6 +438,7 @@ function classifyUpstreamResultRaw(
     credentialGeneration = null,
     priorAuth401Generation = null,
     signatureRepair = false,
+    disableRequestRepair = false,
     usage = null,
   } = {},
 ) {
@@ -451,7 +452,7 @@ function classifyUpstreamResultRaw(
     }
   }
   if (result.cragPolicyBlock === true && !result.committed) {
-    if (result.cragCacheControlBlocked === true && !repaired) {
+    if (result.cragCacheControlBlocked === true && !repaired && !disableRequestRepair) {
       return {
         scope: 'request',
         action: 'repair-and-retry',
@@ -693,8 +694,14 @@ function classifyUpstreamResultRaw(
     // Default off. Turning this on drops thinking history and retries, so the
     // client sees 200 and never learns the upstream rejected the signature.
     // Probe / forged signatures need the 400. Search / prefill / tool-pair
-    // / schema / adaptive repairs are independent of this switch.
-    if (!repaired && signatureRepair && SIGNATURE_PATTERNS.some((pattern) => pattern.test(hay))) {
+    // / schema / adaptive repairs are independent of this switch, except when
+    // `disableRequestRepair` (crag_strict_passthrough) turns all silent 400 repairs off.
+    if (
+      !repaired &&
+      !disableRequestRepair &&
+      signatureRepair &&
+      SIGNATURE_PATTERNS.some((pattern) => pattern.test(hay))
+    ) {
       return {
         scope: 'request',
         action: 'repair-and-retry',
@@ -702,7 +709,7 @@ function classifyUpstreamResultRaw(
         cooldownUntil: null,
       }
     }
-    if (!repaired && SEARCH_HISTORY_PATTERNS.some((pattern) => pattern.test(hay))) {
+    if (!repaired && !disableRequestRepair && SEARCH_HISTORY_PATTERNS.some((pattern) => pattern.test(hay))) {
       return {
         scope: 'request',
         action: 'repair-and-retry',
@@ -710,7 +717,7 @@ function classifyUpstreamResultRaw(
         cooldownUntil: null,
       }
     }
-    if (!repaired && PREFILL_PATTERNS.some((pattern) => pattern.test(hay))) {
+    if (!repaired && !disableRequestRepair && PREFILL_PATTERNS.some((pattern) => pattern.test(hay))) {
       return {
         scope: 'request',
         action: 'repair-and-retry',
@@ -718,7 +725,7 @@ function classifyUpstreamResultRaw(
         cooldownUntil: null,
       }
     }
-    if (!repaired && TOOL_PAIR_PATTERNS.some((pattern) => pattern.test(hay))) {
+    if (!repaired && !disableRequestRepair && TOOL_PAIR_PATTERNS.some((pattern) => pattern.test(hay))) {
       return {
         scope: 'request',
         action: 'repair-and-retry',
@@ -726,7 +733,7 @@ function classifyUpstreamResultRaw(
         cooldownUntil: null,
       }
     }
-    if (!repaired && SCHEMA_PATTERNS.some((pattern) => pattern.test(hay))) {
+    if (!repaired && !disableRequestRepair && SCHEMA_PATTERNS.some((pattern) => pattern.test(hay))) {
       return {
         scope: 'request',
         action: 'repair-and-retry',
@@ -734,7 +741,7 @@ function classifyUpstreamResultRaw(
         cooldownUntil: null,
       }
     }
-    if (!repaired && SAMPLING_PATTERNS.some((pattern) => pattern.test(hay))) {
+    if (!repaired && !disableRequestRepair && SAMPLING_PATTERNS.some((pattern) => pattern.test(hay))) {
       return {
         scope: 'request',
         action: 'repair-and-retry',
@@ -742,7 +749,7 @@ function classifyUpstreamResultRaw(
         cooldownUntil: null,
       }
     }
-    if (!repaired && ADAPTIVE_PATTERNS.some((pattern) => pattern.test(hay))) {
+    if (!repaired && !disableRequestRepair && ADAPTIVE_PATTERNS.some((pattern) => pattern.test(hay))) {
       if (requestBody && !canRepairAdaptiveThinking(requestBody, model)) {
         return {
           scope: 'request',

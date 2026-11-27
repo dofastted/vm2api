@@ -119,26 +119,79 @@ export function applySseSocketTuning(res, { tcpNodelay = true } = {}) {
   }
 }
 
+const OFFICIAL_RESPONSE_HEADER_EXACT = new Set([
+  'request-id',
+  'retry-after',
+  'x-should-retry',
+  'anthropic-organization-id',
+  'anthropic-should-fallback',
+  'cf-ray',
+])
+
+const RESERVED_GATEWAY_HEADERS = new Set([
+  'content-type',
+  'cache-control',
+  'connection',
+  'x-accel-buffering',
+  'x-kin-rewrite',
+  'x-request-id',
+  'x-kin-request-id',
+  'set-cookie',
+  'transfer-encoding',
+  'content-length',
+])
+
+/**
+ * Extract allowlisted official Anthropic/upstream HTTP response headers for
+ * end-to-end client forwarding without ever overwriting gateway headers
+ * (`x-request-id`, `x-kin-request-id`, `x-kin-rewrite`, `content-type`, CORS).
+ */
+export function extractOfficialResponseHeaders(upstreamHeaders = null) {
+  if (!upstreamHeaders || typeof upstreamHeaders !== 'object' || Array.isArray(upstreamHeaders)) return {}
+  const out = {}
+  for (const [rawKey, rawValue] of Object.entries(upstreamHeaders)) {
+    if (rawValue == null) continue
+    const key = String(rawKey).trim().toLowerCase()
+    if (!key || RESERVED_GATEWAY_HEADERS.has(key)) continue
+    if (!OFFICIAL_RESPONSE_HEADER_EXACT.has(key) && !key.startsWith('anthropic-ratelimit-')) continue
+    const value = Array.isArray(rawValue)
+      ? rawValue
+          .map((item) => String(item ?? '').trim())
+          .filter(Boolean)
+          .join(', ')
+      : String(rawValue).trim()
+    if (!value || /[\r\n]/.test(value)) continue
+    out[key] = value
+  }
+  return out
+}
+
 export function createRespond(cfg, options = {}) {
   const resolveNodelay = () => {
     if (typeof options.tcpNodelay === 'function') return options.tcpNodelay() !== false
     return options.tcpNodelay !== false
   }
 
-  function json(res, status, body) {
+  function json(res, status, body, upstreamHeaders = null) {
     const data = JSON.stringify(body)
+    const forwarded = extractOfficialResponseHeaders(upstreamHeaders)
     const headers = corsHeadersForRequest(requestFromResponse(res), {
+      ...forwarded,
       'content-type': 'application/json; charset=utf-8',
       'x-kin-rewrite': cfg.rewrite.enabled ? 'on' : 'off',
     })
     if (res._kinRequestId) headers['x-request-id'] = res._kinRequestId
-    if (body?.error?.details?.retryable === false) headers['x-should-retry'] = 'false'
+    if (body?.error?.details?.retryable === false && !Object.hasOwn(headers, 'x-should-retry')) {
+      headers['x-should-retry'] = 'false'
+    }
     res.writeHead(status, headers)
     res.end(data)
   }
 
-  function writeSSEHeaders(res) {
+  function writeSSEHeaders(res, upstreamHeaders = null) {
+    const forwarded = extractOfficialResponseHeaders(upstreamHeaders)
     const headers = corsHeadersForRequest(requestFromResponse(res), {
+      ...forwarded,
       'content-type': 'text/event-stream; charset=utf-8',
       'cache-control': 'no-cache, no-transform',
       connection: 'keep-alive',

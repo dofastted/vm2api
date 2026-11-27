@@ -2,6 +2,9 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { slotHost } from '../vm/slot-host.mjs'
+import { isCustomKvmMode } from '../vm/custom-os-runtime.mjs'
+import { isKvmRuntime } from '../vm/runtime-kind.mjs'
+import { syncCustomKvmSlotFiles } from '../vm/kvm-slot-agent-client.mjs'
 import { resolveSlotOAuthProxy } from '../vm/proxy-resolve.mjs'
 import { slotExecArgv } from '../vm/slot-exec.mjs'
 import { resolveSlotClaude } from '../vm/slot-engine.mjs'
@@ -122,6 +125,7 @@ export async function runGuestOAuthAuthService(
     runDocker = runSlotProcess,
     postTelemetry = postRustKernelTelemetryEvent,
     runNative,
+    syncWorkerConfig = null,
   } = {},
 ) {
   const context = await prepare({ exec, projectRoot, routing, timeoutMs, proxyPool })
@@ -132,6 +136,21 @@ export async function runGuestOAuthAuthService(
   if (context.controlPlane) return runNative({ ...payload, proxy_url: context.proxyUrl, ...workerConfig(exec) })
   const bin = host.bins.oauthAuth
   if (!bin) throw fail('oauth_auth_bin_missing', 'Target VM OAuth helper is not installed')
+  if (!exec.vm?.node_id && isKvmRuntime(exec.vm) && isCustomKvmMode({ vm: exec.vm })) {
+    const runDir = rustKernelPaths(exec).runDir
+    const syncOpts = { runDir, targets: ['worker_config'], requiredTargets: ['worker_config'] }
+    const syncResult =
+      typeof syncWorkerConfig === 'function'
+        ? await syncWorkerConfig(projectRoot, exec.vm, syncOpts)
+        : await syncCustomKvmSlotFiles(projectRoot, exec.vm, syncOpts)
+    const syncedWorker = !Array.isArray(syncResult?.synced) || syncResult.synced.includes('worker_config')
+    if (!syncResult?.ok || !syncedWorker) {
+      throw fail(
+        safeCode(syncResult?.error, 'oauth_worker_config_sync_failed'),
+        syncResult?.message || 'Failed to sync worker.json to custom-erofs KVM guest',
+      )
+    }
+  }
   const argv = slotExecArgv(exec.vm, [bin], {
     interactive: true,
     user: host.execUser(exec.vm),

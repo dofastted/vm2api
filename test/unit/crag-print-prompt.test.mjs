@@ -267,6 +267,45 @@ test('zero replace does not leave a bare system, and refuses argv overflow', () 
   assert.equal(longAppend.crag_prompt.text.length, 64 * 1024 + 1)
 })
 
+test('legacy non-headless TUI zero + empty system emits empty replace only when prompt_replace_empty is advertised', () => {
+  const legacyCaps = ['generation_controls_v3', 'linux_tui_native_queue', 'prompt_replace', 'prompt_append']
+  const capsWithEmpty = [...legacyCaps, 'prompt_replace_empty']
+
+  for (const system of [
+    undefined,
+    '',
+    billing,
+    [{ type: 'text', text: "You are Claude Code, Anthropic's official CLI for Claude." }],
+  ]) {
+    const withCap = prepareCragPrintBody(
+      { model: 'claude-sonnet-5', system, messages: [{ role: 'user', content: 'hi' }] },
+      { preset: 'zero', officialPassthrough: false, capabilities: capsWithEmpty },
+    )
+    assert.equal(withCap.system, undefined)
+    assert.deepEqual(withCap.crag_prompt, { mode: 'replace', text: '' })
+
+    const withoutCap = prepareCragPrintBody(
+      { model: 'claude-sonnet-5', system, messages: [{ role: 'user', content: 'hi' }] },
+      { preset: 'zero', officialPassthrough: false, capabilities: legacyCaps },
+    )
+    assert.equal(withoutCap.system, undefined)
+    assert.equal(withoutCap.crag_prompt, undefined)
+  }
+
+  // Official passthrough and official_full must never emit empty replace
+  const passthrough = prepareCragPrintBody(
+    { model: 'claude-sonnet-5', messages: [{ role: 'user', content: 'hi' }] },
+    { preset: 'zero', officialPassthrough: true, capabilities: capsWithEmpty },
+  )
+  assert.equal(passthrough.crag_prompt, undefined)
+
+  const appendEmpty = prepareCragPrintBody(
+    { model: 'claude-sonnet-5', messages: [{ role: 'user', content: 'hi' }] },
+    { preset: 'official_full', officialPassthrough: false, capabilities: capsWithEmpty },
+  )
+  assert.equal(appendEmpty.crag_prompt, undefined)
+})
+
 test('official passthrough does not append the caller system', () => {
   const out = prepareCragPrintBody(
     {

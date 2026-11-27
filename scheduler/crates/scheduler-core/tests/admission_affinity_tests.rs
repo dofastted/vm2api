@@ -2193,3 +2193,201 @@ async fn strict_tenant_isolation_blocks_shared_unowned_nodes() {
     );
     release_ok(&eng, &resp.lease_id);
 }
+
+#[tokio::test]
+async fn required_runtime_capabilities_filters_and_recovers_via_telemetry() {
+    use std::collections::BTreeMap;
+
+    let eng = SchedulerEngine::new(EngineOptions::default());
+    let missing = node_cfg(
+        "claude_vm:missing",
+        NodeType::ClaudeVm,
+        "missing",
+        Provider::Anthropic,
+        10,
+        4,
+        4,
+    );
+    let partial = node_cfg(
+        "claude_vm:partial",
+        NodeType::ClaudeVm,
+        "partial",
+        Provider::Anthropic,
+        9,
+        4,
+        4,
+    );
+    let ready = node_cfg(
+        "claude_vm:ready",
+        NodeType::ClaudeVm,
+        "ready",
+        Provider::Anthropic,
+        5,
+        4,
+        4,
+    );
+
+    let mut partial_caps = BTreeMap::new();
+    partial_caps.insert("os_kvm_native_smbios".to_owned(), true);
+    partial_caps.insert("vsock_transport_v1".to_owned(), false);
+
+    let mut ready_caps = BTreeMap::new();
+    ready_caps.insert("os_kvm_native_smbios".to_owned(), true);
+    ready_caps.insert("vsock_transport_v1".to_owned(), true);
+
+    eng.bootstrap(BootstrapRequest {
+        controller_epoch: CompactString::const_new("ep1"),
+        role: Role::Leader,
+        config_version: Some(1),
+        config_snapshot: ConfigSnapshot {
+            config_version: 1,
+            pools: vec![
+                PoolConfig {
+                    id: CompactString::const_new("p_kvm"),
+                    required_runtime_capabilities: vec![
+                        "os_kvm_native_smbios".to_owned(),
+                        "vsock_transport_v1".to_owned(),
+                    ],
+                    members: vec![
+                        member_cfg("claude_vm:missing", NodeType::ClaudeVm, "missing", 1),
+                        member_cfg("claude_vm:partial", NodeType::ClaudeVm, "partial", 2),
+                        member_cfg("claude_vm:ready", NodeType::ClaudeVm, "ready", 3),
+                    ],
+                    ..Default::default()
+                },
+                PoolConfig {
+                    id: CompactString::const_new("p_legacy"),
+                    members: vec![
+                        member_cfg("claude_vm:missing", NodeType::ClaudeVm, "missing", 1),
+                        member_cfg("claude_vm:ready", NodeType::ClaudeVm, "ready", 2),
+                    ],
+                    ..Default::default()
+                },
+                PoolConfig {
+                    id: CompactString::const_new("p_strict_single"),
+                    required_runtime_capabilities: vec![
+                        "os_kvm_native_smbios".to_owned(),
+                        "vsock_transport_v1".to_owned(),
+                    ],
+                    members: vec![member_cfg(
+                        "claude_vm:missing",
+                        NodeType::ClaudeVm,
+                        "missing",
+                        1,
+                    )],
+                    ..Default::default()
+                },
+            ],
+            nodes: vec![missing, partial, ready],
+            ..Default::default()
+        },
+        active_sticky_bindings: vec![],
+        active_penalties: vec![],
+        initial_telemetry: vec![
+            NodeTelemetryUpdate {
+                node_key: CompactString::const_new("claude_vm:partial"),
+                runtime_capabilities: Some(partial_caps),
+                ..Default::default()
+            },
+            NodeTelemetryUpdate {
+                node_key: CompactString::const_new("claude_vm:ready"),
+                runtime_capabilities: Some(ready_caps.clone()),
+                ..Default::default()
+            },
+        ],
+    });
+
+    // Strict KVM pool admits only the node with all required capabilities=true.
+    let resp = eng
+        .acquire(base_req(
+            "r_kvm_1",
+            "p_kvm",
+            "claude-sonnet-4",
+            ModelFamily::Claude,
+            "s_kvm_1",
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.selected_node.node_key, "claude_vm:ready");
+    let cap_excluded: Vec<&str> = resp
+        .explain
+        .excluded
+        .iter()
+        .filter(|e| e.reason == ExcludeReason::CapabilityMismatch)
+        .map(|e| e.node.as_str())
+        .collect();
+    assert_eq!(cap_excluded, vec!["claude_vm:missing", "claude_vm:partial"]);
+    release_ok(&eng, &resp.lease_id);
+
+    // Legacy pool without required_runtime_capabilities admits highest-tier node regardless of caps.
+    let legacy_resp = eng
+        .acquire(base_req(
+            "r_leg_1",
+            "p_legacy",
+            "claude-sonnet-4",
+            ModelFamily::Claude,
+            "s_leg_1",
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(legacy_resp.selected_node.node_key, "claude_vm:missing");
+    release_ok(&eng, &legacy_resp.lease_id);
+
+    // Single-node strict pool fails closed until telemetry reports required capabilities=true.
+    let err = eng
+        .acquire(base_req(
+            "r_strict_fail",
+            "p_strict_single",
+            "claude-sonnet-4",
+            ModelFamily::Claude,
+            "s_strict_1",
+            None,
+        ))
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(err.code(), ErrorCode::PoolExhausted);
+
+    let explain = eng
+        .explain(base_req(
+            "r_strict_explain",
+            "p_strict_single",
+            "claude-sonnet-4",
+            ModelFamily::Claude,
+            "s_strict_1",
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(explain.explain.excluded.len(), 1);
+    assert_eq!(
+        explain.explain.excluded[0].reason,
+        ExcludeReason::CapabilityMismatch
+    );
+
+    // Telemetry upgrade enables admission without config_version bump.
+    let upd = eng.update_telemetry(TelemetryBatchRequest {
+        nodes: vec![NodeTelemetryUpdate {
+            node_key: CompactString::const_new("claude_vm:missing"),
+            runtime_capabilities: Some(ready_caps),
+            ..Default::default()
+        }],
+    });
+    assert_eq!(upd.updated, 1);
+
+    let recovered = eng
+        .acquire(base_req(
+            "r_strict_ok",
+            "p_strict_single",
+            "claude-sonnet-4",
+            ModelFamily::Claude,
+            "s_strict_2",
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(recovered.selected_node.node_key, "claude_vm:missing");
+    release_ok(&eng, &recovered.lease_id);
+}

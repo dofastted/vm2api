@@ -1123,6 +1123,89 @@ export function mapUpstreamError(status, body, headers = {}) {
   })
 }
 
+const STRICT_LOCAL_GATEWAY_CODES = new Set([
+  ErrorCode.FABLE_REQUIRES_MAX,
+  ErrorCode.QUOTA_GUARD_REQUEST_TOO_LARGE,
+  ErrorCode.SLOT_OAUTH_UNAVAILABLE,
+  ErrorCode.CLUSTER_DELIVERY_UNCONFIRMED,
+  ErrorCode.CLUSTER_SLOT_RECONNECTING,
+  'slot_busy',
+  'account_pool_exhausted',
+  'api_pool_exhausted',
+  'pool_overloaded',
+  'pool_wait_queue_full',
+  'pool_queue_timeout',
+  'pool_rate_limited',
+  'pool_fable_rate_limited',
+])
+
+const SEMANTIC_TYPE_STATUS = Object.freeze({
+  invalid_request_error: 400,
+  authentication_error: 401,
+  billing_error: 402,
+  permission_error: 403,
+  not_found_error: 404,
+  request_too_large: 413,
+  rate_limit_error: 429,
+  api_error: 500,
+  timeout_error: 504,
+  overloaded_error: 529,
+})
+
+/**
+ * Strict passthrough error mapper for `crag_strict_passthrough === true`:
+ * - Gateway-local errors (pool exhaustion, license, quota guard, client cancel,
+ *   slot OAuth unavailable) keep gateway error semantics via `mapUpstreamError`.
+ * - Upstream/Anthropic errors preserve exact HTTP status, verbatim Anthropic
+ *   `{ type: "error", error: { type, message, ... }, request_id }` envelope,
+ *   full untruncated message (no Chinese localization / no `upstream_error` rewrite),
+ *   and upstream response headers for forwarding.
+ */
+export function passthroughUpstreamError(status, body, headers = {}) {
+  const inboundCode = String(body?.error?.code || '')
+  const rawMsg =
+    body?.error?.message ??
+    (typeof body?.error === 'string' ? body.error : null) ??
+    (typeof body?.message === 'string' ? body.message : null) ??
+    (typeof body?.raw === 'string' ? body.raw : null) ??
+    null
+  if (
+    /^license_(required|expired|not_yet_valid|invalid|binding_mismatch|unconfigured|crag_host_over_quota|crag_host_usage_unverified)$/.test(
+      inboundCode,
+    ) ||
+    STRICT_LOCAL_GATEWAY_CODES.has(inboundCode) ||
+    isClientCancelledCode(inboundCode, rawMsg) ||
+    (inboundCode === ErrorCode.REFUSAL_GUARD && body?.error?.details?.blocked_by !== 'upstream')
+  ) {
+    return { ...mapUpstreamError(status, body, headers), headers }
+  }
+  const rawErr = body?.error && typeof body.error === 'object' && !Array.isArray(body.error) ? { ...body.error } : {}
+  const upType =
+    (typeof rawErr.type === 'string' && rawErr.type.trim()) ||
+    (typeof body?.type === 'string' && body.type !== 'error' && body.type !== 'message' ? body.type : null) ||
+    'api_error'
+  const message = rawMsg != null ? String(rawMsg) : `Upstream HTTP ${status || 502}`
+  const requestId = body?.request_id || rawErr.request_id || headers['request-id'] || headers['Request-Id'] || null
+  const errorPayload = { ...rawErr, type: upType, message }
+  delete errorPayload.request_id
+  const numericStatus = Number(status)
+  const resolvedStatus =
+    Number.isInteger(numericStatus) && numericStatus >= 400 && numericStatus < 600
+      ? numericStatus
+      : SEMANTIC_TYPE_STATUS[upType] || 502
+  const retryAfterSec = retryAfterSeconds(headers['retry-after'] ?? headers['Retry-After'])
+  return {
+    status: resolvedStatus,
+    body: {
+      type: 'error',
+      error: errorPayload,
+      ...(requestId ? { request_id: String(requestId) } : {}),
+    },
+    headers,
+    ...(retryAfterSec ? { retryAfterSec } : {}),
+  }
+}
+
 /**
  * Validate protocol request body before convert/upstream.
  * @returns {{ ok: true, body } | { ok: false, errorResult }}
@@ -1205,7 +1288,7 @@ export function validateRequestBody(protocol, body) {
           }),
         }
       }
-      if (m.content == null && !m.tool_calls) {
+      if (m.content == null && !m.tool_calls && m.clear_at == null && m.output_config == null) {
         return {
           ok: false,
           errorResult: makeError({
