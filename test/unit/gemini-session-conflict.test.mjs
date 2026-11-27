@@ -163,6 +163,13 @@ test('mapCragWorkerError maps upstream 403 by upstream_reason (TOS, region, bare
 
   const bare = mapCragWorkerError(502, { code: 'upstream_http', upstream_status: 403 })
   assert.equal(bare.code, 'gemini_location_unsupported')
+
+  const multi = mapCragWorkerError(502, {
+    code: 'upstream_http',
+    upstream_status: 403,
+    message: '403 UNSUPPORTED_REGION and TOS_VIOLATION',
+  })
+  assert.equal(multi.code, 'gemini_account_ineligible')
 })
 
 test('mapCragWorkerError maps tool_continuation_aborted to gemini_session_conflict (409)', () => {

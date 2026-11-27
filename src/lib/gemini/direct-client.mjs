@@ -330,19 +330,14 @@ export function buildDirectEnvelope({ model, requestId, bodyObj, gatewayPolicy =
   return envelope
 }
 
-const UPSTREAM_403_REASON_TOKENS = new Set([
-  'TOS_VIOLATION',
-  'UNSUPPORTED_REGION',
-  'VALIDATION_REQUIRED',
-  'UNSUPPORTED_CLIENT',
-])
+const UPSTREAM_403_REASON_TOKENS = ['TOS_VIOLATION', 'UNSUPPORTED_REGION', 'VALIDATION_REQUIRED', 'UNSUPPORTED_CLIENT']
 
 function payloadUpstreamReason(obj) {
   const raw = typeof obj.upstream_reason === 'string' ? obj.upstream_reason.trim() : ''
-  if (raw) return raw.toUpperCase()
+  if (raw.length > 0) return raw.toUpperCase()
   for (const key of ['message', 'error']) {
-    const val = typeof obj[key] === 'string' ? obj[key] : ''
-    if (!val) continue
+    const val = typeof obj[key] === 'string' ? obj[key].trim() : ''
+    if (val.length === 0) continue
     const upper = val.toUpperCase()
     for (const token of UPSTREAM_403_REASON_TOKENS) {
       if (upper.includes(token)) return token

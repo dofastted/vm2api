@@ -421,6 +421,12 @@ assert (
     ).code
     == "gemini_account_ineligible"
 )
+assert (
+    native._payload_upstream_reason(
+        {"message": "403 UNSUPPORTED_REGION and TOS_VIOLATION"},
+    )
+    == "TOS_VIOLATION"
+)
 assert native._map_worker_error(502, {"code": "upstream_http", "upstream_status": 401}).code == "gemini_oauth_required"
 assert native._map_worker_error(502, {"code": "upstream_http", "upstream_status": 404}).code == "gemini_model_unavailable"
 assert native._map_worker_error(504, {"code": "first_byte_timeout"}).code == "gemini_inference_timeout"

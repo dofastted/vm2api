@@ -80,7 +80,7 @@ const FAILURES = {
   ],
   gemini_account_ineligible: [
     403,
-    'Google disabled this account for a terms-of-service violation (403 TOS_VIOLATION). Appeal with Google or use a different account.',
+    'Google rejected this account as ineligible or it may be disabled (403). If upstream reason is TOS_VIOLATION, appeal with Google or use a different account; eligibility checks can still look normal—confirm with an actual conversation.',
   ],
   gemini_proxy_error: [502, 'The bound Gemini proxy could not reach Google.'],
   gemini_quota_exhausted: [429, 'The selected Gemini account quota is exhausted.'],

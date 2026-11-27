@@ -235,13 +235,13 @@ describe('Gemini account presentation', () => {
       vmCredDead(slot({ ...candidate, auth_state: 'reauth_required' }))
     ).toBe(true)
     expect(geminiInferenceErrorLabel('gemini_location_unsupported')).toBe(
-      'Google 地区资格受限'
+      'Google 403：地区或账号受限'
     )
     expect(
       geminiInferenceErrorLabel('gemini_account_verification_required')
     ).toBe('Google 账号需先完成浏览器验证')
     expect(geminiInferenceErrorLabel('gemini_account_ineligible')).toBe(
-      'Google 账号不符合 Antigravity 资格'
+      'Google 账号不符合资格或可能已停用'
     )
     expect(geminiInferenceErrorLabel('license_required')).toBe(
       '未绑定 CRAGGemini 订阅席位'
@@ -352,7 +352,7 @@ describe('Gemini account presentation', () => {
       '代理'
     )
     expect(geminiInferenceErrorAction('gemini_account_ineligible')).toContain(
-      '服务条款'
+      'TOS_VIOLATION'
     )
     expect(geminiInferenceErrorAction('gemini_account_ineligible')).toContain(
       '申诉'

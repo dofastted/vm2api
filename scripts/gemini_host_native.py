@@ -478,13 +478,11 @@ LICENSE_ERROR_CODES = frozenset(
     }
 )
 
-_UPSTREAM_403_REASON_TOKENS = frozenset(
-    {
-        "TOS_VIOLATION",
-        "UNSUPPORTED_REGION",
-        "VALIDATION_REQUIRED",
-        "UNSUPPORTED_CLIENT",
-    }
+_UPSTREAM_403_REASON_TOKENS = (
+    "TOS_VIOLATION",
+    "UNSUPPORTED_REGION",
+    "VALIDATION_REQUIRED",
+    "UNSUPPORTED_CLIENT",
 )
 
 
@@ -492,18 +490,24 @@ def _payload_upstream_reason(payload):
     if not isinstance(payload, dict):
         return None
     raw = payload.get("upstream_reason")
-    if isinstance(raw, str) and raw.strip():
-        token = raw.strip().upper()
-        if token in _UPSTREAM_403_REASON_TOKENS:
-            return token
-        return token
+    if isinstance(raw, str):
+        token = raw.strip()
+        if len(token) > 0:
+            upper = token.upper()
+            if upper in _UPSTREAM_403_REASON_TOKENS:
+                return upper
+            return upper
     for key in ("message", "error"):
         val = payload.get(key)
-        if isinstance(val, str) and val:
-            upper = val.upper()
-            for token in _UPSTREAM_403_REASON_TOKENS:
-                if token in upper:
-                    return token
+        if not isinstance(val, str):
+            continue
+        text = val.strip()
+        if len(text) == 0:
+            continue
+        upper = text.upper()
+        for token in _UPSTREAM_403_REASON_TOKENS:
+            if token in upper:
+                return token
     return None
 
 

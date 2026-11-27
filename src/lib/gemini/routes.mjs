@@ -90,7 +90,7 @@ const RUN_ERRORS = {
   ],
   gemini_account_ineligible: [
     403,
-    'Google 因违反服务条款已停用该账号（403 TOS_VIOLATION）；请在 Google 侧申诉或更换其他可用账号。资格查询不一定反映停用状态，请以实际对话为准',
+    'Google 判定该账号不符合 Antigravity 资格或可能已被停用（403）。若上游原因为 TOS_VIOLATION，请在 Google 侧申诉或更换账号；资格查询不一定反映停用状态，请以实际对话为准',
   ],
   gemini_proxy_error: [
     502,
