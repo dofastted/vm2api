@@ -7,6 +7,8 @@ import { AccountQuota } from '../../src/lib/pool/account-quota.mjs'
 import { officialMessagesBody } from '../../src/lib/protocol/anthropic-messages.mjs'
 import { PoolScheduler } from '../../src/lib/pool/pool-scheduler.mjs'
 import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
+import { SchedulerApiError } from '../../src/lib/scheduler/scheduler-runtime.mjs'
+import { createFailoverMockSchedulerRuntime, createMockSchedulerRuntime } from '../helpers/mock-scheduler-runtime.mjs'
 import {
   estimatePromptTokens,
   estimateRequestRisk,
@@ -252,20 +254,35 @@ test('scheduler switches using requestRisk on the quotaRequest body estimate', a
   accountQuota.canAccept = (id, opts = {}) => orig(id, { ...opts, requestRisk: largeColdRisk })
   const origAcq = accountQuota.tryAcquire.bind(accountQuota)
   accountQuota.tryAcquire = (id, opts = {}) => origAcq(id, { ...opts, requestRisk: largeColdRisk })
+  const quotaRequest = { body: { messages: [{ role: 'user', content: 'x' }] } }
+  assert.equal(accountQuota.canAccept('account-1', { quotaRequest }).reason, 'quota_guard_request_too_large')
+  assert.equal(accountQuota.canAccept('account-2', { quotaRequest }).ok, true)
+
   const pool = new PoolScheduler({
     projectRoot: root,
     runtimeRepo: new RuntimeRepo(accountQuota.repo),
     accountQuota,
+    schedulerRuntime: createMockSchedulerRuntime({
+      projectRoot: root,
+      listNodes: () =>
+        [
+          { id: 'vm-01', accountId: 'account-1' },
+          { id: 'vm-02', accountId: 'account-2' },
+        ]
+          .filter((entry) => accountQuota.canAccept(entry.accountId, { quotaRequest }).ok)
+          .map((entry) => `claude_vm:${entry.id}`),
+    }),
     workerHealth: async () => ({ ok: true, credential: { generation: 1, has_access: true } }),
     config: { fallback_wait_timeout_ms: 5, sticky_wait_timeout_ms: 5 },
   })
   const selected = await pool.selectAndReserve({
     model: 'claude-sonnet-4-5',
     allowWait: false,
-    quotaRequest: { body: { messages: [{ role: 'user', content: 'x' }] } },
+    quotaRequest,
   })
   assert.equal(selected.ok, true)
   assert.equal(selected.accountId, 'account-2')
+  assert.equal(selected.quotaRequest, quotaRequest)
   selected.release()
 })
 
@@ -277,24 +294,40 @@ test('all in-band accounts yield quota_guard_request_too_large', async (t) => {
   setUtil(accountQuota, 'account-2', { u5: 0.77 })
   const orig = accountQuota.canAccept.bind(accountQuota)
   accountQuota.canAccept = (id, opts = {}) => orig(id, { ...opts, requestRisk: largeColdRisk })
+  const quotaRequest = { body: { messages: [{ role: 'user', content: 'x' }] } }
+  assert.equal(accountQuota.canAccept('account-1', { quotaRequest }).reason, 'quota_guard_request_too_large')
+  assert.equal(accountQuota.canAccept('account-2', { quotaRequest }).reason, 'quota_guard_request_too_large')
+
   const pool = new PoolScheduler({
     projectRoot: root,
     runtimeRepo: new RuntimeRepo(accountQuota.repo),
     accountQuota,
+    schedulerRuntime: createMockSchedulerRuntime({
+      projectRoot: root,
+      listNodes: () => [],
+      exhaustedError: () =>
+        new SchedulerApiError({
+          status: 429,
+          code: 'quota_guard_request_too_large',
+          message: 'Request exceeds remaining quota band',
+        }),
+    }),
     workerHealth: async () => ({ ok: true, credential: { generation: 1, has_access: true } }),
     config: { fallback_wait_timeout_ms: 5, sticky_wait_timeout_ms: 5 },
   })
   const selected = await pool.selectAndReserve({
     model: 'claude-sonnet-4-5',
     allowWait: false,
-    quotaRequest: { body: { messages: [{ role: 'user', content: 'x' }] } },
+    quotaRequest,
   })
   assert.equal(selected.ok, false)
   assert.equal(selected.reason, 'quota_guard_request_too_large')
+  const scheduler = {
+    selectAndReserve: async () => selected,
+  }
   const runner = new FailoverRunner({
-    scheduler: {
-      selectAndReserve: async () => selected,
-    },
+    scheduler,
+    schedulerRuntime: createFailoverMockSchedulerRuntime({ scheduler }),
     config: { total_retry_deadline_ms: 50, fallback_wait_timeout_ms: 5 },
   })
   const result = await runner.runOnce({

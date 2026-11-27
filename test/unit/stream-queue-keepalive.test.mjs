@@ -6,6 +6,7 @@ import path from 'node:path'
 import http from 'node:http'
 import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs'
 import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
+import { createFailoverMockSchedulerRuntime } from '../helpers/mock-scheduler-runtime.mjs'
 import { activateFixture, seedEncryptedPackage } from '../fixtures/crag-license.mjs'
 
 const MESSAGE = {
@@ -219,23 +220,26 @@ async function activeAttemptFailure({ block, delta, clusterDisconnect = false })
     }
   })
   const released = []
-  const runner = new FailoverRunner({
-    scheduler: {
-      async selectAndReserve({ excluded, avoid }) {
-        const selected = candidates.find(
-          (candidate) =>
-            !excluded.has(candidate.accountId) &&
-            !excluded.has(candidate.vmId) &&
-            !avoid?.has(candidate.accountId) &&
-            !avoid?.has(candidate.vmId),
-        )
-        return selected
-          ? { ...selected, ok: true, release: () => released.push(selected.accountId) }
-          : { ok: false, reason: 'no_eligible_accounts' }
-      },
-      markCooldown() {},
-      markSuccess() {},
+  const scheduler = {
+    candidates,
+    async selectAndReserve({ excluded, avoid }) {
+      const selected = candidates.find(
+        (candidate) =>
+          !excluded.has(candidate.accountId) &&
+          !excluded.has(candidate.vmId) &&
+          !avoid?.has(candidate.accountId) &&
+          !avoid?.has(candidate.vmId),
+      )
+      return selected
+        ? { ...selected, ok: true, release: () => released.push(selected.accountId) }
+        : { ok: false, reason: 'no_eligible_accounts' }
     },
+    markCooldown() {},
+    markSuccess() {},
+  }
+  const runner = new FailoverRunner({
+    scheduler,
+    schedulerRuntime: createFailoverMockSchedulerRuntime({ scheduler }),
     config: {
       max_same_account_retries: 0,
       max_account_switches: 1,

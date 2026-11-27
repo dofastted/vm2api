@@ -10,6 +10,7 @@ import { CODEX_IMAGE_EDITS_URL, CODEX_IMAGE_GENERATIONS_URL } from '../../src/li
 import { openDatabase, closeDatabase } from '../../src/lib/db/database.mjs'
 import { loadGptModelPolicy, saveGptModelPolicy } from '../../src/lib/protocol/gpt-model-policy.mjs'
 import { resetOpenAIAccountRuntime } from '../../src/lib/pool/openai-account-runtime.mjs'
+import { createMockSchedulerRuntime } from '../helpers/mock-scheduler-runtime.mjs'
 
 const USAGE = {
   input_tokens: 300,
@@ -78,6 +79,7 @@ async function serve(upstream) {
     stats: { errors: 0, requests: 0, by_route: {} },
     groupsRepo: { rateMultiplier: () => 1 },
     routingConfig: {},
+    schedulerRuntime: createMockSchedulerRuntime({ projectRoot: root }),
     codexOps: {
       fetchImpl: async (url, init) => {
         const body = JSON.parse(init.body)

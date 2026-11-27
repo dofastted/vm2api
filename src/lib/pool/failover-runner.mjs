@@ -1333,6 +1333,12 @@ export class FailoverRunner {
           const knownSearchRepair = hint && hint.expiresAt > Date.now() && hint.fingerprint === fingerprint()
           const attemptBody = knownSearchRepair ? flattenSearchResultHistory(requestBody) : requestBody
 
+          const primaryStickyKey = stickyKey || bindKeys[0] || null
+          const attemptStickyBound =
+            primaryStickyKey && typeof this.stickyRouter?.resolve === 'function'
+              ? this.stickyRouter.resolve(primaryStickyKey)
+              : null
+
           const prepared =
             typeof applyAttempt === 'function'
               ? await applyAttempt(clone(attemptBody), selected, {
@@ -1344,7 +1350,7 @@ export class FailoverRunner {
                   ],
                   attemptStartedAt: attemptStarted,
                   freshSlot,
-                  stickyBound: null,
+                  stickyBound: attemptStickyBound,
                 })
               : clone(attemptBody)
 
@@ -1360,6 +1366,46 @@ export class FailoverRunner {
             Object.prototype.hasOwnProperty.call(prepared, 'meta')
           const body = wrappedAttempt ? prepared.body : prepared
           const attemptMeta = wrappedAttempt ? prepared.meta : null
+
+          // Outbound session_id ledger only (Rust kin-scheduler owns inbound routing & SessionGate).
+          // Borrowed hops and slot_busy spills never overwrite the pinned home's outbound session.
+          if (
+            attemptMeta?.sessionId &&
+            bindKeys.length > 0 &&
+            selected?.stickyBorrowed !== true &&
+            typeof this.stickyRouter?.bind === 'function'
+          ) {
+            const outboundSessionId = String(attemptMeta.sessionId)
+            const followCache = this.scheduler?.config?.session_affinity_first === true
+            const replaceSession =
+              freshSlot || Boolean(attemptStickyBound?.vmId && attemptStickyBound.vmId !== selected.vmId)
+            for (const key of bindKeys) {
+              const prev = this.stickyRouter.resolve?.(key) || null
+              if (
+                prev?.accountId &&
+                prev.accountId !== selected.accountId &&
+                !followCache &&
+                budget.spilled.has(prev.accountId)
+              ) {
+                continue
+              }
+              this.stickyRouter.bind(
+                key,
+                {
+                  accountId: selected.accountId,
+                  vmId: selected.vmId,
+                  sessionId: outboundSessionId,
+                  ...(stickyDeviceId ? { deviceId: stickyDeviceId } : {}),
+                },
+                {
+                  countHit: false,
+                  ...(prev ? { ifGeneration: prev.generation || 0 } : {}),
+                  replaceSession,
+                  allowMove: true,
+                },
+              )
+            }
+          }
 
           result = await callAttempt({
             candidate: selected,

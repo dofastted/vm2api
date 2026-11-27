@@ -52,6 +52,8 @@ test('risk-audit and request-level codes never change the slot state', () => {
     'usage_policy_refusal',
     ErrorCode.THIRD_PARTY_CLIENT,
     'invalid_request',
+    'invalid_request_schema',
+    'thinking_incompatible',
     'entitlement_required',
     'signature_repairable',
     'http_404',
@@ -61,6 +63,11 @@ test('risk-audit and request-level codes never change the slot state', () => {
     'slot_busy',
     'concurrency_limit',
     'model_cooldown',
+    'runtime_missing',
+    'pre_reset_generation',
+    'pre_reset_started_at',
+    'pre_reset_probed_at',
+    'missing_reset_timing',
   ]
   for (const code of stateless) assert.equal(stateOfReason(code)?.state, 'on', code)
 })

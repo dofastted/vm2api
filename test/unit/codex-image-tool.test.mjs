@@ -7,6 +7,7 @@ import { handleCodexProtocol, imageGenUsageFromSseLine } from '../../src/lib/pro
 import { openDatabase, closeDatabase } from '../../src/lib/db/database.mjs'
 import { loadGptModelPolicy, saveGptModelPolicy } from '../../src/lib/protocol/gpt-model-policy.mjs'
 import { resetOpenAIAccountRuntime } from '../../src/lib/pool/openai-account-runtime.mjs'
+import { createMockSchedulerRuntime } from '../helpers/mock-scheduler-runtime.mjs'
 
 const IMAGE_GEN = {
   input_tokens: 300,
@@ -74,6 +75,7 @@ async function run(
     },
     routing: {},
     projectRoot: root,
+    schedulerRuntime: createMockSchedulerRuntime({ projectRoot: root }),
     ops: {
       writeCodexKernelConfig() {},
       ensureCodexKernel: async () => ({ ok: true }),

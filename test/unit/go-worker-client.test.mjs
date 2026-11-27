@@ -25,6 +25,7 @@ import { forwardApi, readApiJson } from '../../src/lib/transport/api-kernel-clie
 import { normalizeRedaction } from '../../src/lib/redaction/policy.mjs'
 import { publishRedactionForTests } from '../../src/lib/redaction/runtime.mjs'
 import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
+import { createFailoverMockSchedulerRuntime } from '../helpers/mock-scheduler-runtime.mjs'
 import { classifyUpstreamResult } from '../../src/lib/pool/upstream-error-policy.mjs'
 import { mapUpstreamError } from '../../src/lib/core/errors.mjs'
 import { createAnthropicSseErrorRemapper } from '../../src/lib/protocol/stream-truncation.mjs'
@@ -2064,17 +2065,19 @@ unixTest('redaction 413 stops failover before any worker dispatch for call and s
         ? { input: 'fixture' }
         : { model: 'claude-sonnet-5', messages: [{ role: 'user', content: 'fixture' }] }
     let selections = 0
-    const runner = new FailoverRunner({
-      scheduler: {
-        async selectAndReserve() {
-          selections++
-          assert.equal(selections, 1, 'a local size error must not select another account')
-          return { ok: true, accountId: 'fixture', vmId: 'vm-fixture', release() {} }
-        },
-        markCooldown() {
-          assert.fail('a local size error must not cool down an account')
-        },
+    const scheduler = {
+      async selectAndReserve() {
+        selections++
+        assert.equal(selections, 1, 'a local size error must not select another account')
+        return { ok: true, accountId: 'fixture', vmId: 'vm-fixture', release() {} }
       },
+      markCooldown() {
+        assert.fail('a local size error must not cool down an account')
+      },
+    }
+    const runner = new FailoverRunner({
+      scheduler,
+      schedulerRuntime: createFailoverMockSchedulerRuntime({ scheduler }),
     })
     const result = await runner.run({
       requestId: `redaction-size-${call.name}`,

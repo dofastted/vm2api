@@ -13,6 +13,7 @@ import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
 import { classifyUpstreamResult } from '../../src/lib/pool/upstream-error-policy.mjs'
 import { RateLimitService } from '../../src/lib/pool/rate-limit-service.mjs'
 import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs'
+import { createFailoverMockSchedulerRuntime } from '../helpers/mock-scheduler-runtime.mjs'
 import { consumeNativeHandoffStream, createNativeHandoffState } from '../../src/lib/protocol/native-handoff.mjs'
 import {
   applyClaudeSSELineToMessage,
@@ -685,16 +686,18 @@ unixTest(
     // second attempt strips broken caller cache_control and succeeds on the same slot.
     const seenBodies = []
     let selections = 0
-    const runner = new FailoverRunner({
-      scheduler: {
-        async selectAndReserve() {
-          selections++
-          return { ok: true, vmId: 'vm-01', accountId: 'acc-1', vm: { id: 'vm-01' }, release() {} }
-        },
-        markRateLimited() {
-          throw new Error('must not cool down account on CRAG_CACHE_CONTROL repair')
-        },
+    const scheduler = {
+      async selectAndReserve() {
+        selections++
+        return { ok: true, vmId: 'vm-01', accountId: 'acc-1', vm: { id: 'vm-01' }, release() {} }
       },
+      markRateLimited() {
+        throw new Error('must not cool down account on CRAG_CACHE_CONTROL repair')
+      },
+    }
+    const runner = new FailoverRunner({
+      scheduler,
+      schedulerRuntime: createFailoverMockSchedulerRuntime({ scheduler }),
     })
     const runResult = await runner.run({
       canonicalBody: {
@@ -713,7 +716,7 @@ unixTest(
     })
     assert.equal(runResult.ok, true)
     assert.equal(seenBodies.length, 2)
-    assert.equal(selections, 2)
+    assert.equal(selections, 1, 'one-shot body repair stays on the held Rust lease')
     assert.deepEqual(seenBodies[0].system[0].cache_control, { type: 'ephemeral', ttl: '1h' })
     assert.equal(seenBodies[1].system[0].cache_control, undefined)
     assert.equal(seenBodies[1].messages[0].content[0].cache_control, undefined)
@@ -749,19 +752,21 @@ unixTest('#1139: opaque CRAG 429 returns once without restricting the account', 
   let releases = 0
   const restrictions = []
   const quotaSamples = []
-  const runner = new FailoverRunner({
-    scheduler: {
-      async selectAndReserve({ excluded }) {
-        selections++
-        for (let i = 1; i <= seats; i++) {
-          const vmId = `vm-0${i}`
-          if (excluded.has(vmId)) continue
-          return { ok: true, vmId, accountId: vmId, vm: { id: vmId }, release: () => releases++ }
-        }
-        return { ok: false, reason: 'pool_queue_timeout' }
-      },
-      markCooldown: (_candidate, update) => restrictions.push(update),
+  const scheduler = {
+    async selectAndReserve({ excluded }) {
+      selections++
+      for (let i = 1; i <= seats; i++) {
+        const vmId = `vm-0${i}`
+        if (excluded.has(vmId)) continue
+        return { ok: true, vmId, accountId: vmId, vm: { id: vmId }, release: () => releases++ }
+      }
+      return { ok: false, reason: 'pool_queue_timeout' }
     },
+    markCooldown: (_candidate, update) => restrictions.push(update),
+  }
+  const runner = new FailoverRunner({
+    scheduler,
+    schedulerRuntime: createFailoverMockSchedulerRuntime({ scheduler }),
     onSchedulePause: (update) => restrictions.push(update),
     rateLimitService: new RateLimitService({
       runtimeRepo: { updateWindow: (...args) => restrictions.push(args) },
@@ -1617,22 +1622,24 @@ unixTest(
       fs.rmSync(dataDir, { recursive: true, force: true })
     })
 
+    const scheduler = {
+      async selectAndReserve() {
+        return {
+          ok: true,
+          vmId: 'vm-11',
+          accountId: 'acc-11',
+          vm: { id: 'vm-11' },
+          selectionReason: 'sticky',
+          release() {},
+        }
+      },
+      markSuccess() {},
+      markCooldown() {},
+    }
     const runner = new FailoverRunner({
       attemptsRepo,
-      scheduler: {
-        async selectAndReserve() {
-          return {
-            ok: true,
-            vmId: 'vm-11',
-            accountId: 'acc-11',
-            vm: { id: 'vm-11' },
-            selectionReason: 'sticky',
-            release() {},
-          }
-        },
-        markSuccess() {},
-        markCooldown() {},
-      },
+      scheduler,
+      schedulerRuntime: createFailoverMockSchedulerRuntime({ scheduler }),
     })
 
     const cfg = {
