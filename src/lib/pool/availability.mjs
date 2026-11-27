@@ -33,6 +33,16 @@ export const REVOKE_TEXT = 'revoke'
 export const TRANSIENT_CREDENTIAL_REFRESH_FAIL = /worker_output_invalid|refresh_rejected|refresh_denied/i
 export const CREDENTIAL_REFRESH_FAIL =
   /oauth_invalid_grant|invalid_grant|refresh_token_missing|refresh_token_invalid|refresh token not found|oauth_revoked|oauth_no_refresh|oauth_cleared|credential_refresh_failed|worker_output_invalid|refresh_rejected|refresh_denied|token_revoked|invalidated oauth token/i
+/**
+ * Non-grant refresh failures that carry no revocation wording (e.g. worker's
+ * bare `refresh_failed` or `refresh_outcome_unknown`) and therefore miss
+ * `CREDENTIAL_REFRESH_FAIL`. Pre-exchange setup / transport codes
+ * (`proxy_required`, `config_failed`, `worker_upgrade_required`,
+ * `upstream_transport_error`) are intentionally excluded so proxy or config
+ * repairs can recover the slot instead of locking it as `no_credential`.
+ */
+export const EXPIRED_CREDENTIAL_REFRESH_FAIL =
+  /^(?:refresh_failed|oauth_refresh_failed|refresh_outcome_unknown|invalid_refresh_token|credential_required)$/i
 
 function liveAccessTtlMs(vm = {}, workerCredential = {}, expiresAt = null) {
   return (
@@ -45,6 +55,24 @@ function liveAccessTtlMs(vm = {}, workerCredential = {}, expiresAt = null) {
 
 function currentRefreshError(vm = {}, refreshError = null) {
   return refreshError || vm?.claude?.refresh_error || vm?.refresh_error || null
+}
+
+/**
+ * True when every expiry we can see for this slot is already in the past.
+ * Takes the latest of them so a stale control-plane copy cannot outvote a
+ * fresher ticket the worker reports. Unknown expiry is never "expired".
+ */
+export function isAccessExpiredEverywhere({
+  vm = {},
+  expiresAt = null,
+  workerCredential = null,
+  now = Date.now(),
+} = {}) {
+  const known = [expiresAt, workerCredential?.expires_at, vm?.claude?.expires_at, vm?.expires_at]
+    .map((v) => expiresAtToMs(v))
+    .filter((ms) => Number.isFinite(ms) && ms > 0)
+  if (!known.length) return false
+  return Math.max(...known) <= now
 }
 
 /** True when the slot already has a live access ticket after a later refresh. */
@@ -68,6 +96,20 @@ export function isCredentialRefreshFailed({
 } = {}) {
   if (isOfficialUsageRateLimited(probe)) return false
   const recordedError = currentRefreshError(vm, refreshError)
+  // Expired ticket + a recorded OAuth refresh failure cannot serve a single
+  // request: the CLI starts without a valid token and the slot only times out
+  // (the circuit then reports a "kernel fault"). Worker codes such as a bare
+  // `refresh_failed` carry no grant wording, so `CREDENTIAL_REFRESH_FAIL` below
+  // misses them. Limit this short-circuit to actual refresh failures so
+  // pre-exchange setup codes (`proxy_required`, `config_failed`,
+  // `worker_upgrade_required`) keep their recovery path after repair.
+  if (
+    recordedError &&
+    EXPIRED_CREDENTIAL_REFRESH_FAIL.test(String(recordedError).trim()) &&
+    isAccessExpiredEverywhere({ vm, expiresAt, workerCredential, now })
+  ) {
+    return true
+  }
   const transientRecorded = TRANSIENT_CREDENTIAL_REFRESH_FAIL.test(String(recordedError || ''))
   const accessOutlives = currentAccessOutlivesGrantError(
     vm,

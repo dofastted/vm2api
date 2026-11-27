@@ -2234,6 +2234,7 @@ export class PoolScheduler extends EventEmitter {
               probe_source: account.unified.source,
             }
           : {}
+        const runtimeWorkerStatus = knownHealth || state?.worker_status || account.worker_status || null
         const ev = evaluateAccount({
           vm,
           account: { ...account, last_used_at: lastUsedAt },
@@ -2243,11 +2244,12 @@ export class PoolScheduler extends EventEmitter {
           scheduleDisabledReason: vm.schedule_disabled_reason || null,
           lastProbe: account.last_probe || account.unified?.last_probe || null,
           probeSource: account.unified?.source || account.last_probe?.source || null,
-          workerLastError: account.worker_status?.last_error || vm.claude?.refresh_error,
+          workerLastError: runtimeWorkerStatus?.last_error || vm.claude?.refresh_error,
           refreshError: vm.claude?.refresh_error,
           expiresAt: vm.claude?.expires_at || vm.expires_at || null,
           refreshedAt: vm.claude?.refreshed_at || vm.refreshed_at || null,
-          workerCredential: account.worker_status?.credential || null,
+          workerCredential:
+            knownHealth?.credential || state?.worker_status?.credential || account.worker_status?.credential || null,
           quota,
           policy,
           cooldownUntil:
@@ -3364,6 +3366,7 @@ export class PoolScheduler extends EventEmitter {
     if (!account) return { action: 'keep', reason: null }
     const now = Date.now()
     const lastUsedAt = this.lastUsed.get(accountId) || account.last_used_at || 0
+    const runtimeWorkerStatus = state?.worker_status || account.worker_status || null
     const ev = evaluateAccount({
       vm: {
         ...vm,
@@ -3382,11 +3385,11 @@ export class PoolScheduler extends EventEmitter {
       scheduleDisabledReason: null,
       lastProbe: account.last_probe || account.unified?.last_probe || null,
       probeSource: account.unified?.source || account.last_probe?.source || null,
-      workerLastError: account.worker_status?.last_error || vm.claude?.refresh_error,
+      workerLastError: runtimeWorkerStatus?.last_error || vm.claude?.refresh_error,
       refreshError: vm.claude?.refresh_error,
       expiresAt: vm.claude?.expires_at || vm.expires_at || null,
       refreshedAt: vm.claude?.refreshed_at || vm.refreshed_at || null,
-      workerCredential: account.worker_status?.credential || null,
+      workerCredential: state?.worker_status?.credential || account.worker_status?.credential || null,
       quota: account.unified
         ? {
             ...listQuotaFromHeaders(account.unified, { now }),
