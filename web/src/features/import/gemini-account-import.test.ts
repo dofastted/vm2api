@@ -96,7 +96,8 @@ describe('parseGeminiAccountImportData & parseGeminiAccountImportText', () => {
             email: 'enterprise@example.test',
             refresh_token: '1//06EnterpriseRefreshToken_xyz',
             auth_method: 'business_licensed_enterprise',
-            wif_provider: 'projects/1/locations/global/workloadIdentityPools/p/providers/g',
+            wif_provider:
+              'projects/1/locations/global/workloadIdentityPools/p/providers/g',
           },
         ],
       },
@@ -418,5 +419,123 @@ describe('parseGeminiAccountImportData & parseGeminiAccountImportText', () => {
     await expect(readGeminiAccountImportFile(badJson)).rejects.toThrow(
       /有效的 JSON/
     )
+  })
+
+  test('parses schema_version 2 export, bare RT special chars, relaxed types, tokens bundle, and nested outer metadata', () => {
+    // Redacted Format 2 fixture (antigravity-accounts-2026-11-28_04-34-13.json)
+    const format2 = parseGeminiAccountImportData({
+      schema_version: 2,
+      accounts: [
+        {
+          email: 'redacted2@gmail.com',
+          refresh_token: '1//06Q_Format2Fixture_xyz',
+          oauth_client_key: 'antigravity_enterprise',
+          is_gcp_tos: false,
+          project_id: 'aicode-consumers',
+        },
+        {
+          email: 'redacted3@gmail.com',
+          refresh_token: '1//06R_Format2Second_abc',
+          oauth_client_key: 'consumer',
+          is_gcp_tos: true,
+          project_id: 'aicode-pro',
+        },
+      ],
+    })
+    expect(format2.format).toBe('antigravity_rt')
+    expect(format2.accounts).toHaveLength(2)
+    expect(format2.accounts[0]).toMatchObject({
+      kind: 'oauth',
+      hasRefreshToken: true,
+      email: 'redacted2@gmail.com',
+      project_id: 'aicode-consumers',
+      oauth_client_key: 'antigravity_enterprise',
+      is_gcp_tos: false,
+      suggestedName: 'redacted2@gmail.com',
+      oauth_account: {
+        refresh_token: '1//06Q_Format2Fixture_xyz',
+        oauth_client_key: 'antigravity_enterprise',
+        is_gcp_tos: false,
+        project_id: 'aicode-consumers',
+      },
+    })
+    expect(format2.accounts[1]).toMatchObject({
+      kind: 'oauth',
+      email: 'redacted3@gmail.com',
+      oauth_account: {
+        refresh_token: '1//06R_Format2Second_abc',
+        oauth_client_key: 'consumer',
+        is_gcp_tos: true,
+        project_id: 'aicode-pro',
+      },
+    })
+
+    // Bare refresh tokens with `.`, `~`, `+`, `/` must not be truncated
+    const specialRt = '1//06Bare.Token~with+plus/slash_999'
+    expect(extractBareRefreshTokens(`RT: ${specialRt}`)).toEqual([specialRt])
+    const parsedBare = parseGeminiAccountImportText(`RT: ${specialRt}`)
+    expect(parsedBare.accounts[0]).toMatchObject({
+      kind: 'oauth',
+      oauth_account: { refresh_token: specialRt },
+    })
+
+    // Generic `{ type: "antigravity-export", tokens: [...] }` + relaxed account `type`
+    const relaxed = parseGeminiAccountImportData({
+      type: 'antigravity-export',
+      tokens: [
+        {
+          type: 'authorized_user',
+          email: 'adc@gmail.com',
+          refresh_token: '1//06Adc_111111',
+        },
+        {
+          type: 'personal',
+          email: 'p@gmail.com',
+          refresh_token: '1//06Personal_222222',
+        },
+        {
+          type: 'pro',
+          email: 'pro@gmail.com',
+          refresh_token: '1//06Pro_333333',
+        },
+        {
+          type: 'google',
+          email: 'g@gmail.com',
+          refresh_token: '1//06Google_444444',
+        },
+        {
+          type: 'antigravity_enterprise',
+          email: 'e@gmail.com',
+          refresh_token: '1//06Ent_555555',
+        },
+      ],
+    })
+    expect(relaxed.format).toBe('antigravity_rt')
+    expect(relaxed.accounts).toHaveLength(5)
+
+    // Outer email/name/project_id/oauth_client_key/is_gcp_tos preserved when descending into nested object
+    const nested = parseGeminiAccountImportData({
+      email: 'outer@gmail.com',
+      name: 'Outer Env',
+      project_id: 'outer-proj',
+      oauth_client_key: 'antigravity_enterprise',
+      is_gcp_tos: false,
+      auth: {
+        refresh_token: '1//06NestedToken_abc',
+      },
+    })
+    expect(nested.accounts).toHaveLength(1)
+    expect(nested.accounts[0]).toMatchObject({
+      kind: 'oauth',
+      email: 'outer@gmail.com',
+      project_id: 'outer-proj',
+      suggestedName: 'Outer Env',
+      oauth_account: {
+        refresh_token: '1//06NestedToken_abc',
+        project_id: 'outer-proj',
+        oauth_client_key: 'antigravity_enterprise',
+        is_gcp_tos: false,
+      },
+    })
   })
 })

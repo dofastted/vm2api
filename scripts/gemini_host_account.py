@@ -21,6 +21,10 @@ OAUTH_CLIENT_ENV_KEYS = (
     "KIN_GEMINI_OAUTH_CONSUMER_CLIENT_SECRET",
     "KIN_GEMINI_OAUTH_CLOUD_CLIENT_ID",
     "KIN_GEMINI_OAUTH_CLOUD_CLIENT_SECRET",
+    "KIN_GEMINI_OAUTH_ENTERPRISE_CLIENT_ID",
+    "KIN_GEMINI_OAUTH_ENTERPRISE_CLIENT_SECRET",
+    "KIN_GEMINI_OAUTH_GEMINICLI_CLIENT_ID",
+    "KIN_GEMINI_OAUTH_GEMINICLI_CLIENT_SECRET",
     "KIN_GEMINI_OAUTH_WIF_CLIENT_ID",
 )
 
@@ -36,22 +40,40 @@ def _resolve_oauth_clients(oauth_clients=None):
         return trimmed or None
 
     resolved = {}
-    consumer_id = read_cfg("KIN_GEMINI_OAUTH_CONSUMER_CLIENT_ID")
-    if consumer_id:
-        resolved["consumer"] = (
-            GOOGLE_OAUTH_TOKEN_URL,
-            consumer_id,
-            read_cfg("KIN_GEMINI_OAUTH_CONSUMER_CLIENT_SECRET"),
+    for name, id_key, sec_key, auth_tag in (
+        (
             "consumer",
-        )
-    cloud_id = read_cfg("KIN_GEMINI_OAUTH_CLOUD_CLIENT_ID")
-    if cloud_id:
-        resolved["cloud"] = (
-            GOOGLE_OAUTH_TOKEN_URL,
-            cloud_id,
-            read_cfg("KIN_GEMINI_OAUTH_CLOUD_CLIENT_SECRET"),
+            "KIN_GEMINI_OAUTH_CONSUMER_CLIENT_ID",
+            "KIN_GEMINI_OAUTH_CONSUMER_CLIENT_SECRET",
+            "consumer",
+        ),
+        (
+            "cloud",
+            "KIN_GEMINI_OAUTH_CLOUD_CLIENT_ID",
+            "KIN_GEMINI_OAUTH_CLOUD_CLIENT_SECRET",
             "gcp",
-        )
+        ),
+        (
+            "enterprise",
+            "KIN_GEMINI_OAUTH_ENTERPRISE_CLIENT_ID",
+            "KIN_GEMINI_OAUTH_ENTERPRISE_CLIENT_SECRET",
+            "consumer",
+        ),
+        (
+            "geminicli",
+            "KIN_GEMINI_OAUTH_GEMINICLI_CLIENT_ID",
+            "KIN_GEMINI_OAUTH_GEMINICLI_CLIENT_SECRET",
+            "consumer",
+        ),
+    ):
+        client_id = read_cfg(id_key)
+        if client_id:
+            resolved[name] = (
+                GOOGLE_OAUTH_TOKEN_URL,
+                client_id,
+                read_cfg(sec_key),
+                auth_tag,
+            )
     wif_id = read_cfg("KIN_GEMINI_OAUTH_WIF_CLIENT_ID")
     if wif_id:
         resolved["wif"] = (GOOGLE_WIF_TOKEN_URL, wif_id, None, "gcp")
@@ -92,6 +114,76 @@ def read_token(profile):
             return data if isinstance(data, dict) else None
     except (OSError, ValueError):
         return None
+
+
+def _write_token(profile, token_doc):
+    target = os.path.join(profile, TOKEN_FILE)
+    parent = os.path.dirname(target)
+    staging = os.path.join(parent, f".antigravity-oauth-token.{os.getpid()}.{time.time_ns()}")
+    try:
+        fd = os.open(staging, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(token_doc, stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(staging, 0o600)
+        os.replace(staging, target)
+        return True
+    except OSError:
+        try:
+            os.unlink(staging)
+        except OSError:
+            pass
+        return False
+
+
+def _read_cached_project_id(profile):
+    path = os.path.join(
+        profile, "home/.gemini/antigravity-cli/cache/default_project_id.txt"
+    )
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(descriptor, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.getuid()
+                or info.st_size > 512
+            ):
+                return None
+            raw = stream.read(513).decode("utf-8", errors="replace").strip()
+            return raw[:128] if raw else None
+    except OSError:
+        return None
+
+
+def _token_needs_refresh(token_doc, *, skew_seconds=300):
+    if not isinstance(token_doc, dict):
+        return True
+    cred = token_doc.get("token") if isinstance(token_doc.get("token"), dict) else token_doc
+    if not isinstance(cred, dict):
+        return True
+    access = cred.get("access_token") or cred.get("accessToken")
+    if not isinstance(access, str) or not access.strip():
+        return True
+    expiry = cred.get("expiry") or cred.get("expires_at") or cred.get("expiresAt")
+    expires_at_ts = None
+    if type(expiry) in (int, float) and expiry > 0:
+        expires_at_ts = expiry / 1000.0 if expiry >= 10_000_000_000 else float(expiry)
+    elif isinstance(expiry, str) and expiry.strip():
+        normalized = re.sub(r"\.[0-9]+", "", expiry.strip())
+        if normalized.endswith("Z"):
+            normalized = normalized[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(normalized)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            expires_at_ts = parsed.timestamp()
+        except ValueError:
+            expires_at_ts = None
+    if expires_at_ts is None:
+        return False
+    return expires_at_ts <= time.time() + skew_seconds
 
 
 def _redact_proxy_error(raw, proxy_url=None):
@@ -331,25 +423,65 @@ def post_form_json(proxy_url, url, form_fields, *, timeout=10):
         return 0, {"_transport_error": "request failed or timed out"}
 
 
+def _oauth_client_order(auth_method=None, wif_provider=None, oauth_client_key=None, is_gcp_tos=None):
+    provider = wif_provider.strip() if isinstance(wif_provider, str) else ""
+    if provider:
+        return ("wif",)
+    client_key = oauth_client_key.strip().lower() if isinstance(oauth_client_key, str) else ""
+    method_tag = auth_method.strip().lower() if isinstance(auth_method, str) else ""
+    if client_key in ("gemini_cli", "geminicli") or method_tag in ("gemini_cli", "geminicli"):
+        preferred = ("geminicli", "consumer", "enterprise", "cloud")
+    elif (
+        client_key in ("cloud", "gcp", "business_licensed_enterprise")
+        or method_tag in ("business_licensed_enterprise", "gcp")
+        or is_gcp_tos is True
+    ):
+        preferred = ("cloud", "enterprise", "consumer", "geminicli")
+    elif client_key in ("antigravity_enterprise", "enterprise") or method_tag in (
+        "antigravity_enterprise",
+        "enterprise",
+    ):
+        preferred = ("enterprise", "consumer", "cloud", "geminicli")
+    else:
+        preferred = ("consumer", "cloud", "enterprise", "geminicli")
+    return preferred
+
+
 def refresh_oauth_token(
-    proxy_url, refresh_token, *, auth_method=None, wif_provider=None, oauth_clients=None
+    proxy_url,
+    refresh_token,
+    *,
+    auth_method=None,
+    wif_provider=None,
+    oauth_clients=None,
+    oauth_client_key=None,
+    is_gcp_tos=None,
 ):
     if not isinstance(refresh_token, str) or not REFRESH_TOKEN_RE.fullmatch(refresh_token):
         return {"state": "reauth_required", "error": "invalid_refresh_token"}
-    method_tag = auth_method.strip().lower() if isinstance(auth_method, str) else ""
     provider = wif_provider.strip() if isinstance(wif_provider, str) else ""
     configured = _resolve_oauth_clients(oauth_clients)
-    if provider:
-        order = ("wif",)
-    elif method_tag in ("business_licensed_enterprise", "gcp"):
-        order = ("cloud", "consumer")
-    else:
-        order = ("consumer", "cloud")
-    clients = [configured[name] for name in order if name in configured]
+    order = _oauth_client_order(
+        auth_method=auth_method,
+        wif_provider=provider,
+        oauth_client_key=oauth_client_key,
+        is_gcp_tos=is_gcp_tos,
+    )
+    seen_ids = set()
+    clients = []
+    for name in order:
+        entry = configured.get(name)
+        if not entry:
+            continue
+        if entry[1] in seen_ids:
+            continue
+        seen_ids.add(entry[1])
+        clients.append(entry)
     if not clients:
         return {"state": "error", "error": "oauth_client_not_configured"}
 
     last_error = None
+    last_message = None
     last_status = 0
     for idx, (token_url, client_id, client_secret, resolved_method) in enumerate(clients):
         form = {
@@ -400,19 +532,27 @@ def refresh_oauth_token(
 
         err_code = data.get("error") if isinstance(data.get("error"), str) else ""
         last_error = err_code
-        # Retry with the alternate official OAuth client only on client mismatch.
+        last_message = _sanitize_error_message(
+            data.get("error_description") or data.get("_transport_error")
+        )
+        # Retry across all remaining OAuth clients on client mismatch or invalid_grant.
         if (
-            idx == 0
-            and len(clients) > 1
+            idx + 1 < len(clients)
             and status in (400, 401)
-            and err_code in ("unauthorized_client", "invalid_client")
+            and err_code in ("unauthorized_client", "invalid_client", "invalid_grant")
         ):
             continue
         break
 
     if last_status in (400, 401, 403):
-        return {"state": "reauth_required", "error": last_error or "refresh_rejected"}
-    return {"state": "error", "error": last_error or "refresh_transport_error"}
+        out = {"state": "reauth_required", "error": last_error or "refresh_rejected"}
+        if last_message:
+            out["error_message"] = last_message
+        return out
+    out = {"state": "error", "error": last_error or "refresh_transport_error"}
+    if last_message:
+        out["error_message"] = last_message
+    return out
 
 
 def probe_oauth_refresh_import(proxy_url, oauth_token, *, oauth_clients=None):
@@ -421,16 +561,24 @@ def probe_oauth_refresh_import(proxy_url, oauth_token, *, oauth_clients=None):
     refresh_token = oauth_token.get("refresh_token")
     auth_method = oauth_token.get("auth_method")
     wif_provider = oauth_token.get("wif_provider")
+    oauth_client_key = oauth_token.get("oauth_client_key")
+    is_gcp_tos = oauth_token.get("is_gcp_tos") if isinstance(oauth_token.get("is_gcp_tos"), bool) else None
+    project_hint = text(oauth_token.get("project_id"))
     refreshed = refresh_oauth_token(
         proxy_url,
         refresh_token,
         auth_method=auth_method,
         wif_provider=wif_provider,
         oauth_clients=oauth_clients,
+        oauth_client_key=oauth_client_key,
+        is_gcp_tos=is_gcp_tos,
     )
     if refreshed.get("state") == "ok" and isinstance(refreshed.get("token_doc"), dict):
         token_doc = refreshed["token_doc"]
-        account = probe_oauth_token(proxy_url, token_doc, imported=False)
+        probe_doc = dict(token_doc)
+        if project_hint and not probe_doc.get("project_id"):
+            probe_doc["project_id"] = project_hint
+        account = probe_oauth_token(proxy_url, probe_doc, imported=False)
         if account.get("state") in ("ok", "partial"):
             email = account.get("email")
             if token_doc.get("auth_method") == "gcp" and isinstance(email, str) and email:
@@ -438,32 +586,18 @@ def probe_oauth_refresh_import(proxy_url, oauth_token, *, oauth_clients=None):
             return {"account": account, "token_doc": token_doc}
         return {"account": account}
 
-    # If refresh failed due to a third-party OAuth client mismatch or unconfigured host client
-    # and the caller also supplied a non-expired access token, fall back to access-only import.
-    access_token = oauth_token.get("access_token")
-    expiry = oauth_token.get("expiry")
-    if (
-        refreshed.get("error")
-        in ("unauthorized_client", "invalid_client", "oauth_client_not_configured")
-        and isinstance(access_token, str)
-        and ACCESS_TOKEN_RE.fullmatch(access_token)
-        and type(expiry) is int
-        and expiry > time.time()
-    ):
-        fallback_account = probe_oauth_token(
-            proxy_url,
-            {"token": {"access_token": access_token, "expiry": expiry}},
-            imported=True,
-        )
-        return {"account": fallback_account, "fallback_access_only": True}
-
     err_code = refreshed.get("error")
+    err_msg = refreshed.get("error_message")
     extra = {}
     if isinstance(err_code, str) and err_code:
         extra["error_code"] = err_code
+    if isinstance(err_msg, str) and err_msg:
+        extra["error_message"] = err_msg
     out = {"account": checked(refreshed.get("state") or "error", **extra)}
     if isinstance(err_code, str) and err_code:
         out["error"] = err_code
+    if isinstance(err_msg, str) and err_msg:
+        out["error_message"] = err_msg
     return out
 
 
@@ -747,7 +881,72 @@ def probe_api_key(proxy_url, api_key, *, chat_only=False):
     )
 
 
-def probe_oauth(proxy_url, profile):
+def _merge_refreshed_token_doc(existing_token, refreshed_doc):
+    merged = dict(existing_token) if isinstance(existing_token, dict) else {}
+    merged["token"] = dict(refreshed_doc["token"])
+    if isinstance(refreshed_doc.get("auth_method"), str) and refreshed_doc["auth_method"]:
+        merged["auth_method"] = refreshed_doc["auth_method"]
+    for extra_key in ("wif_provider", "saved_wif_provider"):
+        if extra_key in refreshed_doc:
+            merged[extra_key] = refreshed_doc[extra_key]
+    return merged
+
+
+def _refresh_profile_token(proxy_url, profile, token, *, oauth_clients=None):
+    credential = token.get("token") if isinstance(token, dict) else None
+    if not isinstance(credential, dict):
+        return None, None
+    rt = credential.get("refresh_token") or credential.get("refreshToken")
+    if not isinstance(rt, str) or not REFRESH_TOKEN_RE.fullmatch(rt):
+        return None, None
+    refreshed = refresh_oauth_token(
+        proxy_url,
+        rt,
+        auth_method=token.get("auth_method"),
+        wif_provider=token.get("wif_provider") or token.get("saved_wif_provider"),
+        oauth_clients=oauth_clients,
+        oauth_client_key=token.get("oauth_client_key"),
+    )
+    if refreshed.get("state") == "ok" and isinstance(refreshed.get("token_doc"), dict):
+        merged = _merge_refreshed_token_doc(token, refreshed["token_doc"])
+        _write_token(profile, merged)
+        return merged, refreshed
+    return None, refreshed
+
+
+def _fetch_available_models_request(
+    proxy_url, headers, *, project_id=None, prefer_empty_body=False
+):
+    bases = (CODE_ASSIST_DAILY, CODE_ASSIST)
+    last_status = 0
+    last_data = {}
+    for base_idx, base_url in enumerate(bases):
+        url = base_url + "fetchAvailableModels"
+        if prefer_empty_body:
+            bodies = [{}] + ([{"project": project_id}] if project_id else [])
+        else:
+            bodies = ([{"project": project_id}, {}] if project_id else [{}])
+        should_fallback_base = False
+        for body_idx, body in enumerate(bodies):
+            status, data = get_json(proxy_url, url, headers, body)
+            last_status, last_data = status, data
+            if status == 200:
+                parsed_names, _ = models(data)
+                if parsed_names or body_idx + 1 >= len(bodies):
+                    return status, data
+                continue
+            if status == 400 and body_idx + 1 < len(bodies):
+                continue
+            if status == 0 or status >= 500:
+                should_fallback_base = True
+                break
+            return status, data
+        if not should_fallback_base or base_idx + 1 >= len(bases):
+            break
+    return last_status, last_data
+
+
+def probe_oauth(proxy_url, profile, *, oauth_clients=None):
     token = read_token(profile)
     if token is None:
         return checked(
@@ -756,7 +955,130 @@ def probe_oauth(proxy_url, profile):
             error_message="缺少本地 OAuth 凭证文件，请重新完成授权",
             http_status=401,
         )
-    return probe_oauth_token(proxy_url, token)
+    refreshed_already = False
+    configured_clients = _resolve_oauth_clients(oauth_clients)
+    if _token_needs_refresh(token) and configured_clients:
+        merged, _ = _refresh_profile_token(
+            proxy_url, profile, token, oauth_clients=oauth_clients
+        )
+        if merged is not None:
+            token = merged
+            refreshed_already = True
+    result = probe_oauth_token(proxy_url, token)
+    if (
+        result.get("state") == "reauth_required"
+        and not refreshed_already
+        and configured_clients
+    ):
+        merged, _ = _refresh_profile_token(
+            proxy_url, profile, token, oauth_clients=oauth_clients
+        )
+        if merged is not None:
+            result = probe_oauth_token(proxy_url, merged)
+    return result
+
+
+def fetch_oauth_models(proxy_url, profile, *, project_id=None, oauth_clients=None):
+    token = read_token(profile)
+    if token is None:
+        return checked(
+            "reauth_required",
+            error_code="gemini_oauth_required",
+            error_message="缺少本地 OAuth 凭证文件，请重新完成授权",
+            http_status=401,
+        )
+    refreshed_already = False
+    if _token_needs_refresh(token):
+        merged, refresh_res = _refresh_profile_token(
+            proxy_url, profile, token, oauth_clients=oauth_clients
+        )
+        if merged is not None:
+            token = merged
+            refreshed_already = True
+        elif isinstance(refresh_res, dict):
+            err = refresh_res.get("error")
+            err_msg = refresh_res.get("error_message")
+            if err == "oauth_client_not_configured":
+                return checked(
+                    "error",
+                    error_code="gemini_oauth_client_not_configured",
+                    error_message=err_msg or "宿主未配置 OAuth 客户端凭证",
+                    http_status=503,
+                )
+            if refresh_res.get("state") == "reauth_required":
+                return checked(
+                    "reauth_required",
+                    error_code="gemini_oauth_required",
+                    error_message=err_msg or "Google OAuth 凭证刷新被拒绝，请重新完成授权",
+                    http_status=401,
+                )
+            return checked(
+                "error",
+                error_code="gemini_proxy_error",
+                error_message=err_msg or "无法通过绑定代理刷新 Google OAuth 凭证",
+                http_status=502,
+            )
+
+    credential = token.get("token") if isinstance(token, dict) else None
+    access_token = credential.get("access_token") if isinstance(credential, dict) else None
+    if not isinstance(access_token, str) or not ACCESS_TOKEN_RE.fullmatch(access_token):
+        return checked(
+            "reauth_required",
+            error_code="gemini_oauth_required",
+            error_message="本地 OAuth 访问令牌无效，请重新完成授权",
+            http_status=401,
+        )
+
+    effective_project = (
+        text(project_id)
+        or text(token.get("project_id"))
+        or _read_cached_project_id(profile)
+    )
+    headers = _code_assist_headers(
+        f"Authorization: Bearer {access_token}", ANTIGRAVITY_USER_AGENT
+    )
+    status, data = _fetch_available_models_request(
+        proxy_url,
+        headers,
+        project_id=effective_project,
+        prefer_empty_body=True,
+    )
+    if status == 401 and not refreshed_already:
+        merged, refresh_res = _refresh_profile_token(
+            proxy_url, profile, token, oauth_clients=oauth_clients
+        )
+        if merged is not None:
+            access_token = merged["token"]["access_token"]
+            headers = _code_assist_headers(
+                f"Authorization: Bearer {access_token}", ANTIGRAVITY_USER_AGENT
+            )
+            status, data = _fetch_available_models_request(
+                proxy_url,
+                headers,
+                project_id=effective_project,
+                prefer_empty_body=True,
+            )
+        elif isinstance(refresh_res, dict) and refresh_res.get("error") == "oauth_client_not_configured":
+            return checked(
+                "error",
+                error_code="gemini_oauth_client_not_configured",
+                error_message=refresh_res.get("error_message") or "宿主未配置 OAuth 客户端凭证",
+                http_status=503,
+            )
+
+    if status == 200:
+        names, quotas = models(data)
+        catalog = model_catalog(data)
+        extra = {"models": names, "quotas": quotas}
+        if catalog:
+            extra["model_catalog"] = catalog
+        return checked("ok", **extra)
+
+    err_info = classify_http_error(status, data)
+    return checked(
+        "reauth_required" if status == 401 else "error",
+        **err_info,
+    )
 
 
 def _code_assist_headers(auth_header, user_agent):
@@ -943,11 +1265,11 @@ def probe_oauth_token(proxy_url, token, *, imported=False):
         project_body = {"project": project} if project else {}
         with ThreadPoolExecutor(max_workers=2) as executor:
             model_result = executor.submit(
-                get_json,
+                _fetch_available_models_request,
                 proxy_url,
-                CODE_ASSIST_DAILY + "fetchAvailableModels",
                 code_assist_headers,
-                project_body,
+                project_id=project,
+                prefer_empty_body=False,
             )
             summary = (
                 executor.submit(
@@ -1240,7 +1562,22 @@ if __name__ == "__main__":
             chat_only=sys.argv[1] == "api-key-models",
         )
     elif sys.argv[1] == "oauth":
-        result = probe_oauth(request["proxy_url"], sys.argv[2])
+        result = probe_oauth(
+            request["proxy_url"],
+            sys.argv[2],
+            oauth_clients=request.get("oauth_clients"),
+        )
+    elif sys.argv[1] == "oauth-models":
+        oauth_meta = request.get("oauth_token")
+        project_hint = (
+            oauth_meta.get("project_id") if isinstance(oauth_meta, dict) else None
+        )
+        result = fetch_oauth_models(
+            request["proxy_url"],
+            sys.argv[2],
+            project_id=project_hint,
+            oauth_clients=request.get("oauth_clients"),
+        )
     elif sys.argv[1] == "proxy-probe":
         status, _ = get_json(request["proxy_url"], GOOGLE_USERINFO)
         result = {"ok": status == 401}

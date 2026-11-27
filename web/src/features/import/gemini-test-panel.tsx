@@ -96,13 +96,13 @@ export function GeminiTestPanel({
       : isOAuth && environment.oauth_imported
         ? '已导入 OAuth 凭据，仍需在「账号」完成官方 Google 授权后再测试。'
         : !environment.proxy_id || environment.proxy_ready === false
-          ? '请在「代理」绑定可用的 IPv4 SOCKS5 代理。'
+          ? '请在「代理」绑定可用的 SOCKS5 / HTTP 代理。'
           : null
   const licenseBlocked =
     !unavailable &&
-      isOAuth &&
-      environment.crag_license &&
-      environment.crag_license.valid === false
+    isOAuth &&
+    environment.crag_license &&
+    environment.crag_license.valid === false
       ? '请先在「账号」绑定 CRAGGemini 订阅席位，再发起 OAuth 测试对话。'
       : null
   const pull = useGeminiMutation({
@@ -116,7 +116,7 @@ export function GeminiTestPanel({
     : null
   const models =
     environment.models_discovered === true &&
-      modelError?.code !== 'gemini_models_empty'
+    modelError?.code !== 'gemini_models_empty'
       ? [...new Set(environment.models.filter(Boolean))]
       : []
   const modelGroups = groupGeminiModels(

@@ -34,3 +34,13 @@ test('re-auth worker refreshes outside host.lock, logs failures, and cleans up c
     timeout: 12_000,
   })
 })
+
+test('Gemini host UMask=0077 self-heal, OAuth multi-client RT import, direct pull_models, and proxy plumbing', {
+  timeout: 15_000,
+}, () => {
+  execFileSync('python3', ['-B', path.join(root, 'test/unit/gemini-host-import-models-proxy.py')], {
+    cwd: root,
+    stdio: 'pipe',
+    timeout: 12_000,
+  })
+})

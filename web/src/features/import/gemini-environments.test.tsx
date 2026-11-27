@@ -678,4 +678,113 @@ test('isGeminiProxy accepts HTTP and domain proxies while rejecting local and IP
       status: 'fail',
     })
   ).toBe(false)
+  expect(
+    isGeminiProxy(
+      {
+        id: 'px-fail',
+        enabled: true,
+        kind: 'http',
+        address_family: 4,
+        status: 'fail',
+      },
+      { allowFail: true }
+    )
+  ).toBe(true)
+  // Tenant proxy ownership mirrors backend routes.mjs (`proxyFor`):
+  // - Platform env rejects tenant proxy; tenant env accepts platform + own tenant proxy, rejects other tenant.
+  const tenantProxy = {
+    id: 'px-tenant-1',
+    enabled: true,
+    kind: 'http',
+    address_family: null,
+    status: 'ok',
+    owner_user_id: 'tenant-a',
+  }
+  expect(isGeminiProxy(tenantProxy)).toBe(false)
+  expect(isGeminiProxy(tenantProxy, { ownerUserId: 'tenant-a' })).toBe(true)
+  expect(isGeminiProxy(tenantProxy, { ownerUserId: 'tenant-b' })).toBe(false)
+  expect(
+    isGeminiProxy(
+      {
+        id: 'px-platform-1',
+        enabled: true,
+        kind: 'socks5h',
+        address_family: 4,
+        status: 'ok',
+        owner_user_id: null,
+      },
+      { ownerUserId: 'tenant-a' }
+    )
+  ).toBe(true)
+})
+
+test('GeminiProxyPanel displays SOCKS5 / HTTP copy and allows tenant-owned proxies for tenant environments', () => {
+  const client = new QueryClient()
+  client.setQueryData(['panel', 'gemini-egress-options'], {
+    proxies: [
+      {
+        id: 'px-tenant-bound',
+        label: '租户已绑 HTTP',
+        host: 'us.tenant.example',
+        port: 8080,
+        enabled: true,
+        status: 'ok',
+        kind: 'http',
+        address_family: null,
+        owner_user_id: 'tenant-a',
+      },
+      {
+        id: 'px-tenant-alt',
+        label: '租户备选代理',
+        host: '198.51.100.44',
+        port: 1080,
+        enabled: true,
+        status: 'ok',
+        kind: 'socks5',
+        address_family: 4,
+        owner_user_id: 'tenant-a',
+      },
+      {
+        id: 'px-other-tenant',
+        label: '其他租户代理',
+        host: '198.51.100.55',
+        port: 1080,
+        enabled: true,
+        status: 'ok',
+        kind: 'socks5',
+        address_family: 4,
+        owner_user_id: 'tenant-b',
+      },
+    ],
+  })
+  const html = renderToStaticMarkup(
+    <QueryClientProvider client={client}>
+      <GeminiProxyPanel
+        environment={{
+          id: 'gemini-tenant',
+          name: 'Tenant Env',
+          proxy_id: 'px-tenant-bound',
+          owner_user_id: 'tenant-a',
+          proxy_ready: true,
+          auth_method: 'oauth',
+          auth_state: 'authorized',
+          runtime_ready: true,
+          billing_ready: false,
+          kernel_version: '0.5.3',
+          created_at: null,
+          updated_at: null,
+          models: [],
+          account: null,
+        }}
+        active
+      />
+    </QueryClientProvider>
+  )
+  expect(html).toContain('绑定的出口代理（SOCKS5 / HTTP）')
+  expect(html).not.toContain('IPv4 SOCKS5')
+  expect(html).toContain('us.tenant.example:8080')
+  expect(html).toContain('可用')
+  expect(html).not.toContain('不可用')
+  expect(html).toContain('可用代理（平台 / 租户）')
+  expect(html).not.toContain('其他租户代理')
 })
