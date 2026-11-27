@@ -50,6 +50,7 @@ import {
   markCodexGrantDead,
 } from '../vm/codex-slot.mjs'
 import {
+  clientBlockErrorOf,
   isTrustedGateDecision,
   projectCandidateAccounts,
   resolveRiskRepos,
@@ -978,16 +979,14 @@ export async function handleCodexProtocol({
       logBag.final_state = decision.final_state
       logBag.error_code = decision.error_code
       logBag.error_message = decision.message
+      if (decision.error_details) {
+        logBag.error_details = { ...(logBag.error_details || {}), ...decision.error_details }
+      }
       logBag.intercept = decision.intercept || null
       logBag.jev_state = decision.jev_state || null
       if (decision.retry_after_sec) res.setHeader?.('retry-after', String(decision.retry_after_sec))
-      return json(
-        res,
-        decision.status,
-        decision.error?.body || {
-          error: { type: 'policy_error', code: decision.error_code, message: decision.message },
-        },
-      )
+      const clientErr = clientBlockErrorOf(decision)
+      return json(res, clientErr.status, clientErr.body)
     }
   }
   try {

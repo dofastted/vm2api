@@ -16,7 +16,12 @@ import { ownerScopeFromRequest } from '../admin/resource-owner.mjs'
 import { isOfficialClaudeCodeTraffic } from '../identity/crs-persona.mjs'
 import { resolveInferenceBackend } from '../pool/api-protocol.mjs'
 import { detectInboundPlatform } from './platform-detect.mjs'
-import { projectCandidateAccounts, resolveRiskRepos, runUnifiedPreDispatch } from './unified-pre-dispatch.mjs'
+import {
+  clientBlockErrorOf,
+  projectCandidateAccounts,
+  resolveRiskRepos,
+  runUnifiedPreDispatch,
+} from './unified-pre-dispatch.mjs'
 
 export const RESPONSES_WS_QUEUE_LIMIT = 32
 export const RESPONSES_WS_REPLAY_MAX_ITEMS = 32
@@ -661,15 +666,16 @@ export function createResponsesWsHandler({
           if (closed) return
           if (frameDecision?.action === 'block') {
             currentReq = null
+            const clientErr = clientBlockErrorOf(frameDecision)
             sendFrame(
               ws,
               responsesWsErrorFrame({
-                status: frameDecision.status || frameDecision.error?.status || 400,
-                type: frameDecision.error?.body?.error?.type || 'policy_error',
-                code: frameDecision.error?.body?.error?.code || frameDecision.error_code || 'policy_blocked',
-                message: frameDecision.error?.body?.error?.message || frameDecision.message || '请求被协议拦截',
-                details: frameDecision.error?.body?.error?.details || frameDecision.error_details || undefined,
-                requestId: frameDecision.error?.body?.error?.request_id || undefined,
+                status: clientErr.status,
+                type: clientErr.type,
+                code: clientErr.code,
+                message: clientErr.message,
+                details: clientErr.details,
+                requestId: clientErr.requestId,
               }),
             )
             continue

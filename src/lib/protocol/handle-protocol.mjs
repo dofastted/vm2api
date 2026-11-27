@@ -28,7 +28,12 @@ import { SettingsRepo } from '../db/repos/settings-repo.mjs'
 import { makeApiKeyGateError } from '../admin/api-keys.mjs'
 import { readJevConfig } from './jev-intercept.mjs'
 import { observeUpstreamRisk, upstreamRiskClientError } from './intercept-gate.mjs'
-import { isTrustedGateDecision, projectCandidateAccounts, runUnifiedPreDispatch } from './unified-pre-dispatch.mjs'
+import {
+  clientBlockErrorOf,
+  isTrustedGateDecision,
+  projectCandidateAccounts,
+  runUnifiedPreDispatch,
+} from './unified-pre-dispatch.mjs'
 import {
   toClaudeMessages,
   isClientStream,
@@ -557,17 +562,15 @@ export function createHandleProtocol(deps) {
     }
     logBag.intercept = decision.intercept || null
     logBag.jev_state = decision.jev_state || null
-    const errPayload = decision.error?.body || {
-      type: 'error',
-      error: { type: 'policy_error', code: decision.error_code, message: decision.message },
-    }
+    const clientErr = clientBlockErrorOf(decision)
+    const errPayload = clientErr.body
     if (res.headersSent && logBag.protocol === 'anthropic.messages') {
       res.write(buildAnthropicSseError(errPayload.error))
       res.end()
     } else {
       const retryAfter = decision.retry_after_sec || decision.error?.retryAfterSec
       if (retryAfter) res.setHeader?.('retry-after', String(retryAfter))
-      json(res, decision.status || decision.error?.status || 400, errPayload)
+      json(res, clientErr.status, errPayload)
     }
   }
 

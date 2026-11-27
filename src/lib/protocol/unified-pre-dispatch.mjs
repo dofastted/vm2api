@@ -13,6 +13,7 @@
 import { keyAllowsVm, vmGroupType } from '../admin/key-scope.mjs'
 import { findAccount } from '../admin/panel-api.mjs'
 import { vmMatchesOwnerScope } from '../admin/resource-owner.mjs'
+import { CLIENT_POOL_BUSY_MESSAGE, makePolicyOverloadError } from '../core/errors.mjs'
 import { refusalAuditIdentity, refusalGuardPolicy, riskPrincipal } from '../core/refusal-guard.mjs'
 import { RefusalDeviceBlocksRepo } from '../db/repos/refusal-device-blocks-repo.mjs'
 import { RefusalGuardsRepo } from '../db/repos/refusal-guards-repo.mjs'
@@ -26,6 +27,41 @@ const TRUSTED_DECISION_TAG = Symbol('vm2api.trusted_pre_dispatch')
 
 export function isTrustedGateDecision(decision) {
   return Boolean(decision && typeof decision === 'object' && decision[TRUSTED_DECISION_TAG] === true)
+}
+
+/**
+ * Extract strictly client-safe error fields from a blocking `GateDecision`.
+ * Never exposes internal log fields (`decision.error_code`, `decision.message`,
+ * `decision.error_details` / `jev_score_*`); falls back to a disguised 429
+ * overload error if `decision.error.body` is absent.
+ */
+export function clientBlockErrorOf(decision) {
+  const err = decision?.error?.body?.error
+  if (err && typeof err === 'object') {
+    const hasDetails = Boolean(err.details && typeof err.details === 'object' && Object.keys(err.details).length)
+    return {
+      status: Number(decision?.error?.status) || Number(decision?.status) || 400,
+      type: err.type || 'api_error',
+      code: err.code || 'api_error',
+      message: err.message || CLIENT_POOL_BUSY_MESSAGE,
+      details: hasDetails ? err.details : undefined,
+      requestId: err.request_id || undefined,
+      body: decision.error.body,
+    }
+  }
+  const fallback = makePolicyOverloadError({
+    requestId: decision?.audit_id || undefined,
+    retryAfterSec: decision?.retry_after_sec,
+  })
+  return {
+    status: fallback.status,
+    type: fallback.body.error.type,
+    code: fallback.body.error.code,
+    message: fallback.body.error.message,
+    details: undefined,
+    requestId: fallback.body.error.request_id || undefined,
+    body: fallback.body,
+  }
 }
 
 export function readRuntimeJevConfig(settings = null) {

@@ -36,7 +36,12 @@ import { GEMINI_LICENSE_MESSAGES } from './subscription.mjs'
 import { createGeminiSlotPrefs, parseGeminiDisplayName, parseGeminiScheduleLevel } from './slot-prefs.mjs'
 import { resolveCragGeminiPromptPolicy } from './system-prompt.mjs'
 import { compileWithProtoFront, protoFrontMode } from '../transport/proto-front-client.mjs'
-import { isTrustedGateDecision, resolveRiskRepos, runUnifiedPreDispatch } from '../protocol/unified-pre-dispatch.mjs'
+import {
+  clientBlockErrorOf,
+  isTrustedGateDecision,
+  resolveRiskRepos,
+  runUnifiedPreDispatch,
+} from '../protocol/unified-pre-dispatch.mjs'
 
 const PANEL_PATH = '/api/panel/gemini'
 const PUBLIC_PATH = '/v1/gemini/sessions'
@@ -2433,16 +2438,10 @@ export function createGeminiPublicHandler({
       logBag.jev_state = gateDecision.jev_state || null
       const retryAfter = gateDecision.retry_after_sec || gateDecision.error?.retryAfterSec
       if (retryAfter) res.setHeader?.('Retry-After', String(retryAfter))
-      const status = gateDecision.status || gateDecision.error?.status || 400
+      const clientErr = clientBlockErrorOf(gateDecision)
       return respondJson(
-        status,
-        protocolErrorBody(
-          protocol,
-          status,
-          logBag.error_code,
-          logBag.error_message,
-          gateDecision.error?.body?.error?.details || gateDecision.error_details || undefined,
-        ),
+        clientErr.status,
+        protocolErrorBody(protocol, clientErr.status, clientErr.code, clientErr.message, clientErr.details),
       )
     }
     if (gateDecision?.intercept && !logBag.intercept) logBag.intercept = gateDecision.intercept

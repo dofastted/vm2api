@@ -1223,15 +1223,86 @@ function pushPromptContent(raw, content) {
   }
 }
 
+function decodeInlineTextBase64(data, mediaType = '') {
+  if (typeof data !== 'string' || !data) return ''
+  const inline = /^data:(text\/[\w.+-]+|application\/(?:json|xml))(?:;charset=utf-8)?;base64,/i.exec(data)
+  const media = String(mediaType || '').trim()
+  const encoded = (
+    inline ? data.slice(inline[0].length) : /^(?:text\/|application\/(?:json|xml)$)/i.test(media) ? data : ''
+  ).trim()
+  if (!encoded || encoded.length > 86_000 || !/^[\da-z+/]+={0,2}$/i.test(encoded)) return ''
+  try {
+    return new TextDecoder('utf-8', { fatal: true }).decode(Buffer.from(encoded, 'base64'))
+  } catch {
+    return ''
+  }
+}
+
+const isPlainObj = (value) => Boolean(value && typeof value === 'object' && !Array.isArray(value))
+
 function pushGeminiParts(raw, parts) {
   if (typeof parts === 'string') {
-    raw.push(parts)
+    if (parts) raw.push(parts)
     return
   }
   if (!Array.isArray(parts)) return
   for (const part of parts) {
-    if (typeof part === 'string') raw.push(part)
-    else if (typeof part?.text === 'string') raw.push(part.text)
+    if (typeof part === 'string') {
+      if (part) raw.push(part)
+      continue
+    }
+    if (!isPlainObj(part)) continue
+    // Mirror `parseGeminiNativeInbound` (`isPlainObject(...)` precedence):
+    // only plain-object tool/file/inline/code parts take those branches, so a
+    // truthy decoy like `{ functionCall: true, text: '...' }` or `{ fileData: 1, text: '...' }`
+    // still falls through to `part.text` just like upstream parsing.
+    if (
+      isPlainObj(part.functionCall) ||
+      isPlainObj(part.function_call) ||
+      isPlainObj(part.functionResponse) ||
+      isPlainObj(part.function_response)
+    ) {
+      continue
+    }
+    const inline = isPlainObj(part.inlineData)
+      ? part.inlineData
+      : isPlainObj(part.inline_data)
+        ? part.inline_data
+        : null
+    if (inline) {
+      const decoded = decodeInlineTextBase64(inline.data, inline.mimeType || inline.mime_type)
+      if (decoded) raw.push(decoded)
+      continue
+    }
+    if (isPlainObj(part.fileData) || isPlainObj(part.file_data)) continue
+    const execCode = isPlainObj(part.executableCode)
+      ? part.executableCode
+      : isPlainObj(part.executable_code)
+        ? part.executable_code
+        : null
+    const execResult = isPlainObj(part.codeExecutionResult)
+      ? part.codeExecutionResult
+      : isPlainObj(part.code_execution_result)
+        ? part.code_execution_result
+        : null
+    if (execCode || execResult) {
+      if (execCode) {
+        const code = typeof execCode.code === 'string' ? execCode.code : ''
+        if (code) raw.push(code)
+      }
+      if (execResult) {
+        const outcome =
+          typeof execResult.outcome === 'string' && execResult.outcome !== 'OUTCOME_OK' ? execResult.outcome : ''
+        const output = typeof execResult.output === 'string' ? execResult.output : ''
+        if (outcome && output) raw.push(`${outcome}\n${output}`)
+        else if (output) raw.push(output)
+        else if (outcome) raw.push(outcome)
+      }
+      continue
+    }
+    if (typeof part.text === 'string' && part.text) {
+      raw.push(part.text)
+    }
   }
 }
 
@@ -1251,29 +1322,50 @@ function pushGeminiInstruction(raw, instruction) {
   }
 }
 
-/** Extract user-authored turns from Gemini `contents` (roleless or role==='user'). */
-function extractGeminiUserTexts(src) {
-  if (!src || typeof src !== 'object') return []
-  const out = []
+/**
+ * Extract Gemini `contents` aligned with `parseGeminiNativeInbound`:
+ * - Leading `role === 'system' || role === 'developer'` entries fold into system text.
+ * - Non-leading `system`/`developer` entries become user `<system-reminder>` turns upstream,
+ *   so we emit them into BOTH `systemTexts` and unwrapped `userTexts` (for JEV classifier).
+ * - Only exact lowercase `'model'` and `'assistant'` are skipped as assistant history; every
+ *   other role (empty, `'user'`, custom/unknown/capitalized roles) becomes `'user'` upstream.
+ */
+function extractGeminiContents(src) {
+  const userTexts = []
+  const systemTexts = []
+  if (!src || typeof src !== 'object') return { userTexts, systemTexts }
   const contents = Array.isArray(src.contents) ? src.contents : []
+  let inLeadingSystem = true
   for (const item of contents) {
     if (typeof item === 'string') {
-      if (item.trim()) out.push(item)
+      inLeadingSystem = false
+      if (item.trim()) userTexts.push(item)
       continue
     }
     if (!item || typeof item !== 'object') continue
-    const role = String(item.role || '')
-      .trim()
-      .toLowerCase()
-    if (role && role !== 'user') continue
+    const rawRole = typeof item.role === 'string' ? item.role : ''
     const pieces = []
     if (Array.isArray(item.parts)) pushGeminiParts(pieces, item.parts)
     else if (typeof item.text === 'string') pieces.push(item.text)
     else if (typeof item.content === 'string') pieces.push(item.content)
     const joined = pieces.filter(Boolean).join('\n').trim()
-    if (joined) out.push(joined)
+    if (rawRole === 'system' || rawRole === 'developer') {
+      if (joined) {
+        systemTexts.push(joined)
+        if (!inLeadingSystem) userTexts.push(joined)
+      }
+      continue
+    }
+    inLeadingSystem = false
+    if (rawRole === 'model' || rawRole === 'assistant') continue
+    if (joined) userTexts.push(joined)
   }
-  return out
+  return { userTexts, systemTexts }
+}
+
+/** Extract user-visible turns from Gemini `contents` matching upstream `parseGeminiNativeInbound`. */
+function extractGeminiUserTexts(src) {
+  return extractGeminiContents(src).userTexts
 }
 
 /** Extract search queries from `/v1/alpha/search` payloads (`query`, `q`, `queries`, `commands.search_query`). */
@@ -1325,11 +1417,8 @@ function promptPieces(src, keepReminders) {
     if (role !== 'system' && role !== 'developer') continue
     pushPromptContent(raw, item.content ?? item.text)
   }
-  const contents = Array.isArray(src.contents) ? src.contents : []
-  for (const item of contents) {
-    if (String(item?.role || '').toLowerCase() !== 'system') continue
-    pushGeminiParts(raw, item.parts ?? item.text)
-  }
+  const geminiSystem = extractGeminiContents(src).systemTexts
+  for (const text of geminiSystem) raw.push(text)
   return raw.map((text) => stripOfficialPromptWhitelist(text, keepReminders)).filter(Boolean)
 }
 
@@ -1350,7 +1439,7 @@ export function jevDocument(
   const extraUsers = []
   const seenExtra = new Set()
   const pushExtra = (text) => {
-    const cleaned = cleanUserAsk(text)
+    const cleaned = keepPromptReminders ? String(text || '').trim() : cleanUserAsk(text)
     const norm = normalizeText(cleaned)
     if (!norm || seenExtra.has(norm)) return
     seenExtra.add(norm)
@@ -1381,20 +1470,8 @@ function jevModelContentText(content) {
     if (file.type === 'content') return jevModelContentText(file.content)
     if (file.type === 'text' || typeof file.text === 'string') return cleanUserAsk(file.data ?? file.text)
     const data = file.data ?? file.file_data
-    if (typeof data !== 'string') return ''
-    const inline = /^data:(text\/[\w.+-]+|application\/(?:json|xml))(?:;charset=utf-8)?;base64,/i.exec(data)
-    const media = file.media_type || file.mime_type || ''
-    const encoded = inline
-      ? data.slice(inline[0].length)
-      : /^(?:text\/|application\/(?:json|xml)$)/i.test(media)
-        ? data
-        : ''
-    if (!encoded || encoded.length > 86_000 || !/^[\da-z+/]+={0,2}$/i.test(encoded)) return ''
-    try {
-      return cleanUserAsk(new TextDecoder('utf-8', { fatal: true }).decode(Buffer.from(encoded, 'base64')))
-    } catch {
-      return ''
-    }
+    const decoded = decodeInlineTextBase64(data, file.media_type || file.mime_type || '')
+    return decoded ? cleanUserAsk(decoded) : ''
   }
   if (type && !['text', 'input_text', 'message'].includes(type)) return ''
   if (typeof content.text === 'string') return cleanUserAsk(content.text)
