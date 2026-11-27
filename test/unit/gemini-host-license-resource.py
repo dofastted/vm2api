@@ -84,12 +84,15 @@ def test_license_status_preserves_resource_code():
         assert status["code"] == "gemini_host_resource_exhausted"
         assert status["code"] != "license_unconfigured"
         assert status["code"] != "license_invalid"
+        assert status["status"] == "host_resource_exhausted"
+        assert status["status"] != "unconfigured"
 
 
 test_classify_emfile_enfile()
 test_run_craggemini_license_cli_emfile()
 test_license_status_preserves_resource_code()
 
-assert "gemini_host_resource_exhausted" in impl.SANDBOX_ERROR_CODES
+assert "gemini_host_resource_exhausted" in impl.HOST_RESOURCE_ERROR_CODES
+assert "gemini_host_resource_exhausted" not in impl.SANDBOX_ERROR_CODES
 
 print("gemini-host-license-resource: ok")

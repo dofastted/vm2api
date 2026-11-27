@@ -34,7 +34,7 @@ import { ANTIGRAVITY_PROVIDERS, ANTIGRAVITY_QUOTA_GROUPS, isAntigravityRoutedMod
 import { normalizeGeminiOAuthImport } from './oauth-import.mjs'
 import { normalizeGeminiOutboundPrompt } from './prompt-normalizer.mjs'
 import { isGeminiProtocolAllowed } from './routing-config.mjs'
-import { GEMINI_LICENSE_MESSAGES } from './subscription.mjs'
+import { GEMINI_HOST_RESOURCE_MESSAGES, GEMINI_LICENSE_MESSAGES } from './subscription.mjs'
 import { createGeminiSlotPrefs, parseGeminiDisplayName, parseGeminiScheduleLevel } from './slot-prefs.mjs'
 import { resolveCragGeminiPromptPolicy } from './system-prompt.mjs'
 import { configuredDnsUpstream, proxyDnsEmptyTypes } from '../vm/egress.mjs'
@@ -224,6 +224,7 @@ const HOST_ERRORS = {
     503,
     '宿主机非特权沙箱（bwrap）不可用，无法启动 Gemini 隔离进程；请前往「设置 → Gemini 维护」诊断宿主并检查宿主服务日志',
   ],
+  gemini_host_resource_exhausted: [503, GEMINI_HOST_RESOURCE_MESSAGES.gemini_host_resource_exhausted],
   // Unregistered codes fall through to FAILURE, which reads as "no host service at
   // all" -- the one answer this is not. The socket answered, so the host is up and
   // it is the authorization launch that failed; losing that sent #1622 looking at

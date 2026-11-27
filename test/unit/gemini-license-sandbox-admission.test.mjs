@@ -6,7 +6,11 @@ import path from 'node:path'
 import test from 'node:test'
 import { CRAG_GEMINI_PRODUCT } from '../../src/lib/gemini/payload.mjs'
 import { createGeminiScheduler } from '../../src/lib/gemini/scheduler.mjs'
-import { GEMINI_SANDBOX_MESSAGES, createGeminiCragSubscription } from '../../src/lib/gemini/subscription.mjs'
+import {
+  GEMINI_HOST_RESOURCE_MESSAGES,
+  GEMINI_SANDBOX_MESSAGES,
+  createGeminiCragSubscription,
+} from '../../src/lib/gemini/subscription.mjs'
 
 const GEMINI_ENV_ID = 'gemini-aaaaaaaaaaaaaaaaaaaaaaaa'
 const PROXY_ID = 'proxy-aaaaaaaaaaaaaaaaaaaa'
@@ -74,6 +78,20 @@ function makeSubscription(root) {
   })
 }
 
+test('checkAdmission passes host resource crag_license codes through as HTTP 503', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gemini-host-resource-adm-'))
+  const subscription = makeSubscription(root)
+  const denied = subscription.checkAdmission(
+    { auth_method: 'oauth', crag_license: { valid: false, code: 'gemini_host_resource_exhausted' } },
+    { payloadMode: 'crag_subscription' },
+  )
+  assert.equal(denied.ok, false)
+  assert.equal(denied.status, 503)
+  assert.equal(denied.code, 'gemini_host_resource_exhausted')
+  assert.equal(denied.message, GEMINI_HOST_RESOURCE_MESSAGES.gemini_host_resource_exhausted)
+  assert.notEqual(denied.code, 'license_required')
+})
+
 test('checkAdmission passes sandbox crag_license codes through as HTTP 503', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gemini-sandbox-adm-'))
   const subscription = makeSubscription(root)
@@ -110,6 +128,30 @@ test('scheduler rejects stream with sandbox denial via checkAdmission (503, not 
       err.status === 503 &&
       err.code === 'gemini_sandbox_unavailable' &&
       err.message === GEMINI_SANDBOX_MESSAGES.gemini_sandbox_unavailable,
+  )
+})
+
+test('scheduler rejects stream with host resource denial via checkAdmission (503, not license_required)', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gemini-host-resource-stream-'))
+  const subscription = makeSubscription(root)
+  const scheduler = createGeminiScheduler({
+    cragSubscription: subscription,
+    callHost: async (op) => {
+      if (op === 'list') return installedList([sandboxEnv('gemini_host_resource_exhausted')])
+      throw new Error(`unexpected host op ${op}`)
+    },
+    proxyPool,
+  })
+  await assert.rejects(
+    () =>
+      scheduler.stream({
+        model: 'gemini-2.5-flash',
+        geminiBody: { contents: [{ role: 'user', parts: [{ text: 'hi' }] }] },
+      }),
+    (err) =>
+      err.status === 503 &&
+      err.code === 'gemini_host_resource_exhausted' &&
+      err.message === GEMINI_HOST_RESOURCE_MESSAGES.gemini_host_resource_exhausted,
   )
 })
 

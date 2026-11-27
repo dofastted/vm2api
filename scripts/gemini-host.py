@@ -730,9 +730,9 @@ SANDBOX_ERROR_CODES = frozenset(
     {
         "gemini_sandbox_apparmor_restricted",
         "gemini_sandbox_unavailable",
-        "gemini_host_resource_exhausted",
     }
 )
+HOST_RESOURCE_ERROR_CODES = frozenset({"gemini_host_resource_exhausted"})
 
 _LICENSE_HOST_RESOURCE_ERRNOS = frozenset({errno.EMFILE, errno.ENFILE})
 
@@ -7070,7 +7070,9 @@ class Host:
         except Failure as error:
             code = (
                 error.code
-                if error.code in LICENSE_ERROR_CODES or error.code in SANDBOX_ERROR_CODES
+                if error.code in LICENSE_ERROR_CODES
+                or error.code in SANDBOX_ERROR_CODES
+                or error.code in HOST_RESOURCE_ERROR_CODES
                 else "license_unconfigured"
             )
             status = {
@@ -7080,6 +7082,8 @@ class Host:
                     if code == "license_required"
                     else "sync_pending"
                     if code == "gemini_subscription_sync_pending"
+                    else "host_resource_exhausted"
+                    if code in HOST_RESOURCE_ERROR_CODES
                     else "unconfigured"
                 ),
                 "valid": False,

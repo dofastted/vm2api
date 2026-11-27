@@ -41,6 +41,13 @@ export const RECOVERABLE_GEMINI_SEAT_CODES = new Set([
 
 export const GEMINI_SANDBOX_ERROR_CODES = new Set(['gemini_sandbox_apparmor_restricted', 'gemini_sandbox_unavailable'])
 
+export const GEMINI_HOST_RESOURCE_ERROR_CODES = new Set(['gemini_host_resource_exhausted'])
+
+export const GEMINI_HOST_RESOURCE_MESSAGES = {
+  gemini_host_resource_exhausted:
+    '宿主机文件描述符耗尽（EMFILE/ENFILE），Gemini 许可进程无法启动；请重启 vm2api-gemini 服务并检查 Unix 控制连接池是否泄漏。',
+}
+
 export const GEMINI_SANDBOX_MESSAGES = {
   gemini_sandbox_apparmor_restricted:
     '宿主机 AppArmor 限制了非特权 user namespace，导致 Gemini 沙箱无法启动；请在宿主机执行 prepare-gemini 或前往「设置 → Gemini 维护」执行修复安装',
@@ -1176,6 +1183,14 @@ export function createGeminiCragSubscription({
         return { ok: true, seat_required: true, seat: lic.seat ?? null }
       }
       const licCode = typeof lic?.code === 'string' ? lic.code : null
+      if (licCode && GEMINI_HOST_RESOURCE_ERROR_CODES.has(licCode)) {
+        return {
+          ok: false,
+          status: 503,
+          code: licCode,
+          message: GEMINI_HOST_RESOURCE_MESSAGES[licCode],
+        }
+      }
       if (licCode && GEMINI_SANDBOX_ERROR_CODES.has(licCode)) {
         return {
           ok: false,

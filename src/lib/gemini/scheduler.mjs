@@ -15,7 +15,11 @@ import { classifyAntigravityModel, indexAccountModelCatalog, resolveUpstreamMode
 import { createDirectCragClient } from './direct-client.mjs'
 import { callGeminiHost, callGeminiHostStream } from './routes.mjs'
 import { DEFAULT_GEMINI_ROUTING, normalizeGeminiRouting } from './routing-config.mjs'
-import { GEMINI_LICENSE_MESSAGES, RECOVERABLE_GEMINI_SEAT_CODES } from './subscription.mjs'
+import {
+  GEMINI_HOST_RESOURCE_MESSAGES,
+  GEMINI_LICENSE_MESSAGES,
+  RECOVERABLE_GEMINI_SEAT_CODES,
+} from './subscription.mjs'
 import { PLATFORM_SCOPE, geminiEnvMatchesOwnerScope } from '../admin/resource-owner.mjs'
 import {
   SchedulerApiError,
@@ -120,6 +124,7 @@ const FAILURES = {
     503,
     'The host unprivileged bwrap sandbox is unavailable; inspect Gemini maintenance and host service logs.',
   ],
+  gemini_host_resource_exhausted: [503, GEMINI_HOST_RESOURCE_MESSAGES.gemini_host_resource_exhausted],
   license_required: [403, GEMINI_LICENSE_MESSAGES.license_required],
   license_expired: [403, GEMINI_LICENSE_MESSAGES.license_expired],
   license_not_yet_valid: [403, GEMINI_LICENSE_MESSAGES.license_not_yet_valid],
