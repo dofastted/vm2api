@@ -10,7 +10,15 @@ import { openDatabase, closeDatabase, getDb, getDbPath } from '../../src/lib/db/
 import { BackupRepo } from '../../src/lib/db/repos/backup-repo.mjs'
 import { SettingsRepo } from '../../src/lib/db/repos/settings-repo.mjs'
 import { VmsRepo } from '../../src/lib/db/repos/vms-repo.mjs'
-import { sha256File } from '../../src/lib/admin/backup-core.mjs'
+import {
+  buildDockerPgUri,
+  isPgVersionMismatchStderr,
+  parsePgMajorVersion,
+  queryPgServerMajorVersion,
+  resolvePgTool,
+  restorePgSnapshotJob,
+  sha256File,
+} from '../../src/lib/admin/backup-core.mjs'
 import { BackupService, tarAvailable } from '../../src/lib/admin/backup-service.mjs'
 import { ApiKeyStore } from '../../src/lib/admin/api-keys.mjs'
 import { ensureRedaction, publishRedactionForTests, redactionStatus } from '../../src/lib/redaction/runtime.mjs'
@@ -610,4 +618,107 @@ test('P2-14: restoreBackup awaits async onRestored and resyncs redaction runtime
   })
   await assert.rejects(svc.restoreBackup(rec.id), /async rebind failed/)
   assert.equal(svc.isRestoring, false)
+})
+
+test('resolvePgTool handles major-version mismatch across host binary, PGDG paths, and local Docker container', async () => {
+  assert.equal(parsePgMajorVersion('pg_dump (PostgreSQL) 14.24 (Ubuntu 14.24-0ubuntu0.22.04.1)'), 14)
+  assert.equal(parsePgMajorVersion('pg_dump (PostgreSQL) 18.6'), 18)
+  assert.equal(parsePgMajorVersion('unknown'), null)
+  assert.equal(isPgVersionMismatchStderr('pg_dump: error: aborting because of server version mismatch'), true)
+  assert.equal(isPgVersionMismatchStderr('connection refused'), false)
+
+  const serverMajor = await queryPgServerMajorVersion({
+    query: async () => ({ rows: [{ server_version_num: '180006' }] }),
+  })
+  assert.equal(serverMajor, 18)
+
+  const dockerUri = buildDockerPgUri('postgresql://vm2api:s3cr%40t@127.0.0.1:5433/vm2api')
+  assert.equal(dockerUri.uri, 'postgresql://vm2api@127.0.0.1:5432/vm2api')
+  assert.equal(dockerUri.env.PGPASSWORD, 's3cr@t')
+
+  // 1. Host pg_dump is 14 vs server 18, PGDG 18 is installed -> picks /usr/lib/postgresql/18/bin/pg_dump
+  const pgdgPicked = resolvePgTool('pg_dump', {
+    serverMajor: 18,
+    connectionString: 'postgresql://vm2api:pw@127.0.0.1:5432/vm2api',
+    env: {},
+    readdirImpl: () => ['14', '18'],
+    spawnImpl: (cmd) => {
+      if (cmd === 'pg_dump') return { status: 0, stdout: 'pg_dump (PostgreSQL) 14.24\n' }
+      if (cmd === '/usr/lib/postgresql/18/bin/pg_dump') return { status: 0, stdout: 'pg_dump (PostgreSQL) 18.6\n' }
+      return { status: 1, stdout: '' }
+    },
+  })
+  assert.deepEqual(pgdgPicked, { mode: 'binary', bin: '/usr/lib/postgresql/18/bin/pg_dump', major: 18 })
+
+  // 2. Host pg_dump is 14 vs server 18, no PGDG 18, local loopback DSN -> picks docker exec vm2api-postgres
+  const dockerPicked = resolvePgTool('pg_dump', {
+    serverMajor: 18,
+    connectionString: 'postgresql://vm2api:pw@127.0.0.1:5432/vm2api',
+    env: {},
+    readdirImpl: () => ['14'],
+    spawnImpl: (cmd, args) => {
+      if (cmd === 'pg_dump') return { status: 0, stdout: 'pg_dump (PostgreSQL) 14.24\n' }
+      if (cmd === 'docker' && args[0] === 'exec' && args[1] === 'vm2api-postgres' && args[2] === 'pg_dump') {
+        return { status: 0, stdout: 'pg_dump (PostgreSQL) 18.6\n' }
+      }
+      return { status: 1, stdout: '' }
+    },
+  })
+  assert.deepEqual(dockerPicked, { mode: 'docker', container: 'vm2api-postgres', tool: 'pg_dump', major: 18 })
+
+  // 3. Remote non-loopback DSN with only host pg_dump 14 vs server 18 -> returns null (triggers pure-JS fallback)
+  let dockerProbedForRemote = false
+  const remoteMissed = resolvePgTool('pg_dump', {
+    serverMajor: 18,
+    connectionString: 'postgresql://vm2api:pw@pg.internal.example:5432/vm2api',
+    env: {},
+    readdirImpl: () => ['14'],
+    spawnImpl: (cmd) => {
+      if (cmd === 'docker') dockerProbedForRemote = true
+      if (cmd === 'pg_dump') return { status: 0, stdout: 'pg_dump (PostgreSQL) 14.24\n' }
+      return { status: 1, stdout: '' }
+    },
+  })
+  assert.equal(remoteMissed, null)
+  assert.equal(dockerProbedForRemote, false)
+
+  // 4. restorePgSnapshotJob uses docker exec -i -e PGPASSWORD without leaking secret in argv
+  const dumpFile = path.join(root, 'sample.pgdump')
+  fs.writeFileSync(dumpFile, Buffer.from('PGDMP-test', 'utf8'))
+  const calls = []
+  await restorePgSnapshotJob({
+    pool: {
+      query: async (sql) =>
+        sql.includes('server_version_num') ? { rows: [{ server_version_num: '180006' }] } : { rows: [{ s: 'public' }] },
+    },
+    connectionString: 'postgresql://vm2api:topsecret@127.0.0.1:5432/vm2api',
+    dbFile: dumpFile,
+    resolveToolImpl: () => ({ mode: 'docker', container: 'vm2api-postgres', tool: 'pg_restore', major: 18 }),
+    spawnImpl: (cmd, args, opts) => {
+      calls.push({ cmd, args, env: opts.env, stdinType: typeof opts.stdio[0] })
+      return { status: 0, stderr: '' }
+    },
+  })
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].cmd, 'docker')
+  assert.equal(calls[0].args.includes('topsecret'), false, 'password must never appear in docker argv')
+  assert.equal(calls[0].args.includes('-e'), true)
+  assert.equal(calls[0].args.includes('PGPASSWORD'), true)
+  assert.equal(calls[0].env.PGPASSWORD, 'topsecret')
+  assert.equal(calls[0].stdinType, 'number', 'dbFile must be streamed via file descriptor')
+
+  // 5. restorePgSnapshotJob rejects with pg_restore_missing when no compatible version exists
+  await assert.rejects(
+    restorePgSnapshotJob({
+      pool: { query: async () => ({ rows: [{ server_version_num: '180006' }] }) },
+      connectionString: 'postgresql://vm2api:topsecret@remote.example:5432/vm2api',
+      dbFile: dumpFile,
+      resolveToolImpl: () => null,
+    }),
+    (err) => {
+      assert.equal(err.code, 'pg_restore_missing')
+      assert.match(err.message, />= 18/)
+      return true
+    },
+  )
 })
