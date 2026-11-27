@@ -107,7 +107,7 @@ export const JEV_PLAN_TYPES = Object.freeze([
 
 const TIMEOUT_MIN = 200
 const TIMEOUT_MAX = 8000
-const TIMEOUT_DEFAULT = 2000
+const TIMEOUT_DEFAULT = 4000
 const PATTERN_MAX = 50
 const PATTERN_LEN = 400
 const RULE_MAX = 60
@@ -1418,6 +1418,7 @@ export function parsePolicyDecision(payload, cfg = {}) {
   const ids = custom ? [...asked, 'custom'] : asked
   const hits = []
   const scores = []
+  const scoreMap = {}
   const readScore = (answer) => {
     const value = answer?.noul
     if (typeof value !== 'number' && (typeof value !== 'string' || !value.trim())) return null
@@ -1428,17 +1429,19 @@ export function parsePolicyDecision(payload, cfg = {}) {
     const score = readScore(answers[id])
     if (score === null) continue
     scores.push(score)
+    scoreMap[id] = Math.round(score * 1000) / 1000
     if (scoreBlocks(score, cfg)) hits.push({ category: id, score })
   }
   if (!scores.length) {
     const score = readScore(answers.safety)
     if (score === null) return null
     scores.push(score)
+    scoreMap.safety = Math.round(score * 1000) / 1000
     if (scoreBlocks(score, cfg)) hits.push({ category: 'safety', score })
   }
   const score = cfg.block_if_below === false ? Math.max(...scores) : Math.min(...scores)
   const margin = cfg.block_if_below === false ? policyLine(cfg) - score : score - policyLine(cfg)
-  return { hits: dropLoneNearMiss(hits, cfg), score, margin: Math.max(0, margin) }
+  return { hits: dropLoneNearMiss(hits, cfg), score, margin: Math.max(0, margin), scores: scoreMap }
 }
 
 function noulQuestion(instructions) {
@@ -2301,8 +2304,16 @@ export async function classifyJev(text, cfg, fetchImpl = globalThis.fetch, now =
             category: decision.hits[0].category,
             categories: decision.hits.map((hit) => hit.category),
             state: document,
+            scores: decision.scores,
           }
-        : { action: 'pass', reason: 'safe', state: document, score: decision.score, margin: decision.margin }
+        : {
+            action: 'pass',
+            reason: 'safe',
+            state: document,
+            score: decision.score,
+            margin: decision.margin,
+            scores: decision.scores,
+          }
       if (windowMs > 0) verdictCache.set(key, { verdict, at: now })
       return verdict
     } catch {

@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import type {
   RefusalDeviceBlock,
   RefusalGuardConfig,
+  RefusalSessionBlock,
 } from '@/types/panel-routing'
 import type {
   UsageLogRow,
@@ -171,11 +172,18 @@ export function RefusalRecords({
   const q = useQuery(refusalGuardsQueryOptions())
   const [clearOpen, setClearOpen] = useState(false)
   const [clearDevicesOpen, setClearDevicesOpen] = useState(false)
+  const [clearSessionsOpen, setClearSessionsOpen] = useState(false)
   const [deleteFp, setDeleteFp] = useState<string | null>(null)
   const [unblockId, setUnblockId] = useState<string | null>(null)
+  const [unblockSessionId, setUnblockSessionId] = useState<string | null>(null)
 
   const source = useMutation({
-    mutationFn: async (item: RefusalDeviceBlock) => {
+    mutationFn: async (
+      item: Pick<
+        RefusalDeviceBlock | RefusalSessionBlock,
+        'source_request_id' | 'session_id'
+      >
+    ) => {
       const params = new URLSearchParams({
         request_id: item.source_request_id || '',
         include_muted: '1',
@@ -246,8 +254,40 @@ export function RefusalRecords({
         body: JSON.stringify({ confirm: true }),
       }),
     onSuccess: async () => {
-      toast.success('已清空 device 封禁')
+      toast.success('已清空设备与会话封禁')
       setClearDevicesOpen(false)
+      await qc.invalidateQueries({
+        queryKey: refusalGuardsQueryOptions().queryKey,
+      })
+    },
+    onError: (error: Error) => toast.error(error.message),
+  })
+
+  const unblockSession = useMutation({
+    mutationFn: (sessionId: string) =>
+      api<RefusalGuardConfig>('/api/panel/refusal-session-blocks', {
+        method: 'DELETE',
+        body: JSON.stringify({ session_id: sessionId }),
+      }),
+    onSuccess: async () => {
+      toast.success('已解除会话封禁')
+      setUnblockSessionId(null)
+      await qc.invalidateQueries({
+        queryKey: refusalGuardsQueryOptions().queryKey,
+      })
+    },
+    onError: (error: Error) => toast.error(error.message),
+  })
+
+  const clearSessions = useMutation({
+    mutationFn: () =>
+      api<RefusalGuardConfig>('/api/panel/refusal-session-blocks', {
+        method: 'DELETE',
+        body: JSON.stringify({ confirm: true }),
+      }),
+    onSuccess: async () => {
+      toast.success('已清空根会话封禁')
+      setClearSessionsOpen(false)
       await qc.invalidateQueries({
         queryKey: refusalGuardsQueryOptions().queryKey,
       })
@@ -260,7 +300,10 @@ export function RefusalRecords({
   const data = q.data
   const devices = data.devices ?? []
   const deviceCount = data.device_count ?? devices.length
+  const sessions = data.sessions ?? []
+  const sessionCount = data.session_count ?? sessions.length
   const deleting = data.items.find((item) => item.fingerprint === deleteFp)
+  const unblocking = devices.find((item) => item.device_id === unblockId)
 
   return (
     <div className='space-y-8 p-4'>
@@ -396,6 +439,75 @@ export function RefusalRecords({
           ) : null}
         </Group>
       </div>
+      <Group
+        title='已封禁根会话（含子 Agent）'
+        hint={
+          sessionCount
+            ? sessions.length < sessionCount
+              ? `显示最近 ${sessions.length} / ${sessionCount} 条永久封禁会话`
+              : `${sessionCount} 条永久封禁会话`
+            : '还没有'
+        }
+        action={
+          <Button
+            size='sm'
+            variant='outline'
+            className='cursor-pointer'
+            disabled={!sessionCount || clearSessions.isPending}
+            onClick={() => setClearSessionsOpen(true)}
+          >
+            全部解除
+          </Button>
+        }
+      >
+        {sessions.length ? (
+          <ul className='max-h-72 divide-y overflow-y-auto rounded-xl border'>
+            {sessions.map((item) => (
+              <li
+                key={item.session_id}
+                className='flex flex-wrap items-center justify-between gap-2 px-3 py-2'
+              >
+                <div className='min-w-0 flex-1'>
+                  <p className='text-xs break-all'>
+                    会话 · <code>{item.session_id}</code>
+                  </p>
+                  {item.preview ? (
+                    <p
+                      className='line-clamp-2 text-xs text-muted-foreground'
+                      title={item.preview}
+                    >
+                      {item.preview}
+                    </p>
+                  ) : null}
+                  <p className='text-xs text-muted-foreground tabular-nums'>
+                    {item.reason || 'upstream_refusal'}
+                    {item.model ? ` · ${item.model}` : ''} · 命中{' '}
+                    {item.hit_count} · {fmtExpiresAt(item.last_seen_at)}
+                  </p>
+                </div>
+                {item.source_request_id ? (
+                  <Button
+                    size='sm'
+                    variant='outline'
+                    disabled={source.isPending}
+                    onClick={() => source.mutate(item)}
+                  >
+                    查看原始日志
+                  </Button>
+                ) : null}
+                <Button
+                  size='sm'
+                  variant='ghost'
+                  className='cursor-pointer'
+                  onClick={() => setUnblockSessionId(item.session_id)}
+                >
+                  解除
+                </Button>
+              </li>
+            ))}
+          </ul>
+        ) : null}
+      </Group>
       <ConfirmDialog
         open={clearOpen}
         onOpenChange={setClearOpen}
@@ -438,8 +550,12 @@ export function RefusalRecords({
         onOpenChange={(open) => {
           if (!open) setUnblockId(null)
         }}
-        title='解除这个 device'
-        desc={`解除后 ${unblockId || ''} 的新请求不再因为 device 封禁被拦。`}
+        title={
+          unblocking?.subject_kind === 'session'
+            ? '解除这个会话封禁'
+            : '解除这个设备封禁'
+        }
+        desc={`解除后 ${unblocking?.identity_value || unblockId || ''} 的新请求不再因此封禁记录被拦。`}
         confirmText='解除'
         cancelBtnText='取消'
         destructive
@@ -447,6 +563,32 @@ export function RefusalRecords({
         handleConfirm={() => {
           if (unblockId) unblock.mutate(unblockId)
         }}
+      />
+      <ConfirmDialog
+        open={!!unblockSessionId}
+        onOpenChange={(open) => {
+          if (!open) setUnblockSessionId(null)
+        }}
+        title='解除这个根会话封禁'
+        desc={`解除后会话 ${unblockSessionId || ''}（及其子 Agent）可再次转发。`}
+        confirmText='解除'
+        cancelBtnText='取消'
+        destructive
+        isLoading={unblockSession.isPending}
+        handleConfirm={() => {
+          if (unblockSessionId) unblockSession.mutate(unblockSessionId)
+        }}
+      />
+      <ConfirmDialog
+        open={clearSessionsOpen}
+        onOpenChange={setClearSessionsOpen}
+        title='解除全部根会话封禁'
+        desc='解除后所有被永久封锁的会话可以再次转发。'
+        confirmText='全部解除'
+        cancelBtnText='取消'
+        destructive
+        isLoading={clearSessions.isPending}
+        handleConfirm={() => clearSessions.mutate()}
       />
     </div>
   )

@@ -11,8 +11,17 @@
  * 仍服务于错误归集与导出，由 `types/panel-logs.ts` 描述。
  */
 
-/** 安全脱敏后的标量错误诊断字段（upstream_type / #1705 续传恢复字段 / 410 reason）。 */
+/** 安全脱敏后的标量错误诊断字段（upstream_type / #1705 续传恢复字段 / 410 reason / 风控 JEV 分数）。 */
 export type LogErrorDetails = Record<string, string | number | boolean>
+
+/** 拦截网关单次裁决结构（usage_logs.intercept）。 */
+export type InterceptVerdict = {
+  kind: 'pass' | 'block'
+  by: string
+  keyword?: string
+  rule?: string
+  route?: { kind: string; target: string; score?: number }
+}
 
 /** 单次上游尝试，`request_attempts` 直出，按 `attemptNumber` 升序构成供应商链。 */
 export type ProviderChainItem = {
@@ -197,6 +206,8 @@ export type UsageLogRow = {
   errorMessage: string | null
   upstreamType?: string | null
   errorDetails?: LogErrorDetails | null
+  /** 网关裁决 JSON（via / keyword / rule / route）。 */
+  intercept?: InterceptVerdict | null
   /** classifyJev 实际 POST 的 state。送审上下文，不是模型指出的命中句。 */
   jevState: string | null
 
@@ -249,6 +260,12 @@ export type UsageLogFilters = {
   endpoint?: string
   /** (`protocol`) */
   protocol?: string
+  /** (`via`) 精确匹配路由/拦截器标签（如 jev / hard-regex / refusal-guard / distill-detect）。 */
+  via?: string
+  /** (`final_state`) 精确匹配终态（如 policy_blocked / refusal_device / refusal_session）。 */
+  finalState?: string
+  /** (`upstream_risk_errors=1`) 上游 400/401/403/422 风险与错误诊断行。 */
+  upstreamRiskErrors?: boolean
   /** (`status_code`) 精确状态码。 */
   statusCode?: number
   /** (`exclude_status_200=1`) 只看非 2xx；与 statusCode 互斥，后者优先。 */
