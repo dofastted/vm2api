@@ -5,6 +5,7 @@ import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
+import { createFailoverMockSchedulerRuntime } from '../helpers/mock-scheduler-runtime.mjs'
 import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs'
 
 const ORIGINAL = 'file output\n' + '0123456789abcdef'.repeat(900)
@@ -65,15 +66,17 @@ async function fixture(t, { enabled = true, failSeed = false } = {}) {
   const logged = []
   let sequence = 0
   const vm = { id: 'fixture-slot', official_cc_inference: 'cli-hop' }
-  const runner = new FailoverRunner({
-    scheduler: {
-      async selectAndReserve() {
-        return { ok: true, vmId: vm.id, accountId: vm.id, vm, exec: { vmId: vm.id, vm, homeDir: root }, release() {} }
-      },
-      markSuccess() {},
-      markCooldown() {},
-      releaseAccountSessions() {},
+  const scheduler = {
+    async selectAndReserve() {
+      return { ok: true, vmId: vm.id, accountId: vm.id, vm, exec: { vmId: vm.id, vm, homeDir: root }, release() {} }
     },
+    markSuccess() {},
+    markCooldown() {},
+    releaseAccountSessions() {},
+  }
+  const runner = new FailoverRunner({
+    scheduler,
+    schedulerRuntime: createFailoverMockSchedulerRuntime({ scheduler }),
     config: { max_same_account_retries: 0 },
   })
   const handler = createHandleProtocol({

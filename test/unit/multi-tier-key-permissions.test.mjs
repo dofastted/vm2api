@@ -33,6 +33,7 @@ import { createPanelHandler } from '../../src/lib/admin/panel-routes.mjs'
 import { createIntegrationHandler } from '../../src/lib/admin/integration-routes.mjs'
 import { DEFAULT_INTEGRATION_SCOPES, IntegrationTokenStore } from '../../src/lib/admin/integration-tokens.mjs'
 import { readBody } from '../../src/lib/http/respond.mjs'
+import { createMockSchedulerRuntime } from '../helpers/mock-scheduler-runtime.mjs'
 
 function makeReq({ method = 'GET', url = '/', headers = {}, body, remoteAddress = '127.0.0.1' } = {}) {
   const chunks = body !== undefined ? [Buffer.from(typeof body === 'string' ? body : JSON.stringify(body))] : []
@@ -218,6 +219,7 @@ test('two-way Gemini environment isolation across platform, tenant, and resource
     const inferredEnvs = []
     const scheduler = createGeminiScheduler({
       geminiOwnersRepo: gemOwners,
+      schedulerRuntime: createMockSchedulerRuntime(),
       callHost: async (op, payload) => {
         if (op === 'list') {
           return {

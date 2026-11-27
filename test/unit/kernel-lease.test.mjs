@@ -3,19 +3,21 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { PoolScheduler } from '../../src/lib/pool/pool-scheduler.mjs'
+import { PoolScheduler, normalizePoolRouting } from '../../src/lib/pool/pool-scheduler.mjs'
 import {
   KernelLeaseStats,
   kernelCapacityOf,
   leaseVerdict,
   normalizeKernelLeaseMode,
 } from '../../src/lib/pool/kernel-lease.mjs'
+import { SchedulerUnavailableError } from '../../src/lib/scheduler/scheduler-runtime.mjs'
+import { createMockSchedulerRuntime } from '../helpers/mock-scheduler-runtime.mjs'
 
-function project() {
+function project(policy = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-pool-scheduler-'))
   const vms = path.join(root, 'vms')
   fs.mkdirSync(vms, { recursive: true })
-  const write = (id, accountId, policy = {}) => {
+  const write = (id, accountId, extraPolicy = {}) => {
     const vm = {
       id,
       name: id,
@@ -33,6 +35,7 @@ function project() {
         weight: 1,
         priority: 0,
         ...policy,
+        ...extraPolicy,
       },
       claude: {
         account_uuid: accountId,
@@ -51,125 +54,6 @@ function project() {
   return root
 }
 
-class RuntimeRepo {
-  constructor(accounts = null) {
-    this.accounts = accounts
-  }
-  schedulingSnapshot(ids) {
-    return new Map(
-      ids.map((id) => [
-        id,
-        {
-          state: this.get(id),
-          account: this.accounts?.get(id) ? { status: 'active', schedulable: true, ...this.accounts.get(id) } : null,
-        },
-      ]),
-    )
-  }
-  writeHeartbeat(input) {
-    this.upsert(input)
-  }
-  states = new Map()
-
-  get(id) {
-    return this.states.get(id) || null
-  }
-  clearExpired() {}
-  upsert(state) {
-    const next = { ...(this.states.get(state.account_id) || {}), ...state }
-    this.states.set(state.account_id, next)
-    return next
-  }
-  clearGrantRevokeCooldown(id, { vmId = null } = {}) {
-    const state = this.states.get(id)
-    if (!state) return false
-    if (
-      !/oauth_revoked|oauth_invalid_grant|invalid_grant|token has been revoked|oauth_no_refresh/i.test(
-        String(state.cooldown_reason || ''),
-      )
-    ) {
-      return false
-    }
-    this.states.set(id, {
-      ...state,
-      vm_id: state.vm_id || vmId,
-      status: 'ready',
-      cooldown_until: null,
-      cooldown_reason: null,
-    })
-    return true
-  }
-
-  markCooldown(id, update) {
-    const state = this.states.get(id) || {
-      account_id: id,
-      vm_id: update.vmId,
-      model_states: {},
-    }
-    if (update.model) {
-      state.model_states = {
-        ...(state.model_states || {}),
-        [update.model]: { cooldown_until: update.until, reason: update.reason },
-      }
-    } else {
-      state.cooldown_until = update.until
-      state.cooldown_reason = update.reason
-      state.status = update.status
-    }
-    this.states.set(id, state)
-    return state
-  }
-}
-
-function scheduler(root, extras = {}) {
-  const runtime = extras.runtimeRepo || new RuntimeRepo()
-  runtime.accounts = extras.accountQuota?.repo || null
-  return new PoolScheduler({
-    projectRoot: root,
-    runtimeRepo: runtime,
-    stickyRouter: extras.stickyRouter || null,
-    accountQuota: extras.accountQuota || { canAccept: () => ({ ok: true }) },
-    workerHealth:
-      extras.workerHealth ||
-      (async () => ({
-        ok: true,
-        credential: { generation: 1, has_access: true },
-      })),
-    config: {
-      fallback_wait_timeout_ms: 5,
-      sticky_wait_timeout_ms: 5,
-      ...extras.config,
-    },
-  })
-}
-
-const health = (capacity) => async (exec) => ({
-  ok: true,
-  credential: { generation: 1, has_access: true },
-  ...(capacity == null
-    ? {}
-    : {
-        runnable_capacity: typeof capacity === 'object' ? capacity[exec.vmId] : capacity,
-      }),
-})
-
-function leasePool(root, mode, capacity, lines = []) {
-  const pool = scheduler(root, {
-    workerHealth: health(capacity),
-    config: { kernel_lease: mode },
-  })
-  pool.kernelLeaseStats = new KernelLeaseStats({
-    log: (line) => lines.push(line),
-  })
-  return pool
-}
-
-const only1 = {
-  model: 'claude-test',
-  excluded: new Set(['account-2']),
-  allowWait: false,
-}
-
 test('kernel lease helpers', () => {
   assert.equal(normalizeKernelLeaseMode('Observe'), 'observe')
   assert.equal(normalizeKernelLeaseMode('enforce'), 'enforce')
@@ -184,186 +68,115 @@ test('kernel lease helpers', () => {
   assert.equal(leaseVerdict({ capacity: null, inflight: 9 }), 'unknown')
 })
 
-test('kernel_lease off: no lease on the reservation', async (t) => {
-  const root = project()
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
-  const pool = leasePool(root, 'off', 1)
-  const a = await pool.selectAndReserve(only1)
-  const b = await pool.selectAndReserve(only1)
-  assert.equal(a.ok, true)
-  assert.equal(b.ok, true)
-  assert.equal(a.kernelLease, null)
-  a.release()
-  b.release()
+test('normalizePoolRouting keeps kernel_lease and clamps kernel_lease_queue_grace_ms', () => {
+  assert.equal(normalizePoolRouting({ kernel_lease: 'observe' }).kernel_lease, 'observe')
+  assert.equal(normalizePoolRouting({ kernel_lease: 'enforce' }).kernel_lease, 'enforce')
+  assert.equal(normalizePoolRouting({}).kernel_lease, 'off')
+  assert.equal(normalizePoolRouting({ kernel_lease_queue_grace_ms: 0 }).kernel_lease_queue_grace_ms, 0)
+  assert.equal(normalizePoolRouting({ kernel_lease_queue_grace_ms: 999_999 }).kernel_lease_queue_grace_ms, 120_000)
 })
 
-test('kernel_lease observe: grants beyond runnable_capacity but counts them', async (t) => {
-  const root = project()
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+test('KernelLeaseStats records observe/enforce grants, denials, slot_busy desyncs, and summary flush', () => {
+  let clock = 1_000
   const lines = []
-  const pool = leasePool(root, 'observe', 1, lines)
-  const a = await pool.selectAndReserve(only1)
-  const b = await pool.selectAndReserve(only1)
-  assert.equal(a.ok, true)
-  assert.equal(b.ok, true, 'observe never changes the decision')
-  assert.equal(a.kernelLease.verdict, 'ok')
-  assert.equal(b.kernelLease.verdict, 'over')
+  const stats = new KernelLeaseStats({
+    log: (line) => lines.push(line),
+    intervalMs: 60_000,
+    now: () => clock,
+  })
+
+  stats.noteGrant({ mode: 'observe', verdict: 'ok', vmId: 'vm-01', capacity: 1, inflight: 0 })
+  stats.noteGrant({
+    mode: 'observe',
+    verdict: 'over',
+    vmId: 'vm-01',
+    capacity: 1,
+    inflight: 1,
+    selectionReason: 'balanced',
+  })
+  stats.noteGrant({ mode: 'enforce', verdict: 'over', vmId: 'vm-02', capacity: 1, inflight: 1, denied: true })
+  stats.noteGrant({ mode: 'enforce', verdict: 'unknown', vmId: 'vm-02', capacity: null, inflight: 0 })
+
+  stats.noteSlotBusy({ mode: 'observe', verdict: 'over', vmId: 'vm-01', capacity: 1, inflight: 1, message: 'busy' })
+  stats.noteSlotBusy({ mode: 'observe', verdict: 'ok', vmId: 'vm-01', capacity: 1, inflight: 0, message: 'desync' })
+  stats.noteSlotBusy({ mode: 'enforce', verdict: 'unknown', vmId: 'vm-02', capacity: null, inflight: 0 })
+
+  const snap = stats.snapshot()
+  assert.equal(snap.total.granted, 3)
+  assert.equal(snap.total.unknown, 1)
+  assert.equal(snap.total.over, 1)
+  assert.equal(snap.total.denied, 1)
+  assert.equal(snap.total.slot_busy, 3)
+  assert.equal(snap.total.slot_busy_over, 1)
+  assert.equal(snap.total.desync, 1)
+  assert.equal(snap.total.slot_busy_unknown, 1)
+  assert.equal(snap.by_vm['vm-01'].over, 1)
+  assert.equal(snap.by_vm['vm-01'].desync, 1)
+  assert.equal(snap.by_vm['vm-02'].denied, 1)
+  assert.ok(lines.some((line) => line.includes('would-deny') && line.includes('vm=vm-01')))
+  assert.ok(lines.some((line) => line.includes('deny') && line.includes('vm=vm-02')))
+
+  clock += 60_000
+  stats.maybeFlush('observe')
+  assert.ok(lines.some((line) => line.includes('[kernel-lease] summary mode=observe')))
+})
+
+test('PoolScheduler.noteKernelSlotBusy feeds kernelLeaseSnapshot and ignores selections without kernelLease', () => {
+  const lines = []
+  const pool = new PoolScheduler({ config: { kernel_lease: 'observe' } })
+  pool.kernelLeaseStats = new KernelLeaseStats({ log: (line) => lines.push(line) })
+
+  pool.noteKernelSlotBusy({ vmId: 'vm-01' })
+  assert.equal(pool.kernelLeaseSnapshot().total.slot_busy, 0)
+
+  pool.noteKernelSlotBusy({
+    vmId: 'vm-01',
+    kernelLease: { mode: 'observe', verdict: 'over', capacity: 1, inflight: 1 },
+  })
+  pool.noteKernelSlotBusy({
+    vmId: 'vm-01',
+    kernelLease: { mode: 'observe', verdict: 'ok', capacity: 1, inflight: 0 },
+  })
   const snap = pool.kernelLeaseSnapshot()
   assert.equal(snap.mode, 'observe')
-  assert.equal(snap.total.over, 1)
-  assert.equal(snap.total.denied, 0)
-  assert.ok(lines.some((line) => line.includes('would-deny') && line.includes('vm=vm-01')))
-  // The kernel then says busy for the over-capacity request, and once for a granted one (desync).
-  pool.noteKernelSlotBusy(b)
-  pool.noteKernelSlotBusy(a)
-  assert.equal(pool.kernelLeaseSnapshot().total.slot_busy_over, 1)
-  assert.equal(pool.kernelLeaseSnapshot().total.desync, 1)
-  a.release()
-  b.release()
+  assert.equal(snap.total.slot_busy, 2)
+  assert.equal(snap.total.slot_busy_over, 1)
+  assert.equal(snap.total.desync, 1)
 })
 
-test('kernel_lease enforce: refuses a VM at runnable_capacity and frees on release', async (t) => {
-  const root = project()
+test('M3 cutover (D4): PoolScheduler delegates capacity enforcement to schedulerRuntime and fails closed without it', async (t) => {
+  const root = project({ maxConcurrency: 1 })
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
-  const pool = leasePool(root, 'enforce', 1)
-  const a = await pool.selectAndReserve(only1)
-  assert.equal(a.ok, true)
-  assert.equal(a.kernelLease.verdict, 'ok')
-  assert.ok(
-    a.slotWaitDeadlineMs <= Date.now() + 5000,
-    'a leased request only waits the grace in the kernel (kernel_lease_queue_grace_ms)',
+
+  const unbacked = new PoolScheduler({ projectRoot: root, config: { kernel_lease: 'enforce' } })
+  await assert.rejects(
+    () => unbacked.selectAndReserve({ model: 'claude-test', allowWait: false }),
+    (err) => err instanceof SchedulerUnavailableError && err.code === 'scheduler_unavailable',
   )
-  const b = await pool.selectAndReserve(only1)
-  assert.equal(b.ok, false)
-  assert.equal(pool.kernelLeaseSnapshot().total.denied >= 1, true)
-  a.release()
-  const c = await pool.selectAndReserve(only1)
-  assert.equal(c.ok, true, 'release frees the lease')
-  c.release()
-})
 
-test('kernel_lease enforce: a full kernel spills to a VM with a free slot', async (t) => {
-  const root = project()
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
-  const pool = leasePool(root, 'enforce', { 'vm-01': 1, 'vm-02': 1 })
+  const runtime = createMockSchedulerRuntime({ projectRoot: root })
+  const pool = new PoolScheduler({
+    projectRoot: root,
+    schedulerRuntime: runtime,
+    config: { kernel_lease: 'enforce' },
+  })
+
   const req = { model: 'claude-test', allowWait: false }
   const a = await pool.selectAndReserve(req)
   const b = await pool.selectAndReserve(req)
   assert.equal(a.ok, true)
   assert.equal(b.ok, true)
-  assert.notEqual(a.vmId, b.vmId, 'one request per one-slot kernel')
+  assert.notEqual(a.vmId, b.vmId, 'single-concurrency slots spill across VMs via schedulerRuntime')
+  assert.equal(a.kernelLease, undefined, 'legacy Node PoolScheduler kernelLease field is removed in M3')
+
   const c = await pool.selectAndReserve(req)
-  assert.equal(c.ok, false)
+  assert.equal(c.ok, false, 'saturated slots reject when capacity is full')
+
   a.release()
+  await new Promise((resolve) => setImmediate(resolve))
+  const d = await pool.selectAndReserve(req)
+  assert.equal(d.ok, true, 'release returns capacity to schedulerRuntime')
+  assert.equal(d.vmId, a.vmId)
   b.release()
-})
-
-test('kernel_lease enforce: runnable_capacity 0 takes nothing', async (t) => {
-  const root = project()
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
-  const pool = leasePool(root, 'enforce', { 'vm-01': 0, 'vm-02': 2 })
-  const req = { model: 'claude-test', allowWait: false }
-  const a = await pool.selectAndReserve(req)
-  const b = await pool.selectAndReserve(req)
-  assert.equal(a.vmId, 'vm-02')
-  assert.equal(b.vmId, 'vm-02')
-  a.release()
-  b.release()
-})
-
-test('kernel_lease enforce: a kernel that does not report capacity keeps the old limits', async (t) => {
-  const root = project()
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
-  const pool = leasePool(root, 'enforce', null)
-  const a = await pool.selectAndReserve(only1)
-  const b = await pool.selectAndReserve(only1)
-  assert.equal(a.ok, true)
-  assert.equal(b.ok, true)
-  assert.equal(a.kernelLease.verdict, 'unknown')
-  assert.ok(!(a.slotWaitDeadlineMs <= Date.now() - 1000), 'no fail-fast without a known capacity')
-  a.release()
-  b.release()
-})
-
-test('kernel_lease enforce: a queued request gets the lease when one is released', async (t) => {
-  const root = project()
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
-  const pool = scheduler(root, {
-    workerHealth: health(1),
-    config: {
-      kernel_lease: 'enforce',
-      fallback_wait_timeout_ms: 3000,
-      sticky_wait_timeout_ms: 3000,
-    },
-  })
-  pool.kernelLeaseStats = new KernelLeaseStats({ log: () => {} })
-  const a = await pool.selectAndReserve(only1)
-  assert.equal(a.ok, true)
-  const waiting = pool.selectAndReserve({ ...only1, allowWait: true })
-  setTimeout(() => a.release(), 50)
-  const b = await waiting
-  assert.equal(b.ok, true)
-  assert.equal(b.vmId, 'vm-01')
-  b.release()
-})
-
-test('normalizePoolRouting keeps kernel_lease', async () => {
-  const { normalizePoolRouting } = await import('../../src/lib/pool/pool-scheduler.mjs')
-  assert.equal(normalizePoolRouting({ kernel_lease: 'observe' }).kernel_lease, 'observe')
-  assert.equal(normalizePoolRouting({}).kernel_lease, 'off')
-})
-
-test('kernel_lease enforce: kernel_lease_queue_grace_ms 0 means the kernel must not queue', async (t) => {
-  const root = project()
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
-  const pool = scheduler(root, {
-    workerHealth: health(1),
-    config: { kernel_lease: 'enforce', kernel_lease_queue_grace_ms: 0 },
-  })
-  pool.kernelLeaseStats = new KernelLeaseStats({ log: () => {} })
-  const a = await pool.selectAndReserve(only1)
-  assert.ok(a.slotWaitDeadlineMs <= Date.now())
-  a.release()
-})
-
-test('kernel_lease enforce: a content seat takes a lease per request and spreads over free kernels', async (t) => {
-  const root = project()
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
-  const pool = leasePool(root, 'enforce', 1)
-  const req = { model: 'claude-test', seatKey: 'seat:h:0123456789abcdef', allowWait: false }
-  const a = await pool.selectAndReserve(req)
-  const b = await pool.selectAndReserve(req)
-  assert.equal(a.ok, true)
-  assert.equal(b.ok, true, 'second request of the batch is not stuck behind the first kernel')
-  assert.notEqual(a.vmId, b.vmId)
-  a.release()
-  b.release()
-  const c = await pool.selectAndReserve(req)
-  assert.equal(c.vmId, b.vmId, 'affinity prefers the VM the seat last ran on')
-  c.release()
-})
-
-test('kernel_lease enforce: a session seat stays on its VM', async (t) => {
-  const root = project()
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
-  const pool = leasePool(root, 'enforce', 1)
-  const req = { model: 'claude-test', seatKey: 'seat:sess:abc', allowWait: false }
-  const a = await pool.selectAndReserve(req)
-  assert.equal(a.ok, true)
-  const b = await pool.selectAndReserve(req)
-  assert.equal(b.ok, false, 'a conversation does not spill to another account for a lease')
-  a.release()
-})
-
-test('kernel_lease observe: a content seat keeps the seat path', async (t) => {
-  const root = project()
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
-  const pool = leasePool(root, 'observe', 1)
-  const req = { model: 'claude-test', seatKey: 'seat:h:0123456789abcdef', allowWait: false }
-  const a = await pool.selectAndReserve(req)
-  const b = await pool.selectAndReserve(req)
-  assert.equal(a.vmId, b.vmId)
-  assert.equal(b.selectionReason, 'seat-held')
-  a.release()
-  b.release()
+  d.release()
 })

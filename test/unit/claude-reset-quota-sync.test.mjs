@@ -13,6 +13,7 @@ import {
 } from '../../src/lib/oauth/claude-reset-credits.mjs'
 import { AccountQuota } from '../../src/lib/pool/account-quota.mjs'
 import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
+import { createFailoverMockSchedulerRuntime } from '../helpers/mock-scheduler-runtime.mjs'
 import { listQuotaFromHeaders } from '../../src/lib/pool/quota-window.mjs'
 import { RateLimitService } from '../../src/lib/pool/rate-limit-service.mjs'
 import { resolveUsageWindows } from '../../src/lib/protocol/user-count-tokens.mjs'
@@ -731,6 +732,7 @@ test('#1758 blocker 1 & minor 1: FailoverRunner skips applyCooldown on pre-reset
     }
     const runner = new FailoverRunner({
       scheduler,
+      schedulerRuntime: createFailoverMockSchedulerRuntime({ scheduler }),
       rateLimitService,
       config: { max_same_account_retries: 0, max_total_attempts: 2 },
     })
@@ -797,6 +799,7 @@ test('#1758 blocker 1 & minor 1: FailoverRunner skips applyCooldown on pre-reset
     }
     const runner = new FailoverRunner({
       scheduler,
+      schedulerRuntime: createFailoverMockSchedulerRuntime({ scheduler }),
       rateLimitService,
       config: { max_same_account_retries: 0, max_total_attempts: 2 },
     })

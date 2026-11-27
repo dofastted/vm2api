@@ -8,6 +8,7 @@ import http from 'node:http'
 import { openDatabase, closeDatabase } from '../../src/lib/db/database.mjs'
 import { VmPoolsRepo } from '../../src/lib/db/repos/vm-pools-repo.mjs'
 import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
+import { createFailoverMockSchedulerRuntime } from '../helpers/mock-scheduler-runtime.mjs'
 import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs'
 
 for (const { scope = {}, blocked, downgrade, denied } of [
@@ -42,20 +43,22 @@ for (const { scope = {}, blocked, downgrade, denied } of [
         await new Promise((resolve) => audit.close(resolve))
       })
     }
-    const runner = new FailoverRunner({
-      scheduler: {
-        async selectAndReserve({ keyScope }) {
-          assert.equal(denied, downgrade ? false : undefined)
-          if (downgrade) {
-            assert.equal(keyScope.vm_pool_id, poolId)
-            assert.deepEqual(keyScope.allowed_vms, [vm.id])
-          }
-          return { ok: true, vmId: vm.id, accountId: vm.id, vm, exec: { vmId: vm.id, vm, homeDir: root }, release() {} }
-        },
-        markSuccess() {},
-        markCooldown() {},
-        releaseAccountSessions() {},
+    const scheduler = {
+      async selectAndReserve({ keyScope }) {
+        assert.equal(denied, downgrade ? false : undefined)
+        if (downgrade) {
+          assert.equal(keyScope.vm_pool_id, poolId)
+          assert.deepEqual(keyScope.allowed_vms, [vm.id])
+        }
+        return { ok: true, vmId: vm.id, accountId: vm.id, vm, exec: { vmId: vm.id, vm, homeDir: root }, release() {} }
       },
+      markSuccess() {},
+      markCooldown() {},
+      releaseAccountSessions() {},
+    }
+    const runner = new FailoverRunner({
+      scheduler,
+      schedulerRuntime: createFailoverMockSchedulerRuntime({ scheduler }),
       config: { max_same_account_retries: 0, total_retry_deadline_ms: 100 },
     })
     const attempts = []

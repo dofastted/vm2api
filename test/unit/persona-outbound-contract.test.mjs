@@ -13,6 +13,7 @@ import {
   validateCacheBreakpoints,
 } from '../../src/lib/protocol/cache-ttl.mjs'
 import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs'
+import { createFailoverMockSchedulerRuntime, createMockSchedulerRuntime } from '../helpers/mock-scheduler-runtime.mjs'
 import { OFFICIAL_CLAUDE_CLI_UA } from '../../src/lib/identity/vm-identity.mjs'
 import { clearCachePrefixSessions } from '../../src/lib/protocol/cache-prefix.mjs'
 
@@ -84,16 +85,25 @@ async function outbound(
     t.after(() => new Promise((resolve) => kernel.close(resolve)))
   }
   const vm = { id: 'fixture-slot', persona_preset: preset, official_cc_inference: 'cli-hop' }
-  const runner = new FailoverRunner({
-    scheduler: {
-      async selectAndReserve() {
-        return { ok: true, vmId: vm.id, accountId: vm.id, vm, exec: { vmId: vm.id, vm, homeDir: root }, release() {} }
-      },
-      markSuccess() {},
-      markCooldown() {},
-      releaseAccountSessions() {},
+  const scheduler = {
+    async selectAndReserve() {
+      return { ok: true, vmId: vm.id, accountId: vm.id, vm, exec: { vmId: vm.id, vm, homeDir: root }, release() {} }
     },
+    markSuccess() {},
+    markCooldown() {},
+    releaseAccountSessions() {},
+  }
+  const runner = new FailoverRunner({
+    scheduler,
+    schedulerRuntime: createFailoverMockSchedulerRuntime({ scheduler }),
     config: { max_same_account_retries: 0 },
+  })
+  const apiRt = createMockSchedulerRuntime()
+  const pickApi = () => ({
+    ok: true,
+    endpoint: { id: 'fixture', kind: 'claude', protocol: 'anthropic', base_url: 'https://upstream.invalid' },
+    upstream_model: incoming.model,
+    key: { id: 'fixture', api_key: 'fixture-not-secret' },
   })
   const response = { headersSent: false, on() {}, once() {}, off() {}, write() {}, end() {} }
   const handler = createHandleProtocol({
@@ -116,13 +126,31 @@ async function outbound(
     stickyRouter: { extractPoolKey: () => null, collectPoolKeys: () => [] },
     accountQuota: { ingestHeaders() {} },
     apiKeyStore: { acquire: () => ({ ok: true }), release() {}, recordUsage() {} },
+    ...(backend === 'api' ? { schedulerRuntime: apiRt } : {}),
     apiScheduler: {
-      pick: () => ({
-        ok: true,
-        endpoint: { id: 'fixture', kind: 'claude', protocol: 'anthropic', base_url: 'https://upstream.invalid' },
-        upstream_model: incoming.model,
-        key: { id: 'fixture', api_key: 'fixture-not-secret' },
-      }),
+      pick: pickApi,
+      async acquire(requestedModel, opts = {}) {
+        const picked = pickApi()
+        const acquired = await (opts.schedulerRuntime || apiRt).acquireNode({
+          ...opts,
+          nodeTypes: ['api_endpoint'],
+          allowedNodeKeys: [`api_endpoint:${picked.endpoint.id}`],
+          model: requestedModel,
+        })
+        return {
+          ...picked,
+          leaseId: acquired.lease_id,
+          leaseTtlMs: acquired.lease_ttl_ms,
+          nodeKey: acquired.selected_node.node_key,
+          resolvedPoolId: acquired.resolved_pool_id,
+        }
+      },
+      async commitLease(leaseId, opts = {}) {
+        return (opts.schedulerRuntime || apiRt).commitLease(leaseId)
+      },
+      async releaseLease(leaseId, payload = {}, opts = {}) {
+        return (opts.schedulerRuntime || apiRt).releaseLease(leaseId, payload)
+      },
     },
     apiEndpointStore: {},
     stats: { errors: 0, requests: 0, by_route: {}, passthrough: 0, rewrite: 0, convert: 0 },

@@ -8,6 +8,7 @@ import { getVm, listVms, persistCodexUsage } from '../../src/lib/vm/vm-registry.
 import { persistCodexQuotaSnapshot } from '../../src/lib/vm/codex-slot.mjs'
 import { codexQuotaPark, CODEX_DEFAULT_PARK_MS } from '../../src/lib/protocol/codex-usage.mjs'
 import { resetOpenAIAccountRuntime } from '../../src/lib/pool/openai-account-runtime.mjs'
+import { createMockSchedulerRuntime } from '../helpers/mock-scheduler-runtime.mjs'
 
 beforeEach(() => resetOpenAIAccountRuntime())
 
@@ -57,6 +58,7 @@ async function hop(root, { headers = {}, code = 'usage_limit_reached', status = 
     writeSSEHeaders() {},
     routing: {},
     projectRoot: root,
+    schedulerRuntime: createMockSchedulerRuntime({ projectRoot: root }),
     ops: {
       writeCodexKernelConfig() {},
       ensureCodexKernel: async () => ({ ok: true }),
