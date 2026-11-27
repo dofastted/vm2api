@@ -469,7 +469,7 @@ function selectedUsage(selected, accountQuota = null) {
 function classifyAttempt(
   result,
   selected,
-  { model, requestBody, repaired, oauth401CooldownMs, signatureRepair },
+  { model, requestBody, repaired, oauth401CooldownMs, signatureRepair, disableRequestRepair = false },
   accountQuota = null,
 ) {
   return classifyUpstreamResult(result, {
@@ -481,6 +481,7 @@ function classifyAttempt(
     credentialGeneration: credentialStamp(selected),
     priorAuth401Generation: priorAuth401Stamp(selected),
     signatureRepair,
+    disableRequestRepair,
     usage: selectedUsage(selected, accountQuota),
   })
 }
@@ -1460,11 +1461,16 @@ export class FailoverRunner {
                   repaired,
                   oauth401CooldownMs: this.config.oauth_401_cooldown_ms,
                   signatureRepair: signatureRepairEnabled(this.config) || attemptMeta?.foreignThinking === true,
+                  disableRequestRepair: attemptMeta?.strictPassthrough === true,
                 },
                 this.scheduler?.accountQuota,
               )
 
-          if (policy.reason === 'thinking_incompatible' && !result?.committed) {
+          if (
+            policy.reason === 'thinking_incompatible' &&
+            !result?.committed &&
+            attemptMeta?.strictPassthrough !== true
+          ) {
             const upstreamMessage = String(result?.body?.error?.message || '').trim()
             const detail = `thinking.budget_tokens must be at least ${MIN_THINKING_BUDGET} and less than max_tokens (got max_tokens=${requestBody?.max_tokens})`
             const message = upstreamMessage ? `${upstreamMessage}; ${detail}` : detail

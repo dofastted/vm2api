@@ -353,3 +353,75 @@ test('Claude family session limits round-trip through package export, import, an
   assert.equal(saved.policy.maxSubagentsPerSession, null)
   assert.equal(saved.policy.maxSubagentsPerSessionOverride, false)
 })
+
+test('crag-debian13 & debian-13 package import auto-closes to dataplane=crag, rejects openai, and honors deferredCrag on bring-up', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-vm-pkg-cd13-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const pool = makePool(t)
+
+  // 1. Both canonical crag-debian13 and alias debian-13 auto-close to dataplane='crag' + crag_kernel_version='v2' even when dataplane='wrap'
+  for (const [id, kernel] of [
+    ['vm-cd13-a', 'crag-debian13'],
+    ['vm-cd13-b', 'debian-13'],
+  ]) {
+    const doc = claudePackage(id)
+    doc.vm.kernel = kernel
+    doc.vm.dataplane = 'wrap'
+    const parsed = parseVmPackage(doc)
+    assert.equal(parsed.ok, true, parsed.error?.message)
+    assert.equal(parsed.value.vm.kernel, 'crag-debian13')
+    assert.equal(parsed.value.vm.dataplane, 'crag')
+    assert.equal(parsed.value.vm.crag_kernel_version, 'v2')
+  }
+
+  // 2. OpenAI/Codex package with crag-debian13 is rejected cleanly
+  const badCodex = {
+    type: 'vm2api-vm-package',
+    version: 1,
+    vm: { id: 'vm-bad-gpt', platform: 'openai', family: 'codex', kernel: 'crag-debian13' },
+  }
+  const badParsed = parseVmPackage(badCodex)
+  assert.equal(badParsed.ok, false)
+  assert.equal(badParsed.error.code, 'invalid_create_dataplane')
+
+  // 3. POST /api/panel/vms/package bringUpImportedVm keeps status='stopped' (deferredCrag) when CRAG slot quota is full
+  const doc = claudePackage('vm-cd13-deferred')
+  doc.vm.kernel = 'crag-debian13'
+  doc.vm.dataplane = ''
+  doc.proxy = { kind: 'local' }
+  const response = {}
+  const handlePanel = createPanelHandler({
+    cfg: { paths: { project: root } },
+    proxyPool: pool,
+    accountQuota: {
+      ensure() {},
+      rebindToVm() {},
+      ingestOAuthUsage() {},
+      snapshot: () => ({ accounts: [] }),
+      repo: { get: () => ({ unified: {} }), save() {} },
+    },
+    startSlotReady: async () => ({ ok: false, code: 'slot_limit_reached', error: 'CRAG 槽位额度不足' }),
+    requireAuth(req) {
+      req.apiKeyKind = 'master'
+      req.panelRole = 'admin'
+      return true
+    },
+    json(_res, status, payload) {
+      response.status = status
+      response.body = payload
+      return true
+    },
+    readBody: async () => doc,
+  })
+  await handlePanel({ method: 'POST' }, {}, new URL('http://localhost/api/panel/vms/package'))
+  assert.equal(response.status, 201, JSON.stringify(response.body))
+  assert.equal(response.body.data.vm.kernel, 'crag-debian13')
+  assert.equal(response.body.data.vm.dataplane, 'crag')
+  assert.equal(response.body.data.vm.status, 'stopped')
+  assert.equal(response.body.data.start_error, 'CRAG 槽位额度不足')
+  const saved = JSON.parse(fs.readFileSync(path.join(root, 'vms', 'vm-cd13-deferred.json'), 'utf8'))
+  assert.equal(saved.kernel, 'crag-debian13')
+  assert.equal(saved.dataplane, 'crag')
+  assert.equal(saved.crag_kernel_version, 'v2')
+  assert.equal(saved.status, 'stopped')
+})

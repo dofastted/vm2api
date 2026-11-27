@@ -16,7 +16,11 @@ import { StatusMark } from '@/components/status-mark'
 import { dashboardQueryOptions } from '@/features/overview/queries'
 import { proxyLabel } from '@/features/proxies/proxy-sort'
 import { routingQueryOptions } from '@/features/settings/queries'
-import { kernelProfile } from '@/features/vm/create-options'
+import {
+  CRAG_DEBIAN13_SLOT_NOTICE,
+  isCragDebian13Kernel,
+  kernelProfile,
+} from '@/features/vm/create-options'
 import {
   CreateVmForm,
   SpecSheet,
@@ -91,7 +95,9 @@ function slotSpecRows(vm: Vm): SpecRow[] {
     },
     {
       label: '系统',
-      value: kernelProfile(vm.kernel)?.name || vm.kernel || '—',
+      value: isCragDebian13Kernel(vm.kernel)
+        ? `${kernelProfile(vm.kernel)?.name || vm.kernel}（占用 CRAG 槽位）`
+        : kernelProfile(vm.kernel)?.name || vm.kernel || '—',
     },
     {
       label: '规格',
@@ -301,6 +307,14 @@ function SlotReceipt({ vm, onChange }: { vm: Vm; onChange?: () => void }) {
       <span className='text-xs text-muted-foreground'>
         {kernelProfile(vm.kernel)?.name || vm.kernel}
       </span>
+      {isCragDebian13Kernel(vm.kernel) ? (
+        <span
+          className='text-xs text-[color:var(--status-caution)]'
+          title={CRAG_DEBIAN13_SLOT_NOTICE}
+        >
+          使用会占用 CRAG 槽位
+        </span>
+      ) : null}
       {onChange ? (
         <Button
           size='sm'
@@ -591,6 +605,9 @@ export function OnboardFlow() {
                     ),
                     detail: [
                       kernelProfile(vm.kernel)?.name || vm.kernel,
+                      isCragDebian13Kernel(vm.kernel)
+                        ? '使用会占用 CRAG 槽位'
+                        : null,
                       vm.machine
                         ? machineLine(
                             runtimeTypeOf(vm),

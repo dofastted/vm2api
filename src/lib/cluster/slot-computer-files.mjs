@@ -20,6 +20,8 @@ import { openSftp, runRemote, shellQuote, writeRemoteFile } from './remote-fs.mj
 const MAX_FILE_BYTES = 64 * 1024
 const MAX_FILES = 128
 
+export const MANAGED_SETTINGS_D_REL = 'etc/claude-code/managed-settings.d'
+
 /** Guest path → path under the node's <slot>/computer and the local fingerprint/system dir. */
 const MOUNTS = Object.freeze([
   { guest: '/etc/kin-computer', rel: 'etc/kin-computer', file: true },
@@ -29,6 +31,10 @@ const MOUNTS = Object.freeze([
 
 export function clusterComputerBinds(remoteDir) {
   return MOUNTS.map((m) => `${remoteDir}/computer/${m.rel}:${m.guest}:ro`)
+}
+
+export function clusterManagedSettingsBind(remoteDir) {
+  return `${remoteDir}/computer/${MANAGED_SETTINGS_D_REL}:/etc/claude-code/managed-settings.d:ro`
 }
 
 /** Without remoteDir (callers that only hold the inspected container) any node root is accepted. */
@@ -45,6 +51,36 @@ function regularFile(file) {
   } catch {
     return false
   }
+}
+
+/**
+ * Optional read-only managed-settings.d drop-ins produced by `kin-computer`
+ * under `vms/<id>/kvm/fingerprint/system/etc/claude-code/managed-settings.d/*.json`.
+ * Returns an empty list for legacy slots that do not carry drop-ins.
+ */
+export function localManagedSettingsFiles(projectRoot, vm) {
+  if (!projectRoot || !vm?.id) return []
+  const dir = path.join(fingerprintDir(projectRoot, vm.id), 'system', MANAGED_SETTINGS_D_REL)
+  let names
+  try {
+    const st = fs.lstatSync(dir)
+    if (st.isSymbolicLink() || !st.isDirectory()) return []
+    names = fs.readdirSync(dir).sort()
+  } catch {
+    return []
+  }
+  const out = []
+  for (const name of names) {
+    if (!name || name.startsWith('.') || !name.endsWith('.json')) continue
+    const file = path.join(dir, name)
+    if (!regularFile(file)) continue
+    out.push({ rel: `${MANAGED_SETTINGS_D_REL}/${name}`, data: fs.readFileSync(file) })
+  }
+  return out
+}
+
+export function hasLocalManagedSettings(projectRoot, vm) {
+  return localManagedSettingsFiles(projectRoot, vm).length > 0
 }
 
 /**
@@ -74,6 +110,7 @@ export function localComputerFiles(projectRoot, vm) {
     if (!files.length) return null
     for (const name of files) out.push({ rel: `${m.rel}/${name}`, data: fs.readFileSync(path.join(local, name)) })
   }
+  for (const preset of localManagedSettingsFiles(projectRoot, vm)) out.push(preset)
   return out.length <= MAX_FILES ? out : null
 }
 
@@ -89,11 +126,19 @@ export async function pushClusterComputer(projectRoot, vm, session, { remoteDir,
   const files = localComputerFiles(projectRoot, vm)
   if (!files) return false
   const root = `${remoteDir}/computer`
-  const dirs = [root, `${root}/etc`, `${root}/dmi`, `${root}/dmi/id`, `${root}/hardware`]
+  const hasManaged = files.some((f) => f.rel.startsWith(`${MANAGED_SETTINGS_D_REL}/`))
+  const dirs = [
+    root,
+    `${root}/etc`,
+    `${root}/dmi`,
+    `${root}/dmi/id`,
+    `${root}/hardware`,
+    ...(hasManaged ? [`${root}/etc/claude-code`, `${root}/${MANAGED_SETTINGS_D_REL}`] : []),
+  ]
   const chown = owner ? ` && chown ${owner.uid}:${owner.gid} ${dirs.map(shellQuote).join(' ')}` : ''
   await runRemote(
     session.client,
-    `rm -rf ${shellQuote(`${root}/dmi/id`)} ${shellQuote(`${root}/hardware`)} && umask 022 && mkdir -p ${dirs.map(shellQuote).join(' ')} && chmod 755 ${dirs.map(shellQuote).join(' ')}${chown}`,
+    `rm -rf ${shellQuote(`${root}/dmi/id`)} ${shellQuote(`${root}/hardware`)} ${shellQuote(`${root}/${MANAGED_SETTINGS_D_REL}`)} && umask 022 && mkdir -p ${dirs.map(shellQuote).join(' ')} && chmod 755 ${dirs.map(shellQuote).join(' ')}${chown}`,
     { timeoutMs: 20_000 },
   )
   const sftp = await openSftp(session.client)

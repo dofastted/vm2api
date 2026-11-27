@@ -27,7 +27,22 @@ export const KERNELS = [
     size: '标准机',
     feats: ['dnf', 'glibc', 'cli-hop wrap/crag', 'host-net'],
   },
+  {
+    id: 'crag-debian13',
+    name: 'CRAG Debian 13',
+    base: 'kin-os/debian:13-baked',
+    size: 'CRAG 专用机',
+    feats: ['Debian 13', '使用会占用 CRAG 槽位', 'RO 共享仓', 'KVM EROFS'],
+  },
 ]
+
+export const CRAG_DEBIAN13_SLOT_NOTICE =
+  '使用会占用 CRAG 槽位：该系统仅支持 CRAG 推理数据面，开机启用后占用 1 个 CRAG 授权槽位；授权额度不足时可先创建为已停止待激活。'
+
+export function isCragDebian13Kernel(id?: string | null): boolean {
+  const raw = String(id || '').trim()
+  return raw === 'crag-debian13' || raw === 'debian-13'
+}
 
 export type KernelProfile = {
   id: string
@@ -38,11 +53,12 @@ export type KernelProfile = {
 }
 
 export function kernelProfile(id?: string | null): KernelProfile | null {
-  const k = String(id || '').trim()
+  const raw = String(id || '').trim()
+  const k = raw === 'debian-13' ? 'crag-debian13' : raw
   const known = KERNELS.find((x) => x.id === k)
   if (known) return known
-  if (!k) return null
-  return { id: k, name: k, base: '', size: '', feats: ['自定义内核'] }
+  if (!raw) return null
+  return { id: raw, name: raw, base: '', size: '', feats: ['自定义内核'] }
 }
 
 /**

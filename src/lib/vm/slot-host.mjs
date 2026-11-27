@@ -94,6 +94,7 @@ import {
 import { isCodexVm } from './vm-kind.mjs'
 import { nodeEgressProxyUrl } from '../cluster/node-egress-socks.mjs'
 import { isKvmRuntime } from './runtime-kind.mjs'
+import { isCustomKvmMode } from './custom-os-runtime.mjs'
 import { stopCodexKernel } from '../transport/codex-kernel-supervisor.mjs'
 import { readLocalSlotSeedFiles } from './slot-seed.mjs'
 
@@ -108,6 +109,7 @@ const LOCAL_HOST = Object.freeze({
     cli: CONTAINER_CLI_NODE_BIN,
     cc: CONTAINER_CC_NODE_BIN,
     oauthAuth: '/usr/local/bin/kin-oauth-auth',
+    worker: '/usr/local/bin/kin-worker',
   }),
   supports: () => true,
   dockerEnv: () => undefined,
@@ -202,7 +204,12 @@ function nodeHost(nodeId) {
     nodeId,
     bakedKernel: true,
     ownsSocketFiles: false,
-    bins: { cli: REMOTE_CLI_NODE_BIN, cc: REMOTE_CC_NODE_BIN, oauthAuth: '/usr/local/bin/kin-oauth-auth' },
+    bins: {
+      cli: REMOTE_CLI_NODE_BIN,
+      cc: REMOTE_CC_NODE_BIN,
+      oauthAuth: '/usr/local/bin/kin-oauth-auth',
+      worker: '/usr/local/bin/kin-worker',
+    },
     supports: (cap) => SLOT_CAPS_NODE.has(cap),
     dockerEnv: () => ({ ...process.env, DOCKER_HOST: `unix://${clusterManager().bridgeSocketPath(nodeId)}` }),
     dockerApi: () => clusterManager().docker(nodeId),
@@ -326,10 +333,15 @@ export function slotHost(vm) {
   if (nodeId && isNativeNodeVm(vm)) return nativeHost(nodeId, vm)
   const base = nodeId ? nodeHost(nodeId) : LOCAL_HOST
   if (!isKvmRuntime(vm)) return base
+  const customKvm = isCustomKvmMode({ vm })
   // Runner socat owns run/kernel.sock; deleting it severs the guest relay.
   return {
     ...base,
-    bins: { ...base.bins, oauthAuth: '/opt/kin-payload/usr/local/bin/kin-oauth-auth' },
+    bins: {
+      ...base.bins,
+      oauthAuth: customKvm ? '/usr/local/bin/kin-oauth-auth' : '/opt/kin-payload/usr/local/bin/kin-oauth-auth',
+      worker: customKvm ? '/usr/local/bin/kin-worker' : '/opt/kin-payload/usr/local/bin/kin-worker',
+    },
     ownsSocketFiles: false,
   }
 }

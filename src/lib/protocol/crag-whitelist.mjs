@@ -40,7 +40,18 @@ export const CRAG_CORE_ALLOWED_TOP_KEYS = Object.freeze(
 )
 
 export const CRAG_INTERNAL_ALLOWED_TOP_KEYS = Object.freeze(
-  new Set(['crag_prompt', 'crag_options', 'crag_model', 'cache_ttl', 'cacheTtl', 'session_slots', 'effort']),
+  new Set([
+    'crag_prompt',
+    'crag_options',
+    'crag_model',
+    'crag_persona_preset',
+    'crag_prompt_version',
+    'crag_env',
+    'cache_ttl',
+    'cacheTtl',
+    'session_slots',
+    'effort',
+  ]),
 )
 
 export const CRAG_CAPABILITY_GATED_TOP_KEYS = Object.freeze(
@@ -49,6 +60,10 @@ export const CRAG_CAPABILITY_GATED_TOP_KEYS = Object.freeze(
     ['speed', 'request_speed'],
     ['thread', 'message_threads_beta'],
     ['service_tier', 'request_service_tier'],
+    ['diagnostics', 'headless_claude_bridge_v1'],
+    ['fallbacks', 'headless_claude_bridge_v1'],
+    ['fallback_credit_token', 'headless_claude_bridge_v1'],
+    ['request_tags', 'headless_claude_bridge_v1'],
   ]),
 )
 
@@ -60,10 +75,7 @@ export const CRAG_SILENT_STRIP_TOP_KEYS = Object.freeze(
   new Set([
     'metadata',
     'betas',
-    'diagnostics',
     'auto_compact_window',
-    'fallbacks',
-    'fallback_credit_token',
     'caller_cwd',
     'user',
     'store',
@@ -76,7 +88,7 @@ export const CRAG_SILENT_STRIP_TOP_KEYS = Object.freeze(
   ]),
 )
 
-const CRAG_PROVIDER_TOOL_NAMES = Object.freeze(
+export const CRAG_PROVIDER_TOOL_NAMES = Object.freeze(
   new Map([
     ['web_search_20250305', 'web_search'],
     ['web_search_20260209', 'web_search'],
@@ -89,6 +101,10 @@ const CRAG_PROVIDER_TOOL_NAMES = Object.freeze(
     ['tool_search_tool_regex_20251119', 'tool_search_tool_regex'],
     ['tool_search_tool_bm25_20251119', 'tool_search_tool_bm25'],
   ]),
+)
+
+export const CRAG_PROVIDER_EXECUTION_NAMES = Object.freeze(
+  new Set([...CRAG_PROVIDER_TOOL_NAMES.values(), 'bash_code_execution', 'text_editor_code_execution']),
 )
 
 const CUSTOM_TOOL_KEYS = new Set([
@@ -128,7 +144,7 @@ const PROVIDER_TOOL_DROP_KEYS = new Set(['annotations', 'function', 'parameters'
 const MESSAGE_ALLOWED_KEYS = new Set(['role', 'content', 'output_config', 'clear_at'])
 
 const BLOCK_KEYS_BY_TYPE = Object.freeze({
-  text: new Set(['type', 'text', 'cache_control']),
+  text: new Set(['type', 'text', 'citations', 'cache_control']),
   image: new Set(['type', 'source', 'cache_control']),
   document: new Set(['type', 'source', 'title', 'context', 'citations', 'cache_control']),
   // `extension` rides along opaquely: it is minted by the gateway's issued-tool
@@ -141,6 +157,10 @@ const BLOCK_KEYS_BY_TYPE = Object.freeze({
   tool_result: new Set(['type', 'tool_use_id', 'content', 'is_error', 'cache_control']),
   thinking: new Set(['type', 'thinking', 'signature']),
   redacted_thinking: new Set(['type', 'data']),
+  compaction: new Set(['type', 'content', 'encrypted_content', 'cache_control']),
+  search_result: new Set(['type', 'source', 'title', 'content', 'citations', 'cache_control']),
+  mcp_tool_use: new Set(['type', 'id', 'name', 'server_name', 'input', 'cache_control']),
+  mcp_tool_result: new Set(['type', 'tool_use_id', 'content', 'is_error', 'cache_control']),
   tool_reference: new Set(['type', 'tool_name', 'cache_control']),
   tool_addition: new Set(['type', 'tool', 'cache_control']),
   tool_removal: new Set(['type', 'tool', 'cache_control']),
@@ -156,17 +176,20 @@ const INLINE_TOOL_KEYS_BY_TYPE = Object.freeze({
   tool_definition: new Set(['type', 'definition']),
 })
 
-const PROVIDER_HISTORY_BLOCK_TYPES = new Set([
-  'server_tool_use',
-  'web_search_tool_result',
-  'web_fetch_tool_result',
-  'code_execution_tool_result',
-  'bash_code_execution_tool_result',
-  'text_editor_code_execution_tool_result',
-  'tool_search_tool_result',
-  'container_upload',
-  'advisor_tool_result',
-])
+export const CRAG_PROVIDER_HISTORY_BLOCK_TYPES = Object.freeze(
+  new Set([
+    'server_tool_use',
+    'web_search_tool_result',
+    'web_fetch_tool_result',
+    'code_execution_tool_result',
+    'bash_code_execution_tool_result',
+    'text_editor_code_execution_tool_result',
+    'tool_search_tool_result',
+    'container_upload',
+    'advisor_tool_result',
+  ]),
+)
+const PROVIDER_HISTORY_BLOCK_TYPES = CRAG_PROVIDER_HISTORY_BLOCK_TYPES
 
 const THINKING_KEYS = new Set(['type', 'budget_tokens', 'display', 'block_binding'])
 const TOOL_CHOICE_KEYS = new Set(['type', 'name', 'disable_parallel_tool_use'])
@@ -259,7 +282,7 @@ function stripBillingLines(text) {
     .join('\n')
 }
 
-function sanitizeSystem(system) {
+function sanitizeSystem(system, { preserveCitations = false } = {}) {
   if (system == null) return undefined
   if (typeof system === 'string') {
     const cleaned = stripBillingLines(system)
@@ -280,6 +303,7 @@ function sanitizeSystem(system) {
     const cleaned = stripBillingLines(entry.text)
     if (!cleaned.trim()) continue
     const block = { type: 'text', text: cleaned }
+    if (preserveCitations && entry.citations !== undefined) block.citations = entry.citations
     if (entry.cache_control != null) {
       applySanitizedCacheControl(block, entry.cache_control)
     }
@@ -349,8 +373,22 @@ function isCleanBlock(block) {
         return false
       }
     }
-    if (block.type === 'tool_result') {
+    if (block.type === 'tool_result' || block.type === 'mcp_tool_result') {
       if (typeof block.tool_use_id !== 'string' || !block.tool_use_id) return false
+      if (Array.isArray(block.content) && !block.content.every(isCleanBlock)) return false
+    }
+    if (block.type === 'mcp_tool_use') {
+      if (
+        typeof block.id !== 'string' ||
+        !block.id ||
+        typeof block.name !== 'string' ||
+        !block.name ||
+        !isPlainObject(block.input)
+      ) {
+        return false
+      }
+    }
+    if (block.type === 'search_result') {
       if (Array.isArray(block.content) && !block.content.every(isCleanBlock)) return false
     }
     if (block.type === 'tool_addition' || block.type === 'tool_removal') {
@@ -393,6 +431,7 @@ function sanitizeContentBlock(block, param, capabilities) {
   if (type === 'text') {
     if (typeof block.text !== 'string') invalid(`${param}.text`, 'must be a string')
     const out = { type: 'text', text: block.text }
+    if (block.citations !== undefined) out.citations = block.citations
     if (block.cache_control != null) applySanitizedCacheControl(out, block.cache_control)
     return out
   }
@@ -404,6 +443,45 @@ function sanitizeContentBlock(block, param, capabilities) {
   if (type === 'document') {
     const out = pickKeys(block, BLOCK_KEYS_BY_TYPE.document)
     if (out.cache_control != null) applySanitizedCacheControl(out, out.cache_control)
+    return out
+  }
+  if (type === 'compaction') {
+    const out = pickKeys(block, BLOCK_KEYS_BY_TYPE.compaction)
+    if (out.cache_control != null) applySanitizedCacheControl(out, out.cache_control)
+    return out
+  }
+  if (type === 'search_result') {
+    const out = pickKeys(block, BLOCK_KEYS_BY_TYPE.search_result)
+    if (Array.isArray(block.content)) {
+      out.content = block.content.map((child, i) => sanitizeContentBlock(child, `${param}.content[${i}]`, capabilities))
+    }
+    if (out.cache_control != null) applySanitizedCacheControl(out, out.cache_control)
+    return out
+  }
+  if (type === 'mcp_tool_use') {
+    if (typeof block.id !== 'string' || !block.id) invalid(`${param}.id`, 'is required')
+    if (typeof block.name !== 'string' || !block.name) invalid(`${param}.name`, 'is required')
+    if (!isPlainObject(block.input)) invalid(`${param}.input`, 'must be an object')
+    const out = pickKeys(block, BLOCK_KEYS_BY_TYPE.mcp_tool_use)
+    if (out.cache_control != null) applySanitizedCacheControl(out, out.cache_control)
+    return out
+  }
+  if (type === 'mcp_tool_result') {
+    if (typeof block.tool_use_id !== 'string' || !block.tool_use_id) invalid(`${param}.tool_use_id`, 'is required')
+    const out = { type: 'mcp_tool_result', tool_use_id: block.tool_use_id }
+    if (block.is_error !== undefined) out.is_error = Boolean(block.is_error)
+    if (block.content !== undefined) {
+      if (typeof block.content === 'string') {
+        out.content = block.content
+      } else if (Array.isArray(block.content)) {
+        out.content = block.content.map((child, i) =>
+          sanitizeContentBlock(child, `${param}.content[${i}]`, capabilities),
+        )
+      } else if (block.content !== null) {
+        invalid(`${param}.content`, 'must be text or an array of content blocks')
+      }
+    }
+    if (block.cache_control != null) applySanitizedCacheControl(out, block.cache_control)
     return out
   }
   if (type === 'tool_use') {
@@ -501,12 +579,14 @@ function sanitizeMessages(messages, { preserveCanonicalHistory = false, capabili
  * same checks. Cross-tool name uniqueness stays with the caller: inline tools
  * are added mid-conversation and do not share a namespace with `tools`.
  */
-function sanitizeToolDefinition(tool, param, capabilities) {
+function sanitizeToolDefinition(tool, param, capabilities, { alreadyNormalized = false } = {}) {
   if (!isPlainObject(tool) || typeof tool.name !== 'string' || !tool.name) {
     invalid(param, 'must have a valid tool name')
   }
-  const [normalized] = normalizeToolInputSchemas([tool], invalid)
-  tool = isPlainObject(normalized) ? normalized : tool
+  if (!alreadyNormalized) {
+    const [normalized] = normalizeToolInputSchemas([tool], invalid)
+    tool = isPlainObject(normalized) ? normalized : tool
+  }
   if (tool.type === 'function' || Object.hasOwn(tool, 'function') || Object.hasOwn(tool, 'parameters')) {
     invalid(param, 'must use a Claude tool definition')
   }
@@ -552,9 +632,9 @@ function sanitizeToolDefinition(tool, param, capabilities) {
   return clean
 }
 
-function sanitizeTools(rawTools, capabilities) {
+function sanitizeTools(rawTools, capabilities, { toolsNormalized = false } = {}) {
   if (rawTools == null) return undefined
-  const normalized = normalizeToolInputSchemas(rawTools, invalid)
+  const normalized = toolsNormalized ? rawTools : normalizeToolInputSchemas(rawTools, invalid)
   if (!Array.isArray(normalized)) invalid('tools', 'must be an array')
   if (!normalized.length) return undefined
   const names = new Set()
@@ -564,7 +644,7 @@ function sanitizeTools(rawTools, capabilities) {
     if (!isPlainObject(tool) || typeof tool.name !== 'string' || !tool.name || names.has(tool.name)) {
       invalid(param, 'must have a unique tool name')
     }
-    out.push(sanitizeToolDefinition(tool, param, capabilities))
+    out.push(sanitizeToolDefinition(tool, param, capabilities, { alreadyNormalized: true }))
     names.add(tool.name)
   }
   return out
@@ -603,6 +683,73 @@ export function sanitizeSafeguardsForCrag(safeguards, capabilities) {
     })
   }
   return { value: out.length ? out : undefined, stripped: false }
+}
+
+const CRAG_ENV_MAX_BYTES = 64
+const CRAG_ENV_TIMEZONE_RE = /^[A-Za-z0-9_./+-]+$/
+const CRAG_ENV_LOCALE_RE = /^[A-Za-z0-9_@.-]+$/
+
+export function sanitizeCragEnv(value) {
+  if (!isPlainObject(value)) return undefined
+  const out = {}
+  if (
+    typeof value.timezone === 'string' &&
+    value.timezone.length > 0 &&
+    Buffer.byteLength(value.timezone, 'utf8') <= CRAG_ENV_MAX_BYTES &&
+    CRAG_ENV_TIMEZONE_RE.test(value.timezone)
+  ) {
+    out.timezone = value.timezone
+  }
+  if (
+    typeof value.locale === 'string' &&
+    value.locale.length > 0 &&
+    Buffer.byteLength(value.locale, 'utf8') <= CRAG_ENV_MAX_BYTES &&
+    CRAG_ENV_LOCALE_RE.test(value.locale)
+  ) {
+    out.locale = value.locale
+  }
+  if (!out.timezone && !out.locale) return undefined
+  if (typeof value.inject_if_missing === 'boolean') {
+    out.inject_if_missing = value.inject_if_missing
+  }
+  return out
+}
+
+function sanitizeCragPrompt(value) {
+  if (!isPlainObject(value)) invalid('crag_prompt', 'must be an object')
+  if (value.mode !== undefined && value.mode !== 'append' && value.mode !== 'replace') {
+    invalid('crag_prompt.mode', 'must be "append" or "replace"')
+  }
+  if (value.text !== undefined && typeof value.text !== 'string') {
+    invalid('crag_prompt.text', 'must be a string')
+  }
+  if (value.file !== undefined && typeof value.file !== 'string') {
+    invalid('crag_prompt.file', 'must be a string')
+  }
+  if (value.blocks !== undefined && !Array.isArray(value.blocks)) {
+    invalid('crag_prompt.blocks', 'must be an array')
+  }
+  const hasBlocks = Array.isArray(value.blocks)
+  const hasText = typeof value.text === 'string'
+  const hasFile = typeof value.file === 'string'
+  if (!hasBlocks && !hasText && !hasFile) {
+    invalid('crag_prompt', 'requires blocks, text, or file')
+  }
+  const out = {}
+  if (value.mode !== undefined) out.mode = value.mode
+  if (hasText) out.text = value.text
+  if (hasFile) out.file = value.file
+  if (hasBlocks) {
+    out.blocks = value.blocks.map((block, index) => {
+      if (!isPlainObject(block) || block.type !== 'text' || typeof block.text !== 'string') {
+        invalid(`crag_prompt.blocks[${index}]`, 'must be a text block with a string text field')
+      }
+      const next = { type: 'text', text: block.text }
+      if (block.cache_control != null) applySanitizedCacheControl(next, block.cache_control)
+      return next
+    })
+  }
+  return out
 }
 
 function repairCragCacheBreakpoints(body) {
@@ -659,10 +806,17 @@ export function assertNoUnrepresentableCragFields(body) {
 
 export function sanitizeCragBodyWhitelist(
   input,
-  { capabilities, preserveCanonicalHistory = false, rejectUnknownTopKeys = true, validateCacheBudget = true } = {},
+  {
+    capabilities,
+    preserveCanonicalHistory = false,
+    rejectUnknownTopKeys = true,
+    validateCacheBudget = true,
+    toolsNormalized = false,
+    safeguardsSanitized = false,
+  } = {},
 ) {
   if (!isPlainObject(input)) invalid('body', 'must be an object')
-  const materialized = materializeAutomaticCache(input)
+  const materialized = input.cache_control != null ? materializeAutomaticCache(input) : input
   const caps = Array.isArray(capabilities) ? capabilities : null
   const strippedFields = []
   let strippedSafeguards = false
@@ -690,10 +844,12 @@ export function sanitizeCragBodyWhitelist(
 
   out.messages = sanitizeMessages(materialized.messages, { preserveCanonicalHistory, capabilities: caps })
 
-  const system = sanitizeSystem(materialized.system)
+  const system = sanitizeSystem(materialized.system, {
+    preserveCitations: !caps || caps.includes('headless_claude_bridge_v1'),
+  })
   if (system !== undefined) out.system = system
 
-  const tools = sanitizeTools(materialized.tools, caps)
+  const tools = sanitizeTools(materialized.tools, caps, { toolsNormalized })
   if (tools !== undefined) out.tools = tools
 
   if (materialized.tool_choice != null) {
@@ -760,12 +916,16 @@ export function sanitizeCragBodyWhitelist(
 
   // Capability-gated official extensions
   if (materialized.safeguards != null) {
-    const sg = sanitizeSafeguardsForCrag(materialized.safeguards, caps)
-    if (sg.stripped) {
-      strippedSafeguards = true
-      strippedFields.push('safeguards')
-    } else if (sg.value !== undefined) {
-      out.safeguards = sg.value
+    if (safeguardsSanitized) {
+      out.safeguards = materialized.safeguards
+    } else {
+      const sg = sanitizeSafeguardsForCrag(materialized.safeguards, caps)
+      if (sg.stripped) {
+        strippedSafeguards = true
+        strippedFields.push('safeguards')
+      } else if (sg.value !== undefined) {
+        out.safeguards = sg.value
+      }
     }
   }
 
@@ -806,11 +966,41 @@ export function sanitizeCragBodyWhitelist(
     }
   }
 
+  for (const key of ['diagnostics', 'fallbacks', 'fallback_credit_token', 'request_tags']) {
+    if (materialized[key] == null) continue
+    if (caps && !caps.includes('headless_claude_bridge_v1')) {
+      strippedFields.push(key)
+    } else {
+      out[key] = materialized[key]
+    }
+  }
+
   // Controlled CRAG internal fields
   for (const key of CRAG_INTERNAL_ALLOWED_TOP_KEYS) {
     const value = materialized[key]
     if (value === undefined) continue
     if (key === 'effort' && isEmptyEffortValue(value)) continue
+    if (key === 'crag_persona_preset' || key === 'crag_prompt_version') {
+      if (caps && !caps.includes('headless_claude_bridge_v1')) {
+        strippedFields.push(key)
+        continue
+      }
+      if (typeof value !== 'string') continue
+      const trimmed = value.trim()
+      if (!trimmed || trimmed.length > 512 || /[\r\n\0]/.test(trimmed)) continue
+      if (key === 'crag_persona_preset' && trimmed !== 'zero' && trimmed !== 'official_full') continue
+      out[key] = trimmed
+      continue
+    }
+    if (key === 'crag_env') {
+      if (caps && !caps.includes('headless_claude_bridge_v1')) {
+        strippedFields.push(key)
+        continue
+      }
+      const cleanEnv = sanitizeCragEnv(value)
+      if (cleanEnv) out[key] = cleanEnv
+      continue
+    }
     if (
       key === 'crag_options' &&
       isPlainObject(value) &&
@@ -822,16 +1012,9 @@ export function sanitizeCragBodyWhitelist(
       if (Object.keys(next).length) out[key] = next
       continue
     }
-    if (key === 'crag_prompt' && isPlainObject(value) && Array.isArray(value.blocks)) {
-      out[key] = {
-        ...value,
-        blocks: value.blocks.map((block) => {
-          if (!isPlainObject(block) || block.cache_control == null) return block
-          const next = { ...block }
-          applySanitizedCacheControl(next, block.cache_control)
-          return next
-        }),
-      }
+    if (key === 'crag_prompt') {
+      if (value == null) continue
+      out[key] = sanitizeCragPrompt(value)
       continue
     }
     out[key] = value

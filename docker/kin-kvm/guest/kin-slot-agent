@@ -1,0 +1,1100 @@
+#!/usr/bin/env python3
+"""Authenticated single-direction control RPC daemon for Custom Debian 13 KVM guests.
+
+Protocol (SSOT):
+  - Transport: newline-delimited JSON ('\n'), request-response.
+  - Max single line: 2 MiB; max decoded content per file: 1 MiB.
+  - Request:  {"id":"<req_id>","token":"<64-hex>","op":"<op>","params":{...}}
+  - Response: {"id":"<req_id>","ok":true,"result":{...}}
+           or {"id":"<req_id>","ok":false,"error":"<code>","message":"<msg>"}
+  - Supported ops:
+      sync_file, publish, publish_universal, block, clear, status, core_check, restart_crag
+  - Zero external dependencies (Python 3 stdlib only), zero reverse-pull.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import binascii
+import ctypes
+import errno
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+import re
+import signal
+import socket
+import stat
+import subprocess
+import sys
+import threading
+import time
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+TMPFS_MAGIC = 0x01021994
+MAX_LINE_BYTES = 2 * 1024 * 1024
+MAX_CONTENT_BYTES = 1024 * 1024
+MAX_PUBLISH_FILES = 64
+
+HEX64_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+SAFE_JSON_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.json$")
+SAFE_REL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+RESERVED_PUBLISH_NAMES = frozenset({"sync-pending", "managed", "lock"})
+FORBIDDEN_MANAGED_ENV_KEYS = frozenset({
+    "CLAUDE_CODE_ATTRIBUTION_HEADER",
+    "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+})
+_FORBIDDEN_MANAGED_ENV_KEYS_LOWER = frozenset(k.lower() for k in FORBIDDEN_MANAGED_ENV_KEYS)
+
+_LIBC = ctypes.CDLL(None, use_errno=True)
+
+
+class _StatFS(ctypes.Structure):
+    # On Linux (x86_64/aarch64), f_type is the leading signed long at offset 0.
+    _fields_ = [("f_type", ctypes.c_long), ("_pad", ctypes.c_byte * 256)]
+
+
+class RpcError(Exception):
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+def fd_fs_magic(fd: int) -> int:
+    st = _StatFS()
+    rc = _LIBC.fstatfs(fd, ctypes.byref(st))
+    if rc != 0:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err))
+    return int(st.f_type)
+
+
+def path_fs_magic(path: Path) -> int | None:
+    try:
+        fd = os.open(str(path), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        return None
+    try:
+        return fd_fs_magic(fd)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def open_dir_nofollow(base_dir: Path, subparts: tuple[str, ...] = (), *, create_sub: bool = False, mode: int = 0o755) -> int:
+    """Open base_dir (and optional immediate subparts) strictly rejecting any symlink."""
+    try:
+        st = os.lstat(str(base_dir))
+    except FileNotFoundError as exc:
+        raise RpcError("unsafe_path", f"base directory missing: {base_dir}") from exc
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+        raise RpcError("unsafe_path", f"base path is not a real directory: {base_dir}")
+
+    cur_fd = os.open(str(base_dir), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for part in subparts:
+            if not part or part in (".", "..") or "/" in part or "\\" in part or "\x00" in part:
+                raise RpcError("unsafe_path", f"invalid directory segment: {part!r}")
+            try:
+                next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=cur_fd)
+            except FileNotFoundError:
+                if not create_sub:
+                    raise RpcError("unsafe_path", f"directory missing: {part}")
+                os.mkdir(part, mode, dir_fd=cur_fd)
+                next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=cur_fd)
+            except OSError as exc:
+                if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+                    raise RpcError("unsafe_path", f"symlink or non-directory encountered: {part}") from exc
+                raise
+            os.close(cur_fd)
+            cur_fd = next_fd
+        return cur_fd
+    except Exception:
+        os.close(cur_fd)
+        raise
+
+
+def atomic_write_in_dir(
+    dir_fd: int,
+    filename: str,
+    content: bytes,
+    *,
+    mode: int,
+    uid: int | None = None,
+    gid: int | None = None,
+) -> None:
+    """Write content via same-directory temp file with O_NOFOLLOW, fsync, and os.replace."""
+    if not filename or filename in (".", "..") or "/" in filename or "\\" in filename or "\x00" in filename:
+        raise RpcError("unsafe_path", f"invalid filename: {filename!r}")
+    try:
+        prev = os.stat(filename, dir_fd=dir_fd, follow_symlinks=False)
+        if stat.S_ISLNK(prev.st_mode) or not stat.S_ISREG(prev.st_mode) or prev.st_nlink != 1:
+            raise RpcError("unsafe_path", f"destination is not a safe regular file: {filename}")
+    except FileNotFoundError:
+        pass
+
+    tmp_name = f".kin-tmp-{uuid.uuid4().hex}"
+    fd = os.open(tmp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode, dir_fd=dir_fd)
+    try:
+        try:
+            os.fchmod(fd, mode)
+            if os.geteuid() == 0 and uid is not None and gid is not None:
+                os.fchown(fd, uid, gid)
+            view = memoryview(content)
+            written = 0
+            while written < len(view):
+                n = os.write(fd, view[written:])
+                if n <= 0:
+                    raise OSError("short write")
+                written += n
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp_name, filename, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        os.fsync(dir_fd)
+    except Exception:
+        try:
+            os.unlink(tmp_name, dir_fd=dir_fd)
+        except OSError:
+            pass
+        raise
+
+
+def ensure_relative_symlink_in_dir(dir_fd: int, link_name: str, target_rel: str) -> None:
+    """Atomically ensure link_name in dir_fd is a relative symlink pointing to target_rel."""
+    if not link_name or "/" in link_name or "\\" in link_name or "\x00" in link_name:
+        raise RpcError("unsafe_path", f"invalid symlink name: {link_name!r}")
+    if not target_rel or "/" in target_rel or "\\" in target_rel or "\x00" in target_rel:
+        raise RpcError("unsafe_path", f"invalid relative symlink target: {target_rel!r}")
+    try:
+        prev = os.stat(link_name, dir_fd=dir_fd, follow_symlinks=False)
+        if stat.S_ISLNK(prev.st_mode):
+            if os.readlink(link_name, dir_fd=dir_fd) == target_rel:
+                return
+        elif not stat.S_ISREG(prev.st_mode) or prev.st_nlink != 1:
+            raise RpcError("unsafe_path", f"cannot replace unsafe path with symlink: {link_name}")
+    except FileNotFoundError:
+        pass
+
+    tmp_link = f".kin-link-{uuid.uuid4().hex}"
+    os.symlink(target_rel, tmp_link, dir_fd=dir_fd)
+    try:
+        os.replace(tmp_link, link_name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        os.fsync(dir_fd)
+    except Exception:
+        try:
+            os.unlink(tmp_link, dir_fd=dir_fd)
+        except OSError:
+            pass
+        raise
+
+
+def decode_and_verify_payload(content_b64: Any, expected_sha256: Any) -> tuple[bytes, str]:
+    if not isinstance(content_b64, str):
+        raise RpcError("invalid_params", "content_b64 must be a string")
+    if not isinstance(expected_sha256, str) or not HEX64_RE.fullmatch(expected_sha256):
+        raise RpcError("invalid_params", "sha256 must be a 64-character hex string")
+    if len(content_b64) > (MAX_CONTENT_BYTES * 4 // 3) + 64:
+        raise RpcError("invalid_params", "content_b64 exceeds maximum allowed decoded size (1 MiB)")
+    try:
+        raw = base64.b64decode(content_b64.encode("ascii"), validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise RpcError("invalid_params", f"invalid base64 content: {exc}") from exc
+    if len(raw) > MAX_CONTENT_BYTES:
+        raise RpcError("invalid_params", f"decoded content exceeds 1 MiB ({len(raw)} bytes)")
+    actual_sha256 = hashlib.sha256(raw).hexdigest()
+    if not hmac.compare_digest(actual_sha256, expected_sha256.lower()):
+        raise RpcError("sha256_mismatch", f"sha256 mismatch: expected {expected_sha256.lower()}, got {actual_sha256}")
+    return raw, actual_sha256
+
+
+def _mount_options_for(target: str) -> set[str] | None:
+    found: set[str] | None = None
+    try:
+        with open("/proc/self/mountinfo", encoding="utf-8") as fh:
+            for line in fh:
+                fields = line.split()
+                if len(fields) < 6:
+                    continue
+                mounted = re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), fields[4])
+                if mounted == target:
+                    found = set(fields[5].split(","))
+    except OSError:
+        return None
+    return found
+
+
+def _mount_fstype_for(target: str) -> str | None:
+    found: str | None = None
+    try:
+        with open("/proc/self/mountinfo", encoding="utf-8") as fh:
+            for line in fh:
+                parts = line.split(" - ", 1)
+                if len(parts) != 2:
+                    continue
+                left = parts[0].split()
+                right = parts[1].split()
+                if len(left) < 5 or not right:
+                    continue
+                mounted = re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), left[4])
+                if mounted == target:
+                    found = right[0]
+    except OSError:
+        return None
+    return found
+
+
+DMI_STATUS_FIELDS = (
+    "bios_vendor",
+    "bios_version",
+    "bios_date",
+    "sys_vendor",
+    "product_name",
+    "product_serial",
+    "product_uuid",
+    "board_vendor",
+    "board_name",
+    "board_serial",
+    "chassis_vendor",
+)
+
+
+def _count_mounts_by_fstype(fstype: str) -> int:
+    count = 0
+    for path in ("/proc/mounts", "/proc/self/mounts"):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                for line in fh:
+                    parts = line.split()
+                    if len(parts) >= 3 and parts[2] == fstype:
+                        count += 1
+            return count
+        except OSError:
+            continue
+    return 0
+
+
+def _read_process_info(pid: int) -> tuple[str, int, int] | None:
+    """Return (state_code, ruid, euid) from /proc/<pid>/status, or None if unavailable."""
+    try:
+        status_text = Path(f"/proc/{pid}/status").read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return None
+    state = ""
+    ruid: int | None = None
+    euid: int | None = None
+    for line in status_text.splitlines():
+        if line.startswith("State:"):
+            parts = line.split(":", 1)[1].strip().split()
+            if parts:
+                state = parts[0]
+        elif line.startswith("Uid:"):
+            parts = line.split(":", 1)[1].strip().split()
+            if len(parts) >= 2:
+                try:
+                    ruid = int(parts[0])
+                    euid = int(parts[1])
+                except ValueError:
+                    return None
+    if not state or ruid is None or euid is None:
+        return None
+    return state, ruid, euid
+
+
+def _read_process_dumpable(pid: int | None) -> int | None:
+    if pid is None:
+        return None
+    try:
+        status_text = Path(f"/proc/{pid}/status").read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return None
+    euid: int | None = None
+    for line in status_text.splitlines():
+        if line.startswith("Dumpable:"):
+            parts = line.split(":", 1)[1].strip().split()
+            if parts:
+                try:
+                    return int(parts[0])
+                except ValueError:
+                    pass
+        elif line.startswith("Uid:"):
+            parts = line.split(":", 1)[1].strip().split()
+            if len(parts) >= 2:
+                try:
+                    euid = int(parts[1])
+                except ValueError:
+                    pass
+    # Standard Linux kernels omit Dumpable: from /proc/<pid>/status; instead fs/proc/base.c
+    # sets /proc/<pid>/mem ownership to root (0) when a non-root process sets PR_SET_DUMPABLE=0.
+    if euid is not None and euid != 0:
+        try:
+            mem_st = os.stat(f"/proc/{pid}/mem")
+            return 0 if mem_st.st_uid == 0 else 1
+        except OSError:
+            return None
+    return None
+
+
+def _project_ro_bind(source: Path, target: Path) -> None:
+    """When running as Guest root, ensure target is a RO nosuid,nodev,noexec bind of source."""
+    if os.geteuid() != 0:
+        return
+    try:
+        st = os.lstat(str(target))
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+            raise RpcError("unsafe_path", f"unsafe projection target: {target}")
+    except FileNotFoundError:
+        os.mkdir(str(target), 0o755)
+
+    src_st = os.lstat(str(source))
+    tgt_st = os.lstat(str(target))
+    opts = _mount_options_for(str(target))
+    same_dir = (src_st.st_dev, src_st.st_ino) == (tgt_st.st_dev, tgt_st.st_ino)
+    if opts is not None and not same_dir:
+        raise RpcError("unsafe_path", f"foreign mount present at {target}")
+    if opts is None:
+        fd = os.open(str(target), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            subprocess.run(
+                ["mount", "--no-canonicalize", "--bind", str(source), f"/proc/self/fd/{fd}"],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+                pass_fds=(fd,),
+            )
+        finally:
+            os.close(fd)
+    fd = os.open(str(target), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        subprocess.run(
+            ["mount", "--no-canonicalize", "-o", "remount,bind,ro,nosuid,nodev,noexec", f"/proc/self/fd/{fd}"],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+            pass_fds=(fd,),
+        )
+    finally:
+        os.close(fd)
+
+
+@dataclass
+class AgentConfig:
+    token: str
+    state_dir: Path = Path("/var/lib/kin-slot")
+    claude_dir: Path | None = None
+    run_dir: Path = Path("/run/kin")
+    crag_root: Path = Path("/run/vm2api-crag")
+    managed_preset_dir: Path = Path("/var/lib/kin-slot/managed-settings.d")
+    store_dir: Path = Path("/opt/kin/store")
+    machine_id_file: Path = Path("/etc/machine-id")
+    crag_pid_file: Path = Path("/run/kin/crag.pid")
+    dmi_dir: Path = Path("/sys/class/dmi/id")
+    kincli_uid: int = 999
+    kincli_gid: int = 987
+    project_mounts: bool = True
+
+
+class SlotAgentService:
+    def __init__(self, cfg: AgentConfig) -> None:
+        if not HEX64_RE.fullmatch(cfg.token):
+            raise ValueError("agent token must be 64 hex characters")
+        self.cfg = cfg
+        self._lock = threading.Lock()
+
+    def _require_crag_tmpfs_fd(self) -> int:
+        fd = open_dir_nofollow(self.cfg.crag_root)
+        try:
+            magic = fd_fs_magic(fd)
+            if magic != TMPFS_MAGIC:
+                raise RpcError(
+                    "tmpfs_required",
+                    f"{self.cfg.crag_root} must be real tmpfs (0x{TMPFS_MAGIC:08x}, got 0x{magic:08x})",
+                )
+            return fd
+        except Exception:
+            os.close(fd)
+            raise
+
+    def _with_crag_lock(self, fn):
+        root_fd = self._require_crag_tmpfs_fd()
+        lock_fd = -1
+        try:
+            lock_fd = os.open(".agent.lock", os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600, dir_fd=root_fd)
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            return fn(root_fd)
+        finally:
+            if lock_fd >= 0:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                finally:
+                    os.close(lock_fd)
+            os.close(root_fd)
+
+    def _open_crag_scope_dir(self, root_fd: int, scope: str) -> tuple[int, Path]:
+        if scope not in ("license", "host"):
+            raise RpcError("invalid_params", f"invalid scope: {scope!r}")
+        mode = 0o700 if scope == "license" else 0o755
+        try:
+            sub_fd = os.open(scope, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd)
+        except FileNotFoundError:
+            os.mkdir(scope, mode, dir_fd=root_fd)
+            sub_fd = os.open(scope, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd)
+            if os.geteuid() == 0 and scope == "license":
+                os.fchown(sub_fd, self.cfg.kincli_uid, self.cfg.kincli_gid)
+            os.fchmod(sub_fd, mode)
+        except OSError as exc:
+            if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+                raise RpcError("unsafe_path", f"symlink or non-dir in crag scope: {scope}") from exc
+            raise
+        return sub_fd, self.cfg.crag_root / scope
+
+    def handle_request(self, req: Any) -> dict[str, Any]:
+        if not isinstance(req, dict):
+            return {"id": "", "ok": False, "error": "invalid_request", "message": "request must be a JSON object"}
+        req_id = req.get("id")
+        if not isinstance(req_id, str) or not req_id or len(req_id) > 128:
+            return {"id": "", "ok": False, "error": "invalid_request", "message": "id must be a non-empty string"}
+        token = req.get("token")
+        if not isinstance(token, str) or not hmac.compare_digest(token, self.cfg.token):
+            return {"id": req_id, "ok": False, "error": "unauthorized", "message": "invalid authentication token"}
+        op = req.get("op")
+        if not isinstance(op, str) or not op:
+            return {"id": req_id, "ok": False, "error": "invalid_request", "message": "op must be a non-empty string"}
+        params = req.get("params")
+        if params is None:
+            params = {}
+        if not isinstance(params, dict):
+            return {"id": req_id, "ok": False, "error": "invalid_request", "message": "params must be a JSON object"}
+
+        handlers = {
+            "sync_file": self._op_sync_file,
+            "publish": self._op_publish,
+            "publish_universal": self._op_publish_universal,
+            "block": self._op_block,
+            "clear": self._op_clear,
+            "status": self._op_status,
+            "core_check": self._op_core_check,
+            "restart_crag": self._op_restart_crag,
+        }
+        handler = handlers.get(op)
+        if handler is None:
+            return {"id": req_id, "ok": False, "error": "unknown_op", "message": f"unsupported op: {op}"}
+
+        try:
+            with self._lock:
+                result = handler(params)
+            return {"id": req_id, "ok": True, "result": result}
+        except RpcError as exc:
+            return {"id": req_id, "ok": False, "error": exc.code, "message": exc.message}
+        except Exception as exc:
+            # Never leak payload/credentials contents in error messages.
+            return {"id": req_id, "ok": False, "error": "internal_error", "message": type(exc).__name__}
+
+    def _op_sync_file(self, params: dict[str, Any]) -> dict[str, Any]:
+        target = params.get("target")
+        if target not in ("credentials", "kernel_config", "worker_config", "managed_preset"):
+            raise RpcError("invalid_params", f"unsupported sync_file target: {target!r}")
+        raw, sha256_hex = decode_and_verify_payload(params.get("content_b64"), params.get("sha256"))
+
+        if target == "credentials":
+            if self.cfg.claude_dir is not None:
+                claude_dir = self.cfg.claude_dir
+                try:
+                    rel = claude_dir.relative_to(self.cfg.state_dir)
+                    dir_fd = open_dir_nofollow(self.cfg.state_dir, rel.parts, create_sub=True, mode=0o700)
+                except ValueError:
+                    dir_fd = open_dir_nofollow(claude_dir.parent, (claude_dir.name,), create_sub=True, mode=0o700)
+                if os.geteuid() == 0:
+                    os.fchown(dir_fd, self.cfg.kincli_uid, self.cfg.kincli_gid)
+                dest_path = claude_dir / "credentials.json"
+            else:
+                dir_fd = open_dir_nofollow(self.cfg.state_dir, ("claude",), create_sub=True, mode=0o700)
+                dest_path = self.cfg.state_dir / "claude" / "credentials.json"
+            filename = "credentials.json"
+            mode, uid, gid = 0o600, self.cfg.kincli_uid, self.cfg.kincli_gid
+        elif target == "kernel_config":
+            dir_fd = open_dir_nofollow(self.cfg.run_dir)
+            filename = "kernel.json"
+            dest_path = self.cfg.run_dir / filename
+            mode, uid, gid = 0o640, 0, self.cfg.kincli_gid
+        elif target == "worker_config":
+            dir_fd = open_dir_nofollow(self.cfg.run_dir)
+            filename = "worker.json"
+            dest_path = self.cfg.run_dir / filename
+            mode, uid, gid = 0o600, self.cfg.kincli_uid, self.cfg.kincli_gid
+        else:
+            name = params.get("name") or "10-slot-preset.json"
+            if not isinstance(name, str) or not SAFE_JSON_NAME_RE.fullmatch(name):
+                raise RpcError("invalid_params", f"unsafe managed_preset filename: {name!r}")
+            try:
+                parsed = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise RpcError("invalid_params", f"managed_preset must be valid UTF-8 JSON: {exc}") from exc
+            if not isinstance(parsed, dict):
+                raise RpcError("invalid_params", "managed_preset JSON must be an object")
+            env_obj = parsed.get("env")
+            if isinstance(env_obj, dict):
+                bad = sorted(
+                    k
+                    for k in env_obj.keys()
+                    if isinstance(k, str) and k.lower() in _FORBIDDEN_MANAGED_ENV_KEYS_LOWER
+                )
+                if bad:
+                    raise RpcError("invalid_params", f"forbidden managed_preset env keys: {bad}")
+            dir_fd = open_dir_nofollow(self.cfg.managed_preset_dir)
+            filename = name
+            dest_path = self.cfg.managed_preset_dir / filename
+            mode, uid, gid = 0o644, 0, 0
+
+        try:
+            atomic_write_in_dir(dir_fd, filename, raw, mode=mode, uid=uid, gid=gid)
+            if target == "credentials":
+                ensure_relative_symlink_in_dir(dir_fd, ".credentials.json", "credentials.json")
+        finally:
+            os.close(dir_fd)
+
+        return {
+            "target": target,
+            "path": str(dest_path),
+            "sha256": sha256_hex,
+            "bytes": len(raw),
+        }
+
+    def _publish_files(self, scope: str, files_param: Any) -> list[dict[str, Any]]:
+        if scope not in ("license", "host"):
+            raise RpcError("invalid_params", f"publish scope must be 'license' or 'host', got {scope!r}")
+        if not isinstance(files_param, list) or not files_param or len(files_param) > MAX_PUBLISH_FILES:
+            raise RpcError("invalid_params", "files must be a non-empty list (<= 64 entries)")
+
+        decoded: list[tuple[str, bytes, str]] = []
+        seen_names: set[str] = set()
+        for entry in files_param:
+            if not isinstance(entry, dict):
+                raise RpcError("invalid_params", "each file entry must be an object")
+            rel = entry.get("rel")
+            if (
+                not isinstance(rel, str)
+                or not SAFE_REL_NAME_RE.fullmatch(rel)
+                or rel in RESERVED_PUBLISH_NAMES
+                or rel in seen_names
+            ):
+                raise RpcError("invalid_params", f"unsafe or duplicate rel filename: {rel!r}")
+            raw, digest = decode_and_verify_payload(entry.get("content_b64"), entry.get("sha256"))
+            seen_names.add(rel)
+            decoded.append((rel, raw, digest))
+
+        mode = 0o600 if scope == "license" else 0o644
+        uid = self.cfg.kincli_uid if scope == "license" else 0
+        gid = self.cfg.kincli_gid if scope == "license" else 0
+
+        def _apply(root_fd: int) -> list[dict[str, Any]]:
+            scope_fd, scope_path = self._open_crag_scope_dir(root_fd, scope)
+            written: list[dict[str, Any]] = []
+            try:
+                if self.cfg.project_mounts and os.geteuid() == 0:
+                    _project_ro_bind(scope_path, self.cfg.run_dir / f"crag-{scope}")
+                for rel, raw, digest in decoded:
+                    atomic_write_in_dir(scope_fd, rel, raw, mode=mode, uid=uid, gid=gid)
+                    written.append({
+                        "rel": rel,
+                        "path": str(scope_path / rel),
+                        "sha256": digest,
+                        "bytes": len(raw),
+                    })
+                try:
+                    os.unlink("sync-pending", dir_fd=scope_fd)
+                except FileNotFoundError:
+                    pass
+                os.fsync(scope_fd)
+            finally:
+                os.close(scope_fd)
+            return written
+
+        return self._with_crag_lock(_apply)
+
+    def _op_publish(self, params: dict[str, Any]) -> dict[str, Any]:
+        scope = params.get("scope")
+        if not isinstance(scope, str):
+            raise RpcError("invalid_params", "scope is required ('license' or 'host')")
+        written = self._publish_files(scope, params.get("files"))
+        return {"scope": scope, "count": len(written), "files": written}
+
+    def _op_publish_universal(self, params: dict[str, Any]) -> dict[str, Any]:
+        scope = params.get("scope") or "license"
+        if not isinstance(scope, str):
+            raise RpcError("invalid_params", "scope must be a string")
+        written = self._publish_files(scope, params.get("files"))
+        return {"scope": scope, "universal": True, "count": len(written), "files": written}
+
+    def _resolve_scopes(self, scope: Any) -> list[str]:
+        val = "all" if scope is None else scope
+        if val == "all":
+            return ["license", "host"]
+        if val in ("license", "host"):
+            return [val]
+        raise RpcError("invalid_params", f"scope must be 'license', 'host', or 'all', got {scope!r}")
+
+    def _op_block(self, params: dict[str, Any]) -> dict[str, Any]:
+        scopes = self._resolve_scopes(params.get("scope"))
+        reason = str(params.get("reason") or "blocked").strip()[:256]
+        marker_body = f"pending\nreason={reason}\n".encode("utf-8")
+
+        def _apply(root_fd: int) -> list[str]:
+            markers: list[str] = []
+            for sc in scopes:
+                sc_fd, sc_path = self._open_crag_scope_dir(root_fd, sc)
+                try:
+                    atomic_write_in_dir(sc_fd, "sync-pending", marker_body, mode=0o644, uid=0, gid=0)
+                    markers.append(str(sc_path / "sync-pending"))
+                finally:
+                    os.close(sc_fd)
+            return markers
+
+        markers = self._with_crag_lock(_apply)
+        return {"scope": params.get("scope") or "all", "blocked": True, "reason": reason, "markers": markers}
+
+    def _op_clear(self, params: dict[str, Any]) -> dict[str, Any]:
+        scopes = self._resolve_scopes(params.get("scope"))
+
+        def _apply(root_fd: int) -> list[str]:
+            removed: list[str] = []
+            for sc in scopes:
+                try:
+                    sc_fd = os.open(sc, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd)
+                except FileNotFoundError:
+                    continue
+                try:
+                    for name in sorted(os.listdir(sc_fd)):
+                        st = os.stat(name, dir_fd=sc_fd, follow_symlinks=False)
+                        if stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode):
+                            os.unlink(name, dir_fd=sc_fd)
+                            removed.append(f"{sc}/{name}")
+                    os.fsync(sc_fd)
+                finally:
+                    os.close(sc_fd)
+            return removed
+
+        removed = self._with_crag_lock(_apply)
+        return {"scope": params.get("scope") or "all", "cleared": True, "removed": removed}
+
+    def _read_crag_pid_raw(self, *, strict_path: bool = False) -> int | None:
+        try:
+            fd = os.open(str(self.cfg.crag_pid_file), os.O_RDONLY | os.O_NOFOLLOW)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            if strict_path and exc.errno in (errno.ELOOP, errno.ENOTDIR, errno.EISDIR):
+                raise RpcError("unsafe_path", f"unsafe crag pid file: {self.cfg.crag_pid_file}") from exc
+            return None
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                if strict_path:
+                    raise RpcError("unsafe_path", f"crag pid file is not a regular file: {self.cfg.crag_pid_file}")
+                return None
+            raw = os.read(fd, 64)
+        finally:
+            os.close(fd)
+        text = raw.decode("utf-8", errors="ignore").strip()
+        if not text:
+            return None
+        try:
+            pid = int(text)
+        except ValueError:
+            return None
+        return pid if pid > 0 else None
+
+    def _read_live_crag_pid(self) -> int | None:
+        pid = self._read_crag_pid_raw()
+        if pid is None:
+            return None
+        info = _read_process_info(pid)
+        if info is None or info[0] in ("Z", "X"):
+            return None
+        try:
+            os.kill(pid, 0)
+            return pid
+        except OSError:
+            return None
+
+    def _op_restart_crag(self, _params: dict[str, Any]) -> dict[str, Any]:
+        pid = self._read_crag_pid_raw(strict_path=True)
+        if pid is None:
+            return {"signaled": False, "pid": None}
+        if pid <= 1 or pid == os.getpid():
+            raise RpcError("unsafe_pid", f"refusing to signal protected pid {pid}")
+        info = _read_process_info(pid)
+        if info is None or info[0] in ("Z", "X"):
+            return {"signaled": False, "pid": None}
+        _state, ruid, euid = info
+        if ruid != self.cfg.kincli_uid or euid != self.cfg.kincli_uid:
+            raise RpcError(
+                "pid_uid_mismatch",
+                f"refusing to signal pid {pid}: uid ({ruid}/{euid}) != kincli_uid ({self.cfg.kincli_uid})",
+            )
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return {"signaled": False, "pid": None}
+        except PermissionError as exc:
+            raise RpcError("permission_denied", f"cannot signal pid {pid}: {exc.strerror or exc}") from exc
+        return {"signaled": True, "pid": pid}
+
+    def _op_status(self, _params: dict[str, Any]) -> dict[str, Any]:
+        machine_id = ""
+        try:
+            machine_id = self.cfg.machine_id_file.read_text(encoding="utf-8").strip()
+        except OSError:
+            pass
+
+        store_type = "none"
+        marker = self.cfg.run_dir / "store-mount-type"
+        if marker.is_file():
+            store_type = marker.read_text(encoding="utf-8").strip() or "none"
+        else:
+            fstype = _mount_fstype_for(str(self.cfg.store_dir))
+            if fstype:
+                store_type = "virtiofs" if fstype == "virtiofs" else ("virtio-blk" if fstype in ("erofs", "ext4", "squashfs") else fstype)
+
+        magic = path_fs_magic(self.cfg.crag_root)
+        tmpfs_magic = f"0x{magic:08x}" if magic is not None else None
+        tmpfs_ok = magic == TMPFS_MAGIC
+
+        uptime_sec = 0.0
+        try:
+            uptime_sec = round(float(Path("/proc/uptime").read_text(encoding="utf-8").split()[0]), 2)
+        except (OSError, ValueError, IndexError):
+            pass
+
+        dmi: dict[str, str | None] = {}
+        for fname in DMI_STATUS_FIELDS:
+            cand = self.cfg.dmi_dir / fname
+            val: str | None = None
+            try:
+                if cand.is_file():
+                    text = cand.read_text(encoding="utf-8", errors="ignore").strip()
+                    val = text if text else None
+            except OSError:
+                val = None
+            dmi[fname] = val
+        dmi_present = bool(dmi.get("product_uuid") or dmi.get("product_name"))
+
+        crag_pid = self._read_live_crag_pid()
+        lic_opts = _mount_options_for(str(self.cfg.run_dir / "crag-license"))
+        host_opts = _mount_options_for(str(self.cfg.run_dir / "crag-host"))
+        crag_mounts_ro = {
+            "license": bool(lic_opts is not None and "ro" in lic_opts),
+            "host": bool(host_opts is not None and "ro" in host_opts),
+        }
+
+        return {
+            "machine_id": machine_id,
+            "store_mount_type": store_type,
+            "tmpfs_magic": tmpfs_magic,
+            "tmpfs_ok": tmpfs_ok,
+            "crag_pid": crag_pid,
+            "uptime_sec": uptime_sec,
+            "dmi_present": dmi_present,
+            "dmi": dmi,
+            "dockerenv_exists": Path("/.dockerenv").exists(),
+            "virtio9p_mounts": _count_mounts_by_fstype("9p"),
+            "crag_mounts_ro": crag_mounts_ro,
+            "crag_dumpable": _read_process_dumpable(crag_pid),
+        }
+
+    def _op_core_check(self, params: dict[str, Any]) -> dict[str, Any]:
+        expected = params.get("expected_sha256")
+        if expected is not None:
+            if not isinstance(expected, str) or not HEX64_RE.fullmatch(expected):
+                raise RpcError("invalid_params", "expected_sha256 must be a 64-character hex string")
+            expected = expected.lower()
+
+        pid = self._read_live_crag_pid()
+        if pid is None:
+            raise RpcError("crag_not_running", "crag-v2 process is not running")
+
+        exe_link = f"/proc/{pid}/exe"
+        try:
+            exe_target = os.readlink(exe_link)
+            hasher = hashlib.sha256()
+            with open(exe_link, "rb") as fh:
+                while True:
+                    chunk = fh.read(65536)
+                    if not chunk:
+                        break
+                    hasher.update(chunk)
+            actual = hasher.hexdigest()
+        except OSError as exc:
+            raise RpcError("core_check_failed", f"unable to inspect {exe_link}: {exc.strerror or exc}") from exc
+
+        matches = hmac.compare_digest(actual, expected) if expected is not None else None
+        return {
+            "crag_pid": pid,
+            "exe_target": exe_target,
+            "sha256": actual,
+            "matches": matches,
+        }
+
+
+def process_line(service: SlotAgentService, raw_line: bytes) -> bytes:
+    if len(raw_line) > MAX_LINE_BYTES:
+        resp = {"id": "", "ok": False, "error": "line_too_large", "message": "request line exceeds 2 MiB"}
+    else:
+        try:
+            req = json.loads(raw_line.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            resp = {"id": "", "ok": False, "error": "invalid_json", "message": f"malformed JSON: {exc}"}
+        else:
+            resp = service.handle_request(req)
+    return (json.dumps(resp, separators=(",", ":"), ensure_ascii=False) + "\n").encode("utf-8")
+
+
+def serve_stream_conn(service: SlotAgentService, conn: socket.socket) -> None:
+    buf = bytearray()
+    try:
+        conn.settimeout(30.0)
+        while True:
+            chunk = conn.recv(65536)
+            if not chunk:
+                if buf.strip():
+                    conn.sendall(process_line(service, bytes(buf)))
+                break
+            buf.extend(chunk)
+            if len(buf) > MAX_LINE_BYTES + 1 and b"\n" not in buf:
+                conn.sendall(process_line(service, bytes(buf)))
+                break
+            while True:
+                nl = buf.find(b"\n")
+                if nl < 0:
+                    break
+                line = bytes(buf[:nl])
+                del buf[: nl + 1]
+                if not line.strip():
+                    continue
+                conn.sendall(process_line(service, line))
+    except OSError:
+        pass
+    finally:
+        try:
+            conn.close()
+        except OSError:
+            pass
+
+
+def serve_socket_listener(service: SlotAgentService, sock: socket.socket, stop_event: threading.Event) -> None:
+    sem = threading.Semaphore(16)
+    sock.settimeout(0.5)
+
+    def _worker(c: socket.socket) -> None:
+        try:
+            serve_stream_conn(service, c)
+        finally:
+            sem.release()
+
+    while not stop_event.is_set():
+        try:
+            conn, _addr = sock.accept()
+        except socket.timeout:
+            continue
+        except OSError:
+            if stop_event.is_set():
+                break
+            time.sleep(0.1)
+            continue
+        sem.acquire()
+        t = threading.Thread(target=_worker, args=(conn,), daemon=True)
+        t.start()
+
+
+def serve_serial_device(service: SlotAgentService, serial_path: Path, stop_event: threading.Event) -> None:
+    """Serve line-delimited JSON RPC over a virtio-serial character device or FIFO."""
+    while not stop_event.is_set():
+        if not serial_path.exists():
+            time.sleep(0.2)
+            continue
+        try:
+            fd = os.open(str(serial_path), os.O_RDWR | os.O_NOCTTY)
+        except OSError:
+            time.sleep(0.2)
+            continue
+        buf = bytearray()
+        try:
+            while not stop_event.is_set():
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    time.sleep(0.05)
+                    continue
+                buf.extend(chunk)
+                if len(buf) > MAX_LINE_BYTES + 1 and b"\n" not in buf:
+                    os.write(fd, process_line(service, bytes(buf)))
+                    buf.clear()
+                    continue
+                while True:
+                    nl = buf.find(b"\n")
+                    if nl < 0:
+                        break
+                    line = bytes(buf[:nl])
+                    del buf[: nl + 1]
+                    if not line.strip():
+                        continue
+                    out = process_line(service, line)
+                    view = memoryview(out)
+                    sent = 0
+                    while sent < len(view):
+                        n = os.write(fd, view[sent:])
+                        if n <= 0:
+                            break
+                        sent += n
+        except OSError:
+            time.sleep(0.2)
+        finally:
+            os.close(fd)
+
+
+def _bind_unix(path: Path) -> socket.socket:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        if path.exists() or path.is_symlink():
+            path.unlink()
+    except OSError:
+        pass
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.bind(str(path))
+    os.chmod(str(path), 0o600)
+    sock.listen(16)
+    return sock
+
+
+def _bind_vsock(port: int) -> socket.socket:
+    if not hasattr(socket, "AF_VSOCK"):
+        raise OSError(errno.EAFNOSUPPORT, "AF_VSOCK not supported by Python build")
+    cid_any = getattr(socket, "VMADDR_CID_ANY", 0xFFFFFFFF)
+    sock = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind((cid_any, port))
+    sock.listen(16)
+    return sock
+
+
+def load_token(token_arg: str | None, token_file: str | None) -> str:
+    if token_arg:
+        return token_arg.strip()
+    env_tok = os.environ.get("KIN_AGENT_TOKEN", "").strip()
+    if env_tok:
+        return env_tok
+    if token_file:
+        return Path(token_file).read_text(encoding="utf-8").strip()
+    raise SystemExit("kin-slot-agent: missing authentication token (--token or --token-file)")
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Authenticated guest control RPC agent for Custom Debian 13 KVM")
+    parser.add_argument("--transport", choices=["auto", "vsock", "virtio-serial", "unix"], default="auto")
+    parser.add_argument("--vsock-port", type=int, default=int(os.environ.get("KIN_AGENT_VSOCK_PORT", "7071")))
+    parser.add_argument("--virtio-serial", default=os.environ.get("KIN_AGENT_SERIAL_PATH", "/dev/virtio-ports/kin.agent.0"))
+    parser.add_argument("--unix-socket", default=os.environ.get("KIN_AGENT_UNIX_SOCK", ""))
+    parser.add_argument("--token", default=None)
+    parser.add_argument("--token-file", default="/var/lib/kin-slot/.agent-token")
+    parser.add_argument("--state-dir", default="/var/lib/kin-slot")
+    parser.add_argument("--claude-dir", default=None)
+    parser.add_argument("--run-dir", default="/run/kin")
+    parser.add_argument("--crag-root", default="/run/vm2api-crag")
+    parser.add_argument("--managed-preset-dir", default="/var/lib/kin-slot/managed-settings.d")
+    parser.add_argument("--store-dir", default="/opt/kin/store")
+    parser.add_argument("--machine-id-file", default="/etc/machine-id")
+    parser.add_argument("--crag-pid-file", default="/run/kin/crag.pid")
+    parser.add_argument("--dmi-dir", default="/sys/class/dmi/id")
+    parser.add_argument("--kincli-uid", type=int, default=999)
+    parser.add_argument("--kincli-gid", type=int, default=987)
+    parser.add_argument("--no-mount-project", action="store_true")
+    args = parser.parse_args(argv)
+
+    token = load_token(args.token, args.token_file)
+    cfg = AgentConfig(
+        token=token,
+        state_dir=Path(args.state_dir),
+        claude_dir=Path(args.claude_dir) if args.claude_dir else None,
+        run_dir=Path(args.run_dir),
+        crag_root=Path(args.crag_root),
+        managed_preset_dir=Path(args.managed_preset_dir),
+        store_dir=Path(args.store_dir),
+        machine_id_file=Path(args.machine_id_file),
+        crag_pid_file=Path(args.crag_pid_file),
+        dmi_dir=Path(args.dmi_dir),
+        kincli_uid=args.kincli_uid,
+        kincli_gid=args.kincli_gid,
+        project_mounts=not args.no_mount_project,
+    )
+    service = SlotAgentService(cfg)
+    stop_event = threading.Event()
+
+    def _stop(_signum: int, _frame: Any) -> None:
+        stop_event.set()
+
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGINT, _stop)
+
+    mode = "unix" if args.unix_socket else args.transport
+    if mode == "unix":
+        if not args.unix_socket:
+            raise SystemExit("kin-slot-agent: --unix-socket is required for unix transport")
+        sock = _bind_unix(Path(args.unix_socket))
+        try:
+            sys.stderr.write(f"kin-slot-agent: listening unix:{args.unix_socket}\n")
+            sys.stderr.flush()
+            serve_socket_listener(service, sock, stop_event)
+        finally:
+            sock.close()
+            try:
+                Path(args.unix_socket).unlink()
+            except OSError:
+                pass
+        return 0
+
+    if mode in ("auto", "vsock"):
+        try:
+            sock = _bind_vsock(args.vsock_port)
+        except OSError as exc:
+            if mode == "vsock":
+                raise SystemExit(f"kin-slot-agent: AF_VSOCK port {args.vsock_port} failed: {exc}") from exc
+            sys.stderr.write(f"kin-slot-agent: AF_VSOCK unavailable ({exc}); falling back to virtio-serial\n")
+            sys.stderr.flush()
+        else:
+            try:
+                sys.stderr.write(f"kin-slot-agent: listening vsock:{args.vsock_port}\n")
+                sys.stderr.flush()
+                serve_socket_listener(service, sock, stop_event)
+            finally:
+                sock.close()
+            return 0
+
+    sys.stderr.write(f"kin-slot-agent: listening virtio-serial:{args.virtio_serial}\n")
+    sys.stderr.flush()
+    serve_serial_device(service, Path(args.virtio_serial), stop_event)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

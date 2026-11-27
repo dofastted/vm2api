@@ -134,6 +134,8 @@ function formatTelemetryErrorMessage(summary, reason, upstreamMessage) {
   return detail ? `${summary} (${detail})` : summary
 }
 
+const CRAG_TELEMETRY_SCOPES = new Set(['native_claude_launch', 'headless_bridge'])
+
 export async function verifyCragTelemetryPolicy(exec, enabled, timeoutMs) {
   const { status, body } = await callWorkerPost(
     withRustKernelExec(exec),
@@ -146,7 +148,7 @@ export async function verifyCragTelemetryPolicy(exec, enabled, timeoutMs) {
     body?.ok === true &&
     body.applied === true &&
     body.enabled === enabled &&
-    body.scope === 'native_claude_launch' &&
+    CRAG_TELEMETRY_SCOPES.has(body.scope) &&
     typeof body.upload_confirmed === 'boolean'
   ) {
     const uploadConfirmed = enabled ? body.upload_confirmed === true : false

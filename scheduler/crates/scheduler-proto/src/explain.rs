@@ -42,6 +42,7 @@ pub enum ExcludeReason {
     RpmExceeded,
     SubagentLimitExceeded,
     CrossPromptFallbackBlocked,
+    CapabilityMismatch,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

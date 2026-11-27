@@ -9,12 +9,15 @@
  * persona_preset official|official_full|zero|official_303 on a VM overrides the global protocol;
  * empty inherits routing.compatibility.persona_preset.
  */
+import fs from 'node:fs'
+import path from 'node:path'
 import {
   normalizePersonaPreset,
   OFFICIAL_303_PRESET,
   personaPresetFromLegacyMode,
 } from '../identity/persona-template.mjs'
 import { isCodexVm } from './vm-kind.mjs'
+import { isCustomOsSlot, sharedClaudeGuestPath, sharedProfilesGuestDir } from './custom-os-runtime.mjs'
 
 export const INFERENCE_ENGINES = Object.freeze(['rust'])
 export const SLOT_PERSONA_PRESETS = Object.freeze(['official', 'official_full', 'zero', OFFICIAL_303_PRESET])
@@ -32,13 +35,130 @@ export const REMOTE_KERNEL_ENTRY = `${REMOTE_LIVE_DIR}/kin-kernel`
 export const REMOTE_CLI_NODE_BIN = `${REMOTE_LIVE_DIR}/cli-node`
 export const REMOTE_CC_NODE_BIN = `${REMOTE_LIVE_DIR}/cc-node`
 export const REMOTE_CRAG_ENTRY = `${REMOTE_LIVE_DIR}/crag-kernel`
-// The crag v2 entrypoint is version-locked: payload ships exactly this build
-// (share/crag/kernels/v2/<arch>/claude-code-<version>/claude), so the version is
-// known from the path and never has to be read back off the CLI.
+// Default fallback version when no verified CRAG manifest is present on disk.
+// Active slots resolve `officialClaude.path` & `officialClaude.version` from
+// their verified CRAG manifest.json so official Claude CLI upgrades require
+// zero hardcoded version bumps.
+export const CRAG_CLAUDE_SEMVER_RE = /^\d+\.\d+\.\d+(?:-[A-Za-z0-9.]+)?$/
+export const CRAG_CLAUDE_DIR_RE = /^claude-code-(\d+\.\d+\.\d+(?:-[A-Za-z0-9.]+)?)$/
+export const CRAG_CLAUDE_PATH_RE = /^claude-code-(\d+\.\d+\.\d+(?:-[A-Za-z0-9.]+)?)\/claude$/
 export const CRAG_CLAUDE_VERSION = '2.1.321'
 export const REMOTE_CRAG_CLAUDE = `${REMOTE_LIVE_DIR}/crag-v2/claude-code-${CRAG_CLAUDE_VERSION}/claude`
 export const LOCAL_CRAG_CLAUDE = `/home/kincli/.kin/crag-v2/claude-code-${CRAG_CLAUDE_VERSION}/claude`
 export const CONTAINER_CRAG_V2_CLAUDE = LOCAL_CRAG_CLAUDE
+
+export function isHeadlessBridgeCaps(caps) {
+  return Array.isArray(caps) && caps.includes('headless_claude_bridge_v1')
+}
+
+/**
+ * Native CRAG v3+ kernel where the official Claude CLI / Headless Bridge owns
+ * outbound beta & header assembly. Recognizes both legacy 3.1.24 TUI queue
+ * (`linux_tui_native_queue`) and Phase B Option 2A (`headless_claude_bridge_v1`).
+ */
+export function isNativeCragV3Plus(caps) {
+  return (
+    Array.isArray(caps) &&
+    caps.includes('generation_controls_v3') &&
+    (caps.includes('linux_tui_native_queue') || caps.includes('headless_claude_bridge_v1'))
+  )
+}
+
+/**
+ * Resolve the single official Claude CLI relative path (`claude-code-<semver>/claude`)
+ * and version from a CRAG v2 `manifest.json`.
+ * - Prefers `manifest.officialClaude.path` (strictly validated against semver regex
+ *   and matching `manifest.officialClaude.version` when present).
+ * - Falls back to scanning `manifest.sha256` keys for legacy manifests that omit
+ *   `officialClaude`, requiring exactly one `claude-code-<semver>/claude` member.
+ * Returns `null` when missing, malformed, or ambiguous.
+ */
+export function resolveManifestClaudePath(manifest) {
+  if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) return null
+  const official = manifest.officialClaude
+  if (official != null) {
+    if (typeof official !== 'object' || Array.isArray(official)) return null
+    const rawPath = official.path
+    if (typeof rawPath !== 'string') return null
+    const match = CRAG_CLAUDE_PATH_RE.exec(rawPath)
+    if (!match) return null
+    const version = match[1]
+    if (official.version != null) {
+      if (typeof official.version !== 'string' || official.version !== version) return null
+    }
+    return { path: rawPath, dir: `claude-code-${version}`, version }
+  }
+  const shaMap = manifest.sha256
+  if (!shaMap || typeof shaMap !== 'object' || Array.isArray(shaMap)) return null
+  const matches = []
+  for (const rel of Object.keys(shaMap)) {
+    const match = CRAG_CLAUDE_PATH_RE.exec(rel)
+    if (match) matches.push({ path: rel, dir: `claude-code-${match[1]}`, version: match[1] })
+  }
+  return matches.length === 1 ? matches[0] : null
+}
+
+export function cragClaudePathForHost(relPath, host = {}) {
+  const base = host?.bakedKernel ? `${REMOTE_LIVE_DIR}/crag-v2` : '/home/kincli/.kin/crag-v2'
+  return `${base}/${relPath}`
+}
+
+function readManifestJsonFromDir(dir) {
+  if (!dir || typeof dir !== 'string') return null
+  try {
+    const file = path.join(dir, 'manifest.json')
+    const st = fs.lstatSync(file)
+    if (st.isSymbolicLink() || !st.isFile() || st.size > 64 * 1024) return null
+    const parsed = JSON.parse(fs.readFileSync(file, 'utf8'))
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Read the active CRAG v2 `manifest.json` for a slot (installed slot tree first,
+ * then `KIN_CRAG_V2_ROOT`, then active cached package pointer, then factory tree).
+ */
+export function activeCragManifestForSlot(projectRoot, vm = null, homeDir = '') {
+  const dirs = []
+  if (homeDir) dirs.push(path.join(homeDir, '.kin', 'crag-v2'))
+  else if (projectRoot && vm?.id) dirs.push(path.join(projectRoot, 'vms', String(vm.id), 'cli-home', '.kin', 'crag-v2'))
+  const envRoot = String(process.env.KIN_CRAG_V2_ROOT || '').trim()
+  if (envRoot) dirs.push(envRoot)
+  if (projectRoot) {
+    const archRaw = String(vm?.runtime?.arch || vm?.node_arch || vm?.arch || '')
+      .trim()
+      .toLowerCase()
+    const arch =
+      archRaw === 'arm64' || archRaw === 'aarch64'
+        ? 'arm64'
+        : archRaw === 'x64' || archRaw === 'x86_64' || archRaw === 'amd64'
+          ? 'amd64'
+          : process.arch === 'arm64'
+            ? 'arm64'
+            : 'amd64'
+    const base = path.join(projectRoot, 'share', 'crag', 'kernels', 'v2')
+    for (const candidateArch of arch === 'amd64' ? ['amd64'] : [arch, 'amd64']) {
+      try {
+        const ptr = path.join(base, `current-${candidateArch}.json`)
+        const st = fs.lstatSync(ptr)
+        if (st.isFile() && st.size <= 4096) {
+          const value = JSON.parse(fs.readFileSync(ptr, 'utf8'))
+          if (new RegExp(`^packages/${candidateArch}-[a-f0-9-]{36}$`).test(value?.package)) {
+            dirs.push(path.join(base, value.package))
+          }
+        }
+      } catch {}
+      dirs.push(path.join(base, candidateArch))
+    }
+  }
+  for (const dir of dirs) {
+    const manifest = readManifestJsonFromDir(dir)
+    if (manifest && resolveManifestClaudePath(manifest)) return manifest
+  }
+  return null
+}
 
 export const KERNEL_NATIVE_SLOT_COUNT = 20
 export const SESSION_SLOT_MIN = 1
@@ -208,10 +328,70 @@ export function resolveSlotClaude(vm, routing = {}, host = {}) {
   const dataplane = resolveKernelDataplane(vm, routing)
   const native = dataplane === 'crag' && resolveCragKernelVersion(vm, routing) === 'v2'
   if (native) {
+    const manifest =
+      host?.manifest ||
+      vm?.kernel_installation?.manifest ||
+      readManifestJsonFromDir(host?.cragRoot) ||
+      (host?.homeDir ? readManifestJsonFromDir(path.join(host.homeDir, '.kin', 'crag-v2')) : null)
+    const fromManifest = resolveManifestClaudePath(manifest)
+    const relPath = fromManifest?.path || `claude-code-${CRAG_CLAUDE_VERSION}/claude`
+    const version = fromManifest?.version || CRAG_CLAUDE_VERSION
+    const caps =
+      host?.capabilities ||
+      manifest?.capabilities ||
+      vm?.workerStatus?.capabilities ||
+      vm?.worker_status?.capabilities ||
+      vm?.runtime?.capabilities ||
+      vm?.kernel_installation?.capabilities ||
+      []
+    const headlessBridge = isHeadlessBridgeCaps(caps)
+    const customOs = isCustomOsSlot(vm, host)
+    const unbundled = manifest?.officialClaude?.bundled === false
+    const resolvedBin = cragClaudePathForHost(relPath, host)
+    if (headlessBridge) {
+      if (customOs) {
+        const wireProfileReadonlyDir =
+          String(host?.wireProfileReadonlyDir || '').trim() || sharedProfilesGuestDir(host?.storeGuestDir)
+        const explicitSharedBin = String(host?.sharedClaudeBin || '').trim()
+        const useSharedBin = unbundled || Boolean(explicitSharedBin)
+        const sharedBin = useSharedBin ? explicitSharedBin || sharedClaudeGuestPath(version, host?.storeGuestDir) : ''
+        return {
+          bin: sharedBin,
+          resolvedBin: useSharedBin ? sharedBin : resolvedBin,
+          relativePath: relPath,
+          native: true,
+          version,
+          headlessBridge: true,
+          customOs: true,
+          sharedStore: useSharedBin,
+          bundledClaude: !unbundled,
+          wireProfileReadonlyDir,
+        }
+      }
+      return {
+        bin: '',
+        resolvedBin,
+        relativePath: relPath,
+        native: true,
+        version,
+        headlessBridge: true,
+      }
+    }
+    if (customOs && unbundled) {
+      const sharedBin =
+        String(host?.sharedClaudeBin || '').trim() || sharedClaudeGuestPath(version, host?.storeGuestDir)
+      return {
+        bin: sharedBin,
+        native: true,
+        version,
+        sharedStore: true,
+        bundledClaude: false,
+      }
+    }
     return {
-      bin: host.bakedKernel ? REMOTE_CRAG_CLAUDE : LOCAL_CRAG_CLAUDE,
+      bin: resolvedBin,
       native: true,
-      version: CRAG_CLAUDE_VERSION,
+      version,
     }
   }
   return {

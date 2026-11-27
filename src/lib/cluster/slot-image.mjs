@@ -15,6 +15,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import zlib from 'node:zlib'
 import { OS_CATALOG, imageForKernel, kvmImageForKernel } from '../vm/os-catalog.mjs'
+import { isCustomOsSlot, resolveHostSharedStoreDir } from '../vm/custom-os-runtime.mjs'
 import { EGRESS_BIN } from '../vm/egress.mjs'
 import {
   cliPayloadPath,
@@ -55,13 +56,25 @@ function requireElf(file, label) {
   }
 }
 /** Cluster slot images are linux amd64 even when the control plane is not. */
-export function cragSlotPayload(projectRoot, { required = true } = {}) {
+export function cragSlotPayload(
+  projectRoot,
+  { required = true, vm = null, kernel = '', allowUnbundledStore, sharedClaudeStoreRoot, runtimeMode, env } = {},
+) {
   const root = cragV2PackageRoot(projectRoot, 'amd64')
   if (!root) {
     if (!required) return null
     throw new ClusterError(500, 'slot_payload_missing', 'CRAG v2 缺失')
   }
-  const verified = verifyCragV2Tree(root, { arch: 'amd64' })
+  const customOs =
+    allowUnbundledStore !== undefined
+      ? Boolean(allowUnbundledStore)
+      : isCustomOsSlot(vm || (kernel ? { kernel } : null), { runtimeMode, env })
+  const storeRoot = customOs ? resolveHostSharedStoreDir(projectRoot, { sharedClaudeStoreRoot, env }) : ''
+  const verifyOpts = {
+    arch: 'amd64',
+    ...(customOs ? { allowUnbundledStore: true, sharedClaudeStoreRoot: storeRoot } : {}),
+  }
+  const verified = verifyCragV2Tree(root, verifyOpts)
   if (!verified.ok) {
     const missing = verified.code === 'crag_v2_package_missing'
     throw new ClusterError(500, missing ? 'slot_payload_missing' : 'slot_payload_invalid', verified.error)
@@ -102,14 +115,17 @@ export function cragSlotPayload(projectRoot, { required = true } = {}) {
  * Files that go into the image, as tar entries `{ name, src?, body?, mode }`.
  * Throws slot_payload_missing / slot_payload_invalid with the offending path.
  */
-export function slotPayload(projectRoot, { runtime } = {}) {
+export function slotPayload(
+  projectRoot,
+  { runtime, kernel = '', vm = null, allowUnbundledStore, sharedClaudeStoreRoot, runtimeMode, env } = {},
+) {
   const wrapDir = wrapCliTemplateDir(projectRoot)
-  const kernel = describeKernelPayload(projectRoot)
-  if (kernel.source === 'missing') throw new ClusterError(500, 'slot_payload_missing', 'kin-kernel 缺失')
-  requireElf(kernel.path, 'kin-kernel')
+  const kernelPayload = describeKernelPayload(projectRoot)
+  if (kernelPayload.source === 'missing') throw new ClusterError(500, 'slot_payload_missing', 'kin-kernel 缺失')
+  requireElf(kernelPayload.path, 'kin-kernel')
   const files = [
     { name: 'opt/kin/kin-kernel', body: Buffer.from(wrapKernelWrapperScript()), mode: 0o755 },
-    { name: 'opt/kin/kin-kernel.bin', src: kernel.path, mode: 0o755 },
+    { name: 'opt/kin/kin-kernel.bin', src: kernelPayload.path, mode: 0o755 },
   ]
   const cliSrc = cliPayloadPath(projectRoot, 'cli-node', wrapDir)
   requireElf(cliSrc, 'cli-node')
@@ -139,7 +155,15 @@ export function slotPayload(projectRoot, { runtime } = {}) {
   )
   requireElf(egress, 'kin-egress')
   files.push({ name: 'usr/local/bin/kin-egress', src: egress, mode: 0o755 })
-  const crag = cragSlotPayload(projectRoot, { required: runtime === 'kvm' })
+  const crag = cragSlotPayload(projectRoot, {
+    required: runtime === 'kvm',
+    vm,
+    kernel,
+    allowUnbundledStore,
+    sharedClaudeStoreRoot,
+    runtimeMode,
+    env,
+  })
   if (crag) files.push(...crag.files)
   const codex = codexKernelBinPath() || path.join(projectRoot, 'bin', 'kin-codex-kernel')
   requireElf(codex, 'kin-codex-kernel')
@@ -184,11 +208,24 @@ export function slotDockerfile(baseImage, { runtime } = {}) {
  * vm2api/kin-slot-<kernel>:<hash12> or vm2api/kin-slot-kvm-<kernel>:<hash12>.
  * Docker output is identical when runtime is omitted.
  */
-export function slotImageSpec(projectRoot, kernel, { runtime } = {}) {
-  if (!OS_CATALOG[kernel]) throw new ClusterError(400, 'invalid_kernel', `未知系统：${kernel}`)
+export function slotImageSpec(
+  projectRoot,
+  kernel,
+  { runtime, vm = null, allowUnbundledStore, sharedClaudeStoreRoot, runtimeMode, env } = {},
+) {
+  if (!kernel || !Object.hasOwn(OS_CATALOG, kernel))
+    throw new ClusterError(400, 'invalid_kernel', `未知系统：${kernel}`)
   const kvm = runtime === 'kvm'
   const base = kvm ? kvmImageForKernel(kernel) : imageForKernel(kernel)
-  const files = slotPayload(projectRoot, { runtime })
+  const files = slotPayload(projectRoot, {
+    runtime,
+    kernel,
+    vm,
+    allowUnbundledStore,
+    sharedClaudeStoreRoot,
+    runtimeMode,
+    env,
+  })
   const hash = crypto.createHash('sha256')
   hash.update(slotDockerfile(base, { runtime: kvm ? 'kvm' : 'docker' }))
   for (const f of files) {

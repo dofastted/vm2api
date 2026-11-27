@@ -1763,6 +1763,15 @@ export function officialFamilyBodyPassthrough(officialTraffic, routing = {}) {
   return officialTraffic === true && officialCcPassthroughFromRouting(routing)
 }
 
+/** Explicit opt-in rollout toggle (default false): strict zero-mutation & verbatim error passthrough on CRAG. */
+export function cragStrictPassthroughFromRouting(routing = {}) {
+  return routing?.compatibility?.crag_strict_passthrough === true
+}
+
+export function cragStrictPassthroughEnabled(officialPassthrough, routing = {}) {
+  return officialPassthrough === true && cragStrictPassthroughFromRouting(routing)
+}
+
 function stripSystemCacheControl(body) {
   if (!Array.isArray(body.system)) return body
   let changed = false
@@ -2070,11 +2079,16 @@ function applyTemplatePersona(
     callerAgent: rawCallerAgent = '',
     entrypoint = 'cli',
     cacheTtl = null,
+    cragDirectReplace = false,
   } = {},
 ) {
   const messages = Array.isArray(body.messages) ? body.messages : []
   const zero = preset === 'zero'
-  const blocks = selectedTemplateBlocks(resolvePersonaTemplate(preset, templates), switches, preset)
+  const templateSource =
+    cragDirectReplace && Array.isArray(templates?.[preset]) && templates[preset].length
+      ? templates[preset]
+      : resolvePersonaTemplate(preset, templates)
+  const blocks = selectedTemplateBlocks(templateSource, switches, preset)
   const withEnv = presetFlagEnabled(switches, 'persona_env_presets', preset)
   const hasUser = messages.some((message) => message?.role === 'user')
   // A variable only consumes caller text if its block will actually be sent.
@@ -2083,9 +2097,9 @@ function applyTemplatePersona(
       ? blocks
           .filter((block) =>
             block?.id === 'caller_system'
-              ? !block.role && hasUser
+              ? !block.role && (cragDirectReplace || hasUser)
               : block?.role === 'system'
-                ? withEnv && hasUser
+                ? !cragDirectReplace && withEnv && hasUser
                 : !block?.role,
           )
           .flatMap((block) => extractTemplateVars(block?.text))
@@ -2156,6 +2170,7 @@ function applyTemplatePersona(
     messages,
     entrypoint,
   })
+  if (cragDirectReplace) vars.keep_dynamic_boundary = false
   const callerBlocks = blocks.filter((block) => block?.id === 'caller_system')
   const officialBlocks = blocks.filter((block) => block?.id !== 'caller_system')
   const templateOwned = new Set()
@@ -2171,11 +2186,23 @@ function applyTemplatePersona(
   const renderOptions = { blockVars, templateOwned, usedCallerCache: new Set() }
   let system = renderPersonaTemplate(officialBlocks, vars, renderOptions)
 
-  if (preset === 'official') {
+  if (preset === 'official' && !cragDirectReplace) {
     system = insertOfficialCallerAgent(system, callerAgent, cacheTtl == null ? undefined : { type: 'ephemeral' })
     for (const block of system) templateOwned.add(block)
   }
   if (zero && !zeroVars.has('caller_system')) system = [...system, ...zeroRemaining]
+  if (cragDirectReplace) {
+    if (callerBlocks.length) {
+      const renderedCaller = renderPersonaTemplate(callerBlocks, vars, renderOptions).filter((block) =>
+        unwrapSystemReminder(block.text),
+      )
+      if (renderedCaller.length) system = [...system, ...renderedCaller]
+    }
+    let assembled = { ...body, system, messages }
+    if (zero && renderOptions.usedCallerCache.size)
+      assembled = deferReorderedCallerCache(assembled, body, templateOwned)
+    return mergeTemplateCache(assembled, templateOwned, zero ? normalizeCacheTtl(cacheTtl) : cacheTtl)
+  }
   let outMessages = messages
 
   // Preserve marked expansions through the reminder wrapper. Unmarked
@@ -2235,6 +2262,7 @@ export function applyCrsUnofficialPersona(
     park,
     parkStyle,
     agent,
+    routing = null,
     routingFile,
     headers,
     sessionId,
@@ -2242,6 +2270,7 @@ export function applyCrsUnofficialPersona(
     model,
     entrypoint,
     cacheTtl = null,
+    cragDirectReplace = false,
   } = {},
 ) {
   if (!body || typeof body !== 'object') return body
@@ -2250,18 +2279,21 @@ export function applyCrsUnofficialPersona(
   if (!forceConfigured && officialClient) return body
   let fromFile = null
   let fileSettings = personaTemplateSettingsFallback()
-  let routing = null
-  if (routingFile) {
+  let resolvedRouting = routing && typeof routing === 'object' ? routing : null
+  if (resolvedRouting) {
+    fromFile = personaOptionsFromRouting(resolvedRouting)
+    fileSettings = personaTemplateSettingsFromRouting(resolvedRouting)
+  } else if (routingFile) {
     try {
-      routing = readJsonParsedCached(routingFile)
-      if (routing) {
-        fromFile = personaOptionsFromRouting(routing)
-        fileSettings = personaTemplateSettingsFromRouting(routing)
+      resolvedRouting = readJsonParsedCached(routingFile)
+      if (resolvedRouting) {
+        fromFile = personaOptionsFromRouting(resolvedRouting)
+        fileSettings = personaTemplateSettingsFromRouting(resolvedRouting)
       } else {
         fromFile = { mode: DEFAULT_PERSONA_MODE, park: DEFAULT_PERSONA_PARK, agent: DEFAULT_PERSONA_AGENT }
       }
     } catch {
-      routing = null
+      resolvedRouting = null
       fromFile = { mode: DEFAULT_PERSONA_MODE, park: DEFAULT_PERSONA_PARK, agent: DEFAULT_PERSONA_AGENT }
       fileSettings = personaTemplateSettingsFallback()
     }
@@ -2270,7 +2302,7 @@ export function applyCrsUnofficialPersona(
   // Read the caller's agent prompt before stripLeakySystem drops it as known official text.
   const rawCallerAgent = extractCallerAgentPrompt(body.system)
   const resolvedEntrypoint =
-    entrypoint === 'cli' || entrypoint === 'sdk-cli' ? entrypoint : ccEntrypointFromRouting(routing)
+    entrypoint === 'cli' || entrypoint === 'sdk-cli' ? entrypoint : ccEntrypointFromRouting(resolvedRouting)
   const hopPreset = mode != null ? personaPresetFromHopMode(mode) : null
   const chosen = hopPreset
     ? { ...fileSettings, explicit: true, preset: hopPreset }
@@ -2306,6 +2338,7 @@ export function applyCrsUnofficialPersona(
       callerAgent: rawCallerAgent,
       entrypoint: resolvedEntrypoint,
       cacheTtl,
+      cragDirectReplace,
     })
   }
   const doPark =
@@ -2324,4 +2357,83 @@ export function applyCrsUnofficialPersona(
     model,
     overwrite: resolved === 'overwrite',
   })
+}
+
+const CRAG_BILLING_LINE_RE = /^x-anthropic-billing-header:/i
+const CRAG_PROMPT_VERSION_RE = /prompt_version=<([^>\r\n]+)>/i
+
+/**
+ * Render an explicit panel custom persona template into non-billing `system[]`
+ * text blocks for `headless_claude_bridge_v1` `crag_prompt: { mode: 'replace', blocks }`.
+ * Strips `x-anthropic-billing-header:` lines (CRAG owns `system[0]` billing) and
+ * `__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__` markers while preserving `cache_control`
+ * and extracting any zero-style `prompt_version`.
+ */
+export function renderCragCustomSystemBlocks(
+  body,
+  {
+    preset,
+    routing = null,
+    routingFile,
+    cliVersion,
+    sessionId = '',
+    identity,
+    model,
+    entrypoint = 'cli',
+    cacheTtl = null,
+  } = {},
+) {
+  const rendered = applyCrsUnofficialPersona(body || {}, {
+    forceConfigured: true,
+    routing,
+    routingFile,
+    mode: preset,
+    park: false,
+    cliVersion,
+    sessionId,
+    identity,
+    model: model || body?.model,
+    entrypoint,
+    cacheTtl,
+    cragDirectReplace: true,
+  })
+  const rawBlocks = Array.isArray(rendered?.system)
+    ? rendered.system
+    : typeof rendered?.system === 'string' && rendered.system
+      ? [{ type: 'text', text: rendered.system }]
+      : []
+  let promptVersion = null
+  const blocks = []
+  for (const entry of rawBlocks) {
+    const rawText =
+      typeof entry === 'string' ? entry : entry?.type === 'text' && typeof entry.text === 'string' ? entry.text : ''
+    if (!rawText) continue
+    let text = rawText
+    if (/x-anthropic-billing-header:/i.test(text)) {
+      const lines = text.split('\n')
+      const kept = []
+      for (const line of lines) {
+        const trimmedLine = line.trim()
+        if (CRAG_BILLING_LINE_RE.test(trimmedLine)) {
+          if (!promptVersion) {
+            const match = trimmedLine.match(CRAG_PROMPT_VERSION_RE)
+            if (match?.[1]?.trim()) promptVersion = match[1].trim()
+          }
+          continue
+        }
+        kept.push(line)
+      }
+      text = kept.join('\n').trim()
+    }
+    if (!text.trim() || text.trim() === '__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__') continue
+    const block = { type: 'text', text }
+    if (entry && typeof entry === 'object' && entry.cache_control != null) {
+      block.cache_control = { ...entry.cache_control }
+    }
+    blocks.push(block)
+  }
+  if (!promptVersion && normalizePersonaPreset(preset) === 'zero') {
+    promptVersion = CRS_OFFICIAL_CLI_SYSTEM
+  }
+  return { blocks, promptVersion }
 }

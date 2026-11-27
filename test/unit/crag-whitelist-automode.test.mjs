@@ -200,10 +200,10 @@ test('CRAG whitelist fails closed 400 on unknown top-level and unrepresentable f
   }
 })
 
-test('CRAG whitelist strictly rebuilds cache_control, strips scope/evict_on_complete and thinking markers, and enforces budget/TTL order', () => {
+test('CRAG whitelist preserves valid 2.1.321 cache_control scope/evict_on_complete while stripping unknown keys and thinking markers, and enforces budget/TTL order', () => {
   assert.deepEqual(
     sanitizeCragCacheControl({ type: 'ephemeral', ttl: '1h', scope: 'org', evict_on_complete: true, foo: 'bar' }),
-    { type: 'ephemeral', ttl: '1h' },
+    { type: 'ephemeral', ttl: '1h', scope: 'org', evict_on_complete: true },
   )
   const cleaned = prepareCragRequest(
     {
@@ -258,7 +258,11 @@ test('CRAG whitelist strictly rebuilds cache_control, strips scope/evict_on_comp
   )
 
   assert.deepEqual(cleaned.system, [
-    { type: 'text', text: 'Be concise.', cache_control: { type: 'ephemeral', ttl: '1h' } },
+    {
+      type: 'text',
+      text: 'Be concise.',
+      cache_control: { type: 'ephemeral', ttl: '1h', scope: 'global', evict_on_complete: true },
+    },
   ])
   assert.deepEqual(cleaned.tools, [
     {
@@ -266,7 +270,7 @@ test('CRAG whitelist strictly rebuilds cache_control, strips scope/evict_on_comp
       description: 'Read file',
       input_schema: { type: 'object', properties: { path: { type: 'string' } } },
       defer_loading: true,
-      cache_control: { type: 'ephemeral', ttl: '1h' },
+      cache_control: { type: 'ephemeral', ttl: '1h', scope: 'org' },
     },
   ])
   assert.deepEqual(cleaned.messages[0].content, [{ type: 'text', text: 'Read README' }])
@@ -277,7 +281,7 @@ test('CRAG whitelist strictly rebuilds cache_control, strips scope/evict_on_comp
     type: 'tool_result',
     tool_use_id: 'toolu_1',
     content: [{ type: 'text', text: '# ok' }],
-    cache_control: { type: 'ephemeral', ttl: '5m' },
+    cache_control: { type: 'ephemeral', ttl: '5m', scope: 'org' },
   })
 
   // Inverted TTL (5m before 1h) auto-repairs by downgrading trailing 1h to 5m instead of 400ing
@@ -370,7 +374,11 @@ test('CRAG whitelist strictly rebuilds cache_control, strips scope/evict_on_comp
     { capabilities: V3_CAPS },
   )
   assert.doesNotThrow(() => validateCacheBreakpoints(zeroPromptBudget))
-  assert.deepEqual(zeroPromptBudget.crag_prompt.blocks[0].cache_control, { type: 'ephemeral', ttl: '5m' })
+  assert.deepEqual(zeroPromptBudget.crag_prompt.blocks[0].cache_control, {
+    type: 'ephemeral',
+    ttl: '5m',
+    scope: 'global',
+  })
   assert.deepEqual(zeroPromptBudget.crag_prompt.blocks[1].cache_control, { type: 'ephemeral', ttl: '5m' })
   assert.equal(zeroPromptBudget.messages[0].content[0].cache_control, undefined)
   assert.deepEqual(zeroPromptBudget.messages[0].content[2].cache_control, { type: 'ephemeral', ttl: '5m' })

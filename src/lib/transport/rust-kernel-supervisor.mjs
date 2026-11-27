@@ -23,13 +23,24 @@ import { thinkingDisplayMode } from '../protocol/thinking.mjs'
 import { getModelPolicy } from '../protocol/model-policy.mjs'
 import { ccEntrypointFromRouting } from '../identity/crs-persona.mjs'
 import { setVmSchedulable, listVms, getVm } from '../vm/vm-registry.mjs'
+import {
+  CUSTOM_OS_BRIDGE_TMPFS_DIR,
+  CUSTOM_OS_PROFILES_DIR,
+  DEFAULT_KVM_VSOCK_PORT,
+  isCragDebian13Kernel,
+  isCustomKvmMode,
+  isCustomOsSlot,
+  isVhostVsockUsable,
+} from '../vm/custom-os-runtime.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
 import { isKvmRuntime, runtimeKind } from '../vm/runtime-kind.mjs'
 import { slotExecArgv } from '../vm/slot-exec.mjs'
 import { ensureHostPrivateDir } from '../vm/private-dir.mjs'
 import { withCragRuntimeAdmission } from '../vm/slot-runtime-admission.mjs'
 import {
+  activeCragManifestForSlot,
   CONTAINER_CLI_NODE_BIN,
+  isHeadlessBridgeCaps,
   KERNEL_NATIVE_SLOT_COUNT,
   normalizeSessionIdleTtlSeconds,
   resolveSessionSlots,
@@ -60,6 +71,7 @@ import { publishKvmCragLicense } from '../vm/kvm-crag-license.mjs'
 import { kernelCpuCommand, kernelCpuCommandMatches, usesKernelCpuLimit } from '../vm/kernel-cpu.mjs'
 import { kvmCragAppArmorCommand } from '../vm/kvm-crag-apparmor.mjs'
 import { clearKvmCragSubscription } from '../vm/kvm-crag-subscription.mjs'
+import { createKvmSlotAgentClient, readSlotAgentToken, syncCustomKvmSlotFiles } from '../vm/kvm-slot-agent-client.mjs'
 import { workerPaths } from './go-worker-client.mjs'
 import { effectiveSlotCount } from '../vm/slot-capacity.mjs'
 
@@ -71,7 +83,12 @@ import { effectiveSlotCount } from '../vm/slot-capacity.mjs'
 function runtimeReady(health, allowMissingCredential) {
   if (!allowMissingCredential) return rustKernelReachable(health)
   if (!rustKernelProcessUp(health) || health?.healthy === false) return false
-  return Number(health?.cli_pid) > 0 || health?.execution_mode === 'v2_process_pool'
+  return (
+    Number(health?.cli_pid) > 0 ||
+    health?.execution_mode === 'v2_process_pool' ||
+    health?.transport === 'headless_bridge' ||
+    isHeadlessBridgeCaps(health?.capabilities)
+  )
 }
 
 function normalizeAutoCompactWindow(value) {
@@ -126,8 +143,8 @@ export const WEDGED_READY_WAIT_MS = 3000
  * recorded memory and pids limits hold (see slot-capacity.mjs). A full crag
  * kernel never evicts idle sessions, so this is the resident process cap.
  */
-export function wrapSlotCount(vm = {}, routing) {
-  return Math.min(WRAP_SLOT_MAX, Math.max(WRAP_SLOT_MIN, effectiveSlotCount(vm, routing)))
+export function wrapSlotCount(vm = {}, routing, options = null) {
+  return Math.min(WRAP_SLOT_MAX, Math.max(WRAP_SLOT_MIN, effectiveSlotCount(vm, routing, options)))
 }
 
 /**
@@ -147,8 +164,26 @@ function kernelVm(exec) {
   return vm || {}
 }
 
+function kernelCapacityOptions(exec, vm, health = null) {
+  const healthCaps = health?.capabilities || exec?.workerStatus?.capabilities
+  if (Array.isArray(healthCaps) && healthCaps.length) return { capabilities: healthCaps }
+  if (health?.transport === 'headless_bridge' || exec?.workerStatus?.transport === 'headless_bridge') {
+    return { headlessBridge: true }
+  }
+  const configPath = rustKernelPaths(exec).configPath
+  const filed = configPath ? readExistingKernelConfig(configPath) : {}
+  const isCrag =
+    filed?.runtime_variant === 'crag-v2' ||
+    filed?.dataplane === 'crag' ||
+    resolveKernelDataplane(vm, filed?.dataplane ? { inference: filed } : {}) === 'crag'
+  if (!isCrag) return null
+  const manifest = activeCragManifestForSlot(projectRootFromExec(exec), vm, exec?.homeDir || '')
+  return manifest?.capabilities ? { capabilities: manifest.capabilities } : null
+}
+
 export function expectedKernelSlots(exec = {}) {
-  return wrapSlotCount(kernelVm(exec))
+  const vm = kernelVm(exec)
+  return wrapSlotCount(vm, undefined, kernelCapacityOptions(exec, vm))
 }
 
 export function requestedCragSessionSlots(vm, routing, fallback) {
@@ -304,6 +339,7 @@ const NODE_SETUP_RECHECK_MS = 10 * 60_000
 const nodeSetupAcceptedAt = new Map()
 
 async function acceptNodeClaudeSetup(exec, runDockerExec) {
+  if (isHeadlessBridgeCaps(exec?.workerStatus?.capabilities)) return null
   const host = slotHost(exec?.vm)
   if (!host.bakedKernel || host.native || isCodexVm(exec?.vm || {}) || isKvmRuntime(exec?.vm)) return null
   const vmId = exec?.vmId || exec?.vm?.id
@@ -327,8 +363,11 @@ export async function reconcileCliHopRuntime(exec, { runDockerExec = runDocker }
   const container = slotContainerName(exec)
   if (!container) return { ok: false, reason: 'missing' }
   const actions = []
-  await runDockerExec(execArgv(exec, ['kill', '-CHLD', '1']), { timeoutMs: 2000 })
-  actions.push('reap_zombies')
+  const customKvm = !exec?.vm?.node_id && isKvmRuntime(exec?.vm) && isCustomKvmMode({ vm: exec?.vm })
+  if (!customKvm) {
+    await runDockerExec(execArgv(exec, ['kill', '-CHLD', '1']), { timeoutMs: 2000 })
+    actions.push('reap_zombies')
+  }
   try {
     const setup = await acceptNodeClaudeSetup(exec, runDockerExec)
     if (setup) actions.push(setup)
@@ -488,6 +527,9 @@ export async function ensureRustKernel(
     force = false,
     allowMissingCredential = false,
     prepareGuestAppArmor = false,
+    agentClient = null,
+    publishCragLicense = null,
+    waitForHealthFn = null,
   } = {},
 ) {
   const vmId = exec?.vmId || exec?.vm?.id || 'unknown'
@@ -514,6 +556,9 @@ export async function ensureRustKernel(
     force,
     allowMissingCredential,
     prepareGuestAppArmor,
+    agentClient,
+    publishCragLicense,
+    waitForHealthFn,
   })
   const start = { promise, control, prepareGuestAppArmor }
   starts.set(vmId, start)
@@ -871,6 +916,163 @@ export async function retireLegacyTelemetryChecked(argv, runDockerExec) {
   }
 }
 
+const AGENT_RETRYABLE_ERRORS = new Set(['agent_unreachable', 'agent_timeout', 'agent_eof', 'agent_transport_error'])
+
+async function waitForCustomKvmAgentReady(client, { deadline, control }) {
+  let last = { ok: false, error: 'agent_unreachable', message: 'KVM slot agent not ready' }
+  while (startCurrent(control)) {
+    last = await client.status({ timeoutMs: 2500 })
+    if (last?.ok) return last
+    if (!AGENT_RETRYABLE_ERRORS.has(last?.error) || Date.now() >= deadline) return last
+    await new Promise((resolve) => setTimeout(resolve, 150))
+  }
+  return { ok: false, error: 'start_cancelled', message: 'start cancelled' }
+}
+
+async function waitForCragRestartTransition(client, oldPid, { deadline, control, pollMs = 100 }) {
+  const exitBudgetMs = Math.min(5000, Math.max(200, deadline - Date.now()))
+  const exitDeadline = Date.now() + exitBudgetMs
+  while (startCurrent(control)) {
+    const st = await client.status({ timeoutMs: 2500 })
+    if (!startCurrent(control)) return { ok: false, reason: 'start_cancelled' }
+    if (st?.ok) {
+      const curPid = Number(st.result?.crag_pid)
+      if (!Number.isInteger(curPid) || curPid <= 0 || curPid !== oldPid) {
+        return { ok: true, pid: Number.isInteger(curPid) && curPid > 0 ? curPid : null }
+      }
+    } else if (!AGENT_RETRYABLE_ERRORS.has(st?.error)) {
+      return {
+        ok: false,
+        reason: st?.error || 'crag_restart_failed',
+        error: st?.message || 'KVM slot agent failed while waiting for crag-v2 restart',
+      }
+    }
+    if (Date.now() >= exitDeadline) {
+      return {
+        ok: false,
+        reason: 'crag_restart_timeout',
+        error: `Timed out waiting for guest crag-v2 pid ${oldPid} to exit after SIGTERM`,
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, pollMs))
+  }
+  return { ok: false, reason: 'start_cancelled' }
+}
+
+async function startCustomKvmGuestKernel(
+  exec,
+  {
+    timeoutMs,
+    control,
+    runDockerExec,
+    force,
+    paths,
+    container,
+    allowMissingCredential,
+    crag,
+    agentClient = null,
+    publishCragLicense = null,
+    waitForHealthFn = null,
+  },
+) {
+  const budget = kvmBootBudget(exec.vm, timeoutMs)
+  const projectRoot = projectRootFromExec(exec)
+  const deadline = Date.now() + budget
+  let client = agentClient
+  if (!client) {
+    const kvmDir = path.join(projectRoot, 'vms', exec.vm.id, 'kvm')
+    const token = readSlotAgentToken(kvmDir)
+    if (!token) {
+      return { ok: false, reason: 'agent_token_missing', error: 'KVM slot agent token is missing' }
+    }
+    client = createKvmSlotAgentClient({ socketPath: path.join(kvmDir, 'agent.sock'), token })
+  }
+
+  const ready = await waitForCustomKvmAgentReady(client, { deadline, control })
+  if (!startCurrent(control)) return { ok: false, reason: 'start_cancelled' }
+  if (!ready?.ok) {
+    return {
+      ok: false,
+      reason: ready?.error || 'agent_unreachable',
+      error: ready?.message || 'KVM slot agent did not become ready',
+    }
+  }
+
+  const publishFn = publishCragLicense || publishKvmCragLicense
+  if (crag) {
+    while (startCurrent(control)) {
+      try {
+        if (!(await publishFn(projectRoot, exec.vm, { force: true, runDockerExec, agentClient: client }))) {
+          return { ok: false, reason: 'crag_guest_license_sync_failed', error: 'CRAG guest is not running' }
+        }
+        break
+      } catch (error) {
+        if (!error.retryable || Date.now() >= deadline) {
+          return { ok: false, reason: error.code || 'crag_guest_license_sync_failed', error: error.message }
+        }
+        await new Promise((resolve) => setTimeout(resolve, 250))
+      }
+    }
+    if (!startCurrent(control)) return { ok: false, reason: 'start_cancelled' }
+  } else {
+    try {
+      await clearKvmCragSubscription(projectRoot, exec.vm, { runDockerExec, agentClient: client })
+    } catch (error) {
+      return { ok: false, reason: error.code || 'crag_subscription_projection_failed', error: error.message }
+    }
+    if (!startCurrent(control)) return { ok: false, reason: 'start_cancelled' }
+  }
+
+  const synced = await syncCustomKvmSlotFiles(projectRoot, exec.vm, {
+    client,
+    runDir: paths.runDir,
+    homeDir: exec.homeDir,
+    requiredTargets: ['kernel_config'],
+  })
+  if (!startCurrent(control)) return { ok: false, reason: 'start_cancelled' }
+  if (!synced.ok) {
+    return {
+      ok: false,
+      reason: synced.error || 'kvm_agent_sync_failed',
+      error: synced.message || 'Failed to sync custom-erofs KVM slot files',
+    }
+  }
+
+  const cragRunning = ready.result?.crag_running === true || Number(ready.result?.crag_pid) > 0
+  if (force || cragRunning) {
+    const restarted = await client.restartCrag()
+    if (!startCurrent(control)) return { ok: false, reason: 'start_cancelled' }
+    if (!restarted?.ok) {
+      return {
+        ok: false,
+        reason: restarted?.error || 'crag_restart_failed',
+        error: restarted?.message || 'Failed to signal guest crag-v2 restart',
+      }
+    }
+    const signaledPid = Number(restarted.result?.pid)
+    if (restarted.result?.signaled === true && Number.isInteger(signaledPid) && signaledPid > 0) {
+      const exited = await waitForCragRestartTransition(client, signaledPid, { deadline, control })
+      if (!exited.ok) return exited
+    }
+  }
+
+  const waitHealth =
+    waitForHealthFn ||
+    ((targetExec, opts) =>
+      waitForHealthOrExit(targetExec, {
+        timeoutMs: opts.timeoutMs,
+        container,
+        runDockerExec,
+        control,
+        allowMissingCredential: opts.allowMissingCredential,
+      }))
+  const started = await waitHealth(exec, { timeoutMs: budget, allowMissingCredential })
+  if (started?.ok) {
+    started.reconcile = await reconcileCliHopRuntime(exec, { runDockerExec })
+  }
+  return started
+}
+
 async function startKvmGuestKernel(
   exec,
   {
@@ -884,8 +1086,26 @@ async function startKvmGuestKernel(
     allowMissingCredential,
     prepareGuestAppArmor,
     crag,
+    agentClient = null,
+    publishCragLicense = null,
+    waitForHealthFn = null,
   },
 ) {
+  if (!exec.vm?.node_id && isCustomKvmMode({ vm: exec.vm, kernel: exec.vm?.kernel })) {
+    return startCustomKvmGuestKernel(exec, {
+      timeoutMs,
+      control,
+      runDockerExec,
+      force,
+      paths,
+      container,
+      allowMissingCredential,
+      crag,
+      agentClient,
+      publishCragLicense,
+      waitForHealthFn,
+    })
+  }
   const budget = kvmBootBudget(exec.vm, timeoutMs)
   if (crag) {
     const deadline = Date.now() + budget
@@ -990,6 +1210,9 @@ async function startRustKernel(
     force = false,
     allowMissingCredential = false,
     prepareGuestAppArmor = false,
+    agentClient = null,
+    publishCragLicense = null,
+    waitForHealthFn = null,
   },
 ) {
   const licensed = checkCragLicense(projectRootFromExec(exec), exec?.vm, {
@@ -1013,7 +1236,7 @@ async function startRustKernel(
   // The deploy syncs wraps once that controller exits (handover exclusive pass).
   const staleWrap = !isOverlap() && wrapNewerThanKernel(exec)
   const currentVm = kernelVm(exec)
-  const expectedSlots = wrapSlotCount(currentVm)
+  const expectedSlots = wrapSlotCount(currentVm, undefined, kernelCapacityOptions(exec, currentVm, existing))
   const slotMismatch = !!paths.configPath && kernelSlotsDiffer(paths.configPath, existing, expectedSlots)
   let requestedSessionSlots
   if (slotMismatch && readExistingKernelConfig(paths.configPath)?.runtime_variant === 'crag-v2') {
@@ -1066,6 +1289,9 @@ async function startRustKernel(
       occupied,
       staleWrap,
       slotMismatch,
+      agentClient,
+      publishCragLicense,
+      waitForHealthFn,
     }),
   )
 }
@@ -1088,6 +1314,9 @@ async function launchRustKernel(
     occupied,
     staleWrap,
     slotMismatch,
+    agentClient = null,
+    publishCragLicense = null,
+    waitForHealthFn = null,
   },
 ) {
   if (!startCurrent(control)) return { ok: false, reason: 'start_cancelled' }
@@ -1112,6 +1341,9 @@ async function launchRustKernel(
       allowMissingCredential,
       prepareGuestAppArmor,
       crag: !!licensed.license,
+      agentClient,
+      publishCragLicense,
+      waitForHealthFn,
     })
   }
   const wedged = rustKernelProcessUp(existing) && !rustKernelReachable(existing) && !occupied
@@ -1270,7 +1502,25 @@ function writeKernelJsonAtomically(configPath, config, vm) {
 export function writeKernelConfig(
   projectRoot,
   vm,
-  { token, proxyUrl, proxyRequired, officialCcInference, timezone, routing, publish = true } = {},
+  {
+    token,
+    proxyUrl,
+    proxyRequired,
+    officialCcInference,
+    timezone,
+    locale,
+    routing,
+    publish = true,
+    runtimeMode,
+    kvmMode,
+    accel,
+    sharedClaudeBin,
+    wireProfileReadonlyDir,
+    bridgeSocketDir,
+    vsockEnabled,
+    listenVsockPort,
+    existsSync = fs.existsSync,
+  } = {},
 ) {
   // Callers pass partial vm snapshots; persisted placement owns the guest run mount.
   const record = getVm(projectRoot, vm.id) || vm
@@ -1328,8 +1578,19 @@ export function writeKernelConfig(
     if (host.native) return null
     throw err
   }
-  const claudeBin = resolveSlotClaude(target, kernelRouting, host).bin
-  const tz = String(timezone || vm.timezone || previous.timezone || '').trim()
+  const activeCragManifest = dataplane === 'crag' ? activeCragManifestForSlot(projectRoot, target, homeDir) : null
+  const resolvedClaude = resolveSlotClaude(target, kernelRouting, {
+    ...host,
+    homeDir,
+    manifest: activeCragManifest,
+    ...(runtimeMode !== undefined ? { runtimeMode } : {}),
+    ...(sharedClaudeBin !== undefined ? { sharedClaudeBin } : {}),
+    ...(wireProfileReadonlyDir !== undefined ? { wireProfileReadonlyDir } : {}),
+  })
+  const claudeBin = resolvedClaude.bin
+  const capacityOptions = activeCragManifest?.capabilities ? { capabilities: activeCragManifest.capabilities } : null
+  const tz = String(timezone || target.timezone || target.fingerprint?.timezone || previous.timezone || '').trim()
+  const loc = String(locale || target.locale || target.fingerprint?.locale || previous.locale || '').trim()
   const defaultCacheTtl = routing != null ? cacheTtlFromRouting(routing) : normalizeCacheTtl(previous.default_cache_ttl)
   const thinkingDisplay =
     routing != null
@@ -1382,7 +1643,7 @@ export function writeKernelConfig(
     dataplane,
     ...(dataplane === 'crag' ? { license_dir: '/run/kin/crag-license' } : {}),
     claude_bin: claudeBin,
-    slots_per_worker: wrapSlotCount(vm, routing || {}),
+    slots_per_worker: wrapSlotCount(vm, routing || {}, capacityOptions),
     persona_preset: resolveSlotPersonaPreset(vm, routing || {}),
     system_layout: resolveCliSystemLayout(vm, routing || {}),
     // cli-node hot-reads this per job: UA, billing cc_version and CCH input follow the slot's profile.
@@ -1404,6 +1665,32 @@ export function writeKernelConfig(
     config.asset_dir = '/run/kin/crag-native-assets'
     config.work_dir = '/run/kin/work'
     config.cli_version = ''
+    const slotCustomOs =
+      resolvedClaude.customOs ||
+      resolvedClaude.sharedStore ||
+      (isCragDebian13Kernel(target?.kernel) && isCustomOsSlot(target, { runtimeMode }))
+    if (slotCustomOs) {
+      config.wire_profile_readonly_dir = resolvedClaude.wireProfileReadonlyDir || CUSTOM_OS_PROFILES_DIR
+      config.bridge_socket_dir = String(bridgeSocketDir || CUSTOM_OS_BRIDGE_TMPFS_DIR).trim()
+    }
+    if (kind === 'kvm' && isCustomKvmMode({ vm: target, kvmMode, runtimeMode })) {
+      // Guest root holds CAP_SYS_PTRACE (`core_check` / `crag-core-check.mjs --user 0`),
+      // while Docker slots keep `disable_dumpable` unset so non-root `kincli` checks pass.
+      config.disable_dumpable = true
+      const resolvedAccel = String(accel || target?.runtime?.accel || '')
+        .trim()
+        .toLowerCase()
+      const hasVsockDev = existsSync === fs.existsSync ? isVhostVsockUsable() : existsSync('/dev/vhost-vsock')
+      const useVsock =
+        vsockEnabled === true ||
+        (vsockEnabled !== false && resolvedAccel !== 'tcg' && existsSync('/dev/kvm') && hasVsockDev)
+      if (useVsock) {
+        const port = Number(listenVsockPort ?? DEFAULT_KVM_VSOCK_PORT)
+        if (Number.isInteger(port) && port >= 1 && port <= 65535) {
+          config.listen_vsock_port = port
+        }
+      }
+    }
     if (!host.bakedKernel) {
       const owner = runtimeFileOwner(vm)
       for (const name of ['crag-native-assets', 'work']) {
@@ -1413,7 +1700,7 @@ export function writeKernelConfig(
           privileged,
         })
       }
-      acceptNativeClaudeSetup(homeDir, '/run/kin/work', vm)
+      if (!resolvedClaude.headlessBridge) acceptNativeClaudeSetup(homeDir, '/run/kin/work', vm)
     }
     if (
       config.telemetry &&
@@ -1439,6 +1726,7 @@ export function writeKernelConfig(
   }
 
   if (tz) config.timezone = tz
+  if (loc) config.locale = loc
   if (testEndpoints) {
     const anthropicBaseUrl = String(process.env.KIN_ANTHROPIC_BASE_URL || '').trim()
     const oauthTokenUrl = String(process.env.KIN_OAUTH_TOKEN_URL || '').trim()
@@ -1450,7 +1738,19 @@ export function writeKernelConfig(
     fs.chmodSync(configPath, privileged ? 0o600 : 0o640)
   } catch {}
   // Legacy cli-node hot-reads settings; native V2 uses an explicit idle restart.
-  if (changed && publish) host.queueSyncRun(record, path.join(projectRoot, 'vms', vm.id))
+  if (changed && publish) {
+    host.queueSyncRun(record, path.join(projectRoot, 'vms', vm.id))
+    if (!host.bakedKernel && kind === 'kvm' && isCustomKvmMode({ vm: target, kvmMode, runtimeMode })) {
+      const kvmDir = path.join(projectRoot, 'vms', vm.id, 'kvm')
+      if (fs.existsSync(path.join(kvmDir, 'agent.sock')) && readSlotAgentToken(kvmDir)) {
+        void syncCustomKvmSlotFiles(projectRoot, target, {
+          runDir,
+          targets: ['kernel_config'],
+          timeoutMs: 2500,
+        }).catch(() => {})
+      }
+    }
+  }
   return {
     runDir,
     socketPath,

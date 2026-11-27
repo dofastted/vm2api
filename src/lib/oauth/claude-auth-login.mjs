@@ -2,27 +2,168 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { inspectContainer } from '../vm/vm-runtime.mjs'
 import { execCapture, inspectContainerOrNull } from '../cluster/docker-remote.mjs'
+import {
+  CUSTOM_OS_CLAUDE_CURRENT,
+  isCustomOsSlot,
+  resolveHostSharedStoreDir,
+  validateReadOnlyNoFollowPath,
+} from '../vm/custom-os-runtime.mjs'
 import { LOCAL_CRAG_CLAUDE, REMOTE_CRAG_CLAUDE } from '../vm/slot-engine.mjs'
 import { slotExecCmd, slotExecContainer } from '../vm/slot-exec.mjs'
 import { slotHost } from '../vm/slot-host.mjs'
 import { flattenOauthIdentity } from './oauth-identity.mjs'
-import { cragSlotArch, installedCragV2Root, materializeCragV2, verifyCragV2Tree } from '../vm/wrap-cli-runtime.mjs'
+import {
+  cragSlotArch,
+  cragV2PackageRoot,
+  installedCragV2Root,
+  materializeCragV2,
+  verifyCragV2Tree,
+} from '../vm/wrap-cli-runtime.mjs'
 
 export const AUTH_LOGIN_SOURCE = 'claude-auth-login'
 export const AUTH_LOGIN_FLAVOR = 'claude_code'
+
+const SHARED_CURRENT_TARGET_RE = /^versions\/(\d+\.\d+\.\d+(?:-[A-Za-z0-9.]+)?)\/claude$/
 
 function fail(code, message) {
   return Object.assign(new Error(message), { code })
 }
 
+function usesCustomOsSharedStore(vm, opts = null) {
+  if (slotHost(vm).bakedKernel) return false
+  return isCustomOsSlot(vm, opts)
+}
+
+function verifyElf64ArchFast(filePath, expectedArch) {
+  let fd
+  try {
+    const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0)
+    fd = fs.openSync(filePath, flags)
+    const head = Buffer.alloc(64)
+    const read = fs.readSync(fd, head, 0, 64, 0)
+    if (
+      read < 64 ||
+      head.readUInt32BE(0) !== 0x7f454c46 ||
+      head[4] !== 2 ||
+      head[5] !== 1 ||
+      head[6] !== 1 ||
+      ![2, 3].includes(head.readUInt16LE(16))
+    ) {
+      return {
+        ok: false,
+        code: 'shared_store_elf_invalid',
+        error: `只读共享 store Claude 不是有效的 Linux ELF64 可执行文件: ${filePath}`,
+      }
+    }
+    if (expectedArch === 'amd64' || expectedArch === 'arm64') {
+      const expectedMachine = expectedArch === 'arm64' ? 183 : 62
+      if (head.readUInt16LE(18) !== expectedMachine) {
+        return {
+          ok: false,
+          code: 'shared_store_arch_mismatch',
+          error: `只读共享 store Claude 架构与槽位 ${expectedArch} 不匹配: ${filePath}`,
+        }
+      }
+    }
+    return { ok: true }
+  } catch (err) {
+    return {
+      ok: false,
+      code: err?.code === 'ELOOP' ? 'shared_store_symlink_rejected' : 'shared_store_open_failed',
+      error: `无法打开只读共享 store Claude: ${err?.message || err}`,
+    }
+  } finally {
+    if (fd != null) fs.closeSync(fd)
+  }
+}
+
+function isUnbundledCragManifest(dir) {
+  try {
+    const manifest = JSON.parse(fs.readFileSync(path.join(dir, 'manifest.json'), 'utf8'))
+    return manifest?.officialClaude?.bundled === false
+  } catch {
+    return false
+  }
+}
+
+function resolveSharedCragTreeDir(projectRoot, vm, storeRoot, slotArch) {
+  const installed = installedCragV2Root(projectRoot, vm)
+  if (installed && fs.existsSync(path.join(installed, 'manifest.json'))) return installed
+  for (const candidate of [path.join(storeRoot, 'crag', 'current'), path.join(storeRoot, 'crag')]) {
+    if (fs.existsSync(path.join(candidate, 'manifest.json'))) return candidate
+  }
+  try {
+    const packaged = cragV2PackageRoot(projectRoot, slotArch)
+    if (packaged && isUnbundledCragManifest(packaged)) return packaged
+  } catch {}
+  return ''
+}
+
+function verifySharedStoreAuthClaude(projectRoot, vm, opts = null) {
+  const storeRoot = resolveHostSharedStoreDir(projectRoot, opts)
+  if (!storeRoot) {
+    throw fail('shared_store_missing', 'custom-os 模式缺少只读共享 store 根目录配置')
+  }
+  const claudeDir = path.join(storeRoot, 'claude')
+  const versionsDir = path.join(claudeDir, 'versions')
+  const currentLink = path.join(claudeDir, 'current')
+
+  let linkStat
+  try {
+    linkStat = fs.lstatSync(currentLink)
+  } catch {
+    throw fail('shared_store_claude_missing', `只读共享 store 缺少 ${currentLink}`)
+  }
+  if (!linkStat.isSymbolicLink()) {
+    throw fail('shared_store_current_invalid', '只读共享 store claude/current 必须是相对符号链接')
+  }
+  const rawTarget = fs.readlinkSync(currentLink).replaceAll('\\', '/')
+  const match = SHARED_CURRENT_TARGET_RE.exec(rawTarget)
+  if (!match) {
+    throw fail('shared_store_current_invalid', `只读共享 store claude/current 目标非法: ${rawTarget}`)
+  }
+
+  const requireReadOnly = opts?.requireReadOnlyExternal ?? process.platform !== 'win32'
+  const resolvedBin = path.join(versionsDir, match[1], 'claude')
+  const pathCheck = validateReadOnlyNoFollowPath(resolvedBin, versionsDir, {
+    requireExecutable: true,
+    requireNotWritable: requireReadOnly,
+  })
+  if (!pathCheck.ok) throw fail(pathCheck.code, pathCheck.error)
+
+  const slotArch = cragSlotArch(projectRoot, vm)
+  const elfCheck = verifyElf64ArchFast(pathCheck.path, slotArch)
+  if (!elfCheck.ok) throw fail(elfCheck.code, elfCheck.error)
+
+  const cragTree = resolveSharedCragTreeDir(projectRoot, vm, storeRoot, slotArch)
+  if (cragTree) {
+    const verified = verifyCragV2Tree(cragTree, {
+      arch: slotArch,
+      allowPreviousClaude: true,
+      allowUnbundledStore: true,
+      sharedClaudeStoreRoot: storeRoot,
+      requireReadOnlyExternal: requireReadOnly,
+    })
+    if (!verified.ok) throw fail(verified.code, verified.error)
+  }
+
+  return { storeRoot, version: match[1], binaryPath: pathCheck.path }
+}
+
 /** Login and operations select the same native CLI, never a PATH alias. */
-export function resolveAuthLoginClaude(vm) {
-  return slotHost(vm).bakedKernel ? REMOTE_CRAG_CLAUDE : LOCAL_CRAG_CLAUDE
+export function resolveAuthLoginClaude(vm, opts = null) {
+  if (slotHost(vm).bakedKernel) return REMOTE_CRAG_CLAUDE
+  if (usesCustomOsSharedStore(vm, opts)) return CUSTOM_OS_CLAUDE_CURRENT
+  return LOCAL_CRAG_CLAUDE
 }
 
 /** Stage a complete package without selecting CRAG as the slot's inference engine. */
-function stageBundledAuthClaude(projectRoot, vm) {
+export function stageBundledAuthClaude(projectRoot, vm, opts = null) {
   if (slotHost(vm).bakedKernel) return
+  if (usesCustomOsSharedStore(vm, opts)) {
+    verifySharedStoreAuthClaude(projectRoot, vm, opts)
+    return
+  }
   const slotArch = cragSlotArch(projectRoot, vm)
   const installed = installedCragV2Root(projectRoot, vm)
   if (installed && fs.existsSync(path.join(installed, 'manifest.json'))) {
@@ -36,7 +177,11 @@ function stageBundledAuthClaude(projectRoot, vm) {
   if (!staged.ok) throw fail(staged.code, staged.error)
 }
 
-export async function assertAuthLoginReady(projectRoot, vm, { inspect = inspectContainer, cliExists = null } = {}) {
+export async function assertAuthLoginReady(
+  projectRoot,
+  vm,
+  { inspect = inspectContainer, cliExists = null, ...storeOpts } = {},
+) {
   const host = slotHost(vm)
   const container = slotExecContainer(vm)
   let running
@@ -48,8 +193,8 @@ export async function assertAuthLoginReady(projectRoot, vm, { inspect = inspectC
   }
   if (!running) throw fail('container_not_ready', '虚拟机尚未运行，请先启动再打开终端')
 
-  const bin = resolveAuthLoginClaude(vm)
-  stageBundledAuthClaude(projectRoot, vm)
+  const bin = resolveAuthLoginClaude(vm, storeOpts)
+  stageBundledAuthClaude(projectRoot, vm, storeOpts)
   const { Cmd, User } = slotExecCmd(vm, ['sh', '-c', 'test -f "$1" && test -x "$1"', 'auth-cli', bin], {
     user: host.execUser(vm),
   })
