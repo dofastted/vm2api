@@ -1,0 +1,10 @@
+{
+  "autoUpdates": false,
+  "env": {
+    "DISABLE_AUTOUPDATER": "1",
+    "CLAUDE_CODE_USE_BEDROCK": "0",
+    "CLAUDE_CODE_USE_VERTEX": "0",
+    "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
+    "CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS": "1"
+  }
+}

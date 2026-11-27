@@ -283,12 +283,14 @@ import { DEFAULT_MAX_REQUEST_BYTES, reloadActiveVm } from '../core/config.mjs'
 import {
   OS_CATALOG,
   kernelForIndex,
+  normalizeOsKernel,
   normalizeTimezone,
   nextNumericIndex,
   padVm,
   discardSlotContainer,
   STANDARD_LOCALE,
 } from '../vm/vm-runtime.mjs'
+import { isCragDebian13Kernel } from '../vm/custom-os-runtime.mjs'
 import {
   startSlotReady,
   reloadSlotReady,
@@ -990,7 +992,10 @@ export function createPanelHandler(ctx) {
     if (!hasBoundExit(vm.proxy)) {
       startError = 'no_exit'
     } else {
-      const boot = await startSlotReady(vm, cfg.paths.project, { routing: ctx.routingConfig, bindSubscription })
+      const boot = await (ctx.startSlotReady || startSlotReady)(vm, cfg.paths.project, {
+        routing: ctx.routingConfig,
+        bindSubscription,
+      })
       vm = getVm(cfg.paths.project, id) || vm
       if (!boot?.ok) {
         startError = boot?.error || boot?.reason || 'runtime start failed'
@@ -1466,6 +1471,14 @@ export function createPanelHandler(ctx) {
       targetDataplane !== 'crag' &&
       !isCodexVm(desired) &&
       typeof ctx.cragSubscription?.releaseStoppedBinding === 'function'
+    if (!isCodexVm(desired) && isCragDebian13Kernel(desired.kernel) && targetDataplane !== 'crag') {
+      return {
+        ok: false,
+        id,
+        code: 'crag_debian13_crag_only',
+        error: 'crag-debian13 槽位仅支持 CRAG 推理数据面，不能切换为 cli-node/wrap',
+      }
+    }
     if (kernelSwitch && targetDataplane === 'crag' && targetVersion === 'v2') {
       if (isNativeNodeVm(desired)) {
         return { ok: false, id, code: 'native_crag_unsupported', error: 'crag 数据面暂不支持 macOS 原生节点' }
@@ -2302,6 +2315,14 @@ export function createPanelHandler(ctx) {
           return json(res, 400, {
             ok: false,
             error: { code: 'kernel_switch_unsupported', message: '当前槽位不支持切换 Claude 内核' },
+          })
+        if (isCragDebian13Kernel(vm.kernel) && body.dataplane !== 'crag')
+          return json(res, 400, {
+            ok: false,
+            error: {
+              code: 'crag_debian13_crag_only',
+              message: 'crag-debian13 槽位仅支持 CRAG 推理数据面，不能切换为 cli-node/wrap',
+            },
           })
         // readBody yielded: reserve only after checking the latest admission state.
         if (kernelSwitchJobs.get(id)?.status === 'running')
@@ -4811,7 +4832,8 @@ export function createPanelHandler(ctx) {
                   ? 404
                   : slotPolicyResult.code?.startsWith('license_')
                     ? 403
-                    : slotPolicyResult.code === 'gpt_engine_forbidden'
+                    : slotPolicyResult.code === 'gpt_engine_forbidden' ||
+                        slotPolicyResult.code === 'crag_debian13_crag_only'
                       ? 400
                       : 503
               return json(res, status, {
@@ -6012,18 +6034,26 @@ export function createPanelHandler(ctx) {
           }
         }
         const startNow = body.start !== false && body.status !== 'stopped'
-        const wantKernel = body.kernel && OS_CATALOG[body.kernel] ? body.kernel : kernelForIndex(idx)
+        const wantKernel = normalizeOsKernel(body.kernel) || kernelForIndex(idx)
+        const cragDebian13Create = isCragDebian13Kernel(wantKernel)
         let nodeId = body.node_id ? String(body.node_id) : null
         const kindProbe = {}
         stampVmKind(kindProbe, body)
         const codexCreate = isCodexVm(kindProbe)
+        if (codexCreate && cragDebian13Create) {
+          return json(res, 400, {
+            ok: false,
+            error: { code: 'invalid_create_dataplane', message: 'crag-debian13 仅支持 Anthropic CRAG 槽位' },
+          })
+        }
         if (Object.hasOwn(body, 'dataplane') && (codexCreate || !['wrap', 'crag'].includes(body.dataplane))) {
           return json(res, 400, {
             ok: false,
             error: { code: 'invalid_create_dataplane', message: '仅 Anthropic 支持选择 cli-node 或 CRAG 推理内核' },
           })
         }
-        const selectedCrag = body.dataplane === 'crag'
+        const effectiveDataplane = !codexCreate ? (cragDebian13Create ? 'crag' : (body.dataplane ?? 'wrap')) : undefined
+        const selectedCrag = !codexCreate && effectiveDataplane === 'crag'
         const unsupportedCrag = () =>
           json(res, 409, {
             ok: false,
@@ -6284,7 +6314,7 @@ export function createPanelHandler(ctx) {
         }
         if (nodeId) vm.node_id = nodeId
         stampVmKind(vm, body)
-        if (!codexCreate) vm.dataplane = body.dataplane ?? 'wrap'
+        if (!codexCreate) vm.dataplane = effectiveDataplane
         if (selectedCrag) {
           vm.crag_kernel_version = 'v2'
           // Do not publish a running record before the selected CRAG has passed licensing.
@@ -6420,7 +6450,7 @@ export function createPanelHandler(ctx) {
         if (!startError && startNow && hasExit(vm)) {
           let boot
           try {
-            boot = await startSlotReady(vm, cfg.paths.project, {
+            boot = await (ctx.startSlotReady || startSlotReady)(vm, cfg.paths.project, {
               routing: ctx.routingConfig,
               bindSubscription: createBindSubscription,
             })

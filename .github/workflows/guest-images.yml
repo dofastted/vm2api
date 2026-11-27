@@ -35,6 +35,8 @@ jobs:
             image: arch:latest
           - directory: fedora-41
             image: fedora:41
+          - directory: debian-13
+            image: debian:13-baked
     steps:
       - uses: actions/checkout@v7
       - uses: docker/setup-buildx-action@v4
@@ -106,6 +108,10 @@ jobs:
           - family: fedora
             tag: '41'
             cloud_image: https://download.fedoraproject.org/pub/archive/fedora/linux/releases/41/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-41-1.4.x86_64.qcow2
+          - family: debian
+            tag: '13'
+            cloud_image: ''
+            skip_cloud_image: '1'
     steps:
       - uses: actions/checkout@v7
       - uses: docker/setup-buildx-action@v4
@@ -130,5 +136,6 @@ jobs:
           tags: ${{ steps.meta.outputs.tag }}
           build-args: |
             CLOUD_IMAGE_URL=${{ matrix.cloud_image }}
-          cache-from: type=gha,scope=kin-kvm-${{ matrix.family }}
-          cache-to: type=gha,scope=kin-kvm-${{ matrix.family }},mode=max
+            SKIP_CLOUD_IMAGE=${{ matrix.skip_cloud_image || '0' }}
+          cache-from: type=gha,scope=kin-kvm-${{ matrix.family }}-${{ matrix.tag }}
+          cache-to: type=gha,scope=kin-kvm-${{ matrix.family }}-${{ matrix.tag }},mode=max

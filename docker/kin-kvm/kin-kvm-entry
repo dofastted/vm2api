@@ -1,13 +1,16 @@
 #!/bin/bash
-# PID1 of the kin-kvm runner. Prepares overlay/seed/key, starts qemu
-# (dropped to KIN_KVM_UID:GID) and socat kernel.sock → guest:7070.
+# PID1 of the kin-kvm runner. Supports:
+#   - KIN_KVM_MODE=legacy (default): qcow2 + cloud-init seed ISO + 9p + OVMF + socat TCP:7070
+#   - KIN_KVM_MODE=custom-erofs: direct kernel + EROFS rootfs + offline mke2fs ext4 state disk
+#     + read-only virtiofs (or virtio-blk fallback) + virtio-vsock (or virtio-serial fallback)
+#     + full SMBIOS Type 0/1/2/3/4/17 + zero cloud-init + zero 9p + zero KSM (mem-merge=off).
 set -eu
 
 die() { echo "kin-kvm: $*" >&2; exit 1; }
 log() {
   printf 'kin-kvm: %s\n' "$*" >&2
-  if [ -d /slot/kvm ]; then
-    printf 'kin-kvm: %s\n' "$*" >> /slot/kvm/entry.log
+  if [ -d "${SLOT_KVM:-/slot/kvm}" ]; then
+    printf 'kin-kvm: %s\n' "$*" >> "${SLOT_KVM:-/slot/kvm}/entry.log"
   fi
 }
 
@@ -22,15 +25,49 @@ require() {
   fi
 }
 
+KIN_KVM_MODE=${KIN_KVM_MODE:-legacy}
+case "$KIN_KVM_MODE" in
+  legacy|custom-erofs) ;;
+  *) die "KIN_KVM_MODE must be legacy or custom-erofs (got ${KIN_KVM_MODE})" ;;
+esac
+
+SLOT_KVM=${KIN_KVM_SLOT_KVM:-/slot/kvm}
+SLOT_RUN=${KIN_KVM_SLOT_RUN:-/slot/run}
+SLOT_HOME=${KIN_KVM_SLOT_HOME:-/slot/home}
+PAYLOAD=${KIN_KVM_PAYLOAD_DIR:-/opt/kin-guest}
+OPT_KVM=${KIN_KVM_OPT_DIR:-/opt/kin-kvm}
+KIN_KVM_SMBIOS_ARGS_FILE=${KIN_KVM_SMBIOS_ARGS_FILE:-$SLOT_KVM/fingerprint/qemu-smbios.args}
+KIN_KVM_HW_PLAN_FILE=${KIN_KVM_HW_PLAN_FILE:-$SLOT_KVM/fingerprint/hardware.json}
+KIN_KVM_STORE_MODE=${KIN_KVM_STORE_MODE:-auto}
+KIN_KVM_STORE_DIR=${KIN_KVM_STORE_DIR:-/opt/kin/store}
+KIN_KVM_STORE_BLK_IMAGE=${KIN_KVM_STORE_BLK_IMAGE:-}
+KIN_KVM_VSOCK_PORT=${KIN_KVM_VSOCK_PORT:-7070}
+KIN_KVM_AGENT_VSOCK_PORT=${KIN_KVM_AGENT_VSOCK_PORT:-7071}
+KIN_KVM_AGENT_SOCK=${KIN_KVM_AGENT_SOCK:-$SLOT_KVM/agent.sock}
+KIN_KVM_KERNEL_SOCK=${KIN_KVM_KERNEL_SOCK:-$SLOT_RUN/kernel.sock}
+KIN_KVM_DRY_RUN=${KIN_KVM_DRY_RUN:-0}
+
 require \
   KIN_VM_ID \
   KIN_KVM_UID KIN_KVM_GID \
-  KIN_KVM_MEMORY_MB KIN_KVM_VCPUS KIN_KVM_DISK_GB \
+  KIN_KVM_MEMORY_MB KIN_KVM_VCPUS \
   KIN_KVM_CPU_MODEL KIN_KVM_MAC KIN_KVM_DISK_SERIAL \
-  KIN_KVM_HOSTNAME KIN_KVM_MACHINE_ID KIN_KVM_ACCEL \
-  KIN_KVM_SMBIOS_MANUFACTURER KIN_KVM_SMBIOS_PRODUCT \
-  KIN_KVM_SMBIOS_VERSION KIN_KVM_SMBIOS_FAMILY \
-  KIN_KVM_SMBIOS_SERIAL KIN_KVM_SMBIOS_UUID
+  KIN_KVM_HOSTNAME KIN_KVM_MACHINE_ID KIN_KVM_ACCEL
+
+if [ "$KIN_KVM_MODE" = legacy ]; then
+  require \
+    KIN_KVM_DISK_GB \
+    KIN_KVM_SMBIOS_MANUFACTURER KIN_KVM_SMBIOS_PRODUCT \
+    KIN_KVM_SMBIOS_VERSION KIN_KVM_SMBIOS_FAMILY \
+    KIN_KVM_SMBIOS_SERIAL KIN_KVM_SMBIOS_UUID
+else
+  if [ ! -f "$KIN_KVM_SMBIOS_ARGS_FILE" ]; then
+    require \
+      KIN_KVM_SMBIOS_MANUFACTURER KIN_KVM_SMBIOS_PRODUCT \
+      KIN_KVM_SMBIOS_VERSION KIN_KVM_SMBIOS_FAMILY \
+      KIN_KVM_SMBIOS_SERIAL KIN_KVM_SMBIOS_UUID
+  fi
+fi
 
 KIN_VM_NAME=${KIN_VM_NAME:-$KIN_VM_ID}
 KIN_VM_OS=${KIN_VM_OS:-ubuntu-24.04}
@@ -43,7 +80,7 @@ case "$KIN_KVM_ACCEL" in
   *) die "KIN_KVM_ACCEL must be kvm or tcg (got ${KIN_KVM_ACCEL})" ;;
 esac
 
-if [ "$KIN_KVM_ACCEL" = kvm ]; then
+if [ "$KIN_KVM_ACCEL" = kvm ] && [ "$KIN_KVM_DRY_RUN" != 1 ]; then
   if [ ! -c /dev/kvm ] || [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
     die "KIN_KVM_ACCEL=kvm requires /dev/kvm read-write"
   fi
@@ -51,18 +88,17 @@ fi
 
 UID_NUM=$KIN_KVM_UID
 GID_NUM=$KIN_KVM_GID
-SLOT_KVM=/slot/kvm
-SLOT_RUN=/slot/run
-SLOT_HOME=/slot/home
-PAYLOAD=/opt/kin-guest
-BASE=/opt/kin-kvm/base.qcow2
-BASE_ID_FILE=/opt/kin-kvm/base.id
-[ -f "$BASE" ] || die "missing $BASE"
-[ -f "$BASE_ID_FILE" ] || die "missing $BASE_ID_FILE"
-BASE_ID=$(tr -d '[:space:]' < "$BASE_ID_FILE")
-
 mkdir -p "$SLOT_KVM" "$SLOT_RUN" "$SLOT_HOME" "$SLOT_HOME/.claude"
 mkdir -p "$PAYLOAD/usr/local/bin" "$PAYLOAD/opt/kin" 2>/dev/null || true
+
+# Load zero-eval hardware plan & strict SMBIOS loader helpers.
+HW_PLAN_HELPER=${KIN_KVM_LOAD_HW_PLAN:-/usr/local/bin/load-hw-plan.sh}
+if [ ! -f "$HW_PLAN_HELPER" ]; then
+  HW_PLAN_HELPER="$(cd -- "$(dirname -- "$0")" && pwd)/load-hw-plan.sh"
+fi
+[ -f "$HW_PLAN_HELPER" ] || die "missing helper $HW_PLAN_HELPER"
+# shellcheck disable=SC1090
+. "$HW_PLAN_HELPER"
 
 if [ "$KIN_KVM_ACCEL" = tcg ]; then
   ACCEL_ARG='tcg,thread=multi'
@@ -75,6 +111,26 @@ if [ "$KIN_KVM_ACCEL" = tcg ]; then
 else
   ACCEL_ARG=kvm
   CPU_MODEL=$KIN_KVM_CPU_MODEL
+fi
+
+HOST_MAX_MEMORY_MB=$KIN_KVM_MEMORY_MB
+HOST_MAX_VCPUS=$KIN_KVM_VCPUS
+not_applied=""
+if [ -f "$KIN_KVM_HW_PLAN_FILE" ] && [ "${KIN_KVM_APPLY_HW_PLAN:-1}" != 0 ]; then
+  load_hw_plan "$KIN_KVM_HW_PLAN_FILE"
+  if printf '%s' "$HOST_MAX_MEMORY_MB" | grep -Eq '^[0-9]+$' \
+     && printf '%s' "$KIN_KVM_MEMORY_MB" | grep -Eq '^[0-9]+$' \
+     && [ "$KIN_KVM_MEMORY_MB" -gt "$HOST_MAX_MEMORY_MB" ]; then
+    log "clamping hardware plan memory ${KIN_KVM_MEMORY_MB}M -> slot ceiling ${HOST_MAX_MEMORY_MB}M (SMBIOS Type 17 preserved)"
+    KIN_KVM_MEMORY_MB=$HOST_MAX_MEMORY_MB
+  fi
+  if printf '%s' "$HOST_MAX_VCPUS" | grep -Eq '^[0-9]+$' \
+     && printf '%s' "$KIN_KVM_VCPUS" | grep -Eq '^[0-9]+$' \
+     && [ "$KIN_KVM_VCPUS" -gt "$HOST_MAX_VCPUS" ]; then
+    log "clamping hardware plan vcpus ${KIN_KVM_VCPUS} -> slot ceiling ${HOST_MAX_VCPUS}"
+    KIN_KVM_VCPUS=$HOST_MAX_VCPUS
+  fi
+  log "qemu resources from hardware plan ($KIN_KVM_HW_PLAN_FILE); not applied: ${not_applied:-}"
 fi
 
 find_ovmf() {
@@ -104,6 +160,21 @@ smbios_escape() {
   printf '%s' "$1" | sed 's/,/,,/g'
 }
 
+resolve_smbios_args() {
+  FP_SMBIOS=()
+  if [ -f "$KIN_KVM_SMBIOS_ARGS_FILE" ]; then
+    if ! load_smbios_args "$KIN_KVM_SMBIOS_ARGS_FILE"; then
+      die "invalid or unsafe qemu-smbios.args: $KIN_KVM_SMBIOS_ARGS_FILE"
+    fi
+    log "loaded full SMBIOS args from $KIN_KVM_SMBIOS_ARGS_FILE (${#FP_SMBIOS[@]} tokens)"
+    return 0
+  fi
+  FP_SMBIOS=(
+    -uuid "$KIN_KVM_SMBIOS_UUID"
+    -smbios "type=1,manufacturer=$(smbios_escape "$KIN_KVM_SMBIOS_MANUFACTURER"),product=$(smbios_escape "$KIN_KVM_SMBIOS_PRODUCT"),version=$(smbios_escape "$KIN_KVM_SMBIOS_VERSION"),serial=$(smbios_escape "$KIN_KVM_SMBIOS_SERIAL"),uuid=$KIN_KVM_SMBIOS_UUID,family=$(smbios_escape "$KIN_KVM_SMBIOS_FAMILY")"
+  )
+}
+
 ensure_overlay() {
   local need=0
   if [ ! -f "$SLOT_KVM/disk.qcow2" ]; then
@@ -127,7 +198,9 @@ ensure_overlay() {
 
 ensure_key() {
   if [ ! -f "$SLOT_KVM/id_ed25519" ]; then
-    ssh-keygen -t ed25519 -f "$SLOT_KVM/id_ed25519" -N '' -C "kin-kvm-$KIN_VM_ID" >/dev/null
+    ssh-keygen -q -t ed25519 -f "$SLOT_KVM/id_ed25519" -N '' -C "kin-kvm-$KIN_VM_ID" >/dev/null
+  elif [ ! -f "$SLOT_KVM/id_ed25519.pub" ]; then
+    ssh-keygen -y -f "$SLOT_KVM/id_ed25519" > "$SLOT_KVM/id_ed25519.pub"
   fi
   chmod 600 "$SLOT_KVM/id_ed25519"
   chmod 644 "$SLOT_KVM/id_ed25519.pub"
@@ -197,19 +270,119 @@ s.close()
 PY
 }
 
+ensure_agent_token() {
+  local token_file=${KIN_AGENT_TOKEN_FILE:-$SLOT_KVM/.agent-token}
+  local token=${KIN_AGENT_TOKEN:-}
+  if [ -z "$token" ] && [ -f "$token_file" ]; then
+    token=$(tr -d '[:space:]' < "$token_file")
+  elif [ -z "$token" ] && [ -f "$SLOT_KVM/agent.token" ]; then
+    token=$(tr -d '[:space:]' < "$SLOT_KVM/agent.token")
+  fi
+  if [ -z "$token" ]; then
+    token=$(python3 -c 'import secrets; print(secrets.token_hex(32))')
+    ( umask 077 && printf '%s\n' "$token" > "$token_file" )
+  fi
+  if ! printf '%s' "$token" | grep -Eq '^[0-9a-fA-F]{64}$'; then
+    die "KIN_AGENT_TOKEN must be 64 hex characters"
+  fi
+  chmod 600 "$token_file" 2>/dev/null || true
+  AGENT_TOKEN=$(printf '%s' "$token" | tr 'A-F' 'a-f')
+}
+
+ensure_state_ext4() {
+  local state_img="$SLOT_KVM/slot-state.ext4"
+  local state_mb=${KIN_KVM_STATE_MB:-32}
+  STATE_IMG=$state_img
+  if [ -f "$state_img" ]; then
+    return 0
+  fi
+  command -v mke2fs >/dev/null 2>&1 || die "mke2fs (e2fsprogs) is required for custom-erofs state disk"
+  local mid stage tmp_img preset_src
+  mid=$(printf '%s' "$KIN_KVM_MACHINE_ID" | tr -d '-' | tr 'A-F' 'a-f')
+  if ! printf '%s' "$mid" | grep -Eq '^[0-9a-f]{32}$'; then
+    die "KIN_KVM_MACHINE_ID must be 32 hex chars (got ${KIN_KVM_MACHINE_ID})"
+  fi
+  ensure_agent_token
+  ensure_key
+  stage=$(mktemp -d "${TMPDIR:-/tmp}/kin-state-stage.XXXXXX")
+  chmod 0755 "$stage"
+  tmp_img="$SLOT_KVM/.slot-state.ext4.tmp.$$"
+  mkdir -p "$stage/home/.claude" "$stage/run" "$stage/managed-settings.d" "$stage/ssh"
+  chmod 0750 "$stage/home" "$stage/run"
+  chmod 0700 "$stage/home/.claude" "$stage/ssh"
+  chmod 0755 "$stage/managed-settings.d"
+  ln -sfn .claude/.claude.json "$stage/home/.claude.json"
+  cp "$SLOT_KVM/id_ed25519.pub" "$stage/ssh/authorized_keys"
+  chmod 0600 "$stage/ssh/authorized_keys"
+  ssh-keygen -q -t ed25519 -N '' -C "kin-kvm-host-$KIN_VM_ID" -f "$stage/ssh/ssh_host_ed25519_key" >/dev/null
+  chmod 0600 "$stage/ssh/ssh_host_ed25519_key"
+  chmod 0644 "$stage/ssh/ssh_host_ed25519_key.pub"
+  printf '%s\n' "$mid" > "$stage/machine-id"
+  chmod 0444 "$stage/machine-id"
+  printf '%s\n' "$KIN_KVM_HOSTNAME" > "$stage/hostname"
+  chmod 0644 "$stage/hostname"
+  ( umask 077 && printf '%s\n' "$AGENT_TOKEN" > "$stage/.agent-token" )
+  chmod 0600 "$stage/.agent-token"
+  cat > "$stage/slot.env" <<EOF
+KIN_VM_ID=$KIN_VM_ID
+KIN_VM_NAME=$KIN_VM_NAME
+KIN_VM_OS=$KIN_VM_OS
+TZ=$TZ
+LANG=$LANG
+EOF
+  chmod 0644 "$stage/slot.env"
+  preset_src="$SLOT_KVM/fingerprint/system/etc/claude-code/managed-settings.d/10-slot-preset.json"
+  if [ -f "$preset_src" ]; then
+    cp "$preset_src" "$stage/managed-settings.d/10-slot-preset.json"
+    chmod 0644 "$stage/managed-settings.d/10-slot-preset.json"
+  fi
+  if [ "$(id -u)" = 0 ]; then
+    chown 0:0 "$stage" "$stage/ssh" "$stage/ssh/authorized_keys" "$stage/ssh/ssh_host_ed25519_key" "$stage/ssh/ssh_host_ed25519_key.pub" || true
+    chown -h 999:987 "$stage/home" "$stage/home/.claude" "$stage/home/.claude.json" "$stage/run" || true
+  fi
+  # Offline ext4 image build via mke2fs -d: zero root mount required, host never mounts RW during QEMU run.
+  mke2fs -t ext4 -q -F -L kinstate -d "$stage" "$tmp_img" "${state_mb}M"
+  mv -f "$tmp_img" "$state_img"
+  rm -rf "$stage"
+  log "initialized offline ext4 state disk $state_img (${state_mb} MiB, machine_id=${mid:0:8}...)"
+}
+
+find_virtiofsd() {
+  local cand
+  if [ -n "${KIN_KVM_VIRTIOFSD_BIN:-}" ] && [ -x "$KIN_KVM_VIRTIOFSD_BIN" ]; then
+    printf '%s' "$KIN_KVM_VIRTIOFSD_BIN"
+    return 0
+  fi
+  for cand in /usr/libexec/virtiofsd /usr/lib/qemu/virtiofsd /usr/bin/virtiofsd; do
+    if [ -x "$cand" ]; then
+      printf '%s' "$cand"
+      return 0
+    fi
+  done
+  command -v virtiofsd 2>/dev/null || true
+}
+
+sanitize_cmdline_val() {
+  printf '%s' "$1" | tr -cd 'A-Za-z0-9._:/+-'
+}
+
 QEMU_PID=''
 SOCAT_PID=''
+AGENT_SOCAT_PID=''
+VIRTIOFSD_PID=''
 TAIL_PID=''
 STOPPING=0
 
 cleanup() {
-  rm -f "$SLOT_RUN/kernel.sock"
-  if [ -n "${SOCAT_PID:-}" ] && kill -0 "$SOCAT_PID" 2>/dev/null; then
-    kill "$SOCAT_PID" 2>/dev/null || true
+  rm -f "$KIN_KVM_KERNEL_SOCK" "$SLOT_KVM/virtiofs.sock"
+  if [ "${EFFECTIVE_TRANSPORT:-}" = vsock ]; then
+    rm -f "$KIN_KVM_AGENT_SOCK"
   fi
-  if [ -n "${TAIL_PID:-}" ] && kill -0 "$TAIL_PID" 2>/dev/null; then
-    kill "$TAIL_PID" 2>/dev/null || true
-  fi
+  for pid in "${SOCAT_PID:-}" "${AGENT_SOCAT_PID:-}" "${VIRTIOFSD_PID:-}" "${TAIL_PID:-}"; do
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null || true
+    fi
+  done
 }
 
 powerdown() {
@@ -242,12 +415,379 @@ powerdown() {
 trap powerdown TERM INT
 trap cleanup EXIT
 
-find_ovmf
-ensure_overlay
-ensure_key
-ensure_ovmf_vars
-write_seed
+resolve_smbios_args
 
+VIRTIOFSD_CMD=()
+SOCAT_KERNEL_CMD=()
+SOCAT_AGENT_CMD=()
+EFFECTIVE_STORE_MODE=""
+EFFECTIVE_TRANSPORT=""
+STATE_IMG=""
+
+if [ "$KIN_KVM_MODE" = custom-erofs ]; then
+  KERNEL_IMG=${KIN_KVM_KERNEL:-$OPT_KVM/vmlinuz}
+  INITRD_IMG=${KIN_KVM_INITRD:-$OPT_KVM/initrd.img}
+  EROFS_IMG=${KIN_KVM_EROFS_IMAGE:-$OPT_KVM/kin-kvm-debian-13.erofs}
+  if [ "$KIN_KVM_DRY_RUN" != 1 ]; then
+    [ -f "$KERNEL_IMG" ] || die "missing custom-erofs kernel: $KERNEL_IMG"
+    [ -f "$EROFS_IMG" ] || die "missing custom-erofs rootfs: $EROFS_IMG"
+  fi
+
+  ensure_key
+  ensure_state_ext4
+  # Scrub authentication token from runner env before launching unprivileged virtiofsd/QEMU/socat.
+  unset KIN_AGENT_TOKEN AGENT_TOKEN
+
+  # Resolve read-only shared store: prefer virtiofsd, fall back to read-only virtio-blk.
+  VIRTIOFSD_BIN=$(find_virtiofsd)
+  case "$KIN_KVM_STORE_MODE" in
+    virtiofs)
+      [ -n "$VIRTIOFSD_BIN" ] || die "KIN_KVM_STORE_MODE=virtiofs requested but virtiofsd binary not found"
+      [ -d "$KIN_KVM_STORE_DIR" ] || die "KIN_KVM_STORE_DIR missing: $KIN_KVM_STORE_DIR"
+      EFFECTIVE_STORE_MODE=virtiofs
+      ;;
+    virtio-blk)
+      [ -n "$KIN_KVM_STORE_BLK_IMAGE" ] || die "KIN_KVM_STORE_MODE=virtio-blk requires KIN_KVM_STORE_BLK_IMAGE"
+      if [ "$KIN_KVM_DRY_RUN" != 1 ]; then
+        [ -f "$KIN_KVM_STORE_BLK_IMAGE" ] || die "KIN_KVM_STORE_BLK_IMAGE not found: $KIN_KVM_STORE_BLK_IMAGE"
+      fi
+      EFFECTIVE_STORE_MODE=virtio-blk
+      ;;
+    auto)
+      if [ -n "$VIRTIOFSD_BIN" ] && [ -d "$KIN_KVM_STORE_DIR" ]; then
+        EFFECTIVE_STORE_MODE=virtiofs
+      elif [ -n "$KIN_KVM_STORE_BLK_IMAGE" ] && { [ "$KIN_KVM_DRY_RUN" = 1 ] || [ -f "$KIN_KVM_STORE_BLK_IMAGE" ]; }; then
+        EFFECTIVE_STORE_MODE=virtio-blk
+      else
+        die "no shared store backend available (install virtiofsd + $KIN_KVM_STORE_DIR or set KIN_KVM_STORE_BLK_IMAGE)"
+      fi
+      ;;
+    *)
+      die "KIN_KVM_STORE_MODE must be auto, virtiofs, or virtio-blk (got ${KIN_KVM_STORE_MODE})"
+      ;;
+  esac
+
+  # Resolve transport: prefer vhost-vsock under KVM with valid CID >= 1000, else fall back to virtio-serial.
+  # Verify with a real O_RDWR open so static devtmpfs nodes without a loaded driver (ENODEV) fall back cleanly.
+  VSOCK_DEV=${KIN_KVM_VHOST_VSOCK_DEV:-/dev/vhost-vsock}
+  VSOCK_AVAILABLE=0
+  if [ "$KIN_KVM_ACCEL" = kvm ] && [ "${KIN_KVM_FORCE_SERIAL:-0}" != 1 ] \
+     && [ -n "${KIN_KVM_VSOCK_CID:-}" ] \
+     && printf '%s' "$KIN_KVM_VSOCK_CID" | grep -Eq '^[0-9]+$' \
+     && [ "$KIN_KVM_VSOCK_CID" -ge 1000 ] && [ "$KIN_KVM_VSOCK_CID" -le 4294967294 ]; then
+    if [ "$KIN_KVM_DRY_RUN" = 1 ] && [ "${KIN_KVM_DRY_RUN_VSOCK:-0}" = 1 ]; then
+      VSOCK_AVAILABLE=1
+    elif [ -c "$VSOCK_DEV" ] && [ -r "$VSOCK_DEV" ] && [ -w "$VSOCK_DEV" ] && ( exec 3<>"$VSOCK_DEV" ) 2>/dev/null; then
+      VSOCK_AVAILABLE=1
+    elif [ -c "$VSOCK_DEV" ]; then
+      log "vhost-vsock device $VSOCK_DEV not openable (ENODEV/EACCES); falling back to virtio-serial"
+    fi
+  fi
+  if [ "$VSOCK_AVAILABLE" = 1 ]; then
+    EFFECTIVE_TRANSPORT=vsock
+  else
+    EFFECTIVE_TRANSPORT=virtio-serial
+  fi
+
+  CMDLINE="console=ttyS0 root=/dev/vda rootfstype=erofs ro init=/usr/local/sbin/kin-guest-init net.ifnames=0 biosdevname=0 quiet"
+  CMDLINE+=" kin.vm_id=$(sanitize_cmdline_val "$KIN_VM_ID")"
+  CMDLINE+=" kin.hostname=$(sanitize_cmdline_val "$KIN_KVM_HOSTNAME")"
+  CMDLINE+=" kin.store_mode=${EFFECTIVE_STORE_MODE}"
+  CMDLINE+=" kin.agent_transport=${EFFECTIVE_TRANSPORT}"
+  CMDLINE+=" kin.vsock_port=$(sanitize_cmdline_val "$KIN_KVM_VSOCK_PORT")"
+  CMDLINE+=" kin.agent_vsock_port=$(sanitize_cmdline_val "$KIN_KVM_AGENT_VSOCK_PORT")"
+  CMDLINE+=" kin.tz=$(sanitize_cmdline_val "$TZ")"
+  CMDLINE+=" kin.lang=$(sanitize_cmdline_val "$LANG")"
+
+  # Custom EROFS mode: mem-merge=off disables KSM; zero cloud-init, zero virtio-9p.
+  QEMU=(
+    qemu-system-x86_64
+    -nodefaults
+    -name "kin-$KIN_VM_ID"
+    -machine q35,mem-merge=off
+    -accel "$ACCEL_ARG"
+    -cpu "$CPU_MODEL"
+    -m "$KIN_KVM_MEMORY_MB"
+    -smp "$KIN_KVM_VCPUS"
+    "${FP_SMBIOS[@]}"
+    -kernel "$KERNEL_IMG"
+    -append "$CMDLINE"
+  )
+  if [ -f "$INITRD_IMG" ]; then
+    QEMU+=(-initrd "$INITRD_IMG")
+  fi
+
+  if [ "$EFFECTIVE_STORE_MODE" = virtiofs ]; then
+    VIRTIOFSD_CMD=(
+      "$VIRTIOFSD_BIN"
+      "--socket-path=$SLOT_KVM/virtiofs.sock"
+      "--shared-dir=$KIN_KVM_STORE_DIR"
+      --sandbox=none
+      --readonly
+      --cache=auto
+    )
+    QEMU+=(
+      -object "memory-backend-memfd,id=mem0,size=${KIN_KVM_MEMORY_MB}M,share=on"
+      -numa "node,memdev=mem0"
+      -chardev "socket,id=char_kinstore,path=$SLOT_KVM/virtiofs.sock"
+      -device "vhost-user-fs-pci,queue-size=1024,chardev=char_kinstore,tag=kinstore"
+    )
+  fi
+
+  QEMU+=(
+    -drive "file=$EROFS_IMG,if=none,id=rootfs0,format=raw,readonly=on,cache=none"
+    -device "virtio-blk-pci,drive=rootfs0,serial=$KIN_KVM_DISK_SERIAL"
+    -drive "file=$STATE_IMG,if=none,id=state0,format=raw,cache=writeback"
+    -device "virtio-blk-pci,drive=state0,serial=kinstate"
+  )
+
+  if [ "$EFFECTIVE_STORE_MODE" = virtio-blk ]; then
+    QEMU+=(
+      -drive "file=$KIN_KVM_STORE_BLK_IMAGE,if=none,id=store0,format=raw,readonly=on,cache=none"
+      -device "virtio-blk-pci,drive=store0,serial=kinstore"
+    )
+  fi
+
+  if [ "$EFFECTIVE_TRANSPORT" = vsock ]; then
+    QEMU+=(
+      -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22"
+      -device "virtio-net-pci,netdev=net0,mac=$KIN_KVM_MAC"
+      -device "vhost-vsock-pci,id=vsock0,guest-cid=$KIN_KVM_VSOCK_CID"
+    )
+    SOCAT_KERNEL_CMD=(
+      socat
+      "UNIX-LISTEN:${KIN_KVM_KERNEL_SOCK},fork,mode=0660,user=${UID_NUM},group=${GID_NUM}"
+      "VSOCK-CONNECT:${KIN_KVM_VSOCK_CID}:${KIN_KVM_VSOCK_PORT}"
+    )
+    SOCAT_AGENT_CMD=(
+      socat
+      "UNIX-LISTEN:${KIN_KVM_AGENT_SOCK},fork,mode=0660,user=${UID_NUM},group=${GID_NUM}"
+      "VSOCK-CONNECT:${KIN_KVM_VSOCK_CID}:${KIN_KVM_AGENT_VSOCK_PORT}"
+    )
+  else
+    QEMU+=(
+      -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22,hostfwd=tcp:127.0.0.1:${KIN_KVM_VSOCK_PORT}-:${KIN_KVM_VSOCK_PORT}"
+      -device "virtio-net-pci,netdev=net0,mac=$KIN_KVM_MAC"
+      -device "virtio-serial-pci,id=vserial0"
+      -chardev "socket,id=char_agent,path=$KIN_KVM_AGENT_SOCK,server=on,wait=off"
+      -device "virtserialport,bus=vserial0.0,chardev=char_agent,name=kin.agent.0"
+    )
+    SOCAT_KERNEL_CMD=(
+      socat
+      "UNIX-LISTEN:${KIN_KVM_KERNEL_SOCK},fork,mode=0660,user=${UID_NUM},group=${GID_NUM}"
+      "TCP:127.0.0.1:${KIN_KVM_VSOCK_PORT}"
+    )
+  fi
+
+  QEMU+=(
+    -object rng-random,id=rng0,filename=/dev/urandom
+    -device virtio-rng-pci,rng=rng0
+    -chardev "socket,id=qmp,path=$SLOT_KVM/qmp.sock,server=on,wait=off"
+    -mon chardev=qmp,mode=control
+    -serial "file:$SLOT_KVM/console.log"
+    -display none
+  )
+
+  if [ "$KIN_KVM_DRY_RUN" = 1 ]; then
+    python3 - "$KIN_KVM_MODE" "$EFFECTIVE_STORE_MODE" "$EFFECTIVE_TRANSPORT" "$STATE_IMG" "${not_applied:-}" \
+      --qemu "${QEMU[@]}" \
+      --virtiofsd "${VIRTIOFSD_CMD[@]}" \
+      --socat-kernel "${SOCAT_KERNEL_CMD[@]}" \
+      --socat-agent "${SOCAT_AGENT_CMD[@]}" <<'PY'
+import json, os, sys
+mode, store_mode, transport, state_img, not_applied = sys.argv[1:6]
+sections = {"qemu": [], "virtiofsd": [], "socat_kernel": [], "socat_agent": []}
+cur = None
+mapping = {"--qemu": "qemu", "--virtiofsd": "virtiofsd", "--socat-kernel": "socat_kernel", "--socat-agent": "socat_agent"}
+for arg in sys.argv[6:]:
+    if arg in mapping:
+        cur = mapping[arg]
+        continue
+    if cur is not None:
+        sections[cur].append(arg)
+print(json.dumps({
+    "mode": mode,
+    "store_mode": store_mode,
+    "transport": transport,
+    "state_disk": state_img,
+    "not_applied": not_applied,
+    "agent_token_in_env": ("KIN_AGENT_TOKEN" in os.environ or "AGENT_TOKEN" in os.environ),
+    **sections,
+}))
+PY
+    exit 0
+  fi
+
+  if ! getent group "$GID_NUM" >/dev/null 2>&1; then
+    groupadd -g "$GID_NUM" kinslot
+  fi
+  if ! getent passwd "$UID_NUM" >/dev/null 2>&1; then
+    useradd -u "$UID_NUM" -g "$GID_NUM" -M -d "$SLOT_HOME" -s /usr/sbin/nologin kinslot
+  fi
+
+  : > "$SLOT_KVM/console.log"
+  rm -f "$SLOT_KVM/qmp.sock" "$SLOT_KVM/virtiofs.sock" "$KIN_KVM_KERNEL_SOCK" "$KIN_KVM_AGENT_SOCK"
+  for p in "$STATE_IMG" "$SLOT_KVM/console.log" "$SLOT_KVM" "$SLOT_RUN" "$SLOT_HOME"; do
+    [ -e "$p" ] || continue
+    chown "$UID_NUM:$GID_NUM" "$p" || log "warning: chown $p failed"
+  done
+
+  if [ "$EFFECTIVE_STORE_MODE" = virtiofs ]; then
+    : > "$SLOT_KVM/virtiofsd.log"
+    chown "$UID_NUM:$GID_NUM" "$SLOT_KVM/virtiofsd.log" || true
+    if [ "$UID_NUM" != 0 ]; then
+      setpriv --reuid="$UID_NUM" --regid="$GID_NUM" --clear-groups -- "${VIRTIOFSD_CMD[@]}" >>"$SLOT_KVM/virtiofsd.log" 2>&1 &
+    else
+      "${VIRTIOFSD_CMD[@]}" >>"$SLOT_KVM/virtiofsd.log" 2>&1 &
+    fi
+    VIRTIOFSD_PID=$!
+    w=0
+    while [ ! -S "$SLOT_KVM/virtiofs.sock" ] && [ "$w" -lt 50 ]; do
+      kill -0 "$VIRTIOFSD_PID" 2>/dev/null || die "virtiofsd exited prematurely; see $SLOT_KVM/virtiofsd.log"
+      sleep 0.1
+      w=$((w + 1))
+    done
+    [ -S "$SLOT_KVM/virtiofs.sock" ] || die "virtiofsd socket not ready: $SLOT_KVM/virtiofs.sock"
+    log "virtiofsd ready pid=$VIRTIOFSD_PID dir=$KIN_KVM_STORE_DIR"
+  fi
+
+  log "starting custom-erofs qemu accel=$KIN_KVM_ACCEL store=$EFFECTIVE_STORE_MODE transport=$EFFECTIVE_TRANSPORT cpu=$CPU_MODEL mem=${KIN_KVM_MEMORY_MB}m smp=$KIN_KVM_VCPUS uid=$UID_NUM:$GID_NUM"
+  if [ "$UID_NUM" != 0 ]; then
+    extra_gids=()
+    if [ "$KIN_KVM_ACCEL" = kvm ]; then
+      chmod g+rw /dev/kvm 2>/dev/null || log "chmod g+rw /dev/kvm failed"
+      extra_gids+=("$(stat -Lc %g /dev/kvm)")
+    fi
+    if [ "$EFFECTIVE_TRANSPORT" = vsock ] && [ -c "$VSOCK_DEV" ]; then
+      chmod g+rw "$VSOCK_DEV" 2>/dev/null || log "chmod g+rw $VSOCK_DEV failed"
+      extra_gids+=("$(stat -Lc %g "$VSOCK_DEV")")
+    fi
+    if [ ${#extra_gids[@]} -gt 0 ]; then
+      groups_csv=$(IFS=,; printf '%s' "${extra_gids[*]}")
+      groups=("--groups=$groups_csv")
+    else
+      groups=(--clear-groups)
+    fi
+    setpriv --reuid="$UID_NUM" --regid="$GID_NUM" "${groups[@]}" -- "${QEMU[@]}" &
+  else
+    "${QEMU[@]}" &
+  fi
+  QEMU_PID=$!
+  log "spawned pid=$QEMU_PID"
+  sleep 0.5
+  if ! kill -0 "$QEMU_PID" 2>/dev/null; then
+    QEMU_PID=$(python3 -c 'import pathlib
+for d in pathlib.Path("/proc").iterdir():
+    if not d.name.isdigit():
+        continue
+    try:
+        c = open(d / "comm").read().strip()
+    except OSError:
+        continue
+    if c.startswith("qemu-system"):
+        print(d.name)
+        break
+')
+    log "bg pid died; qemu pid=${QEMU_PID:-none}"
+    [ -n "$QEMU_PID" ] || die "qemu exited immediately; see $SLOT_KVM/console.log"
+  fi
+
+  : > "$SLOT_KVM/socat.log"
+  chown "$UID_NUM:$GID_NUM" "$SLOT_KVM/socat.log" || true
+  ( exec "${SOCAT_KERNEL_CMD[@]}" ) >>"$SLOT_KVM/socat.log" 2>&1 &
+  SOCAT_PID=$!
+  if [ ${#SOCAT_AGENT_CMD[@]} -gt 0 ]; then
+    ( exec "${SOCAT_AGENT_CMD[@]}" ) >>"$SLOT_KVM/socat.log" 2>&1 &
+    AGENT_SOCAT_PID=$!
+  fi
+  sleep 0.3
+  log "custom-erofs running qemu=$QEMU_PID kernel_socat=$SOCAT_PID agent_socat=${AGENT_SOCAT_PID:-virtio-serial} virtiofsd=${VIRTIOFSD_PID:-none}"
+  st=0
+  wait "$QEMU_PID" || st=$?
+  cleanup
+  if [ "$STOPPING" = 1 ]; then
+    exit 0
+  fi
+  log "qemu exited status=$st"
+  exit "$st"
+fi
+
+# ============================================================================
+# Legacy mode (default): 100% backward-compatible cloud-init qcow2 + 9p runner
+# ============================================================================
+BASE="$OPT_KVM/base.qcow2"
+BASE_ID_FILE="$OPT_KVM/base.id"
+if [ "$KIN_KVM_DRY_RUN" != 1 ]; then
+  [ -f "$BASE" ] || die "missing $BASE"
+  [ -f "$BASE_ID_FILE" ] || die "missing $BASE_ID_FILE"
+  BASE_ID=$(tr -d '[:space:]' < "$BASE_ID_FILE")
+  find_ovmf
+  ensure_overlay
+  ensure_key
+  ensure_ovmf_vars
+  write_seed
+else
+  OVMF_CODE=/usr/share/OVMF/OVMF_CODE_4M.fd
+fi
+
+has_share() {
+  echo ",${KIN_KVM_SHARES}," | grep -q ",$1,"
+}
+
+QEMU=(
+  qemu-system-x86_64
+  -nodefaults
+  -name "kin-$KIN_VM_ID"
+  -machine q35,smm=on
+  -accel "$ACCEL_ARG"
+  -cpu "$CPU_MODEL"
+  -m "$KIN_KVM_MEMORY_MB"
+  -smp "$KIN_KVM_VCPUS"
+  "${FP_SMBIOS[@]}"
+  -drive "if=pflash,format=raw,unit=0,readonly=on,file=$OVMF_CODE"
+  -drive "if=pflash,format=raw,unit=1,file=$SLOT_KVM/OVMF_VARS.fd"
+  -drive "file=$SLOT_KVM/disk.qcow2,if=none,id=disk0,format=qcow2,cache=writeback,discard=unmap"
+  -device "virtio-blk-pci,drive=disk0,bootindex=1,serial=$KIN_KVM_DISK_SERIAL"
+  -cdrom "$SLOT_KVM/seed.iso"
+  -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22,hostfwd=tcp:127.0.0.1:7070-:7070"
+  -device "virtio-net-pci,netdev=net0,mac=$KIN_KVM_MAC"
+  -object rng-random,id=rng0,filename=/dev/urandom
+  -device virtio-rng-pci,rng=rng0
+  -chardev "socket,id=qmp,path=$SLOT_KVM/qmp.sock,server=on,wait=off"
+  -mon chardev=qmp,mode=control
+  -serial "file:$SLOT_KVM/console.log"
+  -display none
+)
+
+if has_share home; then
+  QEMU+=(-fsdev "local,id=fs_home,path=$SLOT_HOME,security_model=none,multidevs=remap")
+  QEMU+=(-device "virtio-9p-pci,fsdev=fs_home,mount_tag=kinhome")
+fi
+if has_share run; then
+  QEMU+=(-fsdev "local,id=fs_run,path=$SLOT_RUN,security_model=none,multidevs=remap")
+  QEMU+=(-device "virtio-9p-pci,fsdev=fs_run,mount_tag=kinrun")
+fi
+if has_share claude; then
+  mkdir -p /slot/claude 2>/dev/null || true
+  QEMU+=(-fsdev "local,id=fs_claude,path=/slot/claude,security_model=none,multidevs=remap")
+  QEMU+=(-device "virtio-9p-pci,fsdev=fs_claude,mount_tag=kinclaude")
+fi
+QEMU+=(-fsdev "local,id=fs_payload,path=$PAYLOAD,security_model=none,multidevs=remap,readonly=on")
+QEMU+=(-device "virtio-9p-pci,fsdev=fs_payload,mount_tag=kinpayload")
+
+if [ "$KIN_KVM_DRY_RUN" = 1 ]; then
+  python3 - "$KIN_KVM_MODE" "${not_applied:-}" "${QEMU[@]}" <<'PY'
+import json, sys
+print(json.dumps({
+    "mode": sys.argv[1],
+    "store_mode": "9p",
+    "transport": "tcp-7070",
+    "not_applied": sys.argv[2],
+    "qemu": sys.argv[3:],
+}))
+PY
+  exit 0
+fi
 
 if ! getent group "$GID_NUM" >/dev/null 2>&1; then
   groupadd -g "$GID_NUM" kinslot
@@ -275,52 +815,6 @@ done
 if [ -d /slot/claude ]; then
   chown "$UID_NUM:$GID_NUM" /slot/claude || log "warning: chown /slot/claude failed"
 fi
-
-has_share() {
-  echo ",${KIN_KVM_SHARES}," | grep -q ",$1,"
-}
-
-QEMU=(
-  qemu-system-x86_64
-  -nodefaults
-  -name "kin-$KIN_VM_ID"
-  -machine q35,smm=on
-  -accel "$ACCEL_ARG"
-  -cpu "$CPU_MODEL"
-  -m "$KIN_KVM_MEMORY_MB"
-  -smp "$KIN_KVM_VCPUS"
-  -uuid "$KIN_KVM_SMBIOS_UUID"
-  -smbios "type=1,manufacturer=$(smbios_escape "$KIN_KVM_SMBIOS_MANUFACTURER"),product=$(smbios_escape "$KIN_KVM_SMBIOS_PRODUCT"),version=$(smbios_escape "$KIN_KVM_SMBIOS_VERSION"),serial=$(smbios_escape "$KIN_KVM_SMBIOS_SERIAL"),uuid=$KIN_KVM_SMBIOS_UUID,family=$(smbios_escape "$KIN_KVM_SMBIOS_FAMILY")"
-  -drive "if=pflash,format=raw,unit=0,readonly=on,file=$OVMF_CODE"
-  -drive "if=pflash,format=raw,unit=1,file=$SLOT_KVM/OVMF_VARS.fd"
-  -drive "file=$SLOT_KVM/disk.qcow2,if=none,id=disk0,format=qcow2,cache=writeback,discard=unmap"
-  -device "virtio-blk-pci,drive=disk0,bootindex=1,serial=$KIN_KVM_DISK_SERIAL"
-  -cdrom "$SLOT_KVM/seed.iso"
-  -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22,hostfwd=tcp:127.0.0.1:7070-:7070"
-  -device "virtio-net-pci,netdev=net0,mac=$KIN_KVM_MAC"
-  -object rng-random,id=rng0,filename=/dev/urandom
-  -device virtio-rng-pci,rng=rng0
-  -chardev "socket,id=qmp,path=$SLOT_KVM/qmp.sock,server=on,wait=off"
-  -mon chardev=qmp,mode=control
-  -serial "file:$SLOT_KVM/console.log"
-  -display none
-)
-
-if has_share home; then
-  QEMU+=(-fsdev "local,id=fs_home,path=$SLOT_HOME,security_model=none,multidevs=remap")
-  QEMU+=(-device "virtio-9p-pci,fsdev=fs_home,mount_tag=kinhome")
-fi
-if has_share run; then
-  QEMU+=(-fsdev "local,id=fs_run,path=$SLOT_RUN,security_model=none,multidevs=remap")
-  QEMU+=(-device "virtio-9p-pci,fsdev=fs_run,mount_tag=kinrun")
-fi
-if has_share claude; then
-  mkdir -p /slot/claude
-  QEMU+=(-fsdev "local,id=fs_claude,path=/slot/claude,security_model=none,multidevs=remap")
-  QEMU+=(-device "virtio-9p-pci,fsdev=fs_claude,mount_tag=kinclaude")
-fi
-QEMU+=(-fsdev "local,id=fs_payload,path=$PAYLOAD,security_model=none,multidevs=remap,readonly=on")
-QEMU+=(-device "virtio-9p-pci,fsdev=fs_payload,mount_tag=kinpayload")
 
 log "starting qemu accel=$KIN_KVM_ACCEL cpu=$CPU_MODEL mem=${KIN_KVM_MEMORY_MB}m smp=$KIN_KVM_VCPUS disk=${KIN_KVM_DISK_GB}g uid=$UID_NUM:$GID_NUM"
 # Trixie qemu 10 dropped -runas; drop with setpriv so 9p I/O is the slot uid.

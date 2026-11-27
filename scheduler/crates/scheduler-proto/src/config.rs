@@ -133,6 +133,10 @@ pub struct PoolConfig {
     pub client_system_policy: ClientSystemPolicy,
     #[serde(default)]
     pub jev_profile: JevProfile,
+    /// Optional pool-level runtime capability gate (e.g. `os_kvm_native_smbios`,
+    /// `vsock_transport_v1`). Empty/omitted preserves 100% legacy behavior.
+    #[serde(default)]
+    pub required_runtime_capabilities: Vec<String>,
     #[serde(default)]
     pub members: Vec<PoolMemberConfig>,
 }
@@ -167,6 +171,7 @@ impl Default for PoolConfig {
             system_prompt_text: String::new(),
             client_system_policy: ClientSystemPolicy::PrependPool,
             jev_profile: JevProfile::InheritGlobal,
+            required_runtime_capabilities: Vec::new(),
             members: Vec::new(),
         }
     }
@@ -289,4 +294,24 @@ pub struct ApiKeyScope {
     /// Optional legacy per-node allowlist; empty means all pool members allowed.
     #[serde(default)]
     pub allowed_node_keys: Vec<NodeKey>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PoolConfig;
+    use crate::explain::ExcludeReason;
+
+    #[test]
+    fn pool_config_required_runtime_capabilities_defaults_to_empty_for_compat() {
+        let legacy_json = r#"{
+            "id": "pool_legacy",
+            "members": []
+        }"#;
+        let pool: PoolConfig = serde_json::from_str(legacy_json).expect("legacy PoolConfig json");
+        assert!(pool.required_runtime_capabilities.is_empty());
+        assert_eq!(
+            serde_json::to_string(&ExcludeReason::CapabilityMismatch).unwrap(),
+            "\"capability_mismatch\""
+        );
+    }
 }

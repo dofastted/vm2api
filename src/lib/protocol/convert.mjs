@@ -390,8 +390,25 @@ function normalizeMixedToolHistory(body) {
   return { ...body, messages: normalizeConvertedToolHistory(messages, origins, invalid) }
 }
 
+const STRICT_GATEWAY_PRIVATE_KEYS = new Set([
+  'gateway_policy',
+  'request_context',
+  'kin_outbound_shape',
+  'request_id',
+  'delivery_mode',
+  'caller_cwd',
+])
+
 export function toClaudeMessages(protocol, body, opts = { rewrite: false, model_map: true }) {
   if (protocol === 'anthropic.messages') {
+    if (opts.strict_passthrough === true && !opts.rewrite) {
+      const out = {}
+      for (const [key, value] of Object.entries(body || {})) {
+        if (value === undefined || STRICT_GATEWAY_PRIVATE_KEYS.has(key)) continue
+        out[key] = value
+      }
+      return { claude: withUpstreamStream(out), mode: 'passthrough' }
+    }
     const normalized = normalizeMixedToolHistory(normalizeOpenAIToolsOnMessages(body))
     if (opts.rewrite) {
       const model = mapModel(normalized.model || DEFAULT_MODEL, { allowMap: opts.model_map })

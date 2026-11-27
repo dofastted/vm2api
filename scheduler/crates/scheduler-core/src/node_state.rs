@@ -131,6 +131,12 @@ impl NodeMutable {
             self.external_in_flight = v;
         }
         if let Some(caps) = &upd.runtime_capabilities {
+            if caps
+                .iter()
+                .any(|(k, &v)| v && !self.runtime_capabilities.get(k).copied().unwrap_or(false))
+            {
+                became_freer = true;
+            }
             self.runtime_capabilities = caps.clone();
         }
         became_freer

@@ -6,6 +6,10 @@ import { Button } from '@/components/ui/button'
 import { Progress } from '@/components/ui/progress'
 import { Textarea } from '@/components/ui/textarea'
 import { dashboardQueryOptions } from '@/features/overview/queries'
+import {
+  CRAG_DEBIAN13_SLOT_NOTICE,
+  isCragDebian13Kernel,
+} from '@/features/vm/create-options'
 import { readPackageFacts } from '@/features/vm/vm-package-view'
 
 type ImportResult = {
@@ -101,10 +105,21 @@ export function VmPackageImportCard() {
   }
 
   const facts = parseError ? null : readPackageFacts(text)
+  const cragOsPackage = !!(
+    facts &&
+    facts.ok &&
+    isCragDebian13Kernel(facts.kernel)
+  )
   const progress = progressOf(result, busy, tick)
   const summary =
     facts && facts.ok
-      ? [facts.id, facts.platform, facts.proxy, facts.credential]
+      ? [
+          facts.id,
+          facts.platform,
+          cragOsPackage ? 'CRAG Debian 13' : null,
+          facts.proxy,
+          facts.credential,
+        ]
           .filter(Boolean)
           .join(' · ')
       : ''
@@ -132,9 +147,19 @@ export function VmPackageImportCard() {
       ) : facts && !facts.ok ? (
         <p className='text-xs text-destructive'>{facts.error}</p>
       ) : summary ? (
-        <p className='truncate font-mono text-xs text-muted-foreground'>
-          {summary}
-        </p>
+        <div className='space-y-1'>
+          <p className='truncate font-mono text-xs text-muted-foreground'>
+            {summary}
+          </p>
+          {cragOsPackage ? (
+            <p
+              role='note'
+              className='text-xs text-[color:var(--status-caution)]'
+            >
+              {CRAG_DEBIAN13_SLOT_NOTICE}
+            </p>
+          ) : null}
+        </div>
       ) : null}
       {progress ? (
         <div className='space-y-2'>

@@ -1425,6 +1425,7 @@ for (const vm of listVms(cfg.paths.project)) {
 cliNodeGuard = createCliNodeGuard({
   listTargets: () => listVms(cfg.paths.project),
   liveTokens: () => slotShell.liveShellTokens?.() || [],
+  getRouting: () => routingConfig,
 })
 // Opt-in (routing.crag_zombie_guard.enabled): power-cycles idle CRAG slots whose
 // gateway worker left unreaped claude children, through the panel 恢复服务 path.

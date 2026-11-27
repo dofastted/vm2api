@@ -27,7 +27,8 @@ import { canCountTokens, canOfficialUsage, credentialModeOfVm, isApiKeyMode } fr
 import { attachUsageFetchMeta, getUsageCache, getUsageFetchMeta } from '../oauth/usage-cache.mjs'
 import { probeAccount } from '../oauth/usage-probe.mjs'
 import { isOfficialUsageRateLimited, shouldHopOfficialUsage } from '../oauth/crs-usage-probe.mjs'
-import { countTokensViaWorker } from '../transport/go-worker-client.mjs'
+import { countTokensViaKernel, countTokensViaWorker } from '../transport/go-worker-client.mjs'
+import { peekRustHealth } from '../transport/kernel-router.mjs'
 import { apiKeyBetaHeader, setupTokenBetaHeader } from './claude-code-betas.mjs'
 import { listQuotaFromHeaders, publicUsageWindow, usageWindowsEmpty } from '../pool/quota-window.mjs'
 import { ownerScopeFromRequest, vmMatchesOwnerScope } from '../admin/resource-owner.mjs'
@@ -266,6 +267,62 @@ export async function blockCountTokensBeforeHop(req, inbound, deps = {}) {
   return { error: decision?.action === 'block' ? decision.error : null, wait: decision.wait === true }
 }
 
+function slotCapabilitiesForCountTokens(peeked, deps) {
+  const sources = [
+    peeked?.workerStatus?.capabilities,
+    peeked?.state?.worker_status?.capabilities,
+    peeked?.exec?.workerStatus?.capabilities,
+    peeked?.vm?.workerStatus?.capabilities,
+    peeked?.vm?.worker_status?.capabilities,
+    peeked?.vm?.runtime?.capabilities,
+    peeked?.vm?.kernel_installation?.capabilities,
+    peekRustHealth(peeked?.exec, 60_000)?.health?.capabilities,
+  ]
+  for (const caps of sources) {
+    if (Array.isArray(caps) && caps.length) return caps
+  }
+  if (typeof deps?.slotCapabilities === 'function') {
+    const caps = deps.slotCapabilities(peeked)
+    if (Array.isArray(caps)) return caps
+  }
+  return []
+}
+
+function sendCountTokensHopResult(res, json, hop, { preserveOfficialErrors = false } = {}) {
+  const forwardHeaders = hop?.headers && typeof hop.headers === 'object' ? { ...hop.headers } : null
+  if (!hop?.ok) {
+    const status = hop?.status && hop.status >= 400 ? hop.status : 502
+    // Upstream limit / overload: same mapping and Retry-After as Messages.
+    if (status === 429 || status === 529) {
+      const mapped = mapUpstreamError(status, hop?.body, forwardHeaders || {})
+      const mergedHeaders = forwardHeaders ? { ...forwardHeaders } : {}
+      const hasRetryAfter = Object.keys(mergedHeaders).some((k) => k.toLowerCase() === 'retry-after')
+      if (mapped.retryAfterSec) {
+        if (!hasRetryAfter) mergedHeaders['retry-after'] = String(mapped.retryAfterSec)
+        res.setHeader?.('retry-after', String(mapped.retryAfterSec))
+      }
+      return forwardHeaders
+        ? json(res, mapped.status, mapped.body, mergedHeaders)
+        : json(res, mapped.status, mapped.body)
+    }
+    if (preserveOfficialErrors && hop?.body?.type === 'error' && hop.body.error && typeof hop.body.error === 'object') {
+      return forwardHeaders ? json(res, status, hop.body, forwardHeaders) : json(res, status, hop.body)
+    }
+    const err = hop?.body?.error || {}
+    const errBody = makeError({
+      type: err.type || ErrorType.UPSTREAM,
+      code: err.code || 'count_tokens_failed',
+      message: err.message || 'count_tokens 失败',
+      status,
+    }).body
+    return forwardHeaders ? json(res, status, errBody, forwardHeaders) : json(res, status, errBody)
+  }
+  const raw = hop.body && typeof hop.body === 'object' ? hop.body : {}
+  const inputTokens = Number(raw.input_tokens)
+  const payload = { ...raw, input_tokens: Number.isFinite(inputTokens) ? inputTokens : 0 }
+  return forwardHeaders ? json(res, 200, payload, forwardHeaders) : json(res, 200, payload)
+}
+
 export async function handleUserCountTokens(req, res, deps) {
   const json = (...args) => deps.json(...args)
   if (!deps.requireAuth(req, res)) return
@@ -400,6 +457,14 @@ export async function handleUserCountTokens(req, res, deps) {
       return json(res, again.error.status, again.error.body)
     }
   }
+  const caps = slotCapabilitiesForCountTokens(peeked, deps)
+  if (caps.includes('count_tokens_v1')) {
+    const hop = await (deps.countTokensViaKernel || countTokensViaKernel)(peeked.exec, {
+      body: parsed.body,
+      timeoutMs: 45000,
+    })
+    return sendCountTokensHopResult(res, json, hop, { preserveOfficialErrors: true })
+  }
   const mode = credentialModeOfVm(peeked.vm)
   if (!canCountTokens(mode)) {
     const { listed, source } = await resolveUsageWindows({
@@ -422,29 +487,7 @@ export async function handleUserCountTokens(req, res, deps) {
     },
     timeoutMs: 45000,
   })
-  if (!hop.ok) {
-    const status = hop.status && hop.status >= 400 ? hop.status : 502
-    // Upstream limit / overload: same mapping and Retry-After as Messages.
-    if (status === 429 || status === 529) {
-      const mapped = mapUpstreamError(status, hop.body, hop.headers || {})
-      if (mapped.retryAfterSec) res.setHeader?.('retry-after', String(mapped.retryAfterSec))
-      return json(res, mapped.status, mapped.body)
-    }
-    const err = hop.body?.error || {}
-    return json(
-      res,
-      status,
-      makeError({
-        type: err.type || ErrorType.UPSTREAM,
-        code: err.code || 'count_tokens_failed',
-        message: err.message || 'count_tokens 失败',
-        status,
-      }).body,
-    )
-  }
-  const raw = hop.body && typeof hop.body === 'object' ? hop.body : {}
-  const inputTokens = Number(raw.input_tokens)
-  return json(res, 200, { ...raw, input_tokens: Number.isFinite(inputTokens) ? inputTokens : 0 })
+  return sendCountTokensHopResult(res, json, hop)
 }
 
 export async function resolveUsageWindows({

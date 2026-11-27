@@ -18,7 +18,19 @@ function sse(event, data) {
 }
 
 /** Anthropic streaming error. `type` is what clients branch on (`overloaded_error`, …). */
-export function buildAnthropicSseError(error = {}, poolReason = null) {
+export function buildAnthropicSseError(
+  error = {},
+  poolReason = null,
+  { requestId = null, strictPassthrough = false } = {},
+) {
+  if (strictPassthrough) {
+    const raw = error && typeof error === 'object' ? { ...error } : {}
+    raw.type = String(raw.type || 'api_error')
+    raw.message = raw.message != null ? String(raw.message) : 'An error occurred while processing the request'
+    const envelope = { type: 'error', error: raw }
+    if (requestId) envelope.request_id = String(requestId)
+    return sse('error', envelope)
+  }
   const body = {
     type: String(error.type || 'api_error'),
     message: String(error.message || 'An error occurred while processing the request'),
@@ -59,10 +71,16 @@ export function isRetryableMidStreamSseError(payload, mapped) {
  * capture/stream interruptions are remapped to a retryable `rate_limit_error`
  * so Claude Code retries instead of ending the turn with mid-response disconnect.
  */
-export function createAnthropicSseErrorRemapper({ headers = {}, isStarted = null, onRetryableTruncation = null } = {}) {
+export function createAnthropicSseErrorRemapper({
+  headers = {},
+  isStarted = null,
+  onRetryableTruncation = null,
+  strictPassthrough = false,
+} = {}) {
   let pendingEvent = null
   return {
     remapLine(line) {
+      if (strictPassthrough) return line
       const text = String(line)
       const trimmed = text.trimEnd()
       const bare = trimmed.trim()

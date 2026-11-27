@@ -242,6 +242,23 @@ pub fn filter_members<'a>(
                 });
                 continue;
             }
+            if !pool.required_runtime_capabilities.is_empty() {
+                let missing: Vec<&str> = pool
+                    .required_runtime_capabilities
+                    .iter()
+                    .map(|cap| cap.as_str())
+                    .filter(|cap| !st.runtime_capabilities.get(*cap).copied().unwrap_or(false))
+                    .collect();
+                if !missing.is_empty() {
+                    excluded.push(ExcludedEntry {
+                        pool_id: pool.id.clone(),
+                        node: node.node_key.clone(),
+                        reason: ExcludeReason::CapabilityMismatch,
+                        detail: format!("missing required capabilities: {}", missing.join(",")),
+                    });
+                    continue;
+                }
+            }
 
             let snap_m = st.snapshot_metrics(&node.capacity);
 
@@ -285,6 +302,18 @@ pub fn filter_members<'a>(
 
             snap_m
         } else {
+            if !pool.required_runtime_capabilities.is_empty() {
+                excluded.push(ExcludedEntry {
+                    pool_id: pool.id.clone(),
+                    node: node.node_key.clone(),
+                    reason: ExcludeReason::CapabilityMismatch,
+                    detail: format!(
+                        "missing required capabilities: {}",
+                        pool.required_runtime_capabilities.join(",")
+                    ),
+                });
+                continue;
+            }
             NodeMetricsSnapshot {
                 in_flight: 0,
                 max_concurrency: node.capacity.max_concurrency,

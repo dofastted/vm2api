@@ -29,6 +29,17 @@ test('installation payload verifies and stages without cc-node', (t) => {
     fs.mkdirSync(path.dirname(target), { recursive: true })
     fs.writeFileSync(target, bytes)
   }
+  if (manifest.crag_debian13_release?.tag && manifest.crag_debian13_release?.assets) {
+    const osDir = manifest.crag_debian13_release.dest_dir || 'share/os/crag-debian13'
+    for (const [asset, entry] of Object.entries(manifest.crag_debian13_release.assets)) {
+      const bytes = Buffer.from(`fixture:${asset}`)
+      entry.size = bytes.length
+      entry.sha256 = crypto.createHash('sha256').update(bytes).digest('hex')
+      const target = path.join(dest, osDir, asset)
+      fs.mkdirSync(path.dirname(target), { recursive: true })
+      fs.writeFileSync(target, bytes)
+    }
+  }
   const fixtureManifest = path.join(dest, 'payload.json')
   fs.writeFileSync(fixtureManifest, JSON.stringify(manifest))
   const stage = path.join(dest, 'dist')
@@ -42,6 +53,11 @@ test('installation payload verifies and stages without cc-node', (t) => {
   }
   assert.equal(fs.existsSync(path.join(stage, 'cc-node')), false)
   assert.equal(fs.existsSync(path.join(stage, 'cli-node')), true)
+  if (manifest.crag_debian13_release?.tag) {
+    assert.equal(fs.existsSync(path.join(stage, 'kin-kvm-debian-13.erofs')), true)
+    assert.equal(fs.existsSync(path.join(stage, 'vmlinuz')), true)
+    assert.equal(fs.existsSync(path.join(stage, 'initrd.img')), true)
+  }
 })
 
 test('installation and release scripts do not require cc-node', () => {

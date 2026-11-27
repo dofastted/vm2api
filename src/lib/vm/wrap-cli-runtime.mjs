@@ -18,9 +18,21 @@ import { kernelBinPath } from '../transport/rust-kernel-supervisor.mjs'
 import { isCodexVm } from './vm-kind.mjs'
 import { isKvmRuntime } from './runtime-kind.mjs'
 import { nativeCliForVm, NATIVE_CLI_FILES } from './native-cli.mjs'
-import { resolveKernelDataplane } from './slot-engine.mjs'
+import {
+  CRAG_CLAUDE_DIR_RE,
+  CRAG_CLAUDE_VERSION,
+  resolveKernelDataplane,
+  resolveManifestClaudePath,
+} from './slot-engine.mjs'
+export { CRAG_CLAUDE_VERSION, resolveManifestClaudePath } from './slot-engine.mjs'
 import { checkCragLicense, decodeLicenseBytes } from './crag-license.mjs'
 import { isValidVmId, listVmRecordFiles } from './vm-file.mjs'
+import {
+  isCustomOsRuntimeMode,
+  isCustomOsSlot,
+  resolveHostSharedStoreDir,
+  validateReadOnlyNoFollowPath,
+} from './custom-os-runtime.mjs'
 
 export const WRAP_CLI_BIN = 'cli-node'
 export const CC_NODE_BIN = 'cc-node'
@@ -66,7 +78,6 @@ exec "$DIR/${WRAP_KERNEL_WRAPPER}.real" "$@"
 
 export const CRAG_V2_DIR = 'crag-v2'
 const CRAG_V2_ENTRY = 'crag-v2'
-const CRAG_V2_CLAUDE = 'claude-code-2.1.321/claude'
 const CRAG_V2_CAPS = Object.freeze(['official_full', 'zero', 'cancel', 'telemetry', 'unix_socket_envelope'])
 
 export function normalizeCragArch(raw) {
@@ -336,7 +347,21 @@ function memberDigest(file) {
   return entry
 }
 
-export function verifyCragV2Tree(dir, { arch = cragV2Arch(), allowPreviousClaude = false } = {}) {
+export function verifyCragV2Tree(
+  dir,
+  {
+    arch = cragV2Arch(),
+    expectedArch = null,
+    expectedIssuerPublicKeyId = null,
+    expectedPayloadKeyId = null,
+    allowPreviousClaude = false,
+    allowUnbundledStore = isCustomOsRuntimeMode(),
+    sharedClaudeStoreRoot = '',
+    externalClaudeBin = '',
+    requireReadOnlyExternal = process.platform !== 'win32',
+  } = {},
+) {
+  const targetArch = expectedArch ?? arch
   try {
     const root = fs.lstatSync(dir)
     if (root.isSymbolicLink())
@@ -360,11 +385,11 @@ export function verifyCragV2Tree(dir, { arch = cragV2Arch(), allowPreviousClaude
   if (manifest.family !== 'crag' || manifest.version !== 'v2') {
     return { ok: false, code: 'crag_v2_manifest_invalid', error: 'CRAG v2 manifest family/version mismatch' }
   }
-  if (!['amd64', 'arm64'].includes(manifest.arch) || manifest.arch !== arch) {
+  if (!['amd64', 'arm64'].includes(manifest.arch) || manifest.arch !== targetArch) {
     return {
       ok: false,
       code: 'crag_v2_arch_mismatch',
-      error: `CRAG v2 arch ${manifest.arch} does not match ${arch}`,
+      error: `CRAG v2 arch ${manifest.arch} does not match ${targetArch}`,
     }
   }
   if (manifest.encrypted !== true || manifest.runtime !== 'native' || manifest.entrypoint !== CRAG_V2_ENTRY) {
@@ -380,10 +405,39 @@ export function verifyCragV2Tree(dir, { arch = cragV2Arch(), allowPreviousClaude
   if (!manifest.sha256 || typeof manifest.sha256 !== 'object' || Array.isArray(manifest.sha256)) {
     return { ok: false, code: 'crag_v2_manifest_invalid', error: 'CRAG v2 manifest sha256 map is missing' }
   }
+  const claude = resolveManifestClaudePath(manifest)
+  if (!claude) {
+    return {
+      ok: false,
+      code: 'crag_v2_manifest_invalid',
+      error: 'CRAG v2 manifest officialClaude path is missing or invalid',
+    }
+  }
+  const officialObj =
+    manifest.officialClaude && typeof manifest.officialClaude === 'object' && !Array.isArray(manifest.officialClaude)
+      ? manifest.officialClaude
+      : null
+  const unbundledOfficial = Boolean(officialObj && officialObj.bundled === false)
+  if (unbundledOfficial && !allowUnbundledStore) {
+    return { ok: false, code: 'crag_v2_manifest_invalid', error: 'CRAG v2 encrypted package authorization is invalid' }
+  }
   const expected = new Set(Object.keys(manifest.sha256))
-  for (const required of [CRAG_V2_ENTRY, CRAG_V2_CLAUDE, 'crag-license-public.pem', 'crag-v2.payload.enc']) {
+  const requiredMembers = unbundledOfficial
+    ? [CRAG_V2_ENTRY, 'crag-license-public.pem', 'crag-v2.payload.enc']
+    : [CRAG_V2_ENTRY, claude.path, 'crag-license-public.pem', 'crag-v2.payload.enc']
+  for (const required of requiredMembers) {
     if (!expected.has(required)) {
       return { ok: false, code: 'crag_v2_manifest_invalid', error: `CRAG v2 manifest does not hash ${required}` }
+    }
+  }
+  // Ensure the manifest references at most one `claude-code-<semver>` directory.
+  for (const rel of expected) {
+    if (rel.startsWith('claude-code-') && !rel.startsWith(`${claude.dir}/`)) {
+      return {
+        ok: false,
+        code: 'crag_v2_manifest_invalid',
+        error: `CRAG v2 manifest mixes multiple official Claude versions: ${rel}`,
+      }
     }
   }
   const present = new Set(listed.filter((rel) => rel !== 'manifest.json'))
@@ -416,7 +470,7 @@ export function verifyCragV2Tree(dir, { arch = cragV2Arch(), allowPreviousClaude
   for (const rel of present) {
     if (!expected.has(rel)) {
       // A running slot may still exec the previous official Claude path.
-      if (allowPreviousClaude && retainedClaudePath(rel)) continue
+      if (allowPreviousClaude && retainedClaudePath(rel, claude.path)) continue
       return { ok: false, code: 'crag_v2_hash_mismatch', error: `CRAG v2 package has unlisted file ${rel}` }
     }
     const file = path.join(dir, rel)
@@ -424,7 +478,7 @@ export function verifyCragV2Tree(dir, { arch = cragV2Arch(), allowPreviousClaude
     if (digest !== manifest.sha256[rel]) {
       return { ok: false, code: 'crag_v2_hash_mismatch', error: `CRAG v2 hash mismatch: ${rel}` }
     }
-    const requiredElf = rel === CRAG_V2_ENTRY || rel === CRAG_V2_CLAUDE
+    const requiredElf = rel === CRAG_V2_ENTRY || (!unbundledOfficial && rel === claude.path)
     if (requiredElf || body.subarray(0, 4).equals(Buffer.from([0x7f, 0x45, 0x4c, 0x46]))) {
       if (!requiredElf)
         return {
@@ -456,6 +510,7 @@ export function verifyCragV2Tree(dir, { arch = cragV2Arch(), allowPreviousClaude
       }
     }
   }
+  let verifiedExternalClaudeBin = null
   try {
     const auth = manifest.authorization
     const payload = manifest.payload
@@ -479,6 +534,20 @@ export function verifyCragV2Tree(dir, { arch = cragV2Arch(), allowPreviousClaude
       payload.ciphertext_sha256 !== manifest.sha256[payload.path]
     )
       throw new Error('metadata')
+    if (expectedIssuerPublicKeyId && auth.public_key_id !== expectedIssuerPublicKeyId) {
+      return {
+        ok: false,
+        code: 'crag_v2_identity_mismatch',
+        error: 'CRAG v2 issuer public key id does not match expected identity',
+      }
+    }
+    if (expectedPayloadKeyId && payload.key_id !== expectedPayloadKeyId) {
+      return {
+        ok: false,
+        code: 'crag_v2_identity_mismatch',
+        error: 'CRAG v2 payload key id does not match expected identity',
+      }
+    }
     // Header only: the member loop above already hashed it against the manifest.
     const { head, size } = memberDigest(path.join(dir, payload.path))
     if (size <= 36 || head.subarray(0, 8).toString('ascii') !== 'CRAGV2E1') throw new Error('payload')
@@ -499,15 +568,140 @@ export function verifyCragV2Tree(dir, { arch = cragV2Arch(), allowPreviousClaude
       )
     )
       throw new Error('signature')
+    const official = manifest.officialClaude
+    if (official && typeof official === 'object') {
+      if (official.bundled !== undefined && official.bundled !== true && !unbundledOfficial) {
+        throw new Error('official_claude_unbundled')
+      }
+      if (unbundledOfficial) {
+        if (typeof official.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(official.sha256)) {
+          throw new Error('official_claude_sha256')
+        }
+        if (typeof official.signature !== 'string' || !official.signature) {
+          throw new Error('official_claude_signature')
+        }
+        const signedOfficial = {
+          product: 'crag-v2',
+          arch: manifest.arch,
+          version: claude.version,
+          path: claude.path,
+          sha256: official.sha256,
+        }
+        if (
+          !crypto.verify(
+            null,
+            Buffer.concat([Buffer.from('CRAG-OFFICIAL-CLAUDE-V1\0'), Buffer.from(JSON.stringify(signedOfficial))]),
+            pub,
+            decodeLicenseBytes(official.signature, 64),
+          )
+        ) {
+          throw new Error('official_claude_signature')
+        }
+        const storeRoot = resolveHostSharedStoreDir('', { sharedClaudeStoreRoot })
+        if (!storeRoot) {
+          return {
+            ok: false,
+            code: 'crag_v2_shared_store_missing',
+            error: 'CRAG v2 unbundled officialClaude requires a configured read-only shared store root',
+          }
+        }
+        const versionsPrefix = path.join(storeRoot, 'claude', 'versions')
+        const candidateBin = externalClaudeBin || path.join(versionsPrefix, claude.version, 'claude')
+        const pathCheck = validateReadOnlyNoFollowPath(candidateBin, versionsPrefix, {
+          requireExecutable: true,
+          requireNotWritable: requireReadOnlyExternal,
+        })
+        if (!pathCheck.ok) {
+          return { ok: false, code: pathCheck.code, error: pathCheck.error }
+        }
+        const { digest: extDigest, head: extHead, size: extSize } = memberDigest(pathCheck.path)
+        if (
+          extSize < 64 ||
+          extHead.length < 64 ||
+          extHead.readUInt32BE(0) !== 0x7f454c46 ||
+          extHead[4] !== 2 ||
+          extHead[5] !== 1 ||
+          extHead[6] !== 1 ||
+          ![2, 3].includes(extHead.readUInt16LE(16))
+        ) {
+          return {
+            ok: false,
+            code: 'crag_v2_elf_invalid',
+            error: `CRAG v2 shared store official Claude must be a Linux ELF64 executable: ${pathCheck.path}`,
+          }
+        }
+        if (extHead.readUInt16LE(18) !== (manifest.arch === 'amd64' ? 62 : 183)) {
+          return {
+            ok: false,
+            code: 'crag_v2_arch_mismatch',
+            error: `CRAG v2 shared store official Claude arch does not match ${manifest.arch}`,
+          }
+        }
+        if (extDigest !== official.sha256) {
+          return {
+            ok: false,
+            code: 'crag_v2_hash_mismatch',
+            error: `CRAG v2 shared store official Claude SHA-256 mismatch: ${pathCheck.path}`,
+          }
+        }
+        verifiedExternalClaudeBin = pathCheck.path
+      } else {
+        const expectedSha = manifest.sha256[claude.path]
+        const requireOfficialSha =
+          official.sha256 !== undefined || (official.bundled === true && official.signature !== undefined)
+        if (requireOfficialSha) {
+          if (
+            typeof official.sha256 !== 'string' ||
+            !/^[a-f0-9]{64}$/.test(official.sha256) ||
+            official.sha256 !== expectedSha
+          ) {
+            throw new Error('official_claude_sha256')
+          }
+        }
+        if (official.signature !== undefined) {
+          if (official.signature == null || typeof official.signature !== 'string') {
+            throw new Error('official_claude_signature')
+          }
+          const signedOfficial = {
+            product: 'crag-v2',
+            arch: manifest.arch,
+            version: claude.version,
+            path: claude.path,
+            sha256: expectedSha,
+          }
+          if (
+            !crypto.verify(
+              null,
+              Buffer.concat([Buffer.from('CRAG-OFFICIAL-CLAUDE-V1\0'), Buffer.from(JSON.stringify(signedOfficial))]),
+              pub,
+              decodeLicenseBytes(official.signature, 64),
+            )
+          )
+            throw new Error('official_claude_signature')
+        }
+      }
+    }
   } catch {
     return { ok: false, code: 'crag_v2_manifest_invalid', error: 'CRAG v2 encrypted package authorization is invalid' }
   }
-  return { ok: true, manifest }
+  return {
+    ok: true,
+    manifest,
+    claudePath: claude.path,
+    claudeVersion: claude.version,
+    bundledClaude: !unbundledOfficial,
+    ...(verifiedExternalClaudeBin ? { externalClaudeBin: verifiedExternalClaudeBin } : {}),
+  }
 }
 
-function retainedClaudePath(rel) {
-  const current = CRAG_V2_CLAUDE.split('/')[0]
-  return rel.startsWith('claude-code-') && !rel.startsWith(`${current}/`)
+export function retainedClaudePath(rel, currentPath = '') {
+  const relStr = String(rel || '')
+  const slash = relStr.indexOf('/')
+  if (slash <= 0) return false
+  const top = relStr.slice(0, slash)
+  if (!CRAG_CLAUDE_DIR_RE.test(top)) return false
+  const current = String(currentPath || '').split('/')[0]
+  return !current || top !== current
 }
 
 function restoreDirectoryContents(backup, dest) {
@@ -517,7 +711,7 @@ function restoreDirectoryContents(backup, dest) {
   }
 }
 
-export function stageCragV2Tree(src, dest, { arch } = {}) {
+export function stageCragV2Tree(src, dest, { arch, allowUnbundledStore, sharedClaudeStoreRoot } = {}) {
   const parent = path.dirname(dest)
   const staging = fs.mkdtempSync(path.join(parent, `.${path.basename(dest)}.new-`))
   let backup = ''
@@ -525,7 +719,12 @@ export function stageCragV2Tree(src, dest, { arch } = {}) {
     fs.cpSync(src, staging, { recursive: true, dereference: false })
     // mkdtemp is 0700. The slot user is not root, so it cannot exec the bootstrap inside it.
     fs.chmodSync(staging, 0o755)
-    const verified = verifyCragV2Tree(staging, arch ? { arch } : undefined)
+    const verifyOpts = {
+      ...(arch ? { arch } : {}),
+      ...(allowUnbundledStore !== undefined ? { allowUnbundledStore } : {}),
+      ...(sharedClaudeStoreRoot ? { sharedClaudeStoreRoot } : {}),
+    }
+    const verified = verifyCragV2Tree(staging, Object.keys(verifyOpts).length ? verifyOpts : undefined)
     if (!verified.ok) {
       fs.rmSync(staging, { recursive: true, force: true })
       return verified
@@ -542,7 +741,7 @@ export function stageCragV2Tree(src, dest, { arch } = {}) {
       backup = `${staging}.bak`
       fs.cpSync(dest, backup, { recursive: true, dereference: false })
       try {
-        publishCragTree(staging, dest)
+        publishCragTree(staging, dest, verified.claudePath)
       } catch (error) {
         restoreDirectoryContents(backup, dest)
         fs.rmSync(backup, { recursive: true, force: true })
@@ -570,19 +769,48 @@ export function stageCragV2Tree(src, dest, { arch } = {}) {
   }
 }
 
-function publishCragTree(src, dest) {
-  const next = new Set(listCragV2Files(src))
-  for (const rel of next) replaceFile(path.join(src, rel), path.join(dest, rel))
-  for (const rel of listCragV2Files(dest)) {
-    if (next.has(rel) || retainedClaudePath(rel)) continue
-    fs.rmSync(path.join(dest, rel), { force: true })
+function activeClaudeDirOfTree(dir) {
+  try {
+    const manifest = JSON.parse(fs.readFileSync(path.join(dir, 'manifest.json'), 'utf8'))
+    return resolveManifestClaudePath(manifest)?.dir || ''
+  } catch {
+    return ''
   }
 }
 
-function cragV2WouldChange(src, destDir, select = true, arch = cragV2Arch()) {
+function publishCragTree(src, dest, nextClaudePath = '') {
+  const prevDir = activeClaudeDirOfTree(dest)
+  const nextDir = String(nextClaudePath || '').split('/')[0]
+  const upgradedVersion = Boolean(prevDir && nextDir && prevDir !== nextDir)
+  const next = new Set(listCragV2Files(src))
+  for (const rel of next) replaceFile(path.join(src, rel), path.join(dest, rel))
+  for (const rel of listCragV2Files(dest)) {
+    if (next.has(rel)) continue
+    // On an official Claude version upgrade, retain only the immediately previous
+    // active directory so running slots survive until restart and clean up older
+    // superseded versions. On a same-version resync, keep any previously retained
+    // directory intact because a running slot may still exec it before restart.
+    const keepPrevious = upgradedVersion
+      ? retainedClaudePath(rel, nextClaudePath) && rel.startsWith(`${prevDir}/`)
+      : retainedClaudePath(rel, nextClaudePath)
+    if (keepPrevious) continue
+    fs.rmSync(path.join(dest, rel), { force: true })
+  }
+  if (upgradedVersion) {
+    for (const entry of fs.readdirSync(dest, { withFileTypes: true })) {
+      if (!entry.isDirectory() || !CRAG_CLAUDE_DIR_RE.test(entry.name)) continue
+      if (entry.name === nextDir || entry.name === prevDir) continue
+      try {
+        fs.rmSync(path.join(dest, entry.name), { recursive: true, force: true })
+      } catch {}
+    }
+  }
+}
+
+function cragV2WouldChange(src, destDir, select = true, arch = cragV2Arch(), verifyOpts = {}) {
   const destRoot = path.join(destDir, CRAG_V2_DIR)
   if (!filesEqual(path.join(src, 'manifest.json'), path.join(destRoot, 'manifest.json'))) return true
-  if (verifyCragV2Tree(destRoot, { arch, allowPreviousClaude: true }).ok !== true) return true
+  if (verifyCragV2Tree(destRoot, { arch, allowPreviousClaude: true, ...verifyOpts }).ok !== true) return true
   if (!select) return false
   try {
     const wrapper = fs.lstatSync(path.join(destDir, WRAP_KERNEL_WRAPPER))
@@ -646,7 +874,13 @@ export function materializeCragV2(projectRoot, vm, { uid = null, gid = null, sel
   if (!src) {
     return missingCragPackageResult(projectRoot, slotArch)
   }
-  const verified = verifyCragV2Tree(src, { arch: slotArch })
+  const customOs = isCustomOsSlot(vm, runtimeOptions)
+  const storeRoot = customOs ? resolveHostSharedStoreDir(projectRoot, runtimeOptions) : ''
+  const verifyOpts = {
+    arch: slotArch,
+    ...(customOs ? { allowUnbundledStore: true, sharedClaudeStoreRoot: storeRoot } : {}),
+  }
+  const verified = verifyCragV2Tree(src, verifyOpts)
   if (!verified.ok) return verified
   // Preinstallation only copies encrypted distribution files; runtime admission
   // and the encrypted native binary itself enforce licensing on start. Keep refusing
@@ -670,7 +904,7 @@ export function materializeCragV2(projectRoot, vm, { uid = null, gid = null, sel
       dataplane: 'crag',
       kernel_version: 'v2',
       runtime_variant: 'crag-v2',
-      claude_bin: CRAG_V2_CLAUDE,
+      claude_bin: verified.claudePath,
       changed: false,
       kernel_changed: false,
       glibc_shim: false,
@@ -680,7 +914,7 @@ export function materializeCragV2(projectRoot, vm, { uid = null, gid = null, sel
   }
   const dest = wrapCliHomeDir(projectRoot, vm.id)
   fs.mkdirSync(dest, { recursive: true })
-  if (!cragV2WouldChange(src, dest, select, slotArch)) {
+  if (!cragV2WouldChange(src, dest, select, slotArch, verifyOpts)) {
     try {
       fs.chmodSync(path.join(dest, CRAG_V2_DIR), 0o755)
     } catch {}
@@ -699,7 +933,7 @@ export function materializeCragV2(projectRoot, vm, { uid = null, gid = null, sel
       kernel_bin: true,
     }
   }
-  const tree = stageCragV2Tree(src, path.join(dest, CRAG_V2_DIR), { arch: slotArch })
+  const tree = stageCragV2Tree(src, path.join(dest, CRAG_V2_DIR), verifyOpts)
   if (!tree.ok) return tree
   try {
     if (select) writeCragV2Wrapper(dest)
@@ -1423,7 +1657,13 @@ export function inspectKernelChanges(projectRoot, vms, { routing, nativeCliOptio
         })
         continue
       }
-      const verified = verifyCragV2Tree(src, { arch: slotArch })
+      const customOs = isCustomOsSlot(vm, runtimeOptions)
+      const storeRoot = customOs ? resolveHostSharedStoreDir(projectRoot, runtimeOptions) : ''
+      const verifyOpts = {
+        arch: slotArch,
+        ...(customOs ? { allowUnbundledStore: true, sharedClaudeStoreRoot: storeRoot } : {}),
+      }
+      const verified = verifyCragV2Tree(src, verifyOpts)
       if (!verified.ok) {
         items.push({
           id: vm.id,
@@ -1437,7 +1677,7 @@ export function inspectKernelChanges(projectRoot, vms, { routing, nativeCliOptio
       }
       const kernelChanged = clusterDockerSlot(vm)
         ? false
-        : cragV2WouldChange(src, destDir, true, slotArch) || Boolean(vm?.kernel_restart_pending)
+        : cragV2WouldChange(src, destDir, true, slotArch, verifyOpts) || Boolean(vm?.kernel_restart_pending)
       items.push({ id: vm.id, dataplane, kernel_version: 'v2', ok: true, kernel_changed: kernelChanged })
       continue
     }
