@@ -732,6 +732,19 @@ SANDBOX_ERROR_CODES = frozenset(
         "gemini_sandbox_unavailable",
     }
 )
+HOST_RESOURCE_ERROR_CODES = frozenset({"gemini_host_resource_exhausted"})
+
+_LICENSE_HOST_RESOURCE_ERRNOS = frozenset({errno.EMFILE, errno.ENFILE})
+
+
+def classify_craggemini_license_host_error(exc):
+    if isinstance(exc, OSError) and exc.errno in _LICENSE_HOST_RESOURCE_ERRNOS:
+        return 503, "gemini_host_resource_exhausted"
+    if isinstance(exc, subprocess.SubprocessError):
+        for err in (exc.__cause__, exc.__context__):
+            if isinstance(err, OSError) and err.errno in _LICENSE_HOST_RESOURCE_ERRNOS:
+                return 503, "gemini_host_resource_exhausted"
+    return None
 SAFE_AUTH_REASON = re.compile(
     r"\A(?:timeout|os_error|failed|exited|exit_code=-?[0-9]{1,5}|signal=[0-9]{1,3})\Z"
 )
@@ -6894,7 +6907,11 @@ class Host:
             return data
         except Failure:
             raise
-        except (OSError, subprocess.SubprocessError, ValueError):
+        except (OSError, subprocess.SubprocessError, ValueError) as error:
+            classified = classify_craggemini_license_host_error(error)
+            if classified is not None:
+                status_code, error_code = classified
+                raise Failure(status_code, error_code) from None
             raise Failure(503, "license_unconfigured") from None
         finally:
             if staging_dir is not None:
@@ -7053,7 +7070,9 @@ class Host:
         except Failure as error:
             code = (
                 error.code
-                if error.code in LICENSE_ERROR_CODES or error.code in SANDBOX_ERROR_CODES
+                if error.code in LICENSE_ERROR_CODES
+                or error.code in SANDBOX_ERROR_CODES
+                or error.code in HOST_RESOURCE_ERROR_CODES
                 else "license_unconfigured"
             )
             status = {
@@ -7063,6 +7082,8 @@ class Host:
                     if code == "license_required"
                     else "sync_pending"
                     if code == "gemini_subscription_sync_pending"
+                    else "host_resource_exhausted"
+                    if code in HOST_RESOURCE_ERROR_CODES
                     else "unconfigured"
                 ),
                 "valid": False,

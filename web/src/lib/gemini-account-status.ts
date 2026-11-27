@@ -173,6 +173,7 @@ const INFERENCE_ERROR_LABELS: Readonly<Record<string, string>> = {
   gemini_native_config_invalid: 'CRAGGemini 配置被载荷拒绝',
   gemini_sandbox_apparmor_restricted: '宿主 AppArmor 限制了 Gemini 沙箱',
   gemini_sandbox_unavailable: '宿主非特权沙箱不可用',
+  gemini_host_resource_exhausted: '宿主机文件描述符耗尽（EMFILE/ENFILE）',
   license_required: '未绑定 CRAGGemini 订阅席位',
   license_expired: 'CRAGGemini 订阅许可已过期',
   license_not_yet_valid: 'CRAGGemini 许可尚未生效',
@@ -340,6 +341,8 @@ const INFERENCE_ERROR_ACTIONS: Readonly<Record<string, string>> = {
     '处理方式：宿主机 AppArmor 限制了非特权 user namespace，请前往「设置 → Gemini 维护」执行「修复安装」或在宿主机运行 prepare-gemini。',
   gemini_sandbox_unavailable:
     '处理方式：宿主机非特权沙箱（bwrap）不可用，请前往「设置 → Gemini 维护」诊断宿主并检查 bubblewrap 与服务日志。',
+  gemini_host_resource_exhausted:
+    '处理方式：宿主机文件描述符耗尽（EMFILE/ENFILE），请重启 vm2api-gemini 服务并检查 Unix 控制连接池是否泄漏。',
   license_required:
     '处理方式：请在「账号」页为当前环境绑定可用的 CRAGGemini 订阅席位。',
   license_expired:

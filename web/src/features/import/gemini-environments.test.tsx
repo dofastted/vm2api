@@ -350,6 +350,62 @@ test('CRAGGemini subscription mode renders subscription status and seat bind/rel
   expect(syncPendingHtml).not.toContain('CRAGGemini 宿主订阅未激活')
 })
 
+test('CRAG host resource exhaustion does not offer seat rebind', () => {
+  const client = new QueryClient()
+  client.setQueryData(['panel', 'me'], { role: 'admin' })
+  client.setQueryData(['panel', 'gemini-environments'], {
+    available: true,
+    payload_state: 'installed',
+    payload_mode: 'crag_subscription',
+    release_activated: true,
+    crag_subscription: {
+      configured: true,
+      active: true,
+      product: 'craggemini',
+      host_id: 'host-1',
+      sync_pending: false,
+      version: 2,
+      revision: 2,
+      issued_at: 1_800_000_000,
+      expires_at: 1_803_000_000,
+      slot_limit: 2,
+      used_slots: 1,
+      available_slots: 1,
+      reclaim_supported: true,
+    },
+    environments: [
+      {
+        id: 'gemini-emfile',
+        name: 'FD 耗尽',
+        proxy_id: 'px-one',
+        auth_state: 'authorized',
+        auth_method: 'oauth',
+        runtime_ready: false,
+        billing_ready: false,
+        kernel_version: '0.4.10',
+        models: ['gemini-3-flash'],
+        models_discovered: true,
+        crag_license: {
+          product: 'craggemini',
+          status: 'host_resource_exhausted',
+          valid: false,
+          seat_required: true,
+          code: 'gemini_host_resource_exhausted',
+        },
+        account: null,
+      },
+    ],
+  })
+  const html = renderToStaticMarkup(
+    <QueryClientProvider client={client}>
+      <GeminiEnvironments environmentId='gemini-emfile' />
+    </QueryClientProvider>
+  )
+  expect(html).toContain('宿主机文件描述符耗尽')
+  expect(html).not.toContain('重新绑定 CRAG 席位')
+  expect(html).not.toContain('绑定 CRAG 席位')
+})
+
 test('Gemini authorization challenge exposes copyable link alongside open action', () => {
   const url =
     'https://accounts.google.com/o/oauth2/auth?redirect_uri=https%3A%2F%2Fantigravity.google%2Foauth-callback&response_type=code&code_challenge_method=S256&state=s1&code_challenge=c1'

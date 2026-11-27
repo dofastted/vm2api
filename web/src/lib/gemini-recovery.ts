@@ -23,6 +23,7 @@ const hostIssues: Record<string, true> = {
   gemini_ipv4_forwarding_unavailable: true,
   gemini_sandbox_apparmor_restricted: true,
   gemini_sandbox_unavailable: true,
+  gemini_host_resource_exhausted: true,
   gemini_authorization_unavailable: true,
   gemini_native_tty_unavailable: true,
   gemini_native_worker_unavailable: true,

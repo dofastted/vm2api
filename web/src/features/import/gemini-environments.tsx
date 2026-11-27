@@ -231,6 +231,19 @@ const CRAG_LICENSE_SANDBOX_CODES = new Set([
   'gemini_sandbox_unavailable',
 ])
 
+/** Host FD exhaustion (EMFILE/ENFILE) — not a seat/license binding problem. */
+const CRAG_LICENSE_HOST_RESOURCE_CODES = new Set([
+  'gemini_host_resource_exhausted',
+])
+
+function cragLicenseSeatActionBlocked(code?: string | null) {
+  if (!code) return false
+  return (
+    CRAG_LICENSE_SANDBOX_CODES.has(code) ||
+    CRAG_LICENSE_HOST_RESOURCE_CODES.has(code)
+  )
+}
+
 const OAUTH_ISSUES = {
   gemini_oauth_tools_missing: '宿主缺少 Google 授权所需工具。',
   gemini_egress_unavailable: '宿主缺少可用的 kin-egress。',
@@ -1449,9 +1462,7 @@ export function GeminiEnvironments({
         {isCragSubscription &&
         environment.auth_method === 'oauth' &&
         !environment.crag_license?.valid &&
-        !CRAG_LICENSE_SANDBOX_CODES.has(
-          environment.crag_license?.code ?? ''
-        ) ? (
+        !cragLicenseSeatActionBlocked(environment.crag_license?.code) ? (
           <Button
             type='button'
             variant='outline'
