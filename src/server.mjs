@@ -38,6 +38,7 @@ import {
   createGeminiTerminal,
   formatGoogleModelList,
   geminiKeyAllowsPath,
+  geminiProxyEgressOptionsFor,
   geminiProxyFor,
   googleModelEntry,
   callGeminiHost,
@@ -1501,6 +1502,8 @@ const geminiSlotPrefs = createGeminiSlotPrefs({
 const geminiScheduler = createGeminiScheduler({
   callHost: callGeminiHost,
   resolveProxy: (proxyId, envOwnerId) => geminiProxyFor(proxyPool, proxyId, { ownerUserId: envOwnerId }),
+  resolveProxyEgressOptions: (proxyId, envOwnerId) =>
+    geminiProxyEgressOptionsFor(proxyPool, proxyId, { ownerUserId: envOwnerId }),
   poolScheduler,
   stickyRouter,
   apiKeyStore,

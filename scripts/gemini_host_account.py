@@ -94,7 +94,15 @@ def read_token(profile):
         return None
 
 
-def get_json(proxy_url, url, header=None, body=None, *, timeout=6):
+def _redact_proxy_error(raw, proxy_url=None):
+    text_val = raw.decode("utf-8", errors="replace").strip()[:240] if isinstance(raw, (bytes, bytearray)) else str(raw or "").strip()[:240]
+    if isinstance(proxy_url, str) and proxy_url and proxy_url in text_val:
+        text_val = text_val.replace(proxy_url, "[redacted proxy URL]")
+    text_val = re.sub(r"(?:socks5h?|https?)://[^\s/?#<>\"`]*@[^\s<>\"`]*", "[redacted proxy URL]", text_val, flags=re.IGNORECASE)
+    return text_val[:200]
+
+
+def get_json(proxy_url, url, header=None, body=None, *, timeout=10):
     config_lines = [
         f"proxy = {json.dumps(proxy_url)}\n",
         'noproxy = ""\n',
@@ -109,12 +117,13 @@ def get_json(proxy_url, url, header=None, body=None, *, timeout=6):
         "curl",
         "--disable",
         "--silent",
+        "--show-error",
         "--config",
         "-",
         "--proto",
         "=https",
         "--connect-timeout",
-        "3",
+        "6",
         "--max-time",
         str(timeout),
         "--max-filesize",
@@ -134,11 +143,11 @@ def get_json(proxy_url, url, header=None, body=None, *, timeout=6):
             args,
             input=config.encode(),
             capture_output=True,
-            timeout=timeout + 1,
+            timeout=timeout + 2,
             env=ENV,
         )
         if output.returncode != 0:
-            stderr_msg = output.stderr.decode("utf-8", errors="replace").strip()[:200]
+            stderr_msg = _redact_proxy_error(output.stderr, proxy_url)
             return 0, {"_transport_error": stderr_msg or f"curl exit {output.returncode}"}
         raw, _, status = output.stdout.rpartition(b"\n")
         status = int(status)
@@ -274,12 +283,13 @@ def post_form_json(proxy_url, url, form_fields, *, timeout=10):
         "curl",
         "--disable",
         "--silent",
+        "--show-error",
         "--config",
         "-",
         "--proto",
         "=https",
         "--connect-timeout",
-        "4",
+        "6",
         "--max-time",
         str(timeout),
         "--max-filesize",
@@ -300,7 +310,8 @@ def post_form_json(proxy_url, url, form_fields, *, timeout=10):
             env=ENV,
         )
         if output.returncode != 0:
-            return 0, {}
+            stderr_msg = _redact_proxy_error(output.stderr, proxy_url)
+            return 0, {"_transport_error": stderr_msg or f"curl exit {output.returncode}"}
         raw, _, status_raw = output.stdout.rpartition(b"\n")
         status = int(status_raw)
         try:
@@ -309,7 +320,7 @@ def post_form_json(proxy_url, url, form_fields, *, timeout=10):
             data = {}
         return status, data if isinstance(data, dict) else {}
     except (OSError, subprocess.SubprocessError, ValueError):
-        return 0, {}
+        return 0, {"_transport_error": "request failed or timed out"}
 
 
 def refresh_oauth_token(
@@ -438,7 +449,14 @@ def probe_oauth_refresh_import(proxy_url, oauth_token, *, oauth_clients=None):
         )
         return {"account": fallback_account, "fallback_access_only": True}
 
-    return {"account": checked(refreshed.get("state") or "error")}
+    err_code = refreshed.get("error")
+    extra = {}
+    if isinstance(err_code, str) and err_code:
+        extra["error_code"] = err_code
+    out = {"account": checked(refreshed.get("state") or "error", **extra)}
+    if isinstance(err_code, str) and err_code:
+        out["error"] = err_code
+    return out
 
 
 def checked(state, **data):

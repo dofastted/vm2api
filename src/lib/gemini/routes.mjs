@@ -35,6 +35,7 @@ import { isGeminiProtocolAllowed } from './routing-config.mjs'
 import { GEMINI_LICENSE_MESSAGES } from './subscription.mjs'
 import { createGeminiSlotPrefs, parseGeminiDisplayName, parseGeminiScheduleLevel } from './slot-prefs.mjs'
 import { resolveCragGeminiPromptPolicy } from './system-prompt.mjs'
+import { configuredDnsUpstream, proxyDnsEmptyTypes } from '../vm/egress.mjs'
 import { compileWithProtoFront, protoFrontMode } from '../transport/proto-front-client.mjs'
 import {
   clientBlockErrorOf,
@@ -88,7 +89,7 @@ const RUN_ERRORS = {
   ],
   gemini_proxy_error: [
     502,
-    '无法通过绑定代理连接 Google 上游，请在「代理」页探活检查 SOCKS5 节点连通性与出口质量，或更换代理后重试',
+    '无法通过绑定代理连接 Google 上游，请在「代理」页探活检查代理节点连通性与出口质量，或更换代理后重试',
   ],
   gemini_model_unavailable: [409, '上游不支持或未开放所选模型（404），请先点击「拉取模型」刷新最新模型目录后再试'],
   gemini_models_empty: [502, '上游未返回可调用模型，请检查账号资格与代理连通性，或重新完成授权后再拉取'],
@@ -235,6 +236,10 @@ const HOST_ERRORS = {
   gemini_terminal_limit: [429, '终端会话或连接票据已达上限，请关闭现有终端或稍后重试'],
   gemini_oauth_import_invalid: [400, 'Google 账号文件中的凭据格式无效'],
   gemini_oauth_import_rejected: [400, 'Google 凭据已过期或未获授权，请导出新文件或进行 Google 授权'],
+  gemini_oauth_client_not_configured: [
+    503,
+    '宿主机未配置可用的 Google OAuth 客户端凭据，请检查 /etc/vm2api/gemini-oauth.env 或重新安装 Gemini 签名载荷',
+  ],
   gemini_test_oauth_unsupported: [503, '当前签名载荷不支持 Google OAuth 推理测试'],
   gemini_test_auth_required: [409, '请先为 Gemini 环境完成授权'],
   gemini_test_invalid_input: [400, '请选择此环境的 Gemini 模型并输入有效的测试内容'],
@@ -337,6 +342,10 @@ export function geminiProxyFor(proxyPool, proxyId, opts) {
   return proxyFor(proxyPool, proxyId, opts)
 }
 
+export function geminiProxyEgressOptionsFor(proxyPool, proxyId, opts) {
+  return proxyEgressOptionsFor(proxyPool, proxyId, opts)
+}
+
 const AUTH_STAGE_MESSAGES = {
   network_prepare: 'Gemini 宿主服务在线，但隔离网络初始化失败，请检查宿主服务日志与 ip/nft/iptables 环境',
   relay_start: 'Gemini 宿主服务在线，但宿主侧代理中继未能启动，请检查宿主服务日志',
@@ -436,7 +445,7 @@ function hostRequest(socketPath, operation, payload) {
 }
 
 function redactProxyAuth(value) {
-  return value.replace(/socks5h?:\/\/[^\s/?#<>"`]*@[^\s<>"`]*/gi, '[redacted proxy URL]')
+  return value.replace(/(?:socks5h?|https?):\/\/[^\s/?#<>"`]*@[^\s<>"`]*/gi, '[redacted proxy URL]')
 }
 
 function text(value, size = 128) {
@@ -825,8 +834,30 @@ function authorizationInput(body) {
   }
 }
 
-function proxyFor(proxyPool, proxyId, { allowUnhealthy = false, forBinding = false, ownerUserId = null } = {}) {
-  if (!validId(proxyId)) throw hostError('gemini_proxy_unavailable', 409)
+function isAllowedProxyHost(hostname) {
+  if (typeof hostname !== 'string' || !hostname || hostname.length > 253) return false
+  const family = isIP(hostname)
+  if (family === 4) {
+    return !/^(?:127\.|169\.254\.|22[4-9]\.|23[0-9]\.|0\.0\.0\.0$|255\.255\.255\.255$)/.test(hostname)
+  }
+  if (family === 6) return false
+  const lower = hostname.toLowerCase()
+  if (
+    lower === 'localhost' ||
+    lower.endsWith('.localhost') ||
+    lower.endsWith('.localdomain') ||
+    lower.endsWith('.') ||
+    lower.includes('..')
+  ) {
+    return false
+  }
+  const labels = lower.split('.')
+  if (/^\d+$/.test(labels[labels.length - 1])) return false
+  return labels.every((label) => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label))
+}
+
+function proxyRecordFor(proxyPool, proxyId, ownerUserId = null) {
+  if (!validId(proxyId)) return null
   const targetOwner = normalizeOwnerId(ownerUserId)
   const scopedList = proxyPool?.snapshot({ ownerUserId: targetOwner || null })?.proxies || []
   let proxy = scopedList.find((entry) => entry.id === proxyId)
@@ -835,6 +866,34 @@ function proxyFor(proxyPool, proxyId, { allowUnhealthy = false, forBinding = fal
     const platformList = proxyPool?.snapshot({ ownerUserId: null })?.proxies || []
     proxy = platformList.find((entry) => entry.id === proxyId)
   }
+  return proxy || null
+}
+
+function proxyEgressOptionsFor(proxyPool, proxyId, { ownerUserId = null } = {}) {
+  if (!proxyPool || !validId(proxyId)) return null
+  const proxy = proxyRecordFor(proxyPool, proxyId, ownerUserId)
+  const withAuth = proxyPool.getProxyByIdWithAuth?.(proxyId) || null
+  const opts = {}
+  if (proxy?.domain_forward === true || withAuth?.domain_forward === true) {
+    opts.domain_forward = true
+  }
+  const emptyTypes = proxyDnsEmptyTypes(
+    withAuth?.dns_disable_svcb_https !== undefined ? withAuth : proxy,
+  )
+  if (emptyTypes.length) {
+    opts.dns_empty_types = emptyTypes
+  }
+  const dnsUpstream = configuredDnsUpstream()
+  if (dnsUpstream) {
+    opts.dns_upstream = dnsUpstream
+  }
+  return Object.keys(opts).length ? opts : null
+}
+
+function proxyFor(proxyPool, proxyId, { allowUnhealthy = false, forBinding = false, ownerUserId = null } = {}) {
+  if (!validId(proxyId)) throw hostError('gemini_proxy_unavailable', 409)
+  const targetOwner = normalizeOwnerId(ownerUserId)
+  const proxy = proxyRecordFor(proxyPool, proxyId, targetOwner)
   const pOwner = normalizeOwnerId(proxy?.owner_user_id)
   const ownerAllowed = targetOwner ? !pOwner || pOwner === targetOwner : !pOwner
   if (
@@ -852,15 +911,21 @@ function proxyFor(proxyPool, proxyId, { allowUnhealthy = false, forBinding = fal
   }
   try {
     const url = new URL(proxyPool.getProxyByIdWithAuth(proxyId)?.url)
+    const isSocks = url.protocol === 'socks5:' || url.protocol === 'socks5h:'
+    const isHttp = url.protocol === 'http:'
+    const port = url.port || (isHttp ? '80' : '')
     if (
-      (url.protocol === 'socks5:' || url.protocol === 'socks5h:') &&
-      isIP(url.hostname) === 4 &&
-      url.port &&
-      !/^(?:127\.|169\.254\.|22[4-9]\.|23[0-9]\.|0\.0\.0\.0$|255\.255\.255\.255$)/.test(url.hostname) &&
+      (isSocks || isHttp) &&
+      isAllowedProxyHost(url.hostname) &&
+      port &&
       (!url.pathname || url.pathname === '/') &&
       !url.hash &&
       !url.search
     ) {
+      if (isHttp) {
+        const auth = url.username || url.password ? `${url.username}${url.password ? `:${url.password}` : ''}@` : ''
+        return `http://${auth}${url.hostname}:${port}`
+      }
       return url.href.replace(/^socks5:/, 'socks5h:')
     }
   } catch {
@@ -874,7 +939,13 @@ async function readEnvironment(callHost, id) {
 }
 
 function boundProxy(proxyPool, environment, options) {
-  return { proxy_id: environment.proxy_id, proxy_url: proxyFor(proxyPool(), environment.proxy_id, options) }
+  const pool = proxyPool()
+  const egressOptions = proxyEgressOptionsFor(pool, environment.proxy_id, options)
+  return {
+    proxy_id: environment.proxy_id,
+    proxy_url: proxyFor(pool, environment.proxy_id, options),
+    ...(egressOptions ? { egress_options: egressOptions } : {}),
+  }
 }
 
 function hostStreamRequest(socketPath, operation, payload, { signal, timeoutMs = 300_000 } = {}) {
@@ -963,12 +1034,14 @@ export async function warmGeminiEnvironments({ callHost = callGeminiHost, proxyP
       continue
     }
     const proxySha256 = crypto.createHash('sha256').update(proxyUrl).digest('hex')
+    const egressOptions = proxyEgressOptionsFor(pool, env.proxy_id)
     try {
       const res = await callHost('warm', {
         id: env.id,
         proxy_id: env.proxy_id,
         proxy_url: proxyUrl,
         proxy_sha256: proxySha256,
+        ...(egressOptions ? { egress_options: egressOptions } : {}),
       })
       if (res?.runtime_ready === true || res?.warmed === true) report.warmed += 1
       else if (res?.warming === true) report.warming += 1
@@ -1103,10 +1176,12 @@ export async function checkGeminiAccounts({
       continue
     }
     try {
+      const egressOptions = proxyEgressOptionsFor(pool, env.proxy_id, { ownerUserId })
       const refreshed = await callHost('refresh', {
         id: env.id,
         proxy_id: env.proxy_id,
         proxy_url: proxyUrl,
+        ...(egressOptions ? { egress_options: egressOptions } : {}),
       })
       report.checked += 1
       const { changed } = reconcileGeminiAccountCheck(env.id, refreshed, {
@@ -1146,10 +1221,16 @@ export function createGeminiTerminal({ proxyPool, callHost = callGeminiHost }) {
       if (typeof environment.proxy_id !== 'string' || !ID.test(environment.proxy_id)) {
         throw hostError('gemini_proxy_unavailable', 409)
       }
-      return { proxy_id: environment.proxy_id, proxy_url: proxyFor(proxyPool(), environment.proxy_id) }
+      const pool = proxyPool()
+      const egressOptions = proxyEgressOptionsFor(pool, environment.proxy_id)
+      return {
+        proxy_id: environment.proxy_id,
+        proxy_url: proxyFor(pool, environment.proxy_id),
+        ...(egressOptions ? { egress_options: egressOptions } : {}),
+      }
     },
     errorMessage(code, stage) {
-      if (code === 'gemini_proxy_unavailable') return '需要绑定可用的 IPv4 SOCKS5 代理'
+      if (code === 'gemini_proxy_unavailable') return '需要绑定可用的 SOCKS5 / HTTP 代理'
       if (code === 'gemini_environment_not_found') return 'Gemini 环境不存在'
       if (code === 'gemini_environment_conflict') return 'Gemini 环境状态已变化，请刷新后重试'
       return (
@@ -1352,11 +1433,14 @@ export function createGeminiPanelHandler({
           return fail(400, 'gemini_oauth_import_invalid', HOST_ERRORS.gemini_oauth_import_invalid[1])
         }
         const ownerUserId = normalizeOwnerId(body?.owner_user_id)
-        const proxyUrl = proxyFor(proxyPool(), body.proxy_id, { ownerUserId, forBinding: true })
+        const pool = proxyPool()
+        const proxyUrl = proxyFor(pool, body.proxy_id, { ownerUserId, forBinding: true })
+        const egressOptions = proxyEgressOptionsFor(pool, body.proxy_id, { ownerUserId })
         let created = await callHost('create', {
           name,
           proxy_id: body.proxy_id,
           proxy_url: proxyUrl,
+          ...(egressOptions ? { egress_options: egressOptions } : {}),
           ...(maxConcurrency != null ? { max_concurrency: maxConcurrency } : {}),
           ...(method === 'api_key' ? { auth_method: method, api_key: apiKey } : {}),
           ...(normalizedImport != null && {
@@ -1632,8 +1716,16 @@ export function createGeminiPanelHandler({
       }
       if (req.method === 'POST' && action === 'refresh') {
         const environment = environmentView(await callHost('get', { id }))
-        const proxyUrl = proxyFor(proxyPool(), environment.proxy_id, { ownerUserId: envOwnerOf(id) })
-        let refreshed = await callHost('refresh', { id, proxy_id: environment.proxy_id, proxy_url: proxyUrl })
+        const pool = proxyPool()
+        const ownerUserId = envOwnerOf(id)
+        const proxyUrl = proxyFor(pool, environment.proxy_id, { ownerUserId })
+        const egressOptions = proxyEgressOptionsFor(pool, environment.proxy_id, { ownerUserId })
+        let refreshed = await callHost('refresh', {
+          id,
+          proxy_id: environment.proxy_id,
+          proxy_url: proxyUrl,
+          ...(egressOptions ? { egress_options: egressOptions } : {}),
+        })
         if (environment.auth_method === 'oauth' && cragSubscription?.ensureEnvironmentSeat) {
           const seat = await cragSubscription
             .ensureEnvironmentSeat(id, { env: refreshed })
@@ -1653,13 +1745,17 @@ export function createGeminiPanelHandler({
       if (action !== 'authorization') return fail(404, 'not_found')
       if (req.method === 'POST') {
         const environment = environmentView(await callHost('get', { id }))
-        const proxyUrl = proxyFor(proxyPool(), environment.proxy_id, { ownerUserId: envOwnerOf(id) })
+        const pool = proxyPool()
+        const ownerUserId = envOwnerOf(id)
+        const proxyUrl = proxyFor(pool, environment.proxy_id, { ownerUserId })
         const proxySha256 = crypto.createHash('sha256').update(proxyUrl).digest('hex')
+        const egressOptions = proxyEgressOptionsFor(pool, environment.proxy_id, { ownerUserId })
         const auth = await callHost('authorize', {
           id,
           proxy_id: environment.proxy_id,
           proxy_url: proxyUrl,
           proxy_sha256: proxySha256,
+          ...(egressOptions ? { egress_options: egressOptions } : {}),
         })
         const url = officialGeminiAuthUrl(auth?.url)
         if (!url || !ID.test(auth?.attempt_id ?? '')) throw hostError(FAILURE)
@@ -1672,13 +1768,17 @@ export function createGeminiPanelHandler({
           return fail(400, 'gemini_invalid_authorization_code', '请输入 Google 授权码或完整回调链接')
         }
         const environment = environmentView(await callHost('get', { id }))
-        const proxyUrl = proxyFor(proxyPool(), environment.proxy_id, { ownerUserId: envOwnerOf(id) })
+        const pool = proxyPool()
+        const ownerUserId = envOwnerOf(id)
+        const proxyUrl = proxyFor(pool, environment.proxy_id, { ownerUserId })
         const proxySha256 = crypto.createHash('sha256').update(proxyUrl).digest('hex')
+        const egressOptions = proxyEgressOptionsFor(pool, environment.proxy_id, { ownerUserId })
         let completed = await callHost('complete', {
           id,
           proxy_id: environment.proxy_id,
           proxy_url: proxyUrl,
           proxy_sha256: proxySha256,
+          ...(egressOptions ? { egress_options: egressOptions } : {}),
           attempt_id: body.attempt_id,
           ...authorization,
         })
@@ -1718,7 +1818,7 @@ export function createGeminiPanelHandler({
           error.code === 'gemini_authorization_unavailable' && stage ? AUTH_STAGE_MESSAGES[stage] : message
         return fail(status, error.code, resolvedMessage, stage ? { stage } : null)
       }
-      if (error?.code === 'gemini_proxy_unavailable') return fail(409, error.code, '需要绑定可用的 IPv4 SOCKS5 代理')
+      if (error?.code === 'gemini_proxy_unavailable') return fail(409, error.code, '需要绑定可用的 SOCKS5 / HTTP 代理')
       if (error?.code === 'gemini_environment_not_found') return fail(404, error.code, 'Gemini 环境不存在')
       if (error?.code === 'gemini_environment_conflict')
         return fail(409, error.code, 'Gemini 环境状态已变化，请刷新后重试')

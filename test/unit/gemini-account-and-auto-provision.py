@@ -734,6 +734,160 @@ def test_refresh_token_import_exchanges_and_creates_standard_profile():
                     assert err.status == 400
                     assert err.code == "gemini_oauth_import_rejected"
 
+            # Missing OAuth client config maps to 503 gemini_oauth_client_not_configured (not misleading 502)
+            with patch.object(
+                host_mod,
+                "read_account",
+                return_value={
+                    "account": {
+                        "state": "error",
+                        "error_code": "oauth_client_not_configured",
+                        "checked_at": "2026-11-26T00:00:00+00:00",
+                    },
+                    "error": "oauth_client_not_configured",
+                },
+            ):
+                try:
+                    host._request(
+                        "create",
+                        {
+                            "name": "missing-oauth-cfg",
+                            "proxy_id": "px-1",
+                            "proxy_url": PROXY,
+                            "auth_method": "oauth",
+                            "oauth_account": {"refresh_token": "1//06MissingCfgRt_abc123"},
+                        },
+                    )
+                    raise AssertionError("expected Failure")
+                except host_mod.Failure as err:
+                    assert err.status == 503
+                    assert err.code == "gemini_oauth_client_not_configured"
+
+
+def _build_synthetic_elf64(rodata_bytes, text_bytes, *, text_va=0x401000, ro_va=0x402000):
+    import struct
+
+    shstr = b"\x00.text\x00.rodata\x00.shstrtab\x00"
+    hdr_size = 64
+    text_off = hdr_size
+    ro_off = text_off + len(text_bytes)
+    shstr_off = ro_off + len(rodata_bytes)
+    shoff = shstr_off + len(shstr)
+
+    e_ident = b"\x7fELF" + bytes([2, 1, 1]) + b"\x00" * 9
+    elf_hdr = e_ident + struct.pack(
+        "<HHIQQQIHHHHHH",
+        2,  # ET_EXEC
+        62,  # EM_X86_64
+        1,  # EV_CURRENT
+        text_va,
+        0,
+        shoff,
+        0,
+        hdr_size,
+        0,
+        0,
+        64,  # e_shentsize
+        4,  # e_shnum
+        3,  # e_shstrndx
+    )
+
+    def shdr(name_off, sh_type, flags, addr, offset, size):
+        return struct.pack("<IIQQQQIIQQ", name_off, sh_type, flags, addr, offset, size, 0, 0, 1, 0)
+
+    sh_null = shdr(0, 0, 0, 0, 0, 0)
+    sh_text = shdr(1, 1, 6, text_va, text_off, len(text_bytes))
+    sh_ro = shdr(7, 1, 2, ro_va, ro_off, len(rodata_bytes))
+    sh_str = shdr(15, 3, 0, 0, shstr_off, len(shstr))
+    return elf_hdr + text_bytes + rodata_bytes + shstr + sh_null + sh_text + sh_ro + sh_str
+
+
+def test_default_oauth_elf64_extraction_env_override_and_transport_redaction():
+    import struct
+
+    host_mod = load_module("gemini_host_oauth_defaults", "scripts/gemini-host.py")
+    account_mod = load_module("gemini_account_oauth_defaults", "scripts/gemini_host_account.py")
+
+    consumer_id = host_mod._AGY_DEFAULT_OAUTH_CLIENT_IDS["consumer"].encode("ascii")
+    cloud_id = host_mod._AGY_DEFAULT_OAUTH_CLIENT_IDS["cloud"].encode("ascii")
+    # Build synthetic 35-byte secrets at runtime (no real credentials in source) and pack
+    # them contiguously in .rodata with NO NUL terminators, mirroring Go binary layout.
+    syn_consumer_sec = ("GOCSPX-" + "A" * 28).encode("ascii")
+    syn_cloud_sec = ("GOCSPX-" + "B" * 28).encode("ascii")
+    syn_decoy_sec = ("GOCSPX-" + "C" * 28).encode("ascii")
+
+    rodata = b"PREFIX" + consumer_id + syn_consumer_sec + b"ADJACENT_LITERAL" + cloud_id + syn_cloud_sec + b"TAIL" + syn_decoy_sec
+    text_va = 0x401000
+    ro_va = 0x402000
+
+    def lea_rax(pos, target_off):
+        disp = (ro_va + target_off) - (text_va + pos + 7)
+        return b"\x48\x8d\x05" + struct.pack("<i", disp)
+
+    text = bytearray()
+    # Pair consumer ID + consumer secret closely
+    text += lea_rax(len(text), rodata.index(consumer_id))
+    text += lea_rax(len(text), rodata.index(syn_consumer_sec))
+    text += b"\x90" * 512  # separate functions beyond 256-byte pairing window
+    # Pair cloud ID + cloud secret closely
+    text += lea_rax(len(text), rodata.index(cloud_id))
+    text += lea_rax(len(text), rodata.index(syn_cloud_sec))
+    text += b"\x90" * 512
+    # Distant decoy secret alone (must never hijack consumer/cloud)
+    text += lea_rax(len(text), rodata.index(syn_decoy_sec))
+
+    elf_bytes = _build_synthetic_elf64(rodata, bytes(text), text_va=text_va, ro_va=ro_va)
+
+    with tempfile.TemporaryDirectory(prefix="gemini-elf-oauth-") as tmpdir:
+        fake_agy = Path(tmpdir) / "agy"
+        fake_agy.write_bytes(elf_bytes)
+
+        # 1. Empty env derives both consumer & cloud pairs cleanly from installed agy binary.
+        with patch.dict(os.environ, {}, clear=True):
+            resolved = host_mod._resolve_host_oauth_clients(agy_path=fake_agy)
+        assert resolved == {
+            "KIN_GEMINI_OAUTH_CONSUMER_CLIENT_ID": consumer_id.decode("ascii"),
+            "KIN_GEMINI_OAUTH_CONSUMER_CLIENT_SECRET": syn_consumer_sec.decode("ascii"),
+            "KIN_GEMINI_OAUTH_CLOUD_CLIENT_ID": cloud_id.decode("ascii"),
+            "KIN_GEMINI_OAUTH_CLOUD_CLIENT_SECRET": syn_cloud_sec.decode("ascii"),
+        }, resolved
+
+        # 2. Explicit env client ID override MUST NOT pair with the derived agy secret.
+        with patch.dict(
+            os.environ,
+            {"KIN_GEMINI_OAUTH_CONSUMER_CLIENT_ID": "custom-consumer-id"},
+            clear=True,
+        ):
+            overridden = host_mod._resolve_host_oauth_clients(agy_path=fake_agy)
+        assert overridden["KIN_GEMINI_OAUTH_CONSUMER_CLIENT_ID"] == "custom-consumer-id"
+        assert "KIN_GEMINI_OAUTH_CONSUMER_CLIENT_SECRET" not in overridden
+        assert overridden["KIN_GEMINI_OAUTH_CLOUD_CLIENT_ID"] == cloud_id.decode("ascii")
+        assert overridden["KIN_GEMINI_OAUTH_CLOUD_CLIENT_SECRET"] == syn_cloud_sec.decode("ascii")
+
+    # 3. probe_oauth_refresh_import preserves error_code='oauth_client_not_configured' when unconfigured.
+    with patch.dict(os.environ, {}, clear=True):
+        unconfigured = account_mod.probe_oauth_refresh_import(
+            PROXY, {"refresh_token": "1//06UnconfiguredRt_xyz"}
+        )
+    assert unconfigured["error"] == "oauth_client_not_configured"
+    assert unconfigured["account"]["error_code"] == "oauth_client_not_configured"
+
+    # 4. post_form_json captures redacted curl transport error without leaking proxy password.
+    secret_proxy = "http://alice:verysecretpw@192.0.2.55:8080"
+    fake_curl_err = SimpleNamespace(
+        returncode=56,
+        stdout=b"",
+        stderr=b"curl: (56) Proxy CONNECT aborted via http://alice:verysecretpw@192.0.2.55:8080",
+    )
+    with patch.object(account_mod.subprocess, "run", return_value=fake_curl_err):
+        st, body = account_mod.post_form_json(
+            secret_proxy, "https://oauth2.googleapis.com/token", {"grant_type": "refresh_token"}
+        )
+    assert st == 0
+    assert "_transport_error" in body
+    assert "verysecretpw" not in body["_transport_error"]
+    assert "[redacted proxy URL]" in body["_transport_error"]
+
 
 if __name__ == "__main__":
     test_account_antigravity_ua_and_auto_onboard()
@@ -742,4 +896,5 @@ if __name__ == "__main__":
     test_post_oauth_auto_pulls_models_and_refreshes_expired_token()
     test_unsupported_client_fallback_and_distinct_classification()
     test_refresh_token_import_exchanges_and_creates_standard_profile()
+    test_default_oauth_elf64_extraction_env_override_and_transport_redaction()
     print("OK")

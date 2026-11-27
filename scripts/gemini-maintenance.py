@@ -95,6 +95,7 @@ CRAG_MEMBERS = (
 )
 CRAG_ASSETS = tuple(name for name in CRAG_MEMBERS if name != "agy")
 SYSTEMD_UNIT = "vm2api-gemini.service"
+OAUTH_ENV_FILE = "/etc/vm2api/gemini-oauth.env"
 APPARMOR_SERVICE = "apparmor.service"
 APPARMOR_PROFILE_CONTENT = apparmor_profile_bytes()
 SANDBOX_ERROR_CODES = frozenset(
@@ -1395,6 +1396,50 @@ class Maintenance:
             return static
         return ("warning", "gemini_maintenance_sandbox_unverified")
 
+    def attach_unit_oauth_env_file(self, data):
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            raise fail("unsupported_service_config") from None
+        directive = f"EnvironmentFile=-{OAUTH_ENV_FILE}"
+        lines = text.splitlines()
+        section = ""
+        has_service = False
+        has_env_file = False
+        for raw_line in lines:
+            trimmed = raw_line.strip()
+            if not trimmed or trimmed.startswith(("#", ";")):
+                continue
+            if trimmed.startswith("[") and trimmed.endswith("]"):
+                section = trimmed
+                if section == "[Service]":
+                    has_service = True
+                continue
+            if section == "[Service]" and trimmed.startswith("EnvironmentFile="):
+                target = trimmed.split("=", 1)[1].strip().lstrip("-")
+                if target == OAUTH_ENV_FILE:
+                    has_env_file = True
+        if not has_service or has_env_file:
+            return data
+        out = []
+        section = ""
+        inserted = False
+        for raw_line in lines:
+            trimmed = raw_line.strip()
+            if trimmed.startswith("[") and trimmed.endswith("]"):
+                if section == "[Service]" and not inserted:
+                    out.append(directive)
+                    inserted = True
+                section = trimmed
+            out.append(raw_line)
+            if section == "[Service]" and not inserted and trimmed == "[Service]":
+                out.append(directive)
+                inserted = True
+        if section == "[Service]" and not inserted:
+            out.append(directive)
+        suffix = "\n" if text.endswith("\n") else ""
+        return ("\n".join(out) + suffix).encode("utf-8")
+
     def write_unit(self, before, default=None, *, apparmor=None):
         want_apparmor = (
             self.apparmor_userns_restricted() if apparmor is None else bool(apparmor)
@@ -1417,7 +1462,8 @@ class Maintenance:
         if default is None and options["--egress"] == str(
             self.runtime / "bin/kin-egress"
         ):
-            return self.attach_unit_apparmor(before) if want_apparmor else before
+            updated = self.attach_unit_oauth_env_file(before)
+            return self.attach_unit_apparmor(updated) if want_apparmor else updated
         options["--egress"] = str(self.runtime / "bin/kin-egress")
         if default is not None:
             if self.crag_bundle:
@@ -1456,6 +1502,7 @@ class Maintenance:
         updated = re.sub(
             rb"(?m)^[ \t]*ExecStart=[^\r\n]*", line.encode(), before, count=1
         )
+        updated = self.attach_unit_oauth_env_file(updated)
         return self.attach_unit_apparmor(updated) if want_apparmor else updated
 
     def is_crag_manifest(self, raw):
