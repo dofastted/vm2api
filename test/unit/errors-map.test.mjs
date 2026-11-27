@@ -464,6 +464,19 @@ test('a terminal upstream verdict survives the relay so clients stop retrying (#
       },
     },
     { error: { type: 'partial_provider_output_nonretryable' } },
+    {
+      error: {
+        type: 'refused_continuation_conflict',
+        message:
+          'This tool continuation received a refusal. Repeat the exact submission to retrieve it, or include the refusal as an assistant message and ask a separate user turn.',
+      },
+    },
+    {
+      error: {
+        type: 'tool_continuation_account_changed',
+        message: 'This tool continuation was already submitted under a different provider account',
+      },
+    },
   ]) {
     const nonretryable = mapUpstreamError(409, body)
     assert.equal(nonretryable.status, 409)
