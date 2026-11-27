@@ -91,7 +91,10 @@ function retryAfterFromExpiry(expiresAt, now, fallbackSec = 600) {
 }
 
 function enforcesBan(policy, row) {
-  if (isJevReason(row?.reason)) return true
+  if (isJevReason(row?.reason)) {
+    if (row?.subject_kind === 'session' && policy?.session_block_enabled === false) return false
+    return true
+  }
   return !!(policy?.enabled && (policy.device_block_enabled || row?.reason?.endsWith(':nsfw')))
 }
 
@@ -99,7 +102,10 @@ function recordBan(decision, { devices, policy, requestId, now = Date.now() }) {
   if (!decision.banDevice || !decision.identity) return null
   const jevHit = isJevReason(decision.reason)
   if (!jevHit && (!policy?.enabled || (!policy.device_block_enabled && !decision.forceDeviceBan))) return null
-  const identity = decision.identity
+  const identity =
+    policy?.session_block_enabled === false && decision.identity.sessionId
+      ? { ...decision.identity, sessionId: '' }
+      : decision.identity
   const store = devices
   const evidence = { requestId, fingerprint: decision.fingerprint || null, reason: decision.reason || decision.kind }
   try {
@@ -222,19 +228,9 @@ export function commitProtocolBlock(decision, { repo, devices, sessions, policy,
       console.warn('[risk-audit] failed to record refusal cache hit')
     }
   }
-  if (decision.banSession && decision.sessionId && policy?.session_block_enabled !== false) {
-    try {
-      sessions?.block?.({
-        sessionId: decision.sessionId,
-        requestId,
-        model: decision.model || '',
-        preview: decision.preview || null,
-        reason: decision.reason || 'jev',
-      })
-    } catch {
-      console.warn('[risk-audit] failed to persist session block')
-    }
-  }
+  // JEV session bans are persisted tenant-scoped via devices.recordViolation
+  // (keyed by sha256(principal, 'session', rootSessionId)) instead of the
+  // unscoped global refusal_session_blocks table, preventing cross-tenant DoS.
   const ban = recordBan(decision, { devices, policy, requestId, now })
   if (decision.kind === 'jev' && isJevReason(decision.reason) && ban?.subject_kind === 'device') {
     if (!ban.expires_at) {
@@ -303,7 +299,10 @@ export async function evaluateProtocolIntercept({
   now = Date.now(),
 } = {}) {
   const audit = policy?.risk_audit
-  const reject = (fields) => block({ deviceId: identity.deviceId, identity, ...fields })
+  const rootSessionId = refusalSessionId({ inbound, body, headers }) || identity.sessionId || ''
+  const effectiveIdentity =
+    rootSessionId && rootSessionId !== identity.sessionId ? { ...identity, sessionId: rootSessionId } : identity
+  const reject = (fields) => block({ deviceId: effectiveIdentity.deviceId, identity: effectiveIdentity, ...fields })
   const interceptOpts = { interceptSession, ctx: bodyCtx }
   let rawDocument
   if (!skipMandatory) {
@@ -328,7 +327,7 @@ export async function evaluateProtocolIntercept({
         })
       }
     }
-    const banned = devices?.findBan?.(identity, now, (row) => enforcesBan(policy, row))
+    const banned = devices?.findBan?.(effectiveIdentity, now, (row) => enforcesBan(policy, row))
     if (banned) {
       const tempJevBan = banned.subject_kind === 'device' && isJevReason(banned.reason) && !!banned.expires_at
       const error = tempJevBan
@@ -339,10 +338,10 @@ export async function evaluateProtocolIntercept({
         : error.body.error.message
       return reject({
         kind: 'device',
-        reason: 'refusal_device',
+        reason: banned.subject_kind === 'session' ? 'refusal_session' : 'refusal_device',
         deviceId: banned.device_id,
         via: 'refusal-guard',
-        final_state: 'refusal_device',
+        final_state: banned.subject_kind === 'session' ? 'refusal_session' : 'refusal_device',
         error,
         logErrorCode: 'refusal_guard',
         errorMessage,
@@ -553,10 +552,7 @@ export async function evaluateProtocolIntercept({
       const steps = policy?.risk_audit?.ban_steps || DEFAULT_BAN_STEPS
       const firstMinutes = Number(steps[0]) > 0 ? Number(steps[0]) : 10
       const error = makePolicyOverloadError({ requestId, retryAfterSec: firstMinutes * 60 })
-      const rootSessionId = refusalSessionId({ inbound, body, headers }) || identity.sessionId || ''
-      const banIdentity = rootSessionId && !identity.sessionId ? { ...identity, sessionId: rootSessionId } : identity
       return reject({
-        identity: banIdentity,
         kind: 'jev',
         via: 'jev',
         final_state: 'policy_blocked',

@@ -1870,7 +1870,12 @@ test('JEV intercepts ban session, return 429 overload for 10m on strikes 1 & 2, 
     assert.equal(first.error.body.error.code, 'pool_overloaded')
     assert.equal(first.error.retryAfterSec, 600)
     assert.equal(jevCalls, 1)
-    assert.ok(sessions.get(s1))
+    assert.equal(
+      sessions.get(s1),
+      null,
+      'JEV session ban must stay tenant-scoped, never written to global sessions table',
+    )
+    assert.equal(devices.findBan({ principal: '', sessionId: s1 })?.subject_kind, 'session')
 
     // During 10m cooldown (t + 2m): sub-agent of banned session S1 is blocked immediately at session layer.
     const subAgent = await runProtocolIntercept({
@@ -1885,9 +1890,9 @@ test('JEV intercepts ban session, return 429 overload for 10m on strikes 1 & 2, 
       now: start + 120_000,
     })
     assert.equal(subAgent.action, 'block')
-    assert.equal(subAgent.kind, 'session')
+    assert.equal(subAgent.final_state, 'refusal_session')
     assert.equal(subAgent.error.status, 400)
-    assert.equal(subAgent.error.body.error.message, '此会话已封禁，请开启新会话。')
+    assert.equal(subAgent.error.body.error.message, '此会话已封禁，请勿继续使用此会话。')
     assert.equal(subAgent.logErrorCode, 'refusal_guard')
     assert.equal(jevCalls, 1)
 
@@ -1924,7 +1929,7 @@ test('JEV intercepts ban session, return 429 overload for 10m on strikes 1 & 2, 
       requestId: 'req-s1-after',
       now: start + 600_000,
     })
-    assert.equal(oldAfterExpiry.kind, 'session')
+    assert.equal(oldAfterExpiry.final_state, 'refusal_session')
     assert.equal(oldAfterExpiry.error.status, 400)
 
     const s3 = '33333333-3333-4333-8333-333333333333'
@@ -1960,7 +1965,7 @@ test('JEV intercepts ban session, return 429 overload for 10m on strikes 1 & 2, 
     assert.equal(second.error.status, 429)
     assert.equal(second.error.retryAfterSec, 600)
     assert.match(second.errorMessage, /第 2 次违规/)
-    assert.ok(sessions.get(s3))
+    assert.equal(devices.findBan({ principal: '', sessionId: s3 })?.subject_kind, 'session')
 
     // During 2nd cooldown (t + 15m): new session S4 returns 429 with 300s remaining.
     const s4 = '44444444-4444-4444-8444-444444444444'
@@ -1998,7 +2003,7 @@ test('JEV intercepts ban session, return 429 overload for 10m on strikes 1 & 2, 
     assert.equal(third.error.status, 400)
     assert.equal(third.error.body.error.message, '此设备已永久封禁。')
     assert.match(third.errorMessage, /第 3 次违规，设备永久封禁/)
-    assert.ok(sessions.get(s5))
+    assert.equal(devices.findBan({ principal: '', sessionId: s5 })?.subject_kind, 'session')
 
     // 30 days later: device remains permanently banned without calling JEV.
     const callsBeforePermCheck = jevCalls
@@ -2057,7 +2062,54 @@ test('JEV bans work without device_id and even when refusal_guard_enabled is off
     })
     assert.equal(res1.error.status, 429)
     assert.equal(res1.logErrorCode, 'policy_blocked')
-    assert.ok(sessions.get(onlySession))
+    assert.equal(sessions.get(onlySession), null)
+    assert.equal(devices.findBan({ principal: '', sessionId: onlySession })?.subject_kind, 'session')
+
+    // Cross-tenant isolation: attacker (user:a) triggering JEV with victim's session ID
+    // must NOT block victim (user:b) using the same session ID.
+    const sharedSession = '88888888-8888-4888-8888-888888888888'
+    const attackerBlock = await runProtocolIntercept({
+      inbound: userBody('risky from attacker'),
+      headers: { 'x-claude-code-session-id': sharedSession },
+      identity: { deviceId: '', machineId: '', sessionId: sharedSession, principal: 'user:a' },
+      policy,
+      jev,
+      devices,
+      sessions,
+      fetchImpl: riskyFetch,
+      requestId: 'req-attacker',
+      now: start,
+    })
+    assert.equal(attackerBlock.action, 'block')
+    assert.equal(sessions.get(sharedSession), null)
+    const attackerFollowup = await runProtocolIntercept({
+      inbound: userBody('benign from attacker'),
+      headers: { 'x-claude-code-session-id': sharedSession },
+      identity: { deviceId: '', machineId: '', sessionId: sharedSession, principal: 'user:a' },
+      policy,
+      jev,
+      devices,
+      sessions,
+      fetchImpl: async () => assert.fail('attacker session must stay blocked'),
+      requestId: 'req-attacker-2',
+      now: start + 1000,
+    })
+    assert.equal(attackerFollowup.final_state, 'refusal_session')
+    assert.equal(attackerFollowup.error.status, 400)
+
+    const victimPass = await runProtocolIntercept({
+      inbound: userBody('benign from victim'),
+      headers: { 'x-claude-code-session-id': sharedSession },
+      identity: { deviceId: '', machineId: '', sessionId: sharedSession, principal: 'user:b' },
+      policy,
+      jev,
+      devices,
+      sessions,
+      fetchImpl: async () => ({ ok: true, json: async () => ({ answers: { abuse: { noul: 0.95 } } }) }),
+      requestId: 'req-victim',
+      now: start + 1000,
+    })
+    assert.equal(victimPass.action, 'pass')
 
     // With device_id and policy.enabled=false: JEV temp ban is still recorded and enforced.
     const res2 = await runProtocolIntercept({
