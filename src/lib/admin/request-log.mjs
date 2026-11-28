@@ -70,6 +70,7 @@ const SUMMARIZE_TOOLS_EXACT_BYTES_MAX_NODES = 256
 const SUMMARIZE_TOOLS_EXACT_BYTES_MAX_TOP = 128
 const PG_PROMPT_TOKENS_SQL = PROMPT_TOKENS_SQL.replaceAll('IFNULL(', 'COALESCE(')
 const PG_TOTAL_TOKENS_SQL = TOTAL_TOKENS_SQL.replaceAll('IFNULL(', 'COALESCE(')
+const PG_INGRESS_AUTH_SQL = ingressAuthSql().replaceAll('IFNULL(', 'COALESCE(')
 const CLEANUP_INVALIDATE_NAMESPACES = [
   'stats',
   'overview',
@@ -1611,8 +1612,8 @@ export class RequestLogStore {
     const where = condParts.length ? `WHERE ${condParts.join(' AND ')}` : ''
     const errWhere = condParts.length ? `WHERE ${condParts.join(' AND ')} AND ${ERROR_PRED}` : `WHERE ${ERROR_PRED}`
     const authWhere = condParts.length
-      ? `WHERE ${condParts.join(' AND ')} AND ${ingressAuthSql()}`
-      : `WHERE ${ingressAuthSql()}`
+      ? `WHERE ${condParts.join(' AND ')} AND ${PG_INGRESS_AUTH_SQL}`
+      : `WHERE ${PG_INGRESS_AUTH_SQL}`
 
     const attConds = []
     const attParams = []
