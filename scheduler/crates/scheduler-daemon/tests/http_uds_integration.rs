@@ -41,6 +41,8 @@ fn sample_snapshot(num_nodes: usize, conc: u32) -> ConfigSnapshot {
                 ..Default::default()
             },
             enabled: true,
+            temp_unschedulable_until_ms: None,
+            temp_unschedulable_reason: None,
         });
         members.push(PoolMemberConfig {
             node_key: CompactString::from(&key),

@@ -5,8 +5,8 @@ use crate::snapshot::IndexedSnapshot;
 use compact_str::CompactString;
 use dashmap::DashMap;
 use scheduler_proto::{
-    AcquireRequest, BackendNodeConfig, ExcludeReason, ExcludedEntry, MemberRole, NodeKey, NodeType,
-    PoolConfig, Provider,
+    AcquireRequest, BackendNodeConfig, CodexQuotaPolicy, ExcludeReason, ExcludedEntry, MemberRole,
+    NodeKey, NodeType, PoolConfig, Provider,
 };
 use std::cmp::Reverse;
 use std::sync::Arc;
@@ -203,14 +203,37 @@ pub fn filter_members<'a>(
                 });
                 continue;
             }
-            if st.quota_util_5h_pct >= 95.0 || st.quota_util_7d_pct >= 95.0 {
+            let park_until = if st.temp_park_live_authoritative {
+                st.temp_unschedulable_until_ms
+            } else {
+                st.temp_unschedulable_until_ms
+                    .or(node.temp_unschedulable_until_ms)
+            };
+            let park_reason = if st.temp_park_live_authoritative {
+                st.temp_unschedulable_reason.as_deref()
+            } else {
+                st.temp_unschedulable_reason
+                    .as_deref()
+                    .or(node.temp_unschedulable_reason.as_deref())
+            };
+            if let Some(detail) = temp_park_detail_live(park_until, park_reason, now_ms) {
+                excluded.push(ExcludedEntry {
+                    pool_id: pool.id.clone(),
+                    node: node.node_key.clone(),
+                    reason: ExcludeReason::NotSchedulable,
+                    detail,
+                });
+                continue;
+            }
+            if quota_soft_exhausted(node, &st, &snap.raw.codex_quota) {
+                let (lim5, lim7) = effective_quota_thresholds_pct(node, &snap.raw.codex_quota);
                 excluded.push(ExcludedEntry {
                     pool_id: pool.id.clone(),
                     node: node.node_key.clone(),
                     reason: ExcludeReason::QuotaExhausted,
                     detail: format!(
-                        "quota_5h={:.1}%,quota_7d={:.1}%",
-                        st.quota_util_5h_pct, st.quota_util_7d_pct
+                        "quota_5h={:.1}%>={:.1}%,quota_7d={:.1}%>={:.1}%",
+                        st.quota_util_5h_pct, lim5, st.quota_util_7d_pct, lim7
                     ),
                 });
                 continue;
@@ -302,6 +325,15 @@ pub fn filter_members<'a>(
 
             snap_m
         } else {
+            if let Some(detail) = temp_park_detail_snapshot(node, now_ms) {
+                excluded.push(ExcludedEntry {
+                    pool_id: pool.id.clone(),
+                    node: node.node_key.clone(),
+                    reason: ExcludeReason::NotSchedulable,
+                    detail,
+                });
+                continue;
+            }
             if !pool.required_runtime_capabilities.is_empty() {
                 excluded.push(ExcludedEntry {
                     pool_id: pool.id.clone(),
@@ -354,4 +386,51 @@ fn model_matches(allowed: &[CompactString], model: &str) -> bool {
     allowed
         .iter()
         .any(|m| m.as_str() == "*" || m.eq_ignore_ascii_case(model))
+}
+
+fn is_codex_node(node: &BackendNodeConfig) -> bool {
+    node.node_type == NodeType::CodexVm || node.provider == Provider::Openai
+}
+
+fn effective_quota_thresholds_pct(
+    node: &BackendNodeConfig,
+    policy: &CodexQuotaPolicy,
+) -> (f32, f32) {
+    if is_codex_node(node) {
+        (policy.limit_5h_percent(), policy.limit_7d_percent())
+    } else {
+        (
+            CodexQuotaPolicy::LEGACY_FALLBACK_PCT,
+            CodexQuotaPolicy::LEGACY_FALLBACK_PCT,
+        )
+    }
+}
+
+fn quota_soft_exhausted(
+    node: &BackendNodeConfig,
+    st: &crate::node_state::NodeMutable,
+    policy: &CodexQuotaPolicy,
+) -> bool {
+    let (lim5, lim7) = effective_quota_thresholds_pct(node, policy);
+    st.quota_util_5h_pct >= lim5 || st.quota_util_7d_pct >= lim7
+}
+
+fn temp_park_detail_live(until: Option<u64>, reason: Option<&str>, now_ms: u64) -> Option<String> {
+    let until = until.filter(|u| *u > 0)?;
+    if until <= now_ms {
+        return None;
+    }
+    let reason = reason
+        .filter(|r| !r.is_empty())
+        .unwrap_or("temp_unschedulable");
+    Some(format!("temp_park_until_ms={until};reason={reason}"))
+}
+
+/// Bootstrap / no-runtime fail-closed: static snapshot baseline only.
+fn temp_park_detail_snapshot(node: &BackendNodeConfig, now_ms: u64) -> Option<String> {
+    temp_park_detail_live(
+        node.temp_unschedulable_until_ms,
+        node.temp_unschedulable_reason.as_deref(),
+        now_ms,
+    )
 }

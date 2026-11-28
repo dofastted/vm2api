@@ -50,6 +50,53 @@ fn default_prompt_preset() -> CompactString {
     CompactString::const_new("official_full")
 }
 
+/// Global Codex soft utilization gates (`routing.codex.quota.limit_*` fractions).
+/// Serde field defaults (0.95) preserve legacy Rust admission when JSON omits the object.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CodexQuotaPolicy {
+    #[serde(default = "default_codex_quota_limit_5h")]
+    pub limit_5h: f64,
+    #[serde(default = "default_codex_quota_limit_7d")]
+    pub limit_7d: f64,
+}
+
+fn default_codex_quota_limit_5h() -> f64 {
+    0.95
+}
+
+fn default_codex_quota_limit_7d() -> f64 {
+    0.95
+}
+
+impl Default for CodexQuotaPolicy {
+    fn default() -> Self {
+        Self {
+            limit_5h: default_codex_quota_limit_5h(),
+            limit_7d: default_codex_quota_limit_7d(),
+        }
+    }
+}
+
+impl CodexQuotaPolicy {
+    pub const LEGACY_FALLBACK_PCT: f32 = 95.0;
+
+    pub fn limit_5h_percent(&self) -> f32 {
+        Self::fraction_to_threshold_pct(self.limit_5h)
+    }
+
+    pub fn limit_7d_percent(&self) -> f32 {
+        Self::fraction_to_threshold_pct(self.limit_7d)
+    }
+
+    fn fraction_to_threshold_pct(v: f64) -> f32 {
+        if !v.is_finite() {
+            return Self::LEGACY_FALLBACK_PCT;
+        }
+        let clamped = v.clamp(0.3, 1.0);
+        (clamped * 100.0) as f32
+    }
+}
+
 fn default_global_prompt_mode() -> SystemPromptMode {
     SystemPromptMode::Official
 }
@@ -93,6 +140,8 @@ pub struct ConfigSnapshot {
     pub pools: Vec<PoolConfig>,
     #[serde(default)]
     pub nodes: Vec<BackendNodeConfig>,
+    #[serde(default)]
+    pub codex_quota: CodexQuotaPolicy,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -268,6 +317,11 @@ pub struct BackendNodeConfig {
     pub capacity: NodeCapacityConfig,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Account/ quota park window end (epoch ms). Bootstrap baseline; telemetry overrides.
+    #[serde(default)]
+    pub temp_unschedulable_until_ms: Option<u64>,
+    #[serde(default)]
+    pub temp_unschedulable_reason: Option<String>,
 }
 
 impl BackendNodeConfig {
