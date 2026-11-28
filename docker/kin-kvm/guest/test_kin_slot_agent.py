@@ -172,7 +172,7 @@ class KinSlotAgentRpcTests(unittest.TestCase):
         dot_cred_path = self.state_dir / "claude" / ".credentials.json"
         self.assertEqual(res["result"]["path"], str(cred_path))
         self.assertEqual(cred_path.read_bytes(), creds)
-        self.assertEqual(stat.S_IMODE(cred_path.stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(cred_path.stat().st_mode), 0o440)
         self.assertTrue(dot_cred_path.is_symlink())
         self.assertEqual(os.readlink(dot_cred_path), "credentials.json")
         self.assertEqual(dot_cred_path.read_bytes(), creds)
@@ -249,7 +249,7 @@ class KinSlotAgentRpcTests(unittest.TestCase):
         self.assertTrue(res_custom["ok"], res_custom)
         self.assertEqual(res_custom["result"]["path"], str(custom_claude_dir / "credentials.json"))
         self.assertEqual((custom_claude_dir / "credentials.json").read_bytes(), creds2)
-        self.assertEqual(stat.S_IMODE((custom_claude_dir / "credentials.json").stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE((custom_claude_dir / "credentials.json").stat().st_mode), 0o440)
         self.assertTrue((custom_claude_dir / ".credentials.json").is_symlink())
         self.assertEqual(os.readlink(custom_claude_dir / ".credentials.json"), "credentials.json")
         self.assertEqual((custom_claude_dir / ".credentials.json").read_bytes(), creds2)

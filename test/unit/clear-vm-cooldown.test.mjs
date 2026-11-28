@@ -48,6 +48,7 @@ test('clearVmCooldown drops runtime leftover and usage 429 flag', () => {
     },
   })
   const unbound = []
+  const unrested = []
   let woken = 0
   const out = clearVmCooldown({
     cfg: { paths: { project } },
@@ -82,6 +83,7 @@ test('clearVmCooldown drops runtime leftover and usage 429 flag', () => {
       unbindByAccount: (arg) => unbound.push(arg),
     },
     poolScheduler: {
+      unrestVmNode: (vmId) => unrested.push(vmId),
       notifyCapacity: () => {
         woken += 1
       },
@@ -95,6 +97,7 @@ test('clearVmCooldown drops runtime leftover and usage 429 flag', () => {
   assert.equal(accounts.get('acct-11').unified.usage_rate_limited_until, undefined)
   assert.equal(accounts.get('acct-11').unified.last_probe.rate_limited, false)
   assert.ok(unbound.some((item) => item.accountId === 'acct-11' && item.vmId === 'vm-11'))
+  assert.deepEqual(unrested, ['vm-11'])
   assert.equal(woken, 1)
 })
 

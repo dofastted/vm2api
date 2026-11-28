@@ -362,6 +362,9 @@ export function clearVmCooldown({ cfg, accountQuota, stickyRouter = null, poolSc
     poolScheduler?.syncQuotaSchedule?.(live, acc)
   } catch {}
   try {
+    poolScheduler?.unrestVmNode?.(vm.id)
+  } catch {}
+  try {
     poolScheduler?.notifyCapacity?.(acc?.account_id || vm.claude?.account_uuid || vm.id)
   } catch {}
   const refreshed = getVm(cfg.paths.project, vm.id) || live

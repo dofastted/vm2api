@@ -1,19 +1,21 @@
 # OAuth 凭证生命周期
 
-活票只写在槽位 `credentials.json`。换票由控制面 host `RefreshIfNeeded` 经槽 SOCKS5 完成；`vm.json`、SQLite 只存脱敏元数据。Go `kin-worker` 不再做 hop / refresh。
+**面板是 OAuth 凭证的唯一权威真值源（Panel SSOT）**：活票只由控制面读写 `vms/<id>/cli-home/.claude/credentials.json`（含 `.refresh-attempt` 尝试日志），`vm.json` 与 SQLite 只存脱敏元数据。所有换票与 OAuth 探活（`refresh`、`usage`、`profile`、`models`、`count-tokens`、`reset-status`、`reset-redeem`）全部由**控制面本机的 `bin/kin-worker`** 经目标槽位绑定出口发出（保持 Go Chrome TLS 指纹与出口隔离），**不再通过 `docker exec` / `kin-guest-exec` 在槽内换票，也绝不从槽位反向拉取凭证**。
+
+槽位（本地 Docker、Custom-EROFS KVM、远端 SSH 节点、macOS 原生节点）只接收控制面的**单向只读投影**（本地 `0444`、远端 SFTP `0400`、KVM Guest `0440 root:<slot-gid>`，并配相对软链接 `.credentials.json -> credentials.json`），且 Go `kin-worker` 的非 `refresh` 子命令严格只读、禁止隐式轮换 RT。
 
 ```text
 sessionKey（默认 Setup Token）或授权码
    │ 必须先有 VM + 槽位出口：SOCKS5，或本地出口 px-local（宿主机默认路由直连）；未绑定一律拒绝
    ▼
-目标 VM 内的 `bin/kin-oauth-auth`（控制面只负责 `docker exec`，OAuth 源码只在本地构建）
+目标 VM 内的 `bin/kin-oauth-auth`（或控制面原生入口；OAuth 源码只在本地构建）
    │ sessionKey / 授权码 → authorize → token
    │ 换票后两条路同一后续：profile → eval（bearer 分区）→ roles → first-token date → eval（套餐字段）→ bootstrap（entrypoint=sdk-cli&model=claude-opus-5-5）
    │ 控制面接收完整凭证，不在 helper 返回后再次 bootstrap 或套一层代理
    ▼
-槽 ~/.claude/credentials.json   ← 活票只在这里（含 account_uuid / org_uuid，不含 email）
-   │ host RefreshIfNeeded（推理临期 或 面板显式 refresh）
-   │ 无后台定时器；401 不强制换票
+控制面 vms/<id>/cli-home/.claude/credentials.json   ← 唯一权威活票（含 account_uuid / org_uuid，不含 email）
+   │ 控制面本机 `bin/kin-worker oauth refresh`（经槽绑定出口 hostProxyUrlForVm）
+   │ 成功后重封 0444 + 更新 vm.json 元数据 + 单向只读投影到槽位（slotHost.syncCredentials）
    ▼
 https://platform.claude.com/v1/oauth/token
    │
@@ -36,7 +38,7 @@ commitImportedOauth → 仅完整 OAuth 运行模式排队官方 Claude Code 初
 
 正式凭证的 access/refresh 写入 `credentials.json`（不含 email，同步时也排除 email）；导入时文档顶层和 `claudeAiOauth` 都写 `kinGeneration`，文件仍是 `0444`。`vm.json` / DB 只留 `has_access` / `has_refresh` / email / expiry / generation。
 
-远端 Claude 槽以节点上的 `credentials.json` 为准。官方 CLI 的 `.credentials.json` 使用同目录相对软链接；即使轮换通过原子替换更新文件，下次打开也会读到最新版。节点凭据回拉（包括启动、重载）会修正丢失或指向旧副本的链接，不会把旧副本写回凭据。对已运行的槽，启用的 `credential_refresh` 巡检也会检查链接（默认每 300 秒），不等令牌到期，不读取令牌内容、不额外换票、不重启槽。巡检快照的 `link_failures` 单列未修复的槽，与换票结果分开。
+远端与 KVM Claude 槽均以**控制面面板的 `credentials.json` 为唯一真值源**。每次导入、控制面刷新、认证方式变更以及槽位启动/重载，均通过 `slotHost(vm).syncCredentials` / `reconcileSlotCredentials` 单向推送只读副本（远端 SFTP `0400`、KVM Guest `0440 root:<slot-gid>`），并维护 `.credentials.json -> credentials.json` 同目录相对软链接；**绝不回拉槽位文件覆盖面板，也不采纳槽内原生 CLI 写出的独立 `.credentials.json`**。对已运行的槽，启用的 `credential_refresh` 巡检也会检查链接（默认每 300 秒），不等令牌到期，不读取令牌内容、不额外换票、不重启槽。巡检快照的 `link_failures` 单列未修复的槽，与换票结果分开。
 
 CAI 粘贴码换票规则：`code#state` 只将 `#` 后的上游返回值作为 token 请求的 `state`；只有 code 时不发送 `state`。Claude Code 由原生客户端保存 PKCE，面板将完整授权码交给原进程处理。Setup Token 和 Cookie 流程不变。
 
@@ -70,23 +72,23 @@ CAI 粘贴码换票规则：`code#state` 只将 `#` 后的上游返回值作为 
 
 Cookie authorize 的组织 UUID 同时出现在 `/v1/oauth/{uuid}/authorize` 路径和 JSON 的 `organization_uuid` 字段；只有路径 UUID 不够，上游会返回 400 `Invalid request format`。
 
-SSH 扩展槽同样由控制面经绑定出口换票。拿到授权后，提交阶段先启动节点槽并同步凭据；远端配置与票据均按 UTF-8/Buffer 的字节长度分块写入 SFTP，0600 临时文件原子替换，不跟随目标符号链接。节点启动失败不代表上游授权失败。
+SSH 扩展槽同样由控制面经绑定出口换票。拿到授权后，提交阶段先启动节点槽并单向同步只读凭据；远端配置按 UTF-8/Buffer 字节长度经 `0600` 临时文件原子替换（凭据写完后 `fchmod` 为 `0400`），不跟随目标符号链接。节点启动失败不代表上游授权失败。
 
 ## 刷新规则
 
-**只有 host `RefreshIfNeeded` 决定是否换票**，没有第二套定时器。Go worker 不再 Ensure。
+**只有控制面按 Panel SSOT 经本机 `bin/kin-worker oauth refresh` 决定并执行换票**。非 `refresh` 的 OAuth 探测命令（`usage`、`profile`、`models`、`count-tokens`、`reset-status`、`reset-redeem`）在 Go 层严格只读，临期时先由控制面在串行锁内走同一条 `refresh` + 单向投影链路。
 
-1. 推理（Messages / usage）或面板「刷新凭证」调用 Ensure。
-2. access 到期前 5 分钟进入刷新窗口；未进窗口则只读现票。新票未过期，导入后不强制 refresh。
-3. worker 先进程内 singleflight，再拿 credential file lock。
-4. 锁内重读 credential 与 generation，二次确认仍需刷新。
-5. refresh 必须走该 VM 绑定的 SOCKS5。
-6. 成功后原子写 access、轮换后的 refresh、expiry、新 generation。
+1. 推理临期、定期 `credential_refresh` 巡检、非 refresh 探活临期预检或面板「刷新凭证」触发控制面换票。
+2. access 到期前 5 分钟进入刷新窗口（定期巡检提前 15 分钟）；未进窗口则只读现票。新票未过期，导入后不强制 refresh。
+3. 控制面进程内按槽位串行锁（`withCredentialRefreshLock`）+ Go `kin-worker` 凭证文件锁（`.lock`）与尝试日志（`--attempt-guard`）双重防护。
+4. 锁内重读控制面 `credentials.json` 与 generation，二次确认仍需刷新。
+5. refresh 必须经目标 VM 绑定的出口（`hostProxyUrlForVm`：绑定 SOCKS5、本地 `px-local`，或集群/macOS 节点回环 SSH SOCKS5），未绑定或被封出口一律 fail closed（`proxy_required`）。
+6. 成功后原子写控制面 `credentials.json`，重封 `0444` 并修复相对软链接、脱敏回写 `vm.json`，再单向只读投影至目标槽位（投影失败返回可重试 `credential_sync_failed`，保留控制面新票不重放旧 RT）。
 7. context/deadline 已取消的迟到响应不得落盘。
 8. `invalid_grant` 先重读 generation，识别其他路径已完成的竞争刷新。
 9. 上游 401 **不** force-refresh（端点拒票 ≠ 过期；硬刷会把还能用的 grant 烧成 `invalid_grant`）。
 10. 目录 / 模型列表 **不** hop worker `/v1/models`。
-11. 槽内 cli-node（kernel 推理、初装 hello / `/usage` / 常驻、`setup-token`）带 `CLAUDE_CODE_HOST_REFRESH=1` 和 `CLAUDE_CODE_VERSION`：临期或 401 时只重读 `credentials.json`，不请求 token 端点，不写回凭证。否则它与 host 同用一个轮换 RT，后到的一方拿 `invalid_grant`，且其写回会丢掉 `kinGeneration`。运维终端使用官方原生 Claude 2.1.321，它不读这个变量，终端不覆盖其版本号。CRAG v2 拉起的那个进程会在连上 `platform.claude.com:443` / `console.anthropic.com:443` 后先写 `KIN-BLOCK\n`；kin-egress 看到标记就关掉连接，不向 SOCKS 拨号。`kin-oauth-auth` 和 `kin-worker oauth refresh` 不写这个标记，面板换票仍走原来的出口。
+11. 槽内 cli-node（kernel 推理、初装 hello / `/usage` / 常驻、`setup-token`）带 `CLAUDE_CODE_HOST_REFRESH=1` 和 `CLAUDE_CODE_VERSION`：临期或 401 时只重读只读投影的 `credentials.json`，不请求 token 端点，不写回凭证。否则它与控制面同用一个轮换 RT，后到的一方拿 `invalid_grant`，且其写回会丢掉 `kinGeneration`。运维终端使用官方原生 Claude 2.1.321，它不读这个变量，终端不覆盖其版本号。CRAG v2 拉起的那个进程会在连上 `platform.claude.com:443` / `console.anthropic.com:443` 后先写 `KIN-BLOCK\n`；kin-egress 看到标记就关掉连接，不向 SOCKS 拨号。控制面 `bin/kin-worker oauth refresh` 走面板侧绑定出口，不受槽内 `KIN-BLOCK` 拦截。
 
 过期且无 refresh 的槽不入调度池。面板「网页可用」与调度选槽同一套资格。
 
@@ -109,8 +111,8 @@ SSH 扩展槽同样由控制面经绑定出口换票。拿到授权后，提交�
 
 此入口使用已装载的签名 CRAG 包内原版 Claude Code，不读取 CRAG 源码，也不回退到 `cli-node`。若缺少原生可执行文件，先按[二进制安装说明](DEPLOY.md#crag-v2-二进制更新)补齐包；仅升级面板 OAuth 代码无需替换已有的同版 CRAG 内核。
 
-- 原生客户端的 `.credentials.json` 链接到面板管理的 `credentials.json`。显式导入以面板新凭证为准，不让旧原生客户端留下的文件覆盖新账号。远程槽导入时先推送凭证；后续手动同步保留节点已轮换的凭证，再修复原生客户端链接。
-- 运维终端在连接时及打开后每 60 秒检查凭证链接，临期时通过槽位现有刷新链路刷新。`/sync` 可手动修复链接，不触发重新授权、不输出 token。若已打开的 CC 仍持有旧凭证，请退出后重开。
+- 原生客户端的 `.credentials.json` 链接到面板管理的 `credentials.json`。显式导入、控制面刷新和手动同步均以面板凭证为准，单向投影到槽位并修复原生客户端软链接，不让槽内旧文件覆盖面板账号。
+- 运维终端在连接时及打开后每 60 秒检查凭证链接，临期时通过控制面现有刷新链路换票并单向投影到槽位。`/sync` 可手动将面板凭证同步到槽位并修复链接，不触发重新授权、不输出 token。若已打开的 CC 仍持有旧凭证，请退出后重开。
 - 终端中的 `claude` / `cc` 始终使用包内原生 CC。本地 Docker / KVM 槽使用 `/home/kincli/.kin/crag-v2/claude-code-2.1.321/claude`，集群 Docker 槽使用 `/opt/kin-live/crag-v2/claude-code-2.1.321/claude`。本地缺少程序时从已校验发布包暂存原生客户端；缺包或不可执行会报错。
 - 推理使用当前所选内核对应的客户端：标准内核（wrap）启动 cli-node，cc 使用 cc-node，CRAG v2 启动包内原生 CC。切换时更新 `kernel.json` 的 `claude_bin`；旧的 `KIN_CLAUDE_BIN` 环境变量不覆盖这个选择。OAuth 入口始终使用原生 CC，与推理内核选择无关。
 - `/usage`、`/probe`、`/wrap`、`/reload`、`/sync`、`/help`、`/clear` 在 shell 提示符处可用，也支持粘贴后按回车。原生 CC 或其它前台程序运行时，斜杠输入直接交给该程序。
@@ -147,7 +149,7 @@ SSH 扩展槽同样由控制面经绑定出口换票。拿到授权后，提交�
 
 ## 用量刻度
 
-- 面板探测走槽内 `kin-worker oauth`（usage、models）。Setup Token 运行模式如果凭证实际 scope 完整，可打官方 `/api/oauth/usage`；scope 只有 `user:inference` 的独立官方 Setup Token 会得到 scope 错误。出口是槽的 SOCKS5 或透明网络，Node 不直连 Anthropic：
+- 面板探测走控制面本机 `bin/kin-worker oauth`（usage、models），经目标槽绑定出口发出，Node 不直连 Anthropic。Setup Token 运行模式如果凭证实际 scope 完整，可打官方 `/api/oauth/usage`；scope 只有 `user:inference` 的独立官方 Setup Token 会得到 scope 错误：
 
 - `five_hour` / `seven_day` utilization 0–100
 - 成功且完整的官方 `/usage`：有 5h、7d，且能确定 Fable 7d 是否存在；有 Fable 即 Max，没有即 Pro。失败、scope 不足、只有 5h 或 CLI 文本不完整都不改套餐

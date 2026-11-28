@@ -874,10 +874,8 @@ export class PoolScheduler extends EventEmitter {
         if (this.runtimeRepo?.clearAuthCooldown?.(id, { vmId })) cleared = true
       } catch {}
     }
-    if (cleared) {
-      if (vmId && this.schedulerRuntime?.unrestNode) {
-        void this.schedulerRuntime.unrestNode(formatNodeKey('claude_vm', vmId)).catch(() => {})
-      }
+    const unrested = this.unrestVmNode(vmId)
+    if (cleared || unrested) {
       this.notifyCapacity()
     }
     return cleared
@@ -891,13 +889,18 @@ export class PoolScheduler extends EventEmitter {
         if (this.runtimeRepo?.clearGrantRevokeCooldown?.(id, { vmId })) cleared = true
       } catch {}
     }
-    if (cleared) {
-      if (vmId && this.schedulerRuntime?.unrestNode) {
-        void this.schedulerRuntime.unrestNode(formatNodeKey('claude_vm', vmId)).catch(() => {})
-      }
+    const unrested = this.unrestVmNode(vmId)
+    if (cleared || unrested) {
       this.notifyCapacity()
     }
     return cleared
+  }
+
+  /** Unconditionally clear any Rust scheduler-side rest/sink window for a Claude VM node. */
+  unrestVmNode(vmId) {
+    if (!vmId || !this.schedulerRuntime?.unrestNode) return false
+    void this.schedulerRuntime.unrestNode(formatNodeKey('claude_vm', vmId)).catch(() => {})
+    return true
   }
 
   releaseSticky(bound, stickyKey, stickyKeys) {
