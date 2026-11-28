@@ -1,7 +1,7 @@
 {
   "repo": "dofastted/vm2api",
   "release": "payload-2026.11.28-system-prompt",
-  "crag_release": "payload-2026.11.28-crag-3.1.29",
+  "crag_release": "payload-2026.11.28-crag-3.1.30",
   "crag_debian13_release": {
     "tag": "payload-2026.11.28-crag-debian13-1.1.0",
     "dest_dir": "share/os/crag-debian13",
@@ -175,15 +175,15 @@
     },
     {
       "path": "share/crag/kernels/v2/amd64/crag-v2",
-      "asset": "crag-v2-amd64-v3.1.29-crag-v2",
-      "size": 894552,
-      "sha256": "b37409a3d0e2a6238569258546a3955b0979eb6a1344c6b8e8bfdd870cb1b7c3"
+      "asset": "crag-v2-amd64-v3.1.30-crag-v2",
+      "size": 930752,
+      "sha256": "07636459c92328b090dc9a3bbf474a57602ad831894519b91fa56eb96ac8e554"
     },
     {
       "path": "share/crag/kernels/v2/amd64/crag-v2.payload.enc",
-      "asset": "crag-v2-amd64-v3.1.29-crag-v2.payload.enc",
-      "size": 11094892,
-      "sha256": "bea4b8404e1c5f0ac0bd71b47a1cfb998a47d1eccd00597f580cd3cccb9397a6"
+      "asset": "crag-v2-amd64-v3.1.30-crag-v2.payload.enc",
+      "size": 11089220,
+      "sha256": "08d024979baa28405a8d6b331cbab82c58f6f66fe208279692c0cf97d1d24373"
     },
     {
       "path": "share/crag/kernels/v2/amd64/kernel.json.example",
@@ -193,9 +193,9 @@
     },
     {
       "path": "share/crag/kernels/v2/amd64/manifest.json",
-      "asset": "crag-v2-amd64-v3.1.29-manifest.json",
+      "asset": "crag-v2-amd64-v3.1.30-manifest.json",
       "size": 3046,
-      "sha256": "b035d4e6824c3c15f53be8d58bed3b37192ef1fe44bcd2f5e6f9a9af72fc24a5"
+      "sha256": "129dde38496b20ea8d9d8582551a0138ffaa02bba3f751e9c4de360388bbd33c"
     },
     {
       "path": "share/crag/kernels/v2/amd64/unpack-note.md",
@@ -206,8 +206,8 @@
     {
       "path": "dist/crag-v2-licensed-amd64.tar.gz",
       "asset": "crag-v2-licensed-amd64.tar.gz",
-      "size": 168929186,
-      "sha256": "2c780520df6f3301e267cc1d521167964c0d96371847b738c37f18068e61371e"
+      "size": 168939626,
+      "sha256": "46d3fced7991064275770f9143475e6d5c28d449e7579e5698c463b84a15c1bd"
     }
   ]
 }

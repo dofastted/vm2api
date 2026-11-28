@@ -13,11 +13,8 @@ import {
   alignSamplingWithThinking,
   modelSupportsMidConversationSystem,
 } from './anthropic-policy.mjs'
-import {
-  liftMidConversationSystemMessages,
-  mergeConsecutiveAnthropicMessages,
-  promoteContentToBlocks,
-} from './sanitize.mjs'
+import { liftMidConversationSystemMessages, mergeConsecutiveAnthropicMessages } from './sanitize.mjs'
+import { extractThirdPartySystemMessages } from './third-party-system.mjs'
 import { applyThinkingDisplay, thinkingDisplayMode } from './thinking.mjs'
 import { ensureOutputConfigSchema } from './request-rectifier.mjs'
 import {
@@ -276,40 +273,18 @@ export function prepareCliPersonaInput(body, preset) {
 }
 
 /**
- * Relocate third-party `messages[].role === 'system'` (or `developer`) turns into
- * the first user turn so CRAG V4 never forwards raw third-party system turns and
+ * Relocate third-party `messages[].role === 'system'` (or `developer`) text turns into
+ * the first user turn so CRAG V4 never forwards raw third-party system prose and
  * cli-hop never lifts them back into top-level `system[]`.
+ *
+ * Non-text protocol blocks (`tool_addition`, `tool_removal`, `tool_reference`, etc.) and
+ * turn controls (`output_config`, `clear_at`, `cache_control`) MUST stay in place on their
+ * `role: "system"` message — Anthropic 400s if `tool_addition`/`tool_removal` land in `user`.
  */
 export function foldThirdPartyRoleSystemMessages(body) {
   if (!body || typeof body !== 'object' || !Array.isArray(body.messages) || !body.messages.length) return body
-  const extracted = []
-  const kept = []
-  let sawRoleSystem = false
-  for (const msg of body.messages) {
-    if (msg?.role !== 'system' && msg?.role !== 'developer') {
-      kept.push(msg)
-      continue
-    }
-    sawRoleSystem = true
-    const blocks = promoteContentToBlocks(msg.content)
-    if (Array.isArray(blocks)) {
-      for (const block of blocks) {
-        if (!block || typeof block !== 'object') continue
-        if (block.type === 'text') {
-          if (typeof block.text === 'string' && block.text.trim()) {
-            extracted.push(
-              block.cache_control == null
-                ? { type: 'text', text: block.text }
-                : { type: 'text', text: block.text, cache_control: block.cache_control },
-            )
-          }
-        } else {
-          extracted.push(block)
-        }
-      }
-    }
-  }
-  if (!sawRoleSystem) return body
+  const { moved: extracted, messages: kept, changed } = extractThirdPartySystemMessages(body.messages)
+  if (!changed) return body
   const merged = mergeConsecutiveAnthropicMessages(kept)
   if (extracted.length) {
     const firstUser = merged.findIndex((m) => m?.role === 'user')
