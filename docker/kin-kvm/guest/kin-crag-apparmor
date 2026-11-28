@@ -73,6 +73,18 @@ TRANSCRIPT_DROPIN = (MARKER + '\n'
                      "vm2api-crag-transcripts " + TRANSCRIPT_DIR + "; }; }'\n").encode()
 
 
+# Guest disks created before #1924 keep the first-boot copy of kin-guest-setup, which mounts kinhome/kinclaude with
+# cache=mmap; cloud-init never reinstalls it, so the cache=none fix only reached new overlays and existing CRAG slots
+# kept collecting zombie claude processes wedged in v9fs getattr writeback. This helper runs before every kernel
+# start, so it upgrades exactly those two mount lines in place. The running mounts keep their options until the guest
+# boots again (slot stop/start, 恢复服务); kin-guest-setup then mounts them with cache=none.
+GUEST_SETUP_PATH = '/usr/local/sbin/kin-guest-setup'
+GUEST_SETUP_9P = (
+    (b'mount_9p kinhome /home/kincli mmap\n', b'mount_9p kinhome /home/kincli none\n'),
+    (b'mount_9p kinclaude /home/kincli/.claude mmap\n', b'mount_9p kinclaude /home/kincli/.claude none\n'),
+)
+
+
 def result(status, reason, profile=PROFILE_NAME):
     return {'ok': True, 'status': status, 'reason': reason, 'profile': profile}
 
@@ -262,6 +274,27 @@ def remove_binding(dropin):
     return result('removed', 'not-crag-v2')
 
 
+def upgrade_guest_9p_cache(root):
+    """Rewrite the old cache=mmap mount lines of an existing guest's kin-guest-setup (takes effect at next boot)."""
+    path = fixed_path(root, GUEST_SETUP_PATH)
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return {'guest_9p_cache': 'no-guest-setup'}
+    if not stat.S_ISREG(metadata.st_mode):
+        return {'guest_9p_cache': 'operator-managed'}
+    data = path.read_bytes()
+    upgraded = data
+    for old, new in GUEST_SETUP_9P:
+        if upgraded.count(old) > 1:
+            return {'guest_9p_cache': 'operator-managed'}
+        upgraded = upgraded.replace(old, new)
+    if upgraded == data:
+        return {'guest_9p_cache': 'current'}
+    atomic_write(path, upgraded, stat.S_IMODE(metadata.st_mode))
+    return {'guest_9p_cache': 'upgraded-next-boot'}
+
+
 def prepare(root):
     config_path = fixed_path(root, '/run/kin/kernel.json')
     dropin = fixed_path(root, '/etc/systemd/system/kin-kernel.service.d/50-vm2api-crag-userns.conf')
@@ -273,11 +306,12 @@ def prepare(root):
         raise RuntimeError('invalid kernel configuration JSON') from None
     if not isinstance(config, dict):
         raise RuntimeError('kernel configuration must be an object')
+    cache = upgrade_guest_9p_cache(root)
     if config.get('dataplane') != 'crag' or config.get('crag_kernel_version') != 'v2':
-        return {**remove_binding(dropin), **release_work_dir(root), **release_transcripts(root)}
+        return {**remove_binding(dropin), **release_work_dir(root), **release_transcripts(root), **cache}
     guest = preserve_guest_runtime(root)
     profile = bind_profile(root, dropin)
-    return {**profile, **guest, **isolate_work_dir(root), **isolate_transcripts(root)}
+    return {**profile, **guest, **isolate_work_dir(root), **isolate_transcripts(root), **cache}
 
 
 def bind_profile(root, dropin):
