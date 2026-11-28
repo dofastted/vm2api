@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.4.273 — 2026-11-29 · Stage 2 运行时 `Atomics.wait` 清零、面板异步化与 100K 上下文 CPU/GC 减负
+
+- **Stage 2 高并发运行时与面板异步深度优化（#2138）**：承接 `1.4.269` Stage 1 改造，系统消除真 PostgreSQL 18 + Redis 8 基准归因的残余主线程同步 `Atomics.wait`、面板慢查询与 100K 上下文（~403KB/req）CPU/GC 热点（100% 兼容 SQLite、无 Redis 降级与租户四路隔离）：
+  - **运行时残余 `Atomics.wait` 清零（`pool-scheduler` / `vm-db-sync` / `rate-limit-service` / `thinking-owner` / `scheduler-runtime`）**：
+    - `PoolScheduler.markSuccess()` 预检活跃 `auth_cooldown` / `unschedulable` 字段，干净 VM 直接 no-op（彻底避免每次 200 响应无意义重写 `vms/*.json`）；`vm-db-sync.mjs` 过滤 `.tmp` 并按变更文件名集合防抖合批，PG 模式将 `vmWriteHook` 与 `fs.watch` 增量同步迁至异步 `pgPool` `UNNEST`（仅同步发生变化的单个 `vmId`，彻底消灭 200-VM 同步遍历）。
+    - `RateLimitService` 在 PG 模式改读 L1 合并状态替代每响应同步 `runtimeRepo.get()`，常规 200 限流头 60s 去重后合并脏集经防抖异步 `pgPool` `UNNEST` 批写；429 / 529 / `5h-status=allowed` 提前解除限流等高危态立即更新 L1、`cache.scheduler.bumpRevision()` 广播跨实例并立即异步落库（含失败回队列）。
+    - `ThinkingOwnerStore` 新增进程内有界 L1 负缓存（60s TTL / 16384 上限，`record()` 自动驱逐），PG 模式 `ownersOfAsync()` / `prewarmOwnersAsync()` 走 PK 索引 `WHERE key = ANY($1::text[])`、`record()` 走 `UNNEST ... ON CONFLICT (key) DO NOTHING`，同步路径同步去除 `json_each` 改用 PK `IN (...)`。
+    - `SchedulerRuntime` 对 `api_endpoints` 与 `gemini_environment_owners` 叠加短 TTL（10s/5s）L1+Redis 缓存与写失效联动，并在 `pushTelemetryNow()` / `syncConfigNow()` 并发走异步 `pgPool` 预热（空表跳过子表、不查 `api_key` 明文）。
+  - **面板 `/dashboard` 与 `active-sessions` 异步化（`sticky-router` / `panel-api` / `request-log` / `usage-logs-view`）**：
+    - `StickyRouter` 新增异步 `pgPool` 聚合 + 5s L1/Redis 缓存 `statsAsync()`；`panel-api.mjs` 移出面板读热路径的同步 `runtimeRepo.clearExpired()`，优先消费调度 L1 快照 / 异步 `listAllSnapshotsAsync(pgPool)`，并与 `accountQuota.snapshotAsync`、`totalsAsync`、`windowStatsAsync`（PG 库内 `PERCENTILE_CONT` + 独立 SWR）并发执行。
+    - `usage-logs-view.mjs` 为 `loadOwnerKeyIds` 接入 30s L2 / 15s L1 缓存（随 `api_keys` 写入自动失效），并将 `activeSessions` 改写为带时间窗下推的三路索引 `UNION` + 单遍 `ROW_NUMBER()` CTE，严格保留租户隔离。
+  - **100K 上下文大报文 CPU/GC 减负（`handle-protocol` / `intercept-gate` / `request-log`）**：
+    - 非 `debug` 模式跳过大请求体摘要与重序列化，及时释放 `rawBodyBytes` 与日志闭包中的大 payload 引用，全模式复用 `prewarmOwnersAsync`/`ownersOfAsync` 预热；`intercept-gate.mjs` 对超长会话（>12 条消息或 >32KB）启用尾段窗口扫描；高并发模式下保护 `debug` 序列化不阻塞事件循环。
+  - **真 PG 18 + Redis 8 100K-Context 基准复测（200 VM，100 Keys）**：
+    - 1 实例（10 面板轮询 @ 600 RPM）：实测 **595.9 RPM（99.3%，0% 代理错误）**，Total p95 `6,072.5ms → 1,189.6ms`（↓5.1×），EventLoop p95 `74.3ms → 26.2ms`（↓2.8×），`Atomics.wait` `31.79 → 5.17/req`（`6.82ms/req`，↓6×），`admin:GET:dashboard` p95 `5,951ms → 1,118ms`（↓5.3×），`tenant:GET:active-sessions` p95 `3,990ms → 369.7ms`（↓10.8×），闭环 4/4 全绿。
+    - 4 实例（20 面板轮询 @ 1200 RPM）：实测 **1,137.9 RPM（94.8%，0% 代理错误）**，Total p95 `8,057.4ms → 2,596.7ms`（↓3.1×），EventLoop p95 `190.1ms → 24.9ms`（↓7.6×），`Atomics.wait` `26.77 → 6.83/req`（`13.61ms/req`，↓4×），SUT CPU `293.8% → 211.9%`（↓28%），`accounts`/`account_runtime` seq_scan `284/280 → 87/87`（↓69%），闭环 4/4 全绿。
+- 部署说明：本次改动相对 `1.4.272` 零数据库迁移、零 Rust 变更、零 `deploy/payload.json` 变更；升级后重启控制面即可生效。
+
 ## 1.4.272 — 2026-11-29 · 调度器幂等缓存不再回放已失效租约（外部贡献）
 
 - **acquire / switch 幂等缓存命中时先校验租约仍然有效（#2105，外部贡献 `DNAlec`）**：此前幂等缓存命中后会直接回放成功响应，即便对应租约已被释放或已过期，调用方拿到的租约 ID 实际上不再占用容量。例如控制面准入检查拒绝并释放了一个已授予的租约后，同一 `(request_id, attempt_no)` 的重复请求仍会收到“成功”。
