@@ -14,6 +14,190 @@ const SIGNAL_REPLY_INDEX = 0
 const SIGNAL_DEAD_INDEX = 1
 const WAIT_SLICE_MS = 100
 
+/**
+ * Columns updated by routine per-request API key usage accounting (recordUsage /
+ * dirty-set flush / last_used_at touch). Updating ONLY these columns must NOT
+ * trigger a cluster-wide `apiKeys.invalidateAll()` L1 eviction storm; structural
+ * admin mutations (status/quota/rate limits/scopes/key rotation/delete) still
+ * emit plain `'api_keys'` and invalidate immediately.
+ */
+const ROUTINE_API_KEY_USAGE_COLUMNS = new Set([
+  'requests',
+  'quota_requests_used',
+  'tokens_in',
+  'tokens_out',
+  'cache_read_tokens',
+  'cache_creation_tokens',
+  'quota_used',
+  'usage_5h',
+  'window_5h_start',
+  'usage_1d',
+  'window_1d_start',
+  'usage_7d',
+  'window_7d_start',
+  'last_used_at',
+  'updated_at',
+])
+
+/** Extract the SET clause body of a single UPDATE statement, stopping at top-level WHERE/FROM/RETURNING. */
+function extractUpdateSetClause(sql, startIdx) {
+  let i = startIdx
+  const n = sql.length
+  let depth = 0
+
+  while (i < n) {
+    const ch = sql[i]
+    const next = sql[i + 1]
+    if (ch === "'") {
+      i += 1
+      while (i < n) {
+        if (sql[i] === "'") {
+          if (sql[i + 1] === "'") {
+            i += 2
+            continue
+          }
+          i += 1
+          break
+        }
+        i += 1
+      }
+      continue
+    }
+    if (ch === '"') {
+      i += 1
+      while (i < n) {
+        if (sql[i] === '"') {
+          if (sql[i + 1] === '"') {
+            i += 2
+            continue
+          }
+          i += 1
+          break
+        }
+        i += 1
+      }
+      continue
+    }
+    if (ch === '-' && next === '-') {
+      while (i < n && sql[i] !== '\n') i += 1
+      continue
+    }
+    if (ch === '/' && next === '*') {
+      i += 2
+      while (i < n && !(sql[i] === '*' && sql[i + 1] === '/')) i += 1
+      if (i < n) i += 2
+      continue
+    }
+    if (ch === '(') {
+      depth += 1
+      i += 1
+      continue
+    }
+    if (ch === ')') {
+      depth = Math.max(0, depth - 1)
+      i += 1
+      continue
+    }
+    if (depth === 0) {
+      if (ch === ';') return sql.slice(startIdx, i)
+      const tail = sql.slice(i)
+      if (/^(?:WHERE|FROM|RETURNING)\b/i.test(tail)) {
+        const prev = i > 0 ? sql[i - 1] : ' '
+        if (!/[a-zA-Z0-9_$]/.test(prev)) {
+          return sql.slice(startIdx, i)
+        }
+      }
+    }
+    i += 1
+  }
+  return sql.slice(startIdx)
+}
+
+/** Split a SQL SET clause on top-level commas (outside quotes and parentheses). */
+function splitTopLevelAssignments(setBody) {
+  const parts = []
+  let start = 0
+  let depth = 0
+  let i = 0
+  const n = setBody.length
+
+  while (i < n) {
+    const ch = setBody[i]
+    if (ch === "'") {
+      i += 1
+      while (i < n) {
+        if (setBody[i] === "'") {
+          if (setBody[i + 1] === "'") {
+            i += 2
+            continue
+          }
+          i += 1
+          break
+        }
+        i += 1
+      }
+      continue
+    }
+    if (ch === '"') {
+      i += 1
+      while (i < n) {
+        if (setBody[i] === '"') {
+          if (setBody[i + 1] === '"') {
+            i += 2
+            continue
+          }
+          i += 1
+          break
+        }
+        i += 1
+      }
+      continue
+    }
+    if (ch === '(') depth += 1
+    else if (ch === ')') depth = Math.max(0, depth - 1)
+    else if (ch === ',' && depth === 0) {
+      parts.push(setBody.slice(start, i))
+      start = i + 1
+    }
+    i += 1
+  }
+  parts.push(setBody.slice(start))
+  return parts.map((s) => s.trim()).filter(Boolean)
+}
+
+/**
+ * Returns true iff `sql` is a single `UPDATE api_keys SET ...` that modifies
+ * ONLY routine usage counter / spend window / `last_used_at` columns.
+ */
+export function isRoutineApiKeyUsageUpdate(sql) {
+  if (typeof sql !== 'string') return false
+  const trimmed = sql.trim().replace(/;+\s*$/, '')
+  // Reject multi-statement scripts conservatively
+  if (!/^UPDATE\s+/i.test(trimmed)) return false
+  const header = trimmed.match(/^UPDATE\s+["`]?api_keys["`]?(?:\s+(?:AS\s+)?[a-zA-Z_][a-zA-Z0-9_]*)?\s+SET\s+/i)
+  if (!header) return false
+  // Reject if another DML keyword appears after a semicolon
+  if (/;\s*(?:INSERT|UPDATE|DELETE)\b/i.test(trimmed)) return false
+
+  const setBody = extractUpdateSetClause(trimmed, header[0].length)
+  const assignments = splitTopLevelAssignments(setBody)
+  if (!assignments.length) return false
+
+  for (const item of assignments) {
+    const eqIdx = item.indexOf('=')
+    if (eqIdx <= 0) return false
+    const lhs = item.slice(0, eqIdx).trim()
+    // Strip optional alias (e.g. `k.quota_used`) and quotes
+    const rawCol = lhs.includes('.') ? lhs.slice(lhs.lastIndexOf('.') + 1) : lhs
+    const col = rawCol
+      .replace(/^["`]|["`]$/g, '')
+      .trim()
+      .toLowerCase()
+    if (!col || !ROUTINE_API_KEY_USAGE_COLUMNS.has(col)) return false
+  }
+  return true
+}
+
 function reconstructError(info) {
   const err = new Error(info?.message || 'PostgreSQL query failed')
   if (info?.code) {
@@ -157,11 +341,13 @@ export class PgSyncDb {
     if (!this._onMutation) return
     const tables = detectMutatedTables(sql)
     if (!tables.length) return
+    const normalized =
+      tables.length === 1 && tables[0] === 'api_keys' && isRoutineApiKeyUsageUpdate(sql) ? ['api_keys:usage'] : tables
     if (this._inTransaction) {
-      for (const t of tables) this._txMutatedTables.add(t)
+      for (const t of normalized) this._txMutatedTables.add(t)
     } else {
       try {
-        this._onMutation(tables)
+        this._onMutation(normalized)
       } catch {}
     }
   }
