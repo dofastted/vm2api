@@ -94,34 +94,45 @@ function isSystemMessageRole(role) {
 /**
  * V9: Extract text blocks from third-party `messages[].role === 'system' | 'developer'`
  * turns so they relocate into `messages[0]` instead of leaking on CRAG V4 or lifting
- * back into top-level `system[]` on cli-hop. Directive-only / non-text turns stay.
+ * back into top-level `system[]` on cli-hop. Directive-only / non-text turns
+ * (`tool_addition`, `tool_removal`, `output_config`, `clear_at`, `cache_control`) stay
+ * in place on a `role: "system"` message (never moved into `role: "user"`).
  */
-function extractThirdPartySystemMessages(messages) {
+export function extractThirdPartySystemMessages(messages) {
   const moved = []
   const kept = []
+  let changed = false
   for (const msg of messages) {
     if (!msg || !isSystemMessageRole(msg.role)) {
       kept.push(msg)
       continue
     }
-    const hasTurnControl = msg.output_config != null || msg.cache_control != null
+    const hasTurnControl = msg.output_config != null || msg.clear_at != null || msg.cache_control != null
+    const roleChanged = msg.role !== 'system'
     if (typeof msg.content === 'string') {
       if (msg.content.trim()) {
         moved.push({ type: 'text', text: msg.content })
-        if (hasTurnControl) kept.push({ ...msg, content: [] })
+        changed = true
+        if (hasTurnControl) kept.push({ ...msg, role: 'system', content: [] })
+      } else if (hasTurnControl) {
+        if (roleChanged) changed = true
+        kept.push(roleChanged ? { ...msg, role: 'system', content: [] } : msg)
       } else {
-        kept.push(msg)
+        changed = true
       }
       continue
     }
     if (Array.isArray(msg.content)) {
       const remaining = []
       let extractedAny = false
+      let droppedBlank = false
       for (const block of msg.content) {
         if (typeof block === 'string') {
           if (block.trim()) {
             moved.push({ type: 'text', text: block })
             extractedAny = true
+          } else {
+            droppedBlank = true
           }
         } else if (block && block.type === 'text' && typeof block.text === 'string') {
           if (block.text.trim()) {
@@ -131,21 +142,31 @@ function extractThirdPartySystemMessages(messages) {
                 : { type: 'text', text: block.text, cache_control: block.cache_control },
             )
             extractedAny = true
+          } else {
+            droppedBlank = true
           }
         } else if (block != null) {
           remaining.push(block)
         }
       }
-      if (!extractedAny) {
-        kept.push(msg)
-      } else if (remaining.length > 0 || hasTurnControl) {
-        kept.push({ ...msg, content: remaining })
+      if (extractedAny || droppedBlank || roleChanged) changed = true
+      if (remaining.length > 0) {
+        kept.push(extractedAny || droppedBlank || roleChanged ? { ...msg, role: 'system', content: remaining } : msg)
+      } else if (hasTurnControl) {
+        kept.push(extractedAny || droppedBlank || roleChanged ? { ...msg, role: 'system', content: [] } : msg)
+      } else {
+        changed = true
       }
       continue
     }
-    kept.push(msg)
+    if (hasTurnControl) {
+      if (roleChanged) changed = true
+      kept.push(roleChanged ? { ...msg, role: 'system' } : msg)
+    } else {
+      changed = true
+    }
   }
-  return { moved, messages: kept }
+  return { moved, messages: kept, changed }
 }
 
 function firstUserIndex(messages) {
