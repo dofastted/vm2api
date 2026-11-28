@@ -48,6 +48,13 @@ RUN apt-get update \
  && ln -sfn /opt/kin/store/claude/current /usr/local/bin/claude \
  && rm -f /etc/claude-code/CLAUDE.md \
  && rm -rf /opt/kin/glibc239 /usr/local/lib/glibc239 \
+ && cp -L /usr/lib/os-release /etc/.os-release.reg \
+ && rm -f /etc/os-release \
+ && mv -f /etc/.os-release.reg /etc/os-release \
+ && rm -f /etc/localtime /etc/timezone \
+ && cp -L /usr/share/zoneinfo/UTC /etc/localtime \
+ && printf '%s\n' 'UTC' > /etc/timezone \
+ && chmod 0644 /etc/os-release /etc/localtime /etc/timezone \
  && printf '%s\n' 'debian-13' > /etc/kin-os \
  && printf '%s\n' 'claude-code=2.1.321' > /etc/kin-claude
 
@@ -59,7 +66,8 @@ LABEL kin.os.family=debian \
       kin.os.release=13 \
       kin.os.codename=trixie \
       kin.os.custom=debian-13-baked \
-      kin.os.glibc_unified=1
+      kin.os.glibc_unified=1 \
+      org.vm2api.regular-etc-targets="1"
 
 WORKDIR /home/kincli
 USER kincli

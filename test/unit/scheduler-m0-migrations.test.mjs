@@ -24,7 +24,9 @@ import { SchedulerPoolsRepo, bootstrapSchedulerPools } from '../../src/lib/db/re
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
 const SQLITE_MIG_DIR = path.join(ROOT, 'src/lib/db/migrations')
 const SQLITE_071 = path.join(SQLITE_MIG_DIR, '071_scheduler_center.sql')
+const SQLITE_072 = path.join(SQLITE_MIG_DIR, '072_scheduler_pool_prompt_default.sql')
 const PG_008 = path.join(ROOT, 'src/lib/db/pg/pg-migrations/008_scheduler_center.sql')
+const PG_009 = path.join(ROOT, 'src/lib/db/pg/pg-migrations/009_scheduler_pool_prompt_default.sql')
 const GUARD_SCRIPT = path.join(ROOT, 'deploy/bluegreen/migration-guard.mjs')
 const PG_URL = process.env.VM2API_TEST_PG_URL || ''
 
@@ -73,7 +75,7 @@ test('SQLite 071 upgrades pre-071 DB cleanly, preserves existing api_keys, and e
   )
 
   const applied = applyMigrations(db)
-  assert.deepEqual(applied, ['071_scheduler_center.sql'])
+  assert.deepEqual(applied, ['071_scheduler_center.sql', '072_scheduler_pool_prompt_default.sql'])
 
   // Re-applying is idempotent
   assert.deepEqual(applyMigrations(db), [])
@@ -331,6 +333,24 @@ test('SchedulerPoolsRepo CRUD, multi-pool membership (D1), prompt provider guard
   assert.equal(gPool.session_overflow_policy, 'spill_immediately')
   assert.equal(gPool.session_busy_wait_ms, 0)
 
+  const oPool = repo.insert({ name: 'Codex Default Pool', provider_scope: 'openai' })
+  assert.equal(oPool.provider_scope, 'openai')
+  assert.equal(oPool.system_prompt_mode, 'passthrough')
+
+  const aDefault = repo.insert({ name: 'Anthropic Default Pool', provider_scope: 'anthropic' })
+  assert.equal(aDefault.system_prompt_mode, 'inherit_global')
+  const mDefault = repo.insert({ name: 'Mixed Default Pool' })
+  assert.equal(mDefault.provider_scope, 'mixed')
+  assert.equal(mDefault.system_prompt_mode, 'inherit_global')
+  const apiDefault = repo.insert({ name: 'API Default Pool', provider_scope: 'api' })
+  assert.equal(apiDefault.system_prompt_mode, 'inherit_global')
+  const aExplicitPassthrough = repo.insert({
+    name: 'Anthropic Explicit Passthrough',
+    provider_scope: 'anthropic',
+    system_prompt_mode: 'passthrough',
+  })
+  assert.equal(aExplicitPassthrough.system_prompt_mode, 'passthrough')
+
   const aOfficial = repo.insert({
     name: 'Anthropic Official',
     provider_scope: 'anthropic',
@@ -546,6 +566,7 @@ test('bootstrapSchedulerPools skips strictly with zero DB access when isStandby=
   const repo = new SchedulerPoolsRepo(db)
   const pAlpha = repo.get('pool_a1b2c3d4')
   assert.equal(pAlpha.provider_scope, 'anthropic')
+  assert.equal(pAlpha.system_prompt_mode, 'inherit_global')
   assert.equal(pAlpha.slug, 'alpha-pool')
   assert.equal(pAlpha.enabled, true)
   assert.equal(pAlpha.exclusive_members, false)
@@ -564,11 +585,13 @@ test('bootstrapSchedulerPools skips strictly with zero DB access when isStandby=
   const pDup = repo.get('pool_slug_dup')
   assert.notEqual(pDup.slug, pAlpha.slug)
   assert.equal(pDup.provider_scope, 'anthropic')
+  assert.equal(pDup.system_prompt_mode, 'inherit_global')
 
   const pZh = repo.get('pool_zh01')
   assert.equal(pZh.enabled, false)
   assert.equal(pZh.slug, 'pool_zh01')
   assert.equal(pZh.provider_scope, 'anthropic')
+  assert.equal(pZh.system_prompt_mode, 'inherit_global')
 
   // Only active key with valid pool is backfilled
   const kActive = db.prepare('SELECT default_pool_id, pool_binding_mode FROM api_keys WHERE id = ?').get('key_active')
@@ -634,8 +657,8 @@ test('bootstrapSchedulerPools skips strictly with zero DB access when isStandby=
 test('SQL translation for SchedulerPoolsRepo queries produces valid PostgreSQL SQL and server.mjs wires Leader-only bootstrap', () => {
   const sampleQueries = [
     'SELECT * FROM scheduler_pools WHERE LOWER(slug) = LOWER(?)',
-    `INSERT INTO scheduler_pools (id, slug, name, enabled, provider_scope, created_at, updated_at)
-     VALUES (?, ?, ?, ?, 'anthropic', ?, ?) ON CONFLICT (id) DO NOTHING`,
+    `INSERT INTO scheduler_pools (id, slug, name, enabled, provider_scope, system_prompt_mode, created_at, updated_at)
+     VALUES (?, ?, ?, ?, 'anthropic', 'inherit_global', ?, ?) ON CONFLICT (id) DO NOTHING`,
     `UPDATE api_keys SET default_pool_id = ? WHERE id = ? AND (default_pool_id IS NULL OR TRIM(default_pool_id) = '')`,
   ]
   for (const q of sampleQueries) {
@@ -653,6 +676,81 @@ test('SQL translation for SchedulerPoolsRepo queries produces valid PostgreSQL S
     serverSrc,
     /runAtActivation\(\s*'scheduler-pools-bootstrap'[\s\S]*?bootstrapSchedulerPools\(\{\s*db:\s*getDb\(\),\s*isStandby:\s*!standbyActive\s*\}\)/,
   )
+})
+
+test('072 SQLite / 009 PG migrations safely repair untouched legacy vm_pools backfill rows without clobbering manual passthrough pools', (t) => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vm2api-m0-072-'))
+  t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }))
+
+  // Build DB through 071 only (simulating pre-072 upgraded host)
+  const upTo071Dir = path.join(tmpDir, 'migs-071')
+  fs.mkdirSync(upTo071Dir, { recursive: true })
+  for (const f of fs.readdirSync(SQLITE_MIG_DIR)) {
+    if (/^\d+.*\.sql$/.test(f) && f <= '071_scheduler_center.sql') {
+      fs.copyFileSync(path.join(SQLITE_MIG_DIR, f), path.join(upTo071Dir, f))
+    }
+  }
+  const dbPath = path.join(tmpDir, 'kin.db')
+  const db = new DatabaseSync(dbPath)
+  db.exec('PRAGMA foreign_keys = ON')
+  t.after(() => db.close())
+  applyMigrations(db, { migrationsDir: upTo071Dir })
+
+  const now = '2026-11-27T08:00:00.000Z'
+  // 1. Untouched legacy vm_pool backfilled under old 071 default (config_version=1, passthrough) -> SHOULD become inherit_global
+  db.prepare('INSERT INTO vm_pools (id, name, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?)').run(
+    'pool_legacy_auto',
+    'Legacy Auto',
+    1,
+    now,
+    now,
+  )
+  db.prepare(
+    "INSERT INTO scheduler_pools (id, slug, name, enabled, provider_scope, system_prompt_mode, config_version, created_at, updated_at) VALUES (?, ?, ?, 1, 'anthropic', 'passthrough', 1, ?, ?)",
+  ).run('pool_legacy_auto', 'legacy-auto', 'Legacy Auto', now, now)
+
+  // 2. Legacy vm_pool manually edited back to passthrough (config_version=2) -> MUST stay passthrough
+  db.prepare('INSERT INTO vm_pools (id, name, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?)').run(
+    'pool_legacy_manual',
+    'Legacy Manual',
+    1,
+    now,
+    now,
+  )
+  db.prepare(
+    "INSERT INTO scheduler_pools (id, slug, name, enabled, provider_scope, system_prompt_mode, config_version, created_at, updated_at) VALUES (?, ?, ?, 1, 'anthropic', 'passthrough', 2, ?, ?)",
+  ).run('pool_legacy_manual', 'legacy-manual', 'Legacy Manual', now, now)
+
+  // 3. Direct scheduler_pool explicitly created with passthrough (not in vm_pools) -> MUST stay passthrough
+  db.prepare(
+    "INSERT INTO scheduler_pools (id, slug, name, enabled, provider_scope, system_prompt_mode, config_version, created_at, updated_at) VALUES (?, ?, ?, 1, 'anthropic', 'passthrough', 1, ?, ?)",
+  ).run('pool_direct_pt', 'direct-pt', 'Direct Passthrough', now, now)
+
+  // 4. OpenAI pool -> MUST stay passthrough
+  db.prepare(
+    "INSERT INTO scheduler_pools (id, slug, name, enabled, provider_scope, system_prompt_mode, config_version, created_at, updated_at) VALUES (?, ?, ?, 1, 'openai', 'passthrough', 1, ?, ?)",
+  ).run('pool_openai_pt', 'openai-pt', 'OpenAI Pool', now, now)
+
+  const applied = applyMigrations(db)
+  assert.deepEqual(applied, ['072_scheduler_pool_prompt_default.sql'])
+
+  const modeOf = (id) =>
+    db.prepare('SELECT system_prompt_mode FROM scheduler_pools WHERE id = ?').get(id).system_prompt_mode
+  assert.equal(modeOf('pool_legacy_auto'), 'inherit_global')
+  assert.equal(modeOf('pool_legacy_manual'), 'passthrough')
+  assert.equal(modeOf('pool_direct_pt'), 'passthrough')
+  assert.equal(modeOf('pool_openai_pt'), 'passthrough')
+
+  // Verify PG 009 updates DDL default and carries the same safe backfill repair
+  const pg009Sql = fs.readFileSync(PG_009, 'utf8')
+  const sqlite072Sql = fs.readFileSync(SQLITE_072, 'utf8')
+  assert.match(
+    pg009Sql,
+    /ALTER TABLE scheduler_pools[\s\S]*ALTER COLUMN system_prompt_mode SET DEFAULT 'inherit_global'/i,
+  )
+  assert.match(pg009Sql, /SET system_prompt_mode = 'inherit_global'/i)
+  assert.match(pg009Sql, /config_version = 1/i)
+  assert.match(sqlite072Sql, /SET system_prompt_mode = 'inherit_global'/i)
 })
 
 test('PostgreSQL 008 migration, SchedulerPoolsRepo, bootstrapSchedulerPools, and sqlite-to-pg --verify parity', {

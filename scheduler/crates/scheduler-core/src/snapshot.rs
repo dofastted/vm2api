@@ -200,10 +200,15 @@ impl IndexedSnapshot {
 }
 
 fn effective_pool_prompt_mode(raw: &ConfigSnapshot, pool: &PoolConfig) -> SystemPromptMode {
-    if pool.system_prompt_mode == SystemPromptMode::InheritGlobal {
+    let raw_mode = if pool.system_prompt_mode == SystemPromptMode::InheritGlobal {
         raw.global_prompt_policy.mode
     } else {
         pool.system_prompt_mode
+    };
+    if raw_mode == SystemPromptMode::InheritGlobal {
+        SystemPromptMode::Official
+    } else {
+        raw_mode
     }
 }
 
@@ -215,21 +220,19 @@ fn build_prompt_policy(
     source: PromptPolicySource,
 ) -> ResolvedPromptPolicy {
     match mode {
-        SystemPromptMode::Official => ResolvedPromptPolicy {
-            mode,
-            preset: Some(preset.clone()),
+        SystemPromptMode::Official | SystemPromptMode::InheritGlobal => ResolvedPromptPolicy {
+            mode: SystemPromptMode::Official,
+            preset: Some(if preset.is_empty() {
+                compact_str::CompactString::const_new("official_full")
+            } else {
+                preset.clone()
+            }),
             text: None,
             client_system_policy: None,
             source,
         },
-        SystemPromptMode::ZeroInject
-        | SystemPromptMode::Passthrough
-        | SystemPromptMode::InheritGlobal => ResolvedPromptPolicy {
-            mode: if mode == SystemPromptMode::InheritGlobal {
-                SystemPromptMode::Passthrough
-            } else {
-                mode
-            },
+        SystemPromptMode::ZeroInject | SystemPromptMode::Passthrough => ResolvedPromptPolicy {
+            mode,
             preset: None,
             text: None,
             client_system_policy: None,

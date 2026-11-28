@@ -16,6 +16,10 @@ export const CUSTOM_OS_ASSETS_GUEST_DIR = '/opt/kin-os/crag-debian13'
 export const CUSTOM_OS_EROFS_FILENAME = 'kin-kvm-debian-13.erofs'
 export const CUSTOM_OS_KERNEL_FILENAME = 'vmlinuz'
 export const CUSTOM_OS_INITRD_FILENAME = 'initrd.img'
+export const CUSTOM_OS_CUSTOM_KERNEL_FILENAME = 'vmlinuz-custom'
+export const CUSTOM_OS_CUSTOM_INITRD_FILENAME = 'initrd.img-custom'
+export const KVM_KERNEL_TRACK_OFFICIAL = 'official'
+export const KVM_KERNEL_TRACK_CUSTOM = 'custom'
 export const CUSTOM_OS_STORE_GUEST_DIR = '/opt/kin/store'
 export const CUSTOM_OS_CLAUDE_DIR = `${CUSTOM_OS_STORE_GUEST_DIR}/claude`
 export const CUSTOM_OS_CLAUDE_VERSIONS_DIR = `${CUSTOM_OS_CLAUDE_DIR}/versions`
@@ -105,6 +109,89 @@ export function resolveKvmMode(options = null) {
 export function isCustomKvmMode(options = null) {
   return resolveKvmMode(options) === KVM_MODE_CUSTOM_EROFS
 }
+
+export function normalizeKvmKernelTrack(raw = process.env.KIN_KVM_KERNEL_TRACK) {
+  const value = String(raw || '')
+    .trim()
+    .toLowerCase()
+  if (value === KVM_KERNEL_TRACK_CUSTOM) return KVM_KERNEL_TRACK_CUSTOM
+  if (value === KVM_KERNEL_TRACK_OFFICIAL) return KVM_KERNEL_TRACK_OFFICIAL
+  return ''
+}
+
+/**
+ * Resolve the KVM guest kernel track (`official` | `custom`).
+ * Defaults strictly to `official` for zero-maintenance stability and instant rollback.
+ * Remote cluster KVM slots are pinned to `official` in Phase A/initial Phase B so missing
+ * custom kernels on remote nodes can never break slot startup.
+ */
+export function resolveKvmKernelTrack(options = null) {
+  const isRemote = options?.isRemote === true || Boolean(String(options?.vm?.node_id || '').trim())
+  if (isRemote) return KVM_KERNEL_TRACK_OFFICIAL
+  const hasExplicitEnv = options != null && Object.hasOwn(options, 'env')
+  const raw =
+    options?.kernelTrack ??
+    options?.vm?.runtime?.kernel_track ??
+    options?.vm?.kernel_track ??
+    (hasExplicitEnv ? options.env?.KIN_KVM_KERNEL_TRACK : process.env.KIN_KVM_KERNEL_TRACK)
+  return normalizeKvmKernelTrack(raw) || KVM_KERNEL_TRACK_OFFICIAL
+}
+
+export function resolveKvmKernelAssets(osAssetsDir = CUSTOM_OS_ASSETS_GUEST_DIR, options = null) {
+  const track = resolveKvmKernelTrack(options)
+  const base = String(osAssetsDir || CUSTOM_OS_ASSETS_GUEST_DIR).replace(/\/+$/, '')
+  const kernelFile = track === KVM_KERNEL_TRACK_CUSTOM ? CUSTOM_OS_CUSTOM_KERNEL_FILENAME : CUSTOM_OS_KERNEL_FILENAME
+  const initrdFile = track === KVM_KERNEL_TRACK_CUSTOM ? CUSTOM_OS_CUSTOM_INITRD_FILENAME : CUSTOM_OS_INITRD_FILENAME
+  return {
+    track,
+    kernelFilename: kernelFile,
+    initrdFilename: initrdFile,
+    kernelPath: `${base}/${kernelFile}`,
+    initrdPath: `${base}/${initrdFile}`,
+  }
+}
+
+/**
+ * Fail-closed verification that host custom kernel artifacts exist when `track === 'custom'`.
+ */
+export function verifyKvmKernelTrackFiles(hostOsDir, options = null) {
+  const track = resolveKvmKernelTrack(options)
+  const base = String(hostOsDir || '').trim()
+  const kernelFile = track === KVM_KERNEL_TRACK_CUSTOM ? CUSTOM_OS_CUSTOM_KERNEL_FILENAME : CUSTOM_OS_KERNEL_FILENAME
+  const initrdFile = track === KVM_KERNEL_TRACK_CUSTOM ? CUSTOM_OS_CUSTOM_INITRD_FILENAME : CUSTOM_OS_INITRD_FILENAME
+  const kernelPath = base ? path.join(base, kernelFile) : kernelFile
+  const initrdPath = base ? path.join(base, initrdFile) : initrdFile
+  if (track !== KVM_KERNEL_TRACK_CUSTOM) {
+    return { ok: true, track, kernelPath, initrdPath }
+  }
+  const lstatSync = options?.lstatSync ?? fs.lstatSync
+  for (const [label, filePath] of [
+    ['custom kernel', kernelPath],
+    ['custom initrd', initrdPath],
+  ]) {
+    try {
+      const st = lstatSync(filePath)
+      if (st.isSymbolicLink() || !st.isFile() || st.size <= 0) {
+        return {
+          ok: false,
+          code: 'kvm_custom_kernel_invalid',
+          track,
+          error: `${label} must be a non-empty regular file: ${filePath}`,
+        }
+      }
+    } catch {
+      return {
+        ok: false,
+        code: 'kvm_custom_kernel_missing',
+        track,
+        error: `KIN_KVM_KERNEL_TRACK=custom requires ${label}: ${filePath}`,
+      }
+    }
+  }
+  return { ok: true, track, kernelPath, initrdPath }
+}
+
+export { detectHostCpuVendor } from './slot-identity.mjs'
 
 /**
  * Probe whether `/dev/vhost-vsock` is genuinely backed by the loaded `vhost_vsock` kernel

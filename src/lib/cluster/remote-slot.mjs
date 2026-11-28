@@ -70,6 +70,8 @@ import { dockerEnvMap, ensureKvmMachineRecord, kvmEnvMapIncomplete, kvmMachineFi
 import { slotExecArgv, slotExecCmd } from '../vm/slot-exec.mjs'
 import {
   CODEX_SLOT_ROLE,
+  DOCKER_HOME_TMPFS_OPTS,
+  REGULAR_ETC_TARGETS_LABEL,
   containerName,
   displayName,
   kvmBindChownArgv,
@@ -79,6 +81,13 @@ import {
   STANDARD_LOCALE,
   writeWorkerFiles,
 } from '../vm/vm-runtime.mjs'
+import {
+  isCustomSlotUser,
+  slotClaudeDir,
+  slotGuestUidGid,
+  slotHome,
+  slotUser as resolveSlotUser,
+} from '../vm/slot-identity.mjs'
 import { projectCragUniversalVm, readCragClusterSubscription } from '../vm/crag-license.mjs'
 import { withCragRuntimeAdmission } from '../vm/slot-runtime-admission.mjs'
 import { publishKvmCragLicense } from '../vm/kvm-crag-license.mjs'
@@ -133,9 +142,12 @@ import {
 import {
   clusterComputerBinds,
   clusterManagedSettingsBind,
+  clusterRegularEtcBinds,
+  clusterRuntimeEtcBinds,
   hasClusterComputerBinds,
   hasLocalComputer,
   hasLocalManagedSettings,
+  localRegularEtcNames,
   pushClusterComputer,
 } from './slot-computer-files.mjs'
 import { defaultSeedPolicy, isTelemetryEnabled } from '../protocol/seed-policy.mjs'
@@ -1246,8 +1258,15 @@ function kvmSlotContainerBody(
   if (customKvm) {
     const resolvedStoreMode = String(storeMode || process.env.KIN_KVM_STORE_MODE || DEFAULT_KVM_STORE_MODE).trim()
     const resolvedStoreBlk = String(storeBlkImage || process.env.KIN_KVM_STORE_BLK_IMAGE || '').trim()
+    const guestUser = resolveSlotUser(vm)
+    const guestIds = slotGuestUidGid(vm)
     extraEnv.push(
       `KIN_KVM_MODE=${KVM_MODE_CUSTOM_EROFS}`,
+      `KIN_SLOT_USER=${guestUser}`,
+      `KIN_SLOT_UID=${guestIds.uid}`,
+      `KIN_SLOT_GID=${guestIds.gid}`,
+      // Remote cluster KVM stays on the official kernel track in Phase 3 (custom track is local-only).
+      'KIN_KVM_KERNEL_TRACK=official',
       `KIN_KVM_VSOCK_PORT=${Number(vsockPort || DEFAULT_KVM_VSOCK_PORT)}`,
       `KIN_KVM_AGENT_VSOCK_PORT=${Number(agentVsockPort || DEFAULT_KVM_AGENT_VSOCK_PORT)}`,
       `KIN_KVM_STORE_MODE=${resolvedStoreMode}`,
@@ -1375,6 +1394,8 @@ export function slotContainerBody(
     storeBlkImage = '',
     hasInitrd = true,
     managedSettings = false,
+    runtimeEtc = null,
+    regularEtcNames = [],
   },
 ) {
   if (isKvmRuntime(vm))
@@ -1409,6 +1430,11 @@ export function slotContainerBody(
   const v4CustomOs = crag && isV4CustomOsRemoteSlot(vm, { runtimeMode, capabilities, headlessBridge })
   const entry = crag ? REMOTE_CRAG_ENTRY : REMOTE_KERNEL_ENTRY
   const argv = [entry, '--gateway-worker', '--config', '/run/kin/kernel.json']
+  const userName = resolveSlotUser(vm)
+  const userHome = slotHome(vm)
+  const claudeDir = slotClaudeDir(vm)
+  const customUser = isCustomSlotUser(vm)
+  const bindRuntimeEtc = runtimeEtc === true || (runtimeEtc !== false && computer && customUser)
   const customOsBinds = []
   if (v4CustomOs) {
     const storeHost = resolveRemoteSharedStoreDir({ sharedStoreDir })
@@ -1417,16 +1443,21 @@ export function slotContainerBody(
       customOsBinds.push(clusterManagedSettingsBind(remoteDir))
     }
   }
+  const tmpfs = { '/tmp': 'rw,noexec,nosuid,size=32m' }
+  if (v4CustomOs) tmpfs[CUSTOM_OS_BRIDGE_TMPFS_DIR] = CUSTOM_OS_BRIDGE_TMPFS_OPTS
+  if (customUser) tmpfs['/home'] = DOCKER_HOME_TMPFS_OPTS
   return {
     Image: image,
     Hostname: String(vm.fingerprint?.hostname || '').trim() || slotName,
     User: user,
-    WorkingDir: '/home/kincli',
+    WorkingDir: userHome,
     Env: [
-      'HOME=/home/kincli',
-      'CLAUDE_CONFIG_DIR=/home/kincli/.claude',
+      `HOME=${userHome}`,
+      ...(customUser ? [`USER=${userName}`, `LOGNAME=${userName}`] : []),
+      `CLAUDE_CONFIG_DIR=${claudeDir}`,
       `TZ=${vm.timezone}`,
       `LANG=${vm.locale}`,
+      ...(customUser ? [`LC_ALL=${vm.locale}`] : []),
       `KIN_VM_ID=${vm.id}`,
       `KIN_VM_NAME=${slotName}`,
       `KIN_VM_OS=${vm.kernel}`,
@@ -1445,9 +1476,9 @@ export function slotContainerBody(
     },
     HostConfig: {
       Binds: [
-        `${remoteDir}/cli-home:/home/kincli`,
+        `${remoteDir}/cli-home:${userHome}`,
         // Nested mount: the guest cannot replace ~/.claude with a symlink the host would follow.
-        `${remoteDir}/claude:/home/kincli/.claude`,
+        `${remoteDir}/claude:${claudeDir}`,
         `${remoteDir}/run:/run/kin`,
         `${remoteDir}/machine-id:/etc/machine-id:ro`,
         `${remoteDir}/machine-id:/var/lib/dbus/machine-id:ro`,
@@ -1455,6 +1486,10 @@ export function slotContainerBody(
         ...(subscription ? clusterSubscriptionBinds(remoteDir) : []),
         // Same read-only computer identity a local Docker slot gets (computerDockerArgs).
         ...(computer ? clusterComputerBinds(remoteDir) : []),
+        ...(bindRuntimeEtc ? clusterRuntimeEtcBinds(remoteDir) : []),
+        ...(computer && Array.isArray(regularEtcNames) && regularEtcNames.length
+          ? clusterRegularEtcBinds(remoteDir, regularEtcNames)
+          : []),
         ...customOsBinds,
       ],
       NetworkMode: network,
@@ -1466,9 +1501,7 @@ export function slotContainerBody(
       ...(cpus > 0 ? { NanoCpus: Math.round(cpus * 1e9) } : {}),
       PidsLimit: limits.pids,
       ReadonlyRootfs: true,
-      Tmpfs: v4CustomOs
-        ? { '/tmp': 'rw,noexec,nosuid,size=32m', [CUSTOM_OS_BRIDGE_TMPFS_DIR]: CUSTOM_OS_BRIDGE_TMPFS_OPTS }
-        : { '/tmp': 'rw,noexec,nosuid,size=32m' },
+      Tmpfs: tmpfs,
       SecurityOpt:
         crag && !v4CustomOs
           ? ['no-new-privileges', `seccomp=${CRAG_V2_SECCOMP}`, 'apparmor=unconfined']
@@ -1981,6 +2014,7 @@ async function startRemoteSlotAdmitted(vm, projectRoot, { recreate, routing, pin
       (await pushClusterComputer(projectRoot, vm, session, {
         remoteDir,
         owner: session.host.uid === 0 ? remoteSlotOwner(session.host, vm) : null,
+        containerUser: user,
       }))
     const managedSettings = Boolean(
       computer && typeof hasLocalManagedSettings === 'function' && hasLocalManagedSettings(projectRoot, vm),
@@ -1997,13 +2031,27 @@ async function startRemoteSlotAdmitted(vm, projectRoot, { recreate, routing, pin
     let action = 'started'
     if (!existing) {
       const remoteRoot = String(session.host?.root || '').replace(/\/+$/, '')
-      const remoteSharedStoreDir = isCustomOsSlot(vm) ? resolveRemoteSharedStoreDir({ remoteRoot }) : ''
+      const remoteSharedStoreDir =
+        typeof isCustomOsSlot === 'function' && isCustomOsSlot(vm) ? resolveRemoteSharedStoreDir({ remoteRoot }) : ''
       const remoteOsAssetsDir =
-        kvm && isCustomKvmMode({ vm })
+        kvm && typeof isCustomKvmMode === 'function' && isCustomKvmMode({ vm })
           ? String(
               process.env.KIN_REMOTE_CRAG_DEBIAN13_OS_DIR || (remoteRoot ? `${remoteRoot}/share/os/crag-debian13` : ''),
             ).trim()
           : ''
+      let regularEtcNames = []
+      const candidateEtcNames =
+        !kvm && computer && typeof localRegularEtcNames === 'function' ? localRegularEtcNames(projectRoot, vm) : []
+      if (candidateEtcNames.length && typeof REGULAR_ETC_TARGETS_LABEL === 'string') {
+        const imgInfo = await dockerJson(session.docker, {
+          method: 'GET',
+          path: `/images/${encodeURIComponent(image)}/json`,
+        }).catch(() => null)
+        if (imgInfo?.Config?.Labels?.[REGULAR_ETC_TARGETS_LABEL] === '1') {
+          regularEtcNames = candidateEtcNames
+        }
+      }
+      const runtimeEtc = Boolean(computer && typeof isCustomSlotUser === 'function' && isCustomSlotUser(vm))
       await createContainerRaw(
         session.docker,
         name,
@@ -2018,6 +2066,8 @@ async function startRemoteSlotAdmitted(vm, projectRoot, { recreate, routing, pin
           subscription,
           computer,
           managedSettings,
+          ...(runtimeEtc ? { runtimeEtc: true } : {}),
+          ...(regularEtcNames.length ? { regularEtcNames } : {}),
           ...(remoteSharedStoreDir ? { sharedStoreDir: remoteSharedStoreDir } : {}),
           ...(remoteOsAssetsDir ? { osAssetsDir: remoteOsAssetsDir } : {}),
         }),

@@ -10,6 +10,12 @@ on:
       - 'docker/kin-desktop/**'
       - '.github/workflows/guest-images.yml'
   workflow_dispatch:
+    inputs:
+      build_custom_kernel:
+        description: 'Build pinned Debian 13 Linux 6.12 LTS custom KVM kernel (vmlinuz-custom + initrd.img-custom)'
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
   group: guest-images-${{ github.ref }}
@@ -139,3 +145,30 @@ jobs:
             SKIP_CLOUD_IMAGE=${{ matrix.skip_cloud_image || '0' }}
           cache-from: type=gha,scope=kin-kvm-${{ matrix.family }}-${{ matrix.tag }}
           cache-to: type=gha,scope=kin-kvm-${{ matrix.family }}-${{ matrix.tag }},mode=max
+
+  # Optional Phase B pinned Linux 6.12 LTS custom KVM kernel (opt-in via workflow_dispatch).
+  custom-kernel:
+    if: github.event_name == 'workflow_dispatch' && inputs.build_custom_kernel == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - name: build pinned Debian 13 6.12 LTS custom kernel
+        run: bash scripts/build-custom-debian13-kernel.sh --out-dir "${{ runner.temp }}/custom-kernel-out"
+      - name: verify custom kernel artifacts
+        run: |
+          set -euo pipefail
+          cd "${{ runner.temp }}/custom-kernel-out"
+          ls -la vmlinuz-custom initrd.img-custom SHA256SUMS kernel-build-meta.json
+          sha256sum -c SHA256SUMS
+      - name: archive custom kernel artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: crag-debian13-custom-kernel-amd64
+          path: |
+            ${{ runner.temp }}/custom-kernel-out/vmlinuz-custom
+            ${{ runner.temp }}/custom-kernel-out/initrd.img-custom
+            ${{ runner.temp }}/custom-kernel-out/SHA256SUMS
+            ${{ runner.temp }}/custom-kernel-out/kernel-build-meta.json
+          if-no-files-found: error
+          retention-days: 30

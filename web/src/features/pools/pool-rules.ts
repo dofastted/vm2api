@@ -34,7 +34,7 @@ export const POOL_LOCKED_DEFAULTS = {
   session_ttl_seconds: 86400, // 24 小时
   session_overflow_policy: 'spill_immediately' as SessionOverflowPolicy, // D2: 满了就换
   session_busy_wait_ms: 0, // D2: 零干等
-  system_prompt_mode: 'passthrough' as SystemPromptMode,
+  system_prompt_mode: 'inherit_global' as SystemPromptMode,
   system_prompt_preset: 'official_full' as SystemPromptPreset,
   system_prompt_text: '',
   client_system_policy: 'prepend_pool' as ClientSystemPolicy,
@@ -161,6 +161,12 @@ export function isPromptLockedProvider(
   return normalized === 'openai' || normalized === 'google'
 }
 
+export function defaultSystemPromptModeForProvider(
+  scope: ProviderScope | string | undefined
+): SystemPromptMode {
+  return isPromptLockedProvider(scope) ? 'passthrough' : 'inherit_global'
+}
+
 export function createDefaultPoolDraft(
   overrides: Partial<SchedulerPoolDraft> = {}
 ): SchedulerPoolDraft {
@@ -192,7 +198,7 @@ export function createDefaultPoolDraft(
     session_ttl_seconds: POOL_LOCKED_DEFAULTS.session_ttl_seconds,
     session_busy_wait_ms: POOL_LOCKED_DEFAULTS.session_busy_wait_ms,
     session_overflow_policy: POOL_LOCKED_DEFAULTS.session_overflow_policy,
-    system_prompt_mode: locked ? 'passthrough' : 'inherit_global',
+    system_prompt_mode: defaultSystemPromptModeForProvider(provider_scope),
     system_prompt_preset: POOL_LOCKED_DEFAULTS.system_prompt_preset,
     system_prompt_text: '',
     client_system_policy: POOL_LOCKED_DEFAULTS.client_system_policy,
@@ -249,7 +255,7 @@ export function poolToDraft(pool: SchedulerPool): SchedulerPoolDraft {
       POOL_LOCKED_DEFAULTS.session_overflow_policy,
     system_prompt_mode: locked
       ? 'passthrough'
-      : pool.system_prompt_mode || 'passthrough',
+      : pool.system_prompt_mode || defaultSystemPromptModeForProvider(scope),
     system_prompt_preset: pool.system_prompt_preset || 'official_full',
     system_prompt_text: locked ? '' : pool.system_prompt_text || '',
     client_system_policy: pool.client_system_policy || 'prepend_pool',

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
   normalizeGeminiOAuthImport,
+  normalizeGeminiOAuthImportList,
   normalizeGeminiRefreshToken,
   parseGeminiExpirySeconds,
 } from '../../src/lib/gemini/oauth-import.mjs'
@@ -117,6 +118,7 @@ test('normalizeGeminiOAuthImport accepts CPA antigravity and CPA gemini CLI auth
       refresh_token: '1//06cpa-refresh-token',
       access_token: 'ya29.cpa-ag-token',
       expiry_timestamp: 1893456000,
+      project_id: 'proj-cpa',
     },
   )
 
@@ -151,6 +153,7 @@ test('normalizeGeminiOAuthImport accepts CPA antigravity and CPA gemini CLI auth
       refresh_token: '1//06cpa-gemini-refresh',
       access_token: 'ya29.cpa-gemini-cli',
       expiry_timestamp: 1893456000,
+      project_id: 'proj-cli',
     },
   )
 
@@ -184,6 +187,7 @@ test('normalizeGeminiOAuthImport accepts sub2api single account and unambiguous 
       refresh_token: '1//06sub2api-refresh',
       access_token: 'ya29.sub2api-ag',
       expiry_timestamp: 1893456000,
+      project_id: 'proj-sub',
     },
   )
 
@@ -216,6 +220,7 @@ test('normalizeGeminiOAuthImport accepts sub2api single account and unambiguous 
       refresh_token: '1//06sub2api-gemini-refresh',
       access_token: 'ya29.sub2api-gemini',
       expiry_timestamp: 1893456000,
+      project_id: 'proj-g',
     },
   )
 
@@ -279,31 +284,137 @@ test('normalizeGeminiOAuthImport rejects non-Gemini providers, malformed tokens,
     }),
     null,
   )
-  // Multiple distinct accounts in one bundle or array are ambiguous for direct single-account API import
-  assert.equal(
-    normalizeGeminiOAuthImport({
-      accounts: [
+  // Multiple distinct accounts in one bundle or array return cleanly (list + index selection) instead of null
+  const multiBundle = {
+    accounts: [
+      {
+        name: 'ag-1',
+        platform: 'antigravity',
+        type: 'oauth',
+        credentials: { access_token: 'ya29.one', expires_at: '1893456000' },
+      },
+      {
+        name: 'gem-2',
+        platform: 'gemini',
+        type: 'oauth',
+        credentials: { access_token: 'ya29.two', expires_at: '1893456000' },
+      },
+    ],
+  }
+  assert.deepEqual(normalizeGeminiOAuthImportList(multiBundle), [
+    { access_token: 'ya29.one', expiry_timestamp: 1893456000 },
+    { access_token: 'ya29.two', expiry_timestamp: 1893456000 },
+  ])
+  assert.deepEqual(normalizeGeminiOAuthImport(multiBundle), {
+    access_token: 'ya29.one',
+    expiry_timestamp: 1893456000,
+  })
+  assert.deepEqual(normalizeGeminiOAuthImport(multiBundle, { accountIndex: 1 }), {
+    access_token: 'ya29.two',
+    expiry_timestamp: 1893456000,
+  })
+  assert.equal(normalizeGeminiOAuthImport(multiBundle, { accountIndex: 2 }), null)
+
+  const multiArray = [
+    { email: 'a@example.test', refresh_token: '1//06FirstToken_111111' },
+    { email: 'b@example.test', refresh_token: '1//06SecondToken_222222' },
+  ]
+  assert.deepEqual(normalizeGeminiOAuthImportList(multiArray), [
+    { refresh_token: '1//06FirstToken_111111' },
+    { refresh_token: '1//06SecondToken_222222' },
+  ])
+  assert.deepEqual(normalizeGeminiOAuthImport(multiArray), {
+    refresh_token: '1//06FirstToken_111111',
+  })
+  assert.deepEqual(normalizeGeminiOAuthImport(multiArray, { accountIndex: 1 }), {
+    refresh_token: '1//06SecondToken_222222',
+  })
+})
+
+test('normalizeGeminiOAuthImport supports schema_version 2 export, relaxed types, nested metadata, and extended bare RT chars', () => {
+  // Format 1 redacted fixture (antigravity_accounts_2026-11-27.json)
+  const format1 = [
+    {
+      email: 'redacted1@gmail.com',
+      refresh_token: '1//06M_RedactedFormat1_abc-123',
+    },
+  ]
+  assert.deepEqual(normalizeGeminiOAuthImport(format1), {
+    refresh_token: '1//06M_RedactedFormat1_abc-123',
+  })
+
+  // Format 2 redacted fixture (antigravity-accounts-2026-11-28_04-34-13.json)
+  const format2 = {
+    schema_version: 2,
+    accounts: [
+      {
+        email: 'redacted2@gmail.com',
+        refresh_token: '1//06Q_RedactedFormat2_xyz-789',
+        oauth_client_key: 'antigravity_enterprise',
+        is_gcp_tos: false,
+        project_id: 'aicode-consumers',
+      },
+    ],
+  }
+  assert.deepEqual(normalizeGeminiOAuthImport(format2), {
+    refresh_token: '1//06Q_RedactedFormat2_xyz-789',
+    oauth_client_key: 'antigravity_enterprise',
+    is_gcp_tos: false,
+    project_id: 'aicode-consumers',
+  })
+
+  // Bare RT text containing `.`, `~`, `+`, `/` must not be truncated
+  const specialRt = '1//06Special.Token~with+plus/slash_123-end'
+  assert.deepEqual(normalizeGeminiOAuthImport(`paste:\n${specialRt}\n`), {
+    refresh_token: specialRt,
+  })
+  assert.deepEqual(normalizeGeminiOAuthImportList(`${specialRt}\n1//06Second.RT~a+b/c`), [
+    { refresh_token: specialRt },
+    { refresh_token: '1//06Second.RT~a+b/c' },
+  ])
+
+  // Relaxed bundle & account `type` values (`authorized_user`, `personal`, `pro`, `google`, `antigravity_enterprise`, `{ tokens: [...] }`)
+  assert.deepEqual(
+    normalizeGeminiOAuthImportList({
+      type: 'antigravity-export',
+      tokens: [
+        { type: 'authorized_user', refresh_token: '1//06AdcToken_111111' },
+        { type: 'personal', refresh_token: '1//06PersonalToken_222222' },
+        { type: 'pro', refresh_token: '1//06ProToken_333333' },
+        { type: 'google', refresh_token: '1//06GoogleToken_444444' },
         {
-          name: 'ag-1',
-          platform: 'antigravity',
-          type: 'oauth',
-          credentials: { access_token: 'ya29.one', expires_at: '1893456000' },
+          type: 'antigravity_enterprise',
+          refresh_token: '1//06EntToken_555555',
+          is_gcp_tos: true,
         },
-        {
-          name: 'gem-2',
-          platform: 'gemini',
-          type: 'oauth',
-          credentials: { access_token: 'ya29.two', expires_at: '1893456000' },
-        },
+        { type: 'claude', refresh_token: '1//06ShouldIgnoreClaude' },
       ],
     }),
-    null,
+    [
+      { refresh_token: '1//06AdcToken_111111' },
+      { refresh_token: '1//06PersonalToken_222222' },
+      { refresh_token: '1//06ProToken_333333' },
+      { refresh_token: '1//06GoogleToken_444444' },
+      { refresh_token: '1//06EntToken_555555', is_gcp_tos: true },
+    ],
   )
-  assert.equal(
-    normalizeGeminiOAuthImport([
-      { email: 'a@example.test', refresh_token: '1//06FirstToken_111111' },
-      { email: 'b@example.test', refresh_token: '1//06SecondToken_222222' },
-    ]),
-    null,
+
+  // Outer metadata preserved when descending into nested auth object
+  assert.deepEqual(
+    normalizeGeminiOAuthImport({
+      email: 'outer@gmail.com',
+      project_id: 'outer-project',
+      oauth_client_key: 'antigravity_enterprise',
+      is_gcp_tos: false,
+      auth: {
+        refresh_token: '1//06NestedAuthObj_abc',
+      },
+    }),
+    {
+      refresh_token: '1//06NestedAuthObj_abc',
+      project_id: 'outer-project',
+      oauth_client_key: 'antigravity_enterprise',
+      is_gcp_tos: false,
+    },
   )
 })

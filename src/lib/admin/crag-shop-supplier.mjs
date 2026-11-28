@@ -192,7 +192,15 @@ function validGateway(value) {
   }
 }
 
-function checkout(value, order, receipt) {
+function normalizePathPrefix(value) {
+  if (value == null || value === '') return ''
+  if (typeof value !== 'string' || !/^\/[a-z][a-z0-9_-]{0,31}$/.test(value)) {
+    throw new Error('Invalid CRAG shop path prefix')
+  }
+  return value
+}
+
+function checkout(value, order, receipt, pathPrefix = '') {
   if (value.url === undefined && value.data === undefined) return null
   if (order.status !== 'pending' || !validGateway(value.url) || !object(value.data)) throw invalidReply()
   const fields = value.data
@@ -221,7 +229,9 @@ function checkout(value, order, receipt) {
     fields.sign_type !== 'MD5' ||
     !/^[0-9a-f]{32}$/.test(fields.sign) ||
     !CALLBACK_ORIGINS.some(
-      (origin) => fields.notify_url === `${origin}/shop/epay/notify` && fields.return_url === `${origin}/shop/return`,
+      (origin) =>
+        fields.notify_url === `${origin}${pathPrefix}/shop/epay/notify` &&
+        fields.return_url === `${origin}${pathPrefix}/shop/return`,
     )
   )
     throw invalidReply()
@@ -407,12 +417,14 @@ function parsePlans(value) {
   return result
 }
 
-export function createShopSupplier(fetchImpl = globalThis.fetch) {
+export function createShopSupplier(fetchImpl = globalThis.fetch, { pathPrefix = '' } = {}) {
+  const prefix = normalizePathPrefix(pathPrefix)
   async function send(
     operation,
     path,
     { method = 'GET', receipt, body, allowPilot = true, ifNoneMatch = null, returnMeta = false } = {},
   ) {
+    const fullPath = `${prefix}${path}`
     const conditional = operation === 'plans' && typeof ifNoneMatch === 'string' && ifNoneMatch.length > 0
     const headers = {
       accept: 'application/json',
@@ -441,7 +453,7 @@ export function createShopSupplier(fetchImpl = globalThis.fetch) {
         }
         if (pilotToken) headers['X-Crag-Shop-Pilot'] = pilotToken
       }
-      response = await fetchImpl(`${ROOT}${path}`, {
+      response = await fetchImpl(`${ROOT}${fullPath}`, {
         method,
         headers,
         body: body && JSON.stringify(body),
@@ -489,7 +501,7 @@ export function createShopSupplier(fetchImpl = globalThis.fetch) {
         JSON.stringify({
           event: 'crag-shop-supplier',
           operation,
-          path: auditPath(path),
+          path: auditPath(fullPath),
           status: response?.status ?? 0,
           code: shop?.code ?? 'shop_unavailable',
           ...(shop ? {} : { cause: err?.name ?? 'Error' }),
@@ -534,12 +546,12 @@ export function createShopSupplier(fetchImpl = globalThis.fetch) {
         },
       })
       const order = publicOrder(value, row)
-      return { order, form: checkout(value, order, receipt) }
+      return { order, form: checkout(value, order, receipt, prefix) }
     },
     async resume(row, receipt, { allowPilot = true } = {}) {
       const value = await send('resume', `/shop/orders/${row.order_id}/resume`, { method: 'POST', receipt, allowPilot })
       const order = publicOrder(value, row)
-      return { order, form: checkout(value, order, receipt) }
+      return { order, form: checkout(value, order, receipt, prefix) }
     },
     async status(row, receipt) {
       const value = await send('status', `/shop/orders/${row.order_id}`, { receipt })

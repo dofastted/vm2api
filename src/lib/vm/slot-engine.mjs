@@ -18,6 +18,7 @@ import {
 } from '../identity/persona-template.mjs'
 import { isCodexVm } from './vm-kind.mjs'
 import { isCustomOsSlot, sharedClaudeGuestPath, sharedProfilesGuestDir } from './custom-os-runtime.mjs'
+import { slotHome } from './slot-identity.mjs'
 
 export const INFERENCE_ENGINES = Object.freeze(['rust'])
 export const SLOT_PERSONA_PRESETS = Object.freeze(['official', 'official_full', 'zero', OFFICIAL_303_PRESET])
@@ -98,8 +99,20 @@ export function resolveManifestClaudePath(manifest) {
   return matches.length === 1 ? matches[0] : null
 }
 
-export function cragClaudePathForHost(relPath, host = {}) {
-  const base = host?.bakedKernel ? `${REMOTE_LIVE_DIR}/crag-v2` : '/home/kincli/.kin/crag-v2'
+export function slotCliNodeBin(vm) {
+  return `${slotHome(vm)}/.kin/cli-node`
+}
+
+export function slotCcNodeBin(vm) {
+  return `${slotHome(vm)}/.kin/cc-node`
+}
+
+export function slotLocalCragClaude(vm, version = CRAG_CLAUDE_VERSION) {
+  return `${slotHome(vm)}/.kin/crag-v2/claude-code-${version}/claude`
+}
+
+export function cragClaudePathForHost(relPath, host = {}, vm = null) {
+  const base = host?.bakedKernel ? `${REMOTE_LIVE_DIR}/crag-v2` : `${slotHome(vm)}/.kin/crag-v2`
   return `${base}/${relPath}`
 }
 
@@ -347,7 +360,7 @@ export function resolveSlotClaude(vm, routing = {}, host = {}) {
     const headlessBridge = isHeadlessBridgeCaps(caps)
     const customOs = isCustomOsSlot(vm, host)
     const unbundled = manifest?.officialClaude?.bundled === false
-    const resolvedBin = cragClaudePathForHost(relPath, host)
+    const resolvedBin = cragClaudePathForHost(relPath, host, vm)
     if (headlessBridge) {
       if (customOs) {
         const wireProfileReadonlyDir =
@@ -395,7 +408,7 @@ export function resolveSlotClaude(vm, routing = {}, host = {}) {
     }
   }
   return {
-    bin: dataplane === 'wrap' ? host.bins?.cli || CONTAINER_CLI_NODE_BIN : host.bins?.cc || CONTAINER_CC_NODE_BIN,
+    bin: dataplane === 'wrap' ? host.bins?.cli || slotCliNodeBin(vm) : host.bins?.cc || slotCcNodeBin(vm),
     native: false,
   }
 }

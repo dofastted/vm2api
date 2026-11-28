@@ -62,6 +62,7 @@ import {
   runtimeFileOwner,
 } from '../oauth/oauth-credentials.mjs'
 import { slotHost } from '../vm/slot-host.mjs'
+import { slotClaudeDir, slotHome } from '../vm/slot-identity.mjs'
 import { repairClaudeConfigFromBackup } from '../vm/claude-config-repair.mjs'
 import { buildNativeTelemetry } from '../vm/native-telemetry.mjs'
 import { defaultSeedPolicy, isTelemetryEnabled } from '../protocol/seed-policy.mjs'
@@ -133,6 +134,10 @@ function slotRunner(exec, run) {
 const CONTAINER_KERNEL_BIN = '/home/kincli/.kin/kin-kernel'
 const CONTAINER_KERNEL_CONFIG = '/run/kin/kernel.json'
 export const CONTAINER_CLAUDE_BIN = CONTAINER_CLI_NODE_BIN
+
+function slotContainerKernelBin(vm) {
+  return `${slotHome(vm)}/.kin/kin-kernel`
+}
 
 export const WRAP_SLOT_MIN = 1
 export const WRAP_SLOT_MAX = KERNEL_NATIVE_SLOT_COUNT
@@ -296,7 +301,7 @@ function admitKernelLaunch(exec, start, { bindSubscription = false } = {}) {
 // CRAG refuses every prompt with a 502. Merge them inside the container instead.
 export const NODE_CLAUDE_SETUP_PY = `
 import json, os
-home = "/home/kincli"
+home = os.environ.get("HOME") or "/home/kincli"
 want = ("/run/kin/work", home)
 for f in (home + "/.claude/.claude.json", home + "/.claude.json"):
     changed = False
@@ -347,7 +352,10 @@ async function acceptNodeClaudeSetup(exec, runDockerExec) {
   const last = nodeSetupAcceptedAt.get(vmId) || 0
   if (Date.now() - last < NODE_SETUP_RECHECK_MS) return null
   const result = await runDockerExec(
-    execArgv(exec, ['python3', '-c', NODE_CLAUDE_SETUP_PY], { user: host.execUser(exec.vm) }),
+    execArgv(exec, ['python3', '-c', NODE_CLAUDE_SETUP_PY], {
+      user: host.execUser(exec.vm),
+      env: [`HOME=${slotHome(exec?.vm)}`],
+    }),
     { timeoutMs: 8000 },
   )
   if (!result?.ok) return 'node_claude_setup_failed'
@@ -476,6 +484,7 @@ async function kernelProcessAlive(exec, runDockerExec) {
   const container = slotContainerName(exec)
   if (!container) return false
   const config = readExistingKernelConfig(rustKernelPaths(exec).configPath)
+  const kernelBin = slotContainerKernelBin(exec?.vm)
   const probe =
     config.dataplane === 'crag' && config.crag_kernel_version === 'v2'
       ? [
@@ -486,7 +495,7 @@ async function kernelProcessAlive(exec, runDockerExec) {
           'done',
           'exit 1',
         ].join('\n')
-      : 'pgrep -f /home/kincli/.kin/kin-kernel.bin >/dev/null || pgrep -f /home/kincli/.kin/kin-kernel >/dev/null || pidof kin-kernel >/dev/null'
+      : `pgrep -f ${kernelBin}.bin >/dev/null || pgrep -f ${kernelBin} >/dev/null || pidof kin-kernel >/dev/null`
   const result = await runDockerExec(execArgv(exec, ['sh', '-c', probe]), { timeoutMs: clusterProbeMs(exec, 1500) })
   return result?.ok === true
 }
@@ -1362,7 +1371,12 @@ async function launchRustKernel(
     if (host.ownsSocketFiles) fs.rmSync(paths.socketPath, { force: true })
   } catch {}
   if (!pid1Kernel) await killWrapDataplane(exec, runDockerExec)
-  const argv = [CONTAINER_KERNEL_BIN, '--gateway-worker', '--config', CONTAINER_KERNEL_CONFIG]
+  const argv = [
+    slotContainerKernelBin(exec?.vm) || CONTAINER_KERNEL_BIN,
+    '--gateway-worker',
+    '--config',
+    CONTAINER_KERNEL_CONFIG,
+  ]
   const cpuLimited = usesKernelCpuLimit({
     ...exec?.vm,
     dataplane: readExistingKernelConfig(paths.configPath).dataplane || exec?.vm?.dataplane,
@@ -1465,7 +1479,7 @@ function acceptNativeClaudeSetup(homeDir, workDir, vm) {
       doc.projects = {}
       changed = true
     }
-    for (const folder of [workDir, '/home/kincli']) {
+    for (const folder of [workDir, slotHome(vm)]) {
       const current = doc.projects[folder]
       const project = current && typeof current === 'object' && !Array.isArray(current) ? current : {}
       if (project.hasTrustDialogAccepted === true) continue
@@ -1624,7 +1638,7 @@ export function writeKernelConfig(
       : kind === 'kvm'
         ? '/run/kin-guest/kernel.sock'
         : '/run/kin/kernel.sock',
-    credential_path: nodePaths ? `${nodePaths.claude}/credentials.json` : '/home/kincli/.claude/credentials.json',
+    credential_path: nodePaths ? `${nodePaths.claude}/credentials.json` : `${slotClaudeDir(target)}/credentials.json`,
     proxy_url: '',
     proxy_required: false,
     internal_token: secret,

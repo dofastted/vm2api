@@ -39,6 +39,18 @@ test('installation payload verifies and stages without cc-node', (t) => {
       fs.mkdirSync(path.dirname(target), { recursive: true })
       fs.writeFileSync(target, bytes)
     }
+    const customAssets = manifest.crag_debian13_release.custom_kernel?.assets
+    if (customAssets && typeof customAssets === 'object') {
+      const customDir = manifest.crag_debian13_release.custom_kernel.dest_dir || osDir
+      for (const [asset, entry] of Object.entries(customAssets)) {
+        const bytes = Buffer.from(`fixture:${asset}`)
+        entry.size = bytes.length
+        entry.sha256 = crypto.createHash('sha256').update(bytes).digest('hex')
+        const target = path.join(dest, customDir, asset)
+        fs.mkdirSync(path.dirname(target), { recursive: true })
+        fs.writeFileSync(target, bytes)
+      }
+    }
   }
   const fixtureManifest = path.join(dest, 'payload.json')
   fs.writeFileSync(fixtureManifest, JSON.stringify(manifest))
@@ -57,6 +69,10 @@ test('installation payload verifies and stages without cc-node', (t) => {
     assert.equal(fs.existsSync(path.join(stage, 'kin-kvm-debian-13.erofs')), true)
     assert.equal(fs.existsSync(path.join(stage, 'vmlinuz')), true)
     assert.equal(fs.existsSync(path.join(stage, 'initrd.img')), true)
+    if (manifest.crag_debian13_release.custom_kernel?.assets) {
+      assert.equal(fs.existsSync(path.join(stage, 'vmlinuz-custom')), true)
+      assert.equal(fs.existsSync(path.join(stage, 'initrd.img-custom')), true)
+    }
   }
 })
 

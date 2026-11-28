@@ -6,7 +6,13 @@
  * vs the exit IP). After every bind the slot adopts the proxy's detected zone,
  * unless the operator pinned one by hand (`vm.timezone_source === 'manual'`).
  */
+import fs from 'node:fs'
 import { validTimezone } from '../core/timezone.mjs'
+import {
+  fingerprintDir,
+  pushLiveSlotTimezoneSync,
+  syncSlotIdentityTimezoneAndPreset,
+} from '../identity/slot-computer.mjs'
 import { isLocalEgressProxy, localEgressIdForNode } from './egress.mjs'
 import { slotHost } from './slot-host.mjs'
 import { getVm, persistVmTimezone } from './vm-registry.mjs'
@@ -68,12 +74,19 @@ export async function syncVmTimezoneFromProxy(
     // zone as hand-pinned once the operator opted back into following.
     if (persist && force && vm.timezone_source !== 'proxy_geo') {
       persistVmTimezone(projectRoot, id, timezone, { source: 'proxy_geo' })
+    } else if (persist && fs.existsSync(fingerprintDir(projectRoot, id))) {
+      try {
+        syncSlotIdentityTimezoneAndPreset(projectRoot, vm, { timezone, locale: vm.locale })
+      } catch {}
     }
     return { ok: true, applied: false, timezone, reason: 'already_current' }
   }
   if (!persist) return { ok: true, applied: true, timezone, reason: null }
   const summary = persistVmTimezone(projectRoot, id, timezone, { source: 'proxy_geo' })
   if (!summary) return skip('persist_failed')
+  if (vm.status === 'running' && fs.existsSync(fingerprintDir(projectRoot, id))) {
+    await pushLiveSlotTimezoneSync(projectRoot, { ...vm, timezone }).catch(() => null)
+  }
   return { ok: true, applied: true, timezone, reason: null }
 }
 

@@ -43,9 +43,11 @@ export function GeminiProxyPanel({
   const proxies = useQuery({ ...geminiProxyOptions, enabled: active })
   const pool = proxies.data?.proxies ?? []
   const boundId = environment.proxy_id
+  const envOwnerId = environment.owner_user_id ?? null
   const bound = pool.find((proxy) => proxy.id === boundId)
   const candidates = pool.filter(
-    (proxy) => proxy.id !== boundId && isGeminiProxy(proxy)
+    (proxy) =>
+      proxy.id !== boundId && isGeminiProxy(proxy, { ownerUserId: envOwnerId })
   )
   const selected = candidates.find((proxy) => proxy.id === selection)
   const probe = useGeminiMutation({
@@ -87,7 +89,9 @@ export function GeminiProxyPanel({
     <div className='min-w-0 space-y-3'>
       <Card>
         <CardHeader className='pb-2'>
-          <CardTitle className='text-sm'>绑定的 IPv4 SOCKS5 代理</CardTitle>
+          <CardTitle className='text-sm'>
+            绑定的出口代理（SOCKS5 / HTTP）
+          </CardTitle>
         </CardHeader>
         <CardContent className='space-y-3 pt-0'>
           <div className='divide-y'>
@@ -111,7 +115,11 @@ export function GeminiProxyPanel({
             {boundId ? (
               <Field label='绑定状态'>
                 {environment.proxy_ready === false ||
-                (bound && !isGeminiProxy(bound))
+                (bound &&
+                  !isGeminiProxy(bound, {
+                    ownerUserId: envOwnerId,
+                    allowFail: true,
+                  }))
                   ? '不可用'
                   : environment.proxy_ready === true
                     ? '可用'
@@ -150,14 +158,16 @@ export function GeminiProxyPanel({
         </CardHeader>
         <CardContent className='space-y-3 pt-0'>
           <div className='space-y-1.5'>
-            <Label htmlFor={pickerId}>平台代理</Label>
+            <Label htmlFor={pickerId}>
+              {envOwnerId ? '可用代理（平台 / 租户）' : '平台代理'}
+            </Label>
             <Select
               value={selected?.id ?? ''}
               onValueChange={setSelection}
               disabled={busy || !candidates.length}
             >
               <SelectTrigger id={pickerId} className='w-full'>
-                <SelectValue placeholder='选择 IPv4 SOCKS5 代理' />
+                <SelectValue placeholder='选择 SOCKS5 / HTTP 代理' />
               </SelectTrigger>
               <SelectContent>
                 {candidates.map((proxy) => (
@@ -170,15 +180,16 @@ export function GeminiProxyPanel({
           </div>
           {proxies.isError ? (
             <p role='alert' className='text-sm text-destructive'>
-              读取平台代理失败。
+              读取代理列表失败。
             </p>
           ) : proxies.isPending ? (
             <p role='status' className='text-sm text-muted-foreground'>
-              正在读取平台代理…
+              正在读取代理列表…
             </p>
           ) : !candidates.length ? (
             <p className='text-sm text-muted-foreground'>
-              没有其他符合条件的平台代理。
+              没有其他符合条件的 SOCKS5 / HTTP 代理（支持 IPv4 或域名，不支持
+              IPv6 / HTTPS）。
             </p>
           ) : null}
           <Button

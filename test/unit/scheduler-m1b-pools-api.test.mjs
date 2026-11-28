@@ -174,7 +174,8 @@ test('pools CRUD enforces v4 locked defaults, filters, prompt rules, and fallbac
     assert.deepEqual(p1.plan_tags, ['max_20x', 'pro'])
     assert.equal(p1.config_version, 1)
 
-    // gemini alias -> google, passthrough allowed
+    // gemini alias -> google, passthrough allowed; openai defaults to passthrough;
+    // anthropic / mixed / api default to inherit_global when system_prompt_mode is omitted
     const cGem = await h.callPool('POST', '/api/panel/pools', {
       name: 'Gemini Pool',
       provider_scope: 'gemini',
@@ -183,6 +184,22 @@ test('pools CRUD enforces v4 locked defaults, filters, prompt rules, and fallbac
     assert.equal(cGem.status, 201)
     assert.equal(cGem.body.data.pool.provider_scope, 'google')
     assert.equal(cGem.body.data.pool.system_prompt_mode, 'passthrough')
+
+    const cOpenaiDefault = await h.callPool('POST', '/api/panel/pools', {
+      name: 'OpenAI Default Pool',
+      provider_scope: 'openai',
+    })
+    assert.equal(cOpenaiDefault.status, 201)
+    assert.equal(cOpenaiDefault.body.data.pool.system_prompt_mode, 'passthrough')
+
+    for (const scope of ['anthropic', 'mixed', 'api']) {
+      const createdDefault = await h.callPool('POST', '/api/panel/pools', {
+        name: `Default ${scope}`,
+        provider_scope: scope,
+      })
+      assert.equal(createdDefault.status, 201, scope)
+      assert.equal(createdDefault.body.data.pool.system_prompt_mode, 'inherit_global', scope)
+    }
 
     // openai / google non-passthrough rejected with 400 pool_prompt_unsupported_provider
     for (const scope of ['openai', 'google', 'gemini']) {
@@ -544,6 +561,8 @@ test('panel-routes wires /api/panel/pools RBAC, /api/panel/vm-pools thin sync, a
     const synced = h.repo.get(legacyId)
     assert.ok(synced)
     assert.equal(synced.name, 'Legacy Sync Pool')
+    assert.equal(synced.provider_scope, 'anthropic')
+    assert.equal(synced.system_prompt_mode, 'inherit_global')
     assert.deepEqual(synced.members.map((m) => `${m.node_type}:${m.node_id}`).sort(), [
       'claude_vm:vm-crag-1',
       'codex_vm:vm-codex-1',

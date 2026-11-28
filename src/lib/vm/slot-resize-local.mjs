@@ -39,6 +39,10 @@ export const LOCAL_RESIZE_IDENTITY_KEYS = Object.freeze([
   'KIN_KVM_DISK_SERIAL',
   'KIN_KVM_HOSTNAME',
   'KIN_KVM_MACHINE_ID',
+  'KIN_SLOT_USER',
+  'KIN_SLOT_UID',
+  'KIN_SLOT_GID',
+  'KIN_KVM_KERNEL_TRACK',
 ])
 
 export function dockerRun(argv, { timeout = 30_000 } = {}) {
@@ -75,7 +79,8 @@ export function identityDrift(before, after) {
 
 export async function preflightLocalResize({ projectRoot, vm, memory, routing, jobId, docker = dockerRun, meminfo }) {
   if (vm.node_id) throw migrationError('migration_unsupported', '本机扩容只适用于主控本机的槽')
-  if (process.platform !== 'linux' && !meminfo) throw migrationError('migration_unsupported', '本机扩容仅支持 Linux 主控')
+  if (process.platform !== 'linux' && !meminfo)
+    throw migrationError('migration_unsupported', '本机扩容仅支持 Linux 主控')
   const name = containerName(vm.id)
   const sourceInfo = inspect(name, docker)
   if (!sourceInfo) throw migrationError('migration_source_missing', '本机槽容器不存在')

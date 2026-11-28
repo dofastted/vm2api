@@ -194,6 +194,60 @@ export function cragHostOrdersQueryOptions(limit = 50, offset = 0) {
   })
 }
 
+export type GeminiHostStatus = {
+  configured: boolean
+  active: boolean
+  product: string
+  host_id: string | null
+  sync_pending: boolean
+  issuer_public_key_id?: string | null
+  payload_key_id?: string | null
+  version: number | null
+  revision: number | null
+  issued_at: number | null
+  expires_at: number | null
+  slot_limit: number | 'unlimited'
+  used_slots: number | null
+  available_slots: number | null
+  reclaim_supported: boolean
+  quota_grants?: Array<{
+    code_id?: string
+    expires_at: number
+    slot_limit?: number | null
+  }>
+  credential_recovery?: 'host_id_collision' | 'failed' | 'not_activated'
+}
+
+export function geminiCragSubscriptionQueryOptions(sync = false) {
+  return queryOptions({
+    queryKey: ['panel', 'gemini-environments', 'crag-subscription'] as const,
+    queryFn: ({ signal }) =>
+      api<GeminiHostStatus>(
+        `/api/panel/gemini/crag-subscription${sync ? '?sync=1' : ''}`,
+        { signal }
+      ),
+    retry: false,
+  })
+}
+
+export function geminiCragOrdersQueryOptions(limit = 50, offset = 0) {
+  return queryOptions({
+    queryKey: [
+      'panel',
+      'gemini-environments',
+      'crag-orders',
+      limit,
+      offset,
+    ] as const,
+    queryFn: ({ signal }) =>
+      api<CragCloudOrdersResponse>(
+        `/api/panel/gemini/crag-subscription/orders?limit=${limit}&offset=${offset}`,
+        { signal }
+      ),
+    retry: false,
+  })
+}
+
 export function vmCragLicenseQueryOptions(id: string) {
   return queryOptions({
     queryKey: ['panel', 'vm', id, 'crag-license'] as const,

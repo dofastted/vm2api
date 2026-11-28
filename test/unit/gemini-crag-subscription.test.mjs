@@ -1805,3 +1805,260 @@ test('redeem auto-materializes staged payload via ensure-payload when share/gemi
   assert.equal(redeemed.slot_limit, 10)
   assert.equal(redeemed.available_slots, 10)
 })
+
+test('createGeminiCragSubscription supports orders, claimByOrder collision auto-rebuild, migrate, renewalProof, redeem recovery, and panel routes', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gemini-crag-full-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const authority = makeAuthority()
+  const now = Math.floor(Date.now() / 1000)
+  const machineIdPath = path.join(root, 'machine-id')
+  fs.writeFileSync(machineIdPath, '11223344556677881122334455667788\n')
+
+  const collidedHostId = sha256('crag-gemini-host-v1:11223344556677881122334455667788')
+  const fromUuid = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+  const expectedFromHostId = sha256('crag-gemini-host-v1:aaaaaaaabbbbccccddddeeeeeeeeeeee')
+  const orderId = crypto.randomUUID()
+  const reqUuid = crypto.randomUUID()
+
+  let revision = 0
+  let validCredential = null
+  let forceForbiddenOnce = false
+  const actions = []
+
+  const buildH2 = (hostId, slotLimit = 10) => {
+    revision += 1
+    const claims = {
+      version: 2,
+      product: CRAG_GEMINI_PRODUCT,
+      host_id: hostId,
+      revision,
+      issued_at: now - 60,
+      expires_at: now + 30 * 86400,
+      slot_limit: slotLimit,
+      roster: [],
+    }
+    return {
+      entitlement: signToken(authority, 'CRAGH2', claims),
+      expires_at: claims.expires_at,
+      slot_limit: slotLimit,
+      revision,
+      used_slots: 0,
+      available_slots: slotLimit,
+    }
+  }
+
+  const fetchImpl = async (url, options) => {
+    const action = url.split('/').pop()
+    const body = JSON.parse(options.body)
+    const auth = options.headers?.authorization || null
+    actions.push({ action, body, auth })
+
+    if (action === 'redeem') {
+      if (body.host_id === collidedHostId) {
+        return new Response(JSON.stringify({ ok: false, error: { code: 'auth_forbidden' } }), {
+          status: 403,
+          headers: { 'content-type': 'application/json', 'x-request-id': reqUuid },
+        })
+      }
+      if (forceForbiddenOnce) {
+        forceForbiddenOnce = false
+        return new Response(JSON.stringify({ ok: false, error: { code: 'auth_forbidden' } }), {
+          status: 403,
+          headers: { 'content-type': 'application/json', 'x-request-id': reqUuid },
+        })
+      }
+      validCredential = auth
+      return Response.json({ ok: true, data: buildH2(body.host_id, 20) })
+    }
+    if (action === 'recover') {
+      assert.ok(auth?.startsWith('Bearer '))
+      assert.ok(typeof body.entitlement === 'string' && body.entitlement.startsWith('CRAGH2.'))
+      validCredential = auth
+      return Response.json({ ok: true, data: { recovered: true } })
+    }
+    if (action === 'claim-by-order') {
+      if (body.host_id === collidedHostId) {
+        return new Response(JSON.stringify({ ok: false, error: { code: 'auth_forbidden' } }), {
+          status: 403,
+          headers: { 'content-type': 'application/json', 'x-request-id': reqUuid },
+        })
+      }
+      assert.equal(body.order_id, orderId)
+      validCredential = auth
+      return Response.json({ ok: true, data: buildH2(body.host_id, 10) })
+    }
+    if (action === 'orders') {
+      return Response.json({
+        ok: true,
+        data: {
+          host_id: body.host_id,
+          product: CRAG_GEMINI_PRODUCT,
+          orders: [
+            {
+              order_id: orderId,
+              sku: 'gemini-monthly',
+              order_kind: 'new',
+              payment_method: 'alipay',
+              amount_minor: 9900,
+              months: 1,
+              slot_limit: 10,
+              paid_at: now - 100,
+              expires_at: now + 30 * 86400,
+              status: 'active',
+              active: true,
+            },
+          ],
+          vouchers: [],
+          total: 1,
+          limit: body.limit,
+          offset: body.offset,
+        },
+      })
+    }
+    if (action === 'migrate') {
+      // crag-auth HostMigrateRequest uses #[serde(deny_unknown_fields)] — no host_id field!
+      assert.equal('host_id' in body, false)
+      assert.equal(body.from_host_id, expectedFromHostId)
+      assert.equal(body.proof_order_id, orderId)
+      return Response.json({
+        ok: true,
+        data: {
+          from_host_id: body.from_host_id,
+          to_host_id: body.to_host_id,
+          migrated_vouchers: 1,
+          migrated_orders: 1,
+          rights: buildH2(body.to_host_id, 10),
+        },
+      })
+    }
+    if (action === 'renewal-proof') {
+      assert.equal(auth, validCredential)
+      return Response.json({ ok: true, data: { proof: 'CRAGRP1.payload.signature' } })
+    }
+    throw new Error(`unexpected action: ${action}`)
+  }
+
+  const sub = createGeminiCragSubscription({
+    projectRoot: root,
+    dataDir: path.join(root, 'data'),
+    resolveAuthority: () => ({
+      product: CRAG_GEMINI_PRODUCT,
+      publicKey: authority.publicKey,
+      publicKeyBytes: authority.publicBytes,
+      issuerId: authority.issuerId,
+      payloadKeyId: authority.payloadKeyId,
+    }),
+    callHost: async () => ({}),
+    fetchImpl,
+    origin: 'http://127.0.0.1:18790',
+    machineIdFile: machineIdPath,
+  })
+
+  const responses = []
+  const json = (_res, status, payload) => responses.push({ status, payload })
+  const res = { setHeader() {} }
+  const panel = createGeminiPanelHandler({
+    json,
+    readBody: async (req) => req.body,
+    proxyPool: () => null,
+    cragSubscription: sub,
+    callHost: async () => ({}),
+    publicBaseUrl: 'https://panel.example.test',
+  })
+  const makeReq = (method, body = {}, headers = {}) => ({
+    method,
+    body,
+    headers: {
+      host: 'panel.example.test',
+      origin: 'https://panel.example.test',
+      'sec-fetch-site': 'same-origin',
+      ...headers,
+    },
+  })
+
+  // 1. purchaseDeviceId pins host_id
+  assert.equal(sub.purchaseDeviceId(), collidedHostId)
+
+  // 2. Redeem on a collided host_id surfaces details.recovery === 'host_id_collision' + request ID
+  const voucher = `CRAGR1.${crypto.randomBytes(32).toString('base64url')}`
+  await panel(makeReq('POST', { redemption_code: voucher }), res, '/api/panel/gemini/crag-subscription/redeem')
+  const collisionResp = responses.pop()
+  assert.equal(collisionResp.status, 403)
+  assert.equal(collisionResp.payload.error.code, 'auth_forbidden')
+  assert.equal(collisionResp.payload.error.details.recovery, 'host_id_collision')
+  assert.equal(collisionResp.payload.error.details.authority_request_id, reqUuid)
+
+  // 3. Cross-origin POST to claim-by-order is rejected when publicBaseUrl is configured
+  await panel(
+    makeReq('POST', { order_id: orderId }, { origin: 'https://evil.example.test', 'sec-fetch-site': 'cross-site' }),
+    res,
+    '/api/panel/gemini/crag-subscription/claim-by-order',
+  )
+  assert.equal(responses.pop().status, 403)
+
+  // 4. claim-by-order auto-rebuilds host identity once on host_id_collision and activates subscription!
+  await panel(makeReq('POST', { order_id: orderId }), res, '/api/panel/gemini/crag-subscription/claim-by-order')
+  const claimed = responses.pop()
+  assert.equal(claimed.status, 200)
+  assert.equal(claimed.payload.data.active, true)
+  assert.notEqual(claimed.payload.data.host_id, collidedHostId)
+  const rebuiltHostId = claimed.payload.data.host_id
+
+  // 5. Subsequent redeem with stale credential auto-recovers via /recover + retries once!
+  forceForbiddenOnce = true
+  const stacked = await sub.redeemRenewal(`CRAGR1.${crypto.randomBytes(32).toString('base64url')}`)
+  assert.equal(stacked.active, true)
+  assert.equal(stacked.slot_limit, 20)
+  assert.ok(actions.some((entry) => entry.action === 'recover'))
+
+  // 6. renewalProof succeeds with the recovered credential
+  assert.equal(await sub.renewalProof(), 'CRAGRP1.payload.signature')
+
+  // 7. GET /orders returns cloud orders ledger
+  await panel(
+    { method: 'GET', url: '/api/panel/gemini/crag-subscription/orders?limit=20&offset=0', headers: {} },
+    res,
+    '/api/panel/gemini/crag-subscription/orders',
+  )
+  const listed = responses.pop()
+  assert.equal(listed.status, 200)
+  assert.equal(listed.payload.data.product, CRAG_GEMINI_PRODUCT)
+  assert.equal(listed.payload.data.orders.length, 1)
+  assert.equal(listed.payload.data.orders[0].order_id, orderId)
+
+  // 8. POST /migrate hashes UUID with crag-gemini-host-v1: and omits stray host_id
+  await panel(
+    makeReq('POST', { from_host_id: fromUuid, proof: orderId }),
+    res,
+    '/api/panel/gemini/crag-subscription/migrate',
+  )
+  const migrated = responses.pop()
+  assert.equal(migrated.status, 200)
+  assert.equal(migrated.payload.data.from_host_id, expectedFromHostId)
+  assert.equal(migrated.payload.data.to_host_id, rebuiltHostId)
+  assert.equal(migrated.payload.data.migrated_orders, 1)
+
+  // 9. POST /rebuild-identity rotates host_id and clears local entitlement
+  await panel(makeReq('POST', {}), res, '/api/panel/gemini/crag-subscription/rebuild-identity')
+  const rotated = responses.pop()
+  assert.equal(rotated.status, 200)
+  assert.equal(rotated.payload.data.active, false)
+  assert.notEqual(rotated.payload.data.host_id, rebuiltHostId)
+
+  // 10. Same-origin CSRF check is enforced even when publicBaseUrl is unset (null)
+  const panelNoBase = createGeminiPanelHandler({
+    json,
+    readBody: async (req) => req.body,
+    proxyPool: () => null,
+    cragSubscription: sub,
+    callHost: async () => ({}),
+  })
+  await panelNoBase(
+    makeReq('POST', {}, { origin: 'https://sibling.example.test', 'sec-fetch-site': 'same-site' }),
+    res,
+    '/api/panel/gemini/crag-subscription/rebuild-identity',
+  )
+  const csrfBlocked = responses.pop()
+  assert.equal(csrfBlocked.status, 403)
+  assert.equal(csrfBlocked.payload.error.code, 'crag_subscription_origin_denied')
+})

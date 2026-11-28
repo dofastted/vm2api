@@ -1,14 +1,14 @@
 {
   "repo": "dofastted/vm2api",
-  "release": "payload-2026.11.28-kin-computer",
+  "release": "payload-2026.11.28-kin-computer-2",
   "crag_release": "payload-2026.11.28-crag-3.1.26",
   "crag_debian13_release": {
-    "tag": "payload-2026.11.28-crag-debian13-1.0.0",
+    "tag": "payload-2026.11.28-crag-debian13-1.1.0",
     "dest_dir": "share/os/crag-debian13",
     "assets": {
       "kin-kvm-debian-13.erofs": {
-        "size": 338128896,
-        "sha256": "5be23c9cfa260dee57943fce1c3dffb44f293708e888f9f667e62ce58e6528b3"
+        "size": 338132992,
+        "sha256": "40698c1e840092021e215abde6b9a68a7df2d97783da384a58c1ad47c708a7e7"
       },
       "vmlinuz": {
         "size": 12171200,
@@ -17,6 +17,19 @@
       "initrd.img": {
         "size": 36789010,
         "sha256": "07dcf5836471de47d522c66b7f078fbc011c1e54af869ce7e5a765ecfe36f8ad"
+      }
+    },
+    "custom_kernel": {
+      "tag": "payload-2026.11.28-crag-debian13-1.1.0",
+      "assets": {
+        "vmlinuz-custom": {
+          "size": 10940928,
+          "sha256": "a6e95bef4bb0af87a3ac00b57864aa695145c8feeaacbf285a9835bbe653728b"
+        },
+        "initrd.img-custom": {
+          "size": 11202830,
+          "sha256": "34b78402b01bbd4ebc5f86713c58ec1658de0acb5cf9b1586196abb26b515f84"
+        }
       }
     }
   },
@@ -27,19 +40,19 @@
     "payload_key_id": "835451e266145220a2e75b1f39ff22a0d7b17be48395553a24666b1946e0333a"
   },
   "geminiDefaultLinuxAmd64": {
-    "tag": "payload-2026.11.27-gemini-0.5.3",
+    "tag": "payload-2026.11.28-gemini-0.5.4",
     "assets": {
       "craggemini": {
-        "size": 1480160,
-        "sha256": "a95ae99aab6c1fc89a36e6735f41b3d78525753fce55ac46e55b5bd3ad4e8c89"
+        "size": 1478952,
+        "sha256": "ef8503dfbf4478ab32acd936864f0acf72bdad9aef25131a08e1ee187a4ca3d2"
       },
       "craggemini.payload.enc": {
-        "size": 8923084,
-        "sha256": "4c77c9e7ab3a5a9e1833f0068f5b0f349282b6031eed7756f4688b004ca87f74"
+        "size": 8943260,
+        "sha256": "5fe46565da58b77a61bbadb764f777fb015bef614cc121a03131257780701391"
       },
       "libagy_bridge.so": {
-        "size": 1059968,
-        "sha256": "66756f6e663705a16952723d2c478fb550af49d18e21abd84f837407b10703fe"
+        "size": 1059560,
+        "sha256": "e0c21b2b1af92d5d8537b0e94a0be0fd56524d2e6f94b291384b152948da0524"
       },
       "crag-license-public.pem": {
         "size": 113,
@@ -47,7 +60,7 @@
       },
       "manifest.json": {
         "size": 2131,
-        "sha256": "88f7f95095eaaf54376845ee8a5c7f075a93f19ceed6d1ed82e681b78502b5c7"
+        "sha256": "9eb7bc6b3c3dae98fc8502441f9a0aa8a7ee36eaf065b160db717a89bacc3d04"
       }
     }
   },
@@ -73,8 +86,8 @@
     {
       "path": "bin/kin-computer",
       "asset": "kin-computer",
-      "size": 5470424,
-      "sha256": "584122ee722e8112ed7e8e4ae59080874445693b757878714a33bbb886d4ffaf"
+      "size": 5515480,
+      "sha256": "930d6c6e3e1da4cafe6d29359e5f20865d5e86c594e8542d2d5f85d5771a4687"
     },
     {
       "path": "bin/kin-worker",

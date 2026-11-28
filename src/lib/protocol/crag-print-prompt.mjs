@@ -529,9 +529,10 @@ function applyPoolSystemForCrag(callerSystem, promptPolicy, officialPassthrough)
   const poolText = typeof promptPolicy.text === 'string' ? promptPolicy.text : ''
   const poolBlocks = poolText ? [{ type: 'text', text: poolText }] : []
   if (promptPolicy.mode === 'append') {
-    if (!poolBlocks.length) return callerSystem
+    const baseCaller = !officialPassthrough && isOnlyOfficialCliIdentitySystem(callerSystem) ? undefined : callerSystem
+    if (!poolBlocks.length) return baseCaller
     if (officialPassthrough) return poolBlocks
-    const clientBlocks = systemBlocks(callerSystem)
+    const clientBlocks = systemBlocks(baseCaller)
       .map((b) =>
         typeof b === 'string' ? (b ? { type: 'text', text: b } : null) : b && typeof b === 'object' ? { ...b } : null,
       )
@@ -636,11 +637,17 @@ export function prepareCragPrintBody(
         const appendedBlocks = applyPoolSystemForCrag(body?.system, promptPolicy, officialPassthrough)
         if (Array.isArray(appendedBlocks) && appendedBlocks.length) {
           out.system = appendedBlocks
+        } else if (!officialPassthrough && isOnlyOfficialCliIdentitySystem(out.system)) {
+          delete out.system
         }
         if (officialPassthrough) return out
         const customTemplate = resolveCragCustomTemplate(vm, routing, preset)
         if (customTemplate) {
-          const { blocks, promptVersion } = renderCragCustomSystemBlocks(out, {
+          const {
+            blocks,
+            promptVersion,
+            messages: renderedMessages,
+          } = renderCragCustomSystemBlocks(out, {
             preset: customTemplate.preset,
             routing,
             identity,
@@ -648,6 +655,7 @@ export function prepareCragPrintBody(
             entrypoint,
             cacheTtl,
           })
+          if (Array.isArray(renderedMessages)) out.messages = renderedMessages
           if (providerCompat) {
             if (blocks.length) out.system = blocks
             else delete out.system
@@ -658,7 +666,7 @@ export function prepareCragPrintBody(
           if (promptVersion) out.crag_prompt_version = promptVersion
           return out
         }
-        if (!providerCompat) out.crag_persona_preset = 'official_full'
+        out.crag_persona_preset = 'official_full'
         return out
       }
     }
@@ -668,7 +676,11 @@ export function prepareCragPrintBody(
     // Priority 2: Explicit panel custom template override -> direct replace blocks (no 64 KiB cap).
     const customTemplate = resolveCragCustomTemplate(vm, routing, preset)
     if (customTemplate) {
-      const { blocks, promptVersion } = renderCragCustomSystemBlocks(out, {
+      const {
+        blocks,
+        promptVersion,
+        messages: renderedMessages,
+      } = renderCragCustomSystemBlocks(out, {
         preset: customTemplate.preset,
         routing,
         identity,
@@ -676,6 +688,7 @@ export function prepareCragPrintBody(
         entrypoint,
         cacheTtl,
       })
+      if (Array.isArray(renderedMessages)) out.messages = renderedMessages
       if (providerCompat) {
         if (blocks.length) out.system = blocks
         else delete out.system
@@ -693,6 +706,9 @@ export function prepareCragPrintBody(
       return out
     }
     // Priority 4: Default (official_full, no custom template) -> CRAG prepends probed official template.
+    // Strip the 1-line placeholder left by relocateThirdPartySystem so CRAG V4 wire.rs
+    // (`!caller_starts_with_official_identity`) actually prepends tui_system_template.
+    if (isOnlyOfficialCliIdentitySystem(out.system)) delete out.system
     out.crag_persona_preset = 'official_full'
     return out
   }
@@ -776,7 +792,9 @@ export function prepareCragPrintBody(
     })
   }
   const skipRelocatedPlaceholder =
-    !effectiveOfficialPassthrough && !poolApplied && isOnlyOfficialCliIdentitySystem(effectiveSystem)
+    !effectiveOfficialPassthrough &&
+    (!poolApplied || promptPolicy.mode === 'official' || promptPolicy.mode === 'append') &&
+    isOnlyOfficialCliIdentitySystem(effectiveSystem)
   const tail = effectiveOfficialPassthrough || skipRelocatedPlaceholder ? '' : callerSystemTail(effectiveSystem)
   if (!tail) {
     if (!effectiveOfficialPassthrough && mode === 'replace') {

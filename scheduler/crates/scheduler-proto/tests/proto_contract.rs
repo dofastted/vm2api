@@ -20,8 +20,16 @@ fn pool_config_defaults_match_locked_v4_decisions() {
     assert_eq!(p.queue_wait_ms, 15_000);
     assert_eq!(p.queue_max, 50);
     assert_eq!(p.intra_tier_strategy, IntraTierStrategy::LeastInflightSwrr);
-    assert_eq!(p.system_prompt_mode, SystemPromptMode::Passthrough);
+    assert_eq!(p.system_prompt_mode, SystemPromptMode::InheritGlobal);
     assert!(!p.allow_cross_prompt_fallback);
+
+    let g_default = GlobalPromptPolicy::default();
+    assert_eq!(g_default.mode, SystemPromptMode::Official);
+    assert_eq!(g_default.preset, "official_full");
+
+    let g_deser: GlobalPromptPolicy = serde_json::from_str("{}").unwrap();
+    assert_eq!(g_deser.mode, SystemPromptMode::Official);
+    assert_eq!(g_deser.preset, "official_full");
 }
 
 #[test]

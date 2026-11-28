@@ -40,11 +40,13 @@ from typing import Any
 TMPFS_MAGIC = 0x01021994
 MAX_LINE_BYTES = 2 * 1024 * 1024
 MAX_CONTENT_BYTES = 1024 * 1024
+MAX_LOCALTIME_BYTES = 64 * 1024
 MAX_PUBLISH_FILES = 64
 
 HEX64_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 SAFE_JSON_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.json$")
 SAFE_REL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+SAFE_TZ_RE = re.compile(r"^[A-Za-z0-9._+-]+(?:/[A-Za-z0-9._+-]+){0,3}$")
 RESERVED_PUBLISH_NAMES = frozenset({"sync-pending", "managed", "lock"})
 FORBIDDEN_MANAGED_ENV_KEYS = frozenset({
     "CLAUDE_CODE_ATTRIBUTION_HEADER",
@@ -178,6 +180,60 @@ def atomic_write_in_dir(
         except OSError:
             pass
         raise
+
+
+def overwrite_in_place_no_trunc(
+    dir_fd: int,
+    filename: str,
+    content: bytes,
+    *,
+    mode: int = 0o644,
+) -> None:
+    """Update a bind-mounted file's inode in place via pwrite + trailing ftruncate (no O_TRUNC race)."""
+    if not filename or filename in (".", "..") or "/" in filename or "\\" in filename or "\x00" in filename:
+        raise RpcError("unsafe_path", f"invalid filename: {filename!r}")
+    try:
+        prev = os.stat(filename, dir_fd=dir_fd, follow_symlinks=False)
+        if stat.S_ISLNK(prev.st_mode) or not stat.S_ISREG(prev.st_mode) or prev.st_nlink != 1:
+            raise RpcError("unsafe_path", f"destination is not a safe regular file: {filename}")
+    except FileNotFoundError:
+        pass
+
+    fd = os.open(filename, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, mode, dir_fd=dir_fd)
+    try:
+        os.fchmod(fd, mode)
+        if os.geteuid() == 0:
+            os.fchown(fd, 0, 0)
+        view = memoryview(content)
+        written = 0
+        while written < len(view):
+            n = os.pwrite(fd, view[written:], written)
+            if n <= 0:
+                raise OSError("short pwrite")
+            written += n
+        os.ftruncate(fd, len(content))
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def validate_managed_preset_bytes(raw: bytes) -> dict[str, Any]:
+    try:
+        parsed = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RpcError("invalid_params", f"managed_preset must be valid UTF-8 JSON: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise RpcError("invalid_params", "managed_preset JSON must be an object")
+    env_obj = parsed.get("env")
+    if isinstance(env_obj, dict):
+        bad = sorted(
+            k
+            for k in env_obj.keys()
+            if isinstance(k, str) and k.lower() in _FORBIDDEN_MANAGED_ENV_KEYS_LOWER
+        )
+        if bad:
+            raise RpcError("invalid_params", f"forbidden managed_preset env keys: {bad}")
+    return parsed
 
 
 def ensure_relative_symlink_in_dir(dir_fd: int, link_name: str, target_rel: str) -> None:
@@ -407,6 +463,7 @@ class AgentConfig:
     run_dir: Path = Path("/run/kin")
     crag_root: Path = Path("/run/vm2api-crag")
     managed_preset_dir: Path = Path("/var/lib/kin-slot/managed-settings.d")
+    etc_tz_dir: Path | None = Path("/run/kin/etc-tz")
     store_dir: Path = Path("/opt/kin/store")
     machine_id_file: Path = Path("/etc/machine-id")
     crag_pid_file: Path = Path("/run/kin/crag.pid")
@@ -490,6 +547,7 @@ class SlotAgentService:
 
         handlers = {
             "sync_file": self._op_sync_file,
+            "sync_preset_tz": self._op_sync_preset_tz,
             "publish": self._op_publish,
             "publish_universal": self._op_publish_universal,
             "block": self._op_block,
@@ -548,21 +606,7 @@ class SlotAgentService:
             name = params.get("name") or "10-slot-preset.json"
             if not isinstance(name, str) or not SAFE_JSON_NAME_RE.fullmatch(name):
                 raise RpcError("invalid_params", f"unsafe managed_preset filename: {name!r}")
-            try:
-                parsed = json.loads(raw.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                raise RpcError("invalid_params", f"managed_preset must be valid UTF-8 JSON: {exc}") from exc
-            if not isinstance(parsed, dict):
-                raise RpcError("invalid_params", "managed_preset JSON must be an object")
-            env_obj = parsed.get("env")
-            if isinstance(env_obj, dict):
-                bad = sorted(
-                    k
-                    for k in env_obj.keys()
-                    if isinstance(k, str) and k.lower() in _FORBIDDEN_MANAGED_ENV_KEYS_LOWER
-                )
-                if bad:
-                    raise RpcError("invalid_params", f"forbidden managed_preset env keys: {bad}")
+            validate_managed_preset_bytes(raw)
             dir_fd = open_dir_nofollow(self.cfg.managed_preset_dir)
             filename = name
             dest_path = self.cfg.managed_preset_dir / filename
@@ -581,6 +625,86 @@ class SlotAgentService:
             "sha256": sha256_hex,
             "bytes": len(raw),
         }
+
+    def _op_sync_preset_tz(self, params: dict[str, Any]) -> dict[str, Any]:
+        tz_raw = params.get("timezone")
+        has_tz = tz_raw is not None and tz_raw != ""
+        has_localtime = params.get("localtime_b64") is not None
+        has_preset = params.get("preset_b64") is not None
+        if not (has_tz or has_localtime or has_preset):
+            raise RpcError("invalid_params", "sync_preset_tz requires at least one of timezone, localtime_b64, or preset_b64")
+
+        tz_clean: str | None = None
+        if has_tz:
+            if not isinstance(tz_raw, str):
+                raise RpcError("invalid_params", "timezone must be a string")
+            tz_clean = tz_raw.strip()
+            if len(tz_clean) > 64 or ".." in tz_clean or not SAFE_TZ_RE.fullmatch(tz_clean):
+                raise RpcError("invalid_params", f"invalid timezone: {tz_raw!r}")
+
+        localtime_bytes: bytes | None = None
+        localtime_sha: str | None = None
+        if has_localtime:
+            localtime_bytes, localtime_sha = decode_and_verify_payload(
+                params.get("localtime_b64"),
+                params.get("localtime_sha256"),
+            )
+            if len(localtime_bytes) < 44 or len(localtime_bytes) > MAX_LOCALTIME_BYTES or localtime_bytes[:4] != b"TZif":
+                raise RpcError("invalid_localtime", "localtime payload must be a valid TZif file (44..65536 bytes)")
+
+        preset_bytes: bytes | None = None
+        preset_sha: str | None = None
+        preset_name = params.get("preset_name") or "10-slot-preset.json"
+        if has_preset:
+            if not isinstance(preset_name, str) or not SAFE_JSON_NAME_RE.fullmatch(preset_name):
+                raise RpcError("invalid_params", f"unsafe preset_name: {preset_name!r}")
+            preset_bytes, preset_sha = decode_and_verify_payload(
+                params.get("preset_b64"),
+                params.get("preset_sha256"),
+            )
+            validate_managed_preset_bytes(preset_bytes)
+
+        updated: list[str] = []
+        result: dict[str, Any] = {"updated": updated}
+
+        if preset_bytes is not None:
+            preset_fd = open_dir_nofollow(self.cfg.managed_preset_dir)
+            try:
+                atomic_write_in_dir(preset_fd, preset_name, preset_bytes, mode=0o644, uid=0, gid=0)
+            finally:
+                os.close(preset_fd)
+            updated.append("managed_preset")
+            result["preset_path"] = str(self.cfg.managed_preset_dir / preset_name)
+            result["preset_sha256"] = preset_sha
+
+        if tz_clean is not None or localtime_bytes is not None:
+            override_fd = open_dir_nofollow(self.cfg.state_dir, ("etc-override",), create_sub=True, mode=0o755)
+            try:
+                if tz_clean is not None:
+                    tz_bytes = (tz_clean + "\n").encode("utf-8")
+                    atomic_write_in_dir(override_fd, "timezone", tz_bytes, mode=0o644, uid=0, gid=0)
+                    updated.append("timezone")
+                    result["timezone"] = tz_clean
+                if localtime_bytes is not None:
+                    atomic_write_in_dir(override_fd, "localtime", localtime_bytes, mode=0o644, uid=0, gid=0)
+                    updated.append("localtime")
+                    result["localtime_sha256"] = localtime_sha
+                    result["localtime_bytes"] = len(localtime_bytes)
+            finally:
+                os.close(override_fd)
+
+            if self.cfg.etc_tz_dir is not None and self.cfg.etc_tz_dir.exists():
+                tz_fd = open_dir_nofollow(self.cfg.etc_tz_dir)
+                try:
+                    if tz_clean is not None:
+                        overwrite_in_place_no_trunc(tz_fd, "timezone", (tz_clean + "\n").encode("utf-8"), mode=0o644)
+                    if localtime_bytes is not None:
+                        overwrite_in_place_no_trunc(tz_fd, "localtime", localtime_bytes, mode=0o644)
+                finally:
+                    os.close(tz_fd)
+                result["live_tz_refreshed"] = True
+
+        return result
 
     def _publish_files(self, scope: str, files_param: Any) -> list[dict[str, Any]]:
         if scope not in ("license", "host"):
@@ -1022,12 +1146,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--run-dir", default="/run/kin")
     parser.add_argument("--crag-root", default="/run/vm2api-crag")
     parser.add_argument("--managed-preset-dir", default="/var/lib/kin-slot/managed-settings.d")
+    parser.add_argument("--etc-tz-dir", default="/run/kin/etc-tz")
     parser.add_argument("--store-dir", default="/opt/kin/store")
     parser.add_argument("--machine-id-file", default="/etc/machine-id")
     parser.add_argument("--crag-pid-file", default="/run/kin/crag.pid")
     parser.add_argument("--dmi-dir", default="/sys/class/dmi/id")
-    parser.add_argument("--kincli-uid", type=int, default=999)
-    parser.add_argument("--kincli-gid", type=int, default=987)
+    parser.add_argument("--slot-uid", "--kincli-uid", dest="slot_uid", type=int, default=999)
+    parser.add_argument("--slot-gid", "--kincli-gid", dest="slot_gid", type=int, default=987)
     parser.add_argument("--no-mount-project", action="store_true")
     args = parser.parse_args(argv)
 
@@ -1039,12 +1164,13 @@ def main(argv: list[str] | None = None) -> int:
         run_dir=Path(args.run_dir),
         crag_root=Path(args.crag_root),
         managed_preset_dir=Path(args.managed_preset_dir),
+        etc_tz_dir=Path(args.etc_tz_dir) if args.etc_tz_dir else None,
         store_dir=Path(args.store_dir),
         machine_id_file=Path(args.machine_id_file),
         crag_pid_file=Path(args.crag_pid_file),
         dmi_dir=Path(args.dmi_dir),
-        kincli_uid=args.kincli_uid,
-        kincli_gid=args.kincli_gid,
+        kincli_uid=args.slot_uid,
+        kincli_gid=args.slot_gid,
         project_mounts=not args.no_mount_project,
     )
     service = SlotAgentService(cfg)

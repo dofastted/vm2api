@@ -211,7 +211,13 @@ import { createKeySelfHandler, KEY_SELF_PATHS } from './lib/protocol/key-self.mj
 import { createPanelHandler, syncInstalledKernels } from './lib/admin/panel-routes.mjs'
 import { IntegrationTokenStore } from './lib/admin/integration-tokens.mjs'
 import { createIntegrationHandler } from './lib/admin/integration-routes.mjs'
-import { createCragShopHandler, isCragShopPath, sessionBuyerOwner } from './lib/admin/crag-shop.mjs'
+import {
+  createCragShopHandler,
+  createGeminiCragShopHandler,
+  isCragShopPath,
+  isGeminiCragShopPath,
+  sessionBuyerOwner,
+} from './lib/admin/crag-shop.mjs'
 
 const FEATURES = [
   'passthrough',
@@ -1541,6 +1547,16 @@ const geminiCragSubscription = createGeminiCragSubscription({
   publicKeyFile: process.env.KIN_GEMINI_PUBLIC_KEY_FILE || null,
   callHost: callGeminiHost,
 })
+const handleGeminiCragShop = createGeminiCragShopHandler({
+  getDb,
+  dataDir: cfg.paths.data,
+  publicBaseUrl: cfg.base_url,
+  json,
+  readRawBody,
+  subscription: geminiCragSubscription,
+  isCurrentAdmin: (req) => isCragShopAdmin(req.panelBuyerOwner),
+  isActivationAdmin: isCragShopAdmin,
+})
 const geminiTerminal = createGeminiTerminal({ proxyPool: () => proxyPool })
 const geminiSlotPrefs = createGeminiSlotPrefs({
   settingsRepo: {
@@ -1624,6 +1640,7 @@ const handlePanel = createPanelHandler({
   geminiSlotPrefs,
   geminiScheduler,
   handleCragShop,
+  handleGeminiCragShop,
   json,
   writeSSEHeaders,
   readBody,
@@ -1859,7 +1876,9 @@ const server = http.createServer(async (req, res) => {
   try {
     res.req = req
     const url = parseRequestUrl(req)
-    if (url && isCragShopPath(url.pathname)) res.setHeader('Cache-Control', 'no-store')
+    if (url && (isCragShopPath(url.pathname) || isGeminiCragShopPath(url.pathname))) {
+      res.setHeader('Cache-Control', 'no-store')
+    }
     if (req.method === 'OPTIONS') {
       res.writeHead(204, corsHeadersForRequest(req))
       return res.end()
@@ -2558,19 +2577,27 @@ server.listen(cfg.port, cfg.host, () => {
     // lifecycle, so this runs whether or not activation polling is enabled. One order
     // per tick, so a backlog drains without bursting requests at the supplier.
     {
-      const expireOrders = () =>
+      const expireOrders = () => {
         void handleCragShop.pollOrderExpiry().catch(() => {
           console.warn('[crag-shop] order expiry deferred')
         })
+        void handleGeminiCragShop.pollOrderExpiry().catch(() => {
+          console.warn('[crag-gemini-shop] order expiry deferred')
+        })
+      }
       const timer = setInterval(expireOrders, 60_000).unref()
       onLeaderStop(() => clearInterval(timer))
       expireOrders()
     }
     if (process.env.KIN_CRS_MOCK !== '1' && typeof handleCragShop.warmPlans === 'function') {
-      const warmCatalog = () =>
+      const warmCatalog = () => {
         void handleCragShop.warmPlans().catch(() => {
           console.warn('[crag-shop] catalog cache warm deferred')
         })
+        void handleGeminiCragShop.warmPlans().catch(() => {
+          console.warn('[crag-gemini-shop] catalog cache warm deferred')
+        })
+      }
       const timer = setInterval(warmCatalog, 5 * 60_000).unref()
       onLeaderStop(() => clearInterval(timer))
       warmCatalog()

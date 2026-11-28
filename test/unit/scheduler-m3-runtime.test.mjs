@@ -32,6 +32,7 @@ import {
   createSchedulerRuntime,
   formatSchedulerError,
   inferModelFamily,
+  resolveGlobalPromptPolicy,
   scopeSchedulerRequestId,
 } from '../../src/lib/scheduler/scheduler-runtime.mjs'
 
@@ -1427,4 +1428,126 @@ test('M3 security: request_id is isolated by authorization scope and data planes
   assert.notEqual(seenAcquireIds[0], sharedClientReqId)
   assert.notEqual(seenAcquireIds[1], sharedClientReqId)
   assert.notEqual(seenAcquireIds[0], seenAcquireIds[1])
+})
+
+test('resolveGlobalPromptPolicy maps persona_preset, crag_persona_preset, and persona_inject accurately without dead branches', () => {
+  assert.deepEqual(resolveGlobalPromptPolicy({}), {
+    mode: 'official',
+    preset: 'official_full',
+    text: '',
+    client_system_policy: 'prepend_pool',
+  })
+  assert.deepEqual(
+    resolveGlobalPromptPolicy({
+      compatibility: { persona_preset: 'official', crag_persona_preset: 'official_full' },
+    }),
+    {
+      mode: 'official',
+      preset: 'official',
+      text: '',
+      client_system_policy: 'prepend_pool',
+    },
+  )
+  assert.deepEqual(resolveGlobalPromptPolicy({ compatibility: { persona_preset: 'official_303' } }), {
+    mode: 'official',
+    preset: 'official_303',
+    text: '',
+    client_system_policy: 'prepend_pool',
+  })
+  assert.deepEqual(resolveGlobalPromptPolicy({ compatibility: { persona_preset: 'zero' } }), {
+    mode: 'zero_inject',
+    preset: 'official_full',
+    text: '',
+    client_system_policy: 'prepend_pool',
+  })
+  assert.deepEqual(resolveGlobalPromptPolicy({ compatibility: { persona_inject: 'zero' } }), {
+    mode: 'zero_inject',
+    preset: 'official_full',
+    text: '',
+    client_system_policy: 'prepend_pool',
+  })
+  assert.deepEqual(resolveGlobalPromptPolicy({ compatibility: { crag_persona_preset: 'zero' } }), {
+    mode: 'zero_inject',
+    preset: 'official_full',
+    text: '',
+    client_system_policy: 'prepend_pool',
+  })
+  for (const mode of ['none', 'off', 'passthrough']) {
+    assert.equal(resolveGlobalPromptPolicy({ compatibility: { persona_inject: mode } }).mode, 'passthrough', mode)
+  }
+})
+
+test('M3 runtime: default Anthropic pool inherits global official policy and snapshot fallback is provider-aware', async (t) => {
+  const tmp = makeTempDir('vm2api-m3-inherit-')
+  const fx = makeFixtureState(tmp)
+
+  // Default-created Anthropic pool (no explicit system_prompt_mode) -> inherit_global
+  const defaultAnth = fx.repo.insert({
+    id: 'pool_anth_def',
+    name: 'Anthropic Default Inherit',
+    slug: 'anth-default-inherit',
+    provider_scope: 'anthropic',
+  })
+  assert.equal(defaultAnth.system_prompt_mode, 'inherit_global')
+  fx.repo.setMembers(defaultAnth.id, [
+    { node_type: 'claude_vm', node_id: 'vm-c1', enabled: true, member_role: 'active', member_order: 0 },
+  ])
+
+  // Simulate empty system_prompt_mode rows directly in SQLite to exercise snapshot fallback
+  const now = new Date().toISOString()
+  fx.db
+    .prepare(
+      "INSERT INTO scheduler_pools (id, slug, name, enabled, provider_scope, system_prompt_mode, created_at, updated_at) VALUES (?, ?, ?, 1, 'mixed', '', ?, ?)",
+    )
+    .run('pool_empty_mixed', 'empty-mixed', 'Empty Mixed', now, now)
+  fx.db
+    .prepare(
+      "INSERT INTO scheduler_pools (id, slug, name, enabled, provider_scope, system_prompt_mode, created_at, updated_at) VALUES (?, ?, ?, 1, 'openai', '', ?, ?)",
+    )
+    .run('pool_empty_openai', 'empty-openai', 'Empty OpenAI', now, now)
+
+  const runtime = createSchedulerRuntime({
+    getDb: () => fx.db,
+    getVms: () => fx.vms,
+    getRoutingConfig: () => ({
+      compatibility: { persona_preset: 'official', crag_persona_preset: 'official_full' },
+      pool: {},
+    }),
+    apiKeyStore: makeApiKeyStore(fx.db),
+    apiEndpointStore: { listRaw: () => fx.endpoints },
+    geminiScheduler: { listEnvironments: () => fx.geminiEnvs },
+    telemetryIntervalMs: 0,
+    clientOptions: {
+      binPath: BIN_PATH,
+      dataDir: tmp,
+      socketPath: path.join(tmp, 'inherit.sock'),
+      tokenPath: path.join(tmp, 'inherit.token'),
+      capFile: path.join(tmp, 'inherit.cap.json'),
+    },
+  })
+  t.after(async () => {
+    await runtime.shutdown({ drain: false, stopProcess: true })
+    fx.db.close()
+    fs.rmSync(tmp, { recursive: true, force: true })
+  })
+
+  await runtime.start({ waitMs: 5_000, startLoops: true })
+  const snap = runtime.lastSnapshot
+  assert.equal(snap.global_prompt_policy.mode, 'official')
+  assert.equal(snap.global_prompt_policy.preset, 'official')
+  assert.equal(snap.pools.find((p) => p.id === 'pool_empty_mixed')?.system_prompt_mode, 'inherit_global')
+  assert.equal(snap.pools.find((p) => p.id === 'pool_empty_openai')?.system_prompt_mode, 'passthrough')
+
+  const acq = await runtime.acquireNode({
+    originPoolId: defaultAnth.id,
+    apiKeyKind: 'master',
+    model: 'claude-sonnet-4-6',
+    protocol: 'anthropic',
+    sessionId: '550e8400-e29b-41d4-a716-446655440091',
+  })
+  assert.equal(acq.resolved_pool_id, defaultAnth.id)
+  assert.equal(acq.prompt_policy.mode, 'official')
+  assert.equal(acq.prompt_policy.preset, 'official')
+  assert.equal(acq.prompt_policy.source, 'global')
+  await runtime.releaseLease(acq.lease_id, 'ok')
 })

@@ -81,7 +81,10 @@ import {
   CONTAINER_CLI_NODE_BIN,
   REMOTE_CC_NODE_BIN,
   REMOTE_CLI_NODE_BIN,
+  slotCcNodeBin,
+  slotCliNodeBin,
 } from './slot-engine.mjs'
+import { isCustomSlotUser, slotGuestUidGid } from './slot-identity.mjs'
 import { destroyVmRuntime, officialCcUidGid, reloadSlotWorker, startVmRuntime, stopVmRuntime } from './vm-runtime.mjs'
 import {
   boundProxyUrl,
@@ -332,16 +335,36 @@ export function slotHost(vm) {
   const nodeId = vmNodeId(vm)
   if (nodeId && isNativeNodeVm(vm)) return nativeHost(nodeId, vm)
   const base = nodeId ? nodeHost(nodeId) : LOCAL_HOST
-  if (!isKvmRuntime(vm)) return base
+  const localCustomBins =
+    !nodeId && isCustomSlotUser(vm)
+      ? {
+          ...base.bins,
+          cli: slotCliNodeBin(vm),
+          cc: slotCcNodeBin(vm),
+        }
+      : base.bins
+  if (!isKvmRuntime(vm)) {
+    return localCustomBins === base.bins ? base : { ...base, bins: localCustomBins }
+  }
   const customKvm = isCustomKvmMode({ vm })
   // Runner socat owns run/kernel.sock; deleting it severs the guest relay.
+  // Custom-erofs KVM runs crag-v2 and owns /home/<user>/.claude as slotGuestUidGid(vm)
+  // (1000:1000 for custom users, 999:987 for legacy kincli), so execUser must match.
   return {
     ...base,
     bins: {
-      ...base.bins,
+      ...localCustomBins,
       oauthAuth: customKvm ? '/usr/local/bin/kin-oauth-auth' : '/opt/kin-payload/usr/local/bin/kin-oauth-auth',
       worker: customKvm ? '/usr/local/bin/kin-worker' : '/opt/kin-payload/usr/local/bin/kin-worker',
     },
+    ...(customKvm
+      ? {
+          execUser: (targetVm = vm) => {
+            const { uid, gid } = slotGuestUidGid(targetVm || vm)
+            return `${uid}:${gid}`
+          },
+        }
+      : {}),
     ownsSocketFiles: false,
   }
 }
