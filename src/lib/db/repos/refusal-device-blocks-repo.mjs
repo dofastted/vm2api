@@ -74,7 +74,13 @@ export class RefusalDeviceBlocksRepo {
   findBan(identity, now = Date.now(), accepts = () => true) {
     const sessionKey = subjectKey(identity, 'session')
     const session = sessionKey && this.get(sessionKey)
-    if (session?.subject_kind === 'session' && accepts(session)) return session
+    if (
+      session?.subject_kind === 'session' &&
+      accepts(session) &&
+      (!session.expires_at || Date.parse(session.expires_at) > now)
+    ) {
+      return session
+    }
     for (const { key, value } of this.deviceSubjects(identity)) {
       const device = this.get(key)
       if (
@@ -96,6 +102,50 @@ export class RefusalDeviceBlocksRepo {
     })
   }
 
+  blockSession(
+    identity,
+    { requestId = null, fingerprint = null, reason = 'upstream_400', ttlMs = 10 * 60_000, now = Date.now() } = {},
+  ) {
+    if (!identity?.sessionId) return null
+    const sessionKey = subjectKey(identity, 'session')
+    if (!sessionKey) return null
+    const at = new Date(now).toISOString()
+    const why = String(reason || 'upstream_400').slice(0, 160)
+    const durationMs = Number(ttlMs)
+    const expiresAt = Number.isFinite(durationMs) && durationMs > 0 ? new Date(now + durationMs).toISOString() : null
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      const prior = this._get.get(sessionKey)
+      // Never downgrade an existing permanent session ban to a temporary cooldown.
+      if (prior && prior.subject_kind === 'session' && !prior.expires_at) {
+        this.db.exec('COMMIT')
+        return rowToRec(prior)
+      }
+      const priorActive = Boolean(prior?.expires_at && Date.parse(prior.expires_at) > now)
+      const violations = prior ? (priorActive ? Number(prior.violations) || 1 : (Number(prior.violations) || 0) + 1) : 1
+      const effectiveExpiresAt =
+        priorActive && expiresAt && Date.parse(prior.expires_at) > Date.parse(expiresAt) ? prior.expires_at : expiresAt
+      this._violation.run(
+        sessionKey,
+        at,
+        at,
+        requestId,
+        fingerprint,
+        why,
+        'session',
+        identity.sessionId,
+        identity.sessionId,
+        violations,
+        effectiveExpiresAt,
+      )
+      this.db.exec('COMMIT')
+      return this.get(sessionKey)
+    } catch (error) {
+      this.db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
   recordViolation(
     identity,
     { requestId = null, fingerprint = null, reason = 'refusal_guard', steps, now = Date.now(), accepts },
@@ -106,7 +156,10 @@ export class RefusalDeviceBlocksRepo {
     const why = String(reason).slice(0, 160)
     this.db.exec('BEGIN IMMEDIATE')
     try {
-      const existing = this.findBan(identity, now, accepts)
+      const rawExisting = this.findBan(identity, now, accepts)
+      // A temporary session cooldown (e.g. 10m upstream_400) must not block
+      // recording a device strike or upgrading the session ban to permanent.
+      const existing = rawExisting?.subject_kind === 'session' && rawExisting.expires_at ? null : rawExisting
       const subjects = this.deviceSubjects(identity)
       const prior = subjects.map(({ key }) => this._get.get(key)).find(Boolean)
       const deviceKey =
@@ -137,7 +190,8 @@ export class RefusalDeviceBlocksRepo {
         }
       }
       const priorSession = sessionKey && this._get.get(sessionKey)
-      if (sessionKey && (!priorSession || (accepts && !accepts(priorSession)))) {
+      const priorSessionTemporary = Boolean(priorSession?.expires_at)
+      if (sessionKey && (!priorSession || priorSessionTemporary || (accepts && !accepts(priorSession)))) {
         this._violation.run(
           sessionKey,
           at,
