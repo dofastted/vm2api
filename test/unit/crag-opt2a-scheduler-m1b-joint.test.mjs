@@ -110,7 +110,9 @@ test('Fail-Closed crag_prompt_replace_empty_unsupported fails over across mixed 
 
   // Mixed pool: old slot (no prompt_replace_empty) fails over directly to headless slot without retrying old slot.
   const seen = []
+  const failures = []
   const mixedRt = createMockSchedulerRuntime({
+    onSwitch: ({ body }) => failures.push(body.failure),
     nodes: [
       { nodeType: 'claude_vm', nodeId: 'vm-old', nodeKey: 'claude_vm:vm-old', maxConcurrency: 4, priority: 10 },
       { nodeType: 'claude_vm', nodeId: 'vm-3126', nodeKey: 'claude_vm:vm-3126', maxConcurrency: 4, priority: 5 },
@@ -166,6 +168,9 @@ test('Fail-Closed crag_prompt_replace_empty_unsupported fails over across mixed 
     }),
   })
   assert.equal(mixedRes.ok, true)
+  assert.equal(failures.length, 1)
+  assert.equal(failures[0].error_class, 'request_protocol')
+  assert.equal(failures[0].http_status, 503)
   assert.deepEqual(
     seen,
     ['vm-old', 'vm-3126'],

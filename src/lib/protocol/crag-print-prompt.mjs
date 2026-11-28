@@ -106,6 +106,13 @@ export function cragSupportsEmptyReplace(capabilities, health = null) {
   return false
 }
 
+// Keep local capability rejections distinct from identically named upstream errors.
+const localEmptyReplaceErrors = new WeakSet()
+
+export function isLocalCragEmptyReplaceUnsupportedError(error) {
+  return localEmptyReplaceErrors.has(error)
+}
+
 export function cragEmptyReplaceUnsupportedError() {
   const message =
     'CRAG worker lacks prompt_replace_empty capability and is not statically configured as zero persona; refusing to silently fall back to official prompt'
@@ -121,6 +128,7 @@ export function cragEmptyReplaceUnsupportedError() {
       details: { retryable: false },
     },
   }
+  localEmptyReplaceErrors.add(error)
   return error
 }
 
