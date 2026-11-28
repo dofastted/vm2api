@@ -27,6 +27,8 @@ fn build_two_node_engine() -> Arc<SchedulerEngine> {
             ..Default::default()
         },
         enabled: true,
+        temp_unschedulable_until_ms: None,
+        temp_unschedulable_reason: None,
     };
 
     let pool = PoolConfig {

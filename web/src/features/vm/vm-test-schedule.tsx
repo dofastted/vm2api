@@ -799,8 +799,8 @@ export function VmTestSchedule({
               开关（{enabled ? '启用' : '暂停'}
               ）、频率、时刻/分钟、星期、时区、运行模式、自动续热、模型、Prompt、
               {codex ? 'effort' : 'token 上限'}。不用先点保存。
-              另一类槽（Claude/Codex 不同）只同步开关和时间，保留自己的模型与
-              Prompt。
+              另一类槽（Claude/Codex 不同）保留自己的模型与
+              Prompt，但仍同步开关、时间，以及本表单显式提供的运行模式与自动续热。
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
