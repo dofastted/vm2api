@@ -1571,15 +1571,22 @@ export function GeminiEnvironments({
           </Button>
         ) : null}
         {!isImport && isCragSubscription && !cragSub?.sync_pending ? (
-          <GeminiRedeemDialog
-            mode='crag_subscription'
-            triggerLabel={
-              cragSub?.active ? '叠加/续费 CRAGGemini 订阅' : undefined
-            }
-            onRedeemed={() => {
-              void client.invalidateQueries({ queryKey: QUERY_KEY })
-            }}
-          />
+          <>
+            <GeminiRedeemDialog
+              mode='crag_subscription'
+              triggerLabel={
+                cragSub?.active ? '叠加/续费 CRAGGemini 订阅' : undefined
+              }
+              onRedeemed={() => {
+                void client.invalidateQueries({ queryKey: QUERY_KEY })
+              }}
+            />
+            <Button type='button' size='sm' variant='outline' asChild>
+              <Link to='/crag-subscription' search={{ product: 'craggemini' }}>
+                购买 CRAGGemini 订阅
+              </Link>
+            </Button>
+          </>
         ) : null}
         <Button
           type='button'
@@ -1675,26 +1682,35 @@ export function GeminiEnvironments({
         </div>
       ) : null}
       {isImport ? (
-        <GeminiRedeemDialog
-          mode={isCragSubscription ? 'crag_subscription' : 'legacy_release'}
-          triggerVisible={awaitingRedemption || isCragSubscription}
-          returnFocusTo={nameInput}
-          onRedeemed={() => {
-            if (!isCragSubscription) {
-              client.setQueryData<GeminiInventory>(
-                QUERY_KEY,
-                (current) =>
-                  current && {
-                    ...current,
-                    payload_state: 'installed',
-                    payload_issue: null,
-                    release_activated: true,
-                  }
-              )
-            }
-            void client.invalidateQueries({ queryKey: QUERY_KEY })
-          }}
-        />
+        <div className='flex flex-wrap items-center gap-2'>
+          <GeminiRedeemDialog
+            mode={isCragSubscription ? 'crag_subscription' : 'legacy_release'}
+            triggerVisible={awaitingRedemption || isCragSubscription}
+            returnFocusTo={nameInput}
+            onRedeemed={() => {
+              if (!isCragSubscription) {
+                client.setQueryData<GeminiInventory>(
+                  QUERY_KEY,
+                  (current) =>
+                    current && {
+                      ...current,
+                      payload_state: 'installed',
+                      payload_issue: null,
+                      release_activated: true,
+                    }
+                )
+              }
+              void client.invalidateQueries({ queryKey: QUERY_KEY })
+            }}
+          />
+          {isCragSubscription ? (
+            <Button type='button' size='sm' variant='outline' asChild>
+              <Link to='/crag-subscription' search={{ product: 'craggemini' }}>
+                购买 CRAGGemini 订阅
+              </Link>
+            </Button>
+          ) : null}
+        </div>
       ) : null}
       {isImport ? (
         <form

@@ -5,6 +5,7 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { ConfirmDialog } from '@/components/confirm-dialog'
+import { geminiInventoryOptions } from '@/features/import/gemini-environments'
 import {
   cragHostMigrateErrors,
   cragSubscriptionErrors,
@@ -12,8 +13,12 @@ import {
 import {
   cragHostOrdersQueryOptions,
   cragHostStatusQueryOptions,
+  geminiCragOrdersQueryOptions,
+  geminiCragSubscriptionQueryOptions,
   type CragCloudOrder,
+  type CragCloudOrdersResponse,
   type CragHostStatus,
+  type GeminiHostStatus,
 } from '@/features/vm/queries'
 import { yuan } from './crag-catalog'
 import { paymentLabels, type PaymentMethod } from './crag-commerce'
@@ -74,13 +79,17 @@ type LockedRenewalQuote = {
 }
 
 export function CragCloudOrdersPanel({
+  product = 'crag-v2',
   host,
+  hostIdOverride,
   channels,
   busy,
   onRenewOrder,
   onHostChanged,
 }: {
+  product?: 'crag-v2' | 'craggemini'
   host?: CragHostStatus
+  hostIdOverride?: string | null
   channels: readonly PaymentMethod[]
   busy: boolean
   onRenewOrder: (
@@ -90,8 +99,21 @@ export function CragCloudOrdersPanel({
   ) => void
   onHostChanged: () => void
 }) {
+  const isGemini = product === 'craggemini'
   const qc = useQueryClient()
-  const ordersQuery = useQuery(cragHostOrdersQueryOptions())
+  const ordersQuery = useQuery({
+    queryKey: isGemini
+      ? geminiCragOrdersQueryOptions().queryKey
+      : cragHostOrdersQueryOptions().queryKey,
+    queryFn: ({ signal }) =>
+      api<CragCloudOrdersResponse>(
+        isGemini
+          ? '/api/panel/gemini/crag-subscription/orders?limit=50&offset=0'
+          : '/api/panel/crag-subscription/orders?limit=50&offset=0',
+        { signal }
+      ),
+    retry: false,
+  })
   const [copiedId, setCopiedId] = useState<string>()
   const [migrateOpen, setMigrateOpen] = useState(false)
   const [fromHostId, setFromHostId] = useState('')
@@ -103,7 +125,8 @@ export function CragCloudOrdersPanel({
   const [renewLoading, setRenewLoading] = useState(false)
   const [renewError, setRenewError] = useState('')
 
-  const hostId = ordersQuery.data?.host_id || host?.host_id
+  const hostId = ordersQuery.data?.host_id || hostIdOverride || host?.host_id
+  const unitLabel = isGemini ? '席位' : '槽位'
   const orders = ordersQuery.data?.orders ?? []
   const vouchers = ordersQuery.data?.vouchers ?? []
   const activeVouchers = vouchers.filter(
@@ -135,28 +158,48 @@ export function CragCloudOrdersPanel({
         to_host_id: string
         migrated_vouchers: number
         migrated_orders: number
-        status?: CragHostStatus
-      }>('/api/panel/crag-subscription/migrate', {
-        method: 'POST',
-        body: JSON.stringify({
-          from_host_id: trimmedFrom,
-          proof: trimmedProof,
-        }),
-      })
+        status?: CragHostStatus | GeminiHostStatus
+      }>(
+        isGemini
+          ? '/api/panel/gemini/crag-subscription/migrate'
+          : '/api/panel/crag-subscription/migrate',
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            from_host_id: trimmedFrom,
+            proof: trimmedProof,
+          }),
+        }
+      )
       setMigrateOpen(false)
       setFromHostId('')
       setMigrateProof('')
-      if (result.status) {
-        qc.setQueryData(cragHostStatusQueryOptions().queryKey, result.status)
+      if (isGemini) {
+        if (result.status) {
+          qc.setQueryData(
+            geminiCragSubscriptionQueryOptions().queryKey,
+            result.status as GeminiHostStatus
+          )
+        }
+        await qc.invalidateQueries({
+          queryKey: geminiInventoryOptions().queryKey,
+        })
+      } else {
+        if (result.status) {
+          qc.setQueryData(
+            cragHostStatusQueryOptions().queryKey,
+            result.status as CragHostStatus
+          )
+        }
+        await Promise.all([
+          qc.invalidateQueries({
+            queryKey: cragHostStatusQueryOptions().queryKey,
+          }),
+          qc.invalidateQueries({
+            queryKey: cragHostOrdersQueryOptions().queryKey,
+          }),
+        ])
       }
-      await Promise.all([
-        qc.invalidateQueries({
-          queryKey: cragHostStatusQueryOptions().queryKey,
-        }),
-        qc.invalidateQueries({
-          queryKey: cragHostOrdersQueryOptions().queryKey,
-        }),
-      ])
       onHostChanged()
       setNotice({
         text: `已迁移 ${result.migrated_vouchers} 张兑换券与 ${result.migrated_orders} 笔历史订单到当前宿主机，原宿主机已自动解绑。`,
@@ -166,7 +209,8 @@ export function CragCloudOrdersPanel({
         text:
           (isApiError(error) &&
             (cragHostMigrateErrors[error.code] ||
-              cragSubscriptionErrors[error.code])) ||
+              cragSubscriptionErrors[error.code] ||
+              error.message)) ||
           '迁移失败，请核对原宿主机 ID 后重试。',
         error: true,
       })
@@ -182,7 +226,9 @@ export function CragCloudOrdersPanel({
     setRenewLoading(true)
     try {
       const quote = await api<LockedRenewalQuote>(
-        '/api/panel/crag-shop/quote',
+        isGemini
+          ? '/api/panel/gemini/crag-shop/quote'
+          : '/api/panel/crag-shop/quote',
         {
           method: 'POST',
           body: JSON.stringify({
@@ -212,7 +258,9 @@ export function CragCloudOrdersPanel({
       <div className='flex flex-wrap items-center justify-between gap-2'>
         <div>
           <h2 id='crag-cloud-ledger-heading' className='font-semibold'>
-            宿主机身份与云端历史订单
+            {isGemini
+              ? 'CRAGGemini 宿主机身份与云端历史订单'
+              : '宿主机身份与云端历史订单'}
           </h2>
           <p className='text-xs text-muted-foreground'>
             以宿主机 ID
@@ -294,8 +342,8 @@ export function CragCloudOrdersPanel({
             const badge = orderStatusBadge(order)
             const slotText =
               order.slot_limit === 'unlimited'
-                ? '不限槽位'
-                : `${order.slot_limit} 槽位`
+                ? `不限${unitLabel}`
+                : `${order.slot_limit} ${unitLabel}`
             const canRenewThis =
               order.status !== 'revoked' &&
               order.amount_minor > 0 &&

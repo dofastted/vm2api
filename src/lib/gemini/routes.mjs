@@ -29,6 +29,7 @@ import {
   sessionIdForLog,
 } from '../protocol/log-fields.mjs'
 import { createGeminiTerminalBridge } from './terminal.mjs'
+import { sameOriginPost } from '../admin/crag-shop.mjs'
 import { createGeminiMaintenanceHandler } from './maintenance.mjs'
 import { ANTIGRAVITY_PROVIDERS, ANTIGRAVITY_QUOTA_GROUPS, isAntigravityRoutedModel } from './model-catalog.mjs'
 import { normalizeGeminiOAuthImport } from './oauth-import.mjs'
@@ -1281,6 +1282,7 @@ export function createGeminiPanelHandler({
   requestLog = null,
   callHost = callGeminiHost,
   billingReady = Boolean(requestLog),
+  publicBaseUrl = null,
 }) {
   const maintenance = createGeminiMaintenanceHandler({ json, readBody })
   const slotPrefs = geminiSlotPrefs || createGeminiSlotPrefs()
@@ -1358,6 +1360,25 @@ export function createGeminiPanelHandler({
         const sync = syncParam === '1' || syncParam === 'true'
         return ok(await cragSubscription.status({ sync }))
       }
+      if (req.method === 'GET' && pathname === `${PANEL_PATH}/crag-subscription/orders`) {
+        if (!cragSubscription) return fail(503, 'license_unconfigured', GEMINI_LICENSE_MESSAGES.license_unconfigured)
+        const reqUrl = new URL(req.url || pathname, 'http://127.0.0.1')
+        const rawLimit = reqUrl.searchParams.get('limit')
+        const rawOffset = reqUrl.searchParams.get('offset')
+        const limit = rawLimit == null ? 50 : Number(rawLimit)
+        const offset = rawOffset == null ? 0 : Number(rawOffset)
+        if (
+          !Number.isInteger(limit) ||
+          limit < 1 ||
+          limit > 200 ||
+          !Number.isInteger(offset) ||
+          offset < 0 ||
+          offset > 1_000_000
+        ) {
+          return fail(400, 'invalid_request', GEMINI_LICENSE_MESSAGES.invalid_request)
+        }
+        return ok(await cragSubscription.orders({ limit, offset }))
+      }
       if (req.method === 'POST' && pathname === `${PANEL_PATH}/crag-subscription/sync`) {
         if (!cragSubscription) return fail(503, 'license_unconfigured', GEMINI_LICENSE_MESSAGES.license_unconfigured)
         if (cragSubscription.hasSyncPending?.()) {
@@ -1370,6 +1391,45 @@ export function createGeminiPanelHandler({
         if (!cragSubscription) return fail(503, 'license_unconfigured', GEMINI_LICENSE_MESSAGES.license_unconfigured)
         const body = await readBody(req, 2048)
         const out = await cragSubscription.redeem(body?.redemption_code)
+        geminiScheduler?.invalidateCatalogCache?.()
+        return ok(out)
+      }
+      if (req.method === 'POST' && pathname === `${PANEL_PATH}/crag-subscription/claim-by-order`) {
+        if (!cragSubscription) return fail(503, 'license_unconfigured', GEMINI_LICENSE_MESSAGES.license_unconfigured)
+        if (req.apiKeyKind !== 'master' && !sameOriginPost(req, publicBaseUrl)) {
+          return fail(403, 'crag_subscription_origin_denied', '请从本面板发起请求')
+        }
+        const body = await readBody(req, 2048)
+        if (typeof body?.order_id !== 'string' || !body.order_id.trim()) {
+          return fail(400, 'invalid_request', GEMINI_LICENSE_MESSAGES.invalid_request)
+        }
+        const out = await cragSubscription.claimByOrder(body.order_id)
+        geminiScheduler?.invalidateCatalogCache?.()
+        return ok(out)
+      }
+      if (req.method === 'POST' && pathname === `${PANEL_PATH}/crag-subscription/migrate`) {
+        if (!cragSubscription) return fail(503, 'license_unconfigured', GEMINI_LICENSE_MESSAGES.license_unconfigured)
+        if (req.apiKeyKind !== 'master' && !sameOriginPost(req, publicBaseUrl)) {
+          return fail(403, 'crag_subscription_origin_denied', '请从本面板发起请求')
+        }
+        const body = await readBody(req, 4096)
+        if (typeof body?.from_host_id !== 'string' || !body.from_host_id.trim()) {
+          return fail(400, 'invalid_request', GEMINI_LICENSE_MESSAGES.invalid_request)
+        }
+        const out = await cragSubscription.migrate(body.from_host_id, {
+          proof: body.proof,
+          proof_order_id: body.proof_order_id,
+          proof_redemption_code: body.proof_redemption_code,
+        })
+        geminiScheduler?.invalidateCatalogCache?.()
+        return ok(out)
+      }
+      if (req.method === 'POST' && pathname === `${PANEL_PATH}/crag-subscription/rebuild-identity`) {
+        if (!cragSubscription) return fail(503, 'license_unconfigured', GEMINI_LICENSE_MESSAGES.license_unconfigured)
+        if (req.apiKeyKind !== 'master' && !sameOriginPost(req, publicBaseUrl)) {
+          return fail(403, 'crag_subscription_origin_denied', '请从本面板发起请求')
+        }
+        const out = await cragSubscription.rebuildIdentity()
         geminiScheduler?.invalidateCatalogCache?.()
         return ok(out)
       }
@@ -1846,7 +1906,21 @@ export function createGeminiPanelHandler({
             : null
         const resolvedMessage =
           error.code === 'gemini_authorization_unavailable' && stage ? AUTH_STAGE_MESSAGES[stage] : message
-        return fail(status, error.code, resolvedMessage, stage ? { stage } : null)
+        const details = {}
+        if (
+          typeof error.recovery === 'string' &&
+          ['not_activated', 'host_id_collision', 'failed'].includes(error.recovery)
+        ) {
+          details.recovery = error.recovery
+        }
+        if (typeof error.authorityRequestId === 'string' && error.authorityRequestId) {
+          details.authority_request_id = error.authorityRequestId
+        }
+        const extra = {
+          ...(stage ? { stage } : {}),
+          ...(Object.keys(details).length ? { details } : {}),
+        }
+        return fail(status, error.code, resolvedMessage, Object.keys(extra).length ? extra : null)
       }
       if (error?.code === 'gemini_proxy_unavailable') return fail(409, error.code, '需要绑定可用的 SOCKS5 / HTTP 代理')
       if (error?.code === 'gemini_environment_not_found') return fail(404, error.code, 'Gemini 环境不存在')

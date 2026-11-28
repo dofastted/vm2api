@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.4.243 — 2026-11-28 · 修复 CRAG 商城直充刷新与 CRAGGemini 购买、订单台账/认领、身份迁移/重建、续费自愈及双产品订阅工作台
+
+- **CRAG 商城代理双产品参数化与直充立即生效修复（#2022）**：
+  - `src/lib/crag-shop/shop-supplier.mjs` 支持按 `pathPrefix` 参数化商城上游路由（支持 Claude CRAG 根路径与 CRAGGemini `/gemini` 路径前缀）；`src/lib/crag-shop/routes.mjs` 参数化 `ownerPrefix`、`catalogCacheKey`、`orderPathPattern`、`deviceEnabled` 并导出 `createGeminiCragShopHandler`，新增 `/api/panel/gemini/crag-shop/{catalog,orders,orders/:id,orders/:id/refresh,orders/:id/cancel}` 完整代理路由，与 Claude CRAG 目录缓存、过期轮询及激活轮询严格隔离。
+  - 修复 `syncDirectCredit()` 在订单支付后直接入账时仅调只读 `status()` 未触发远端权威刷新导致页面不立即显示新额度的问题，改为调用 `subscription.status({ sync: true })` 主动同步。
+  - `src/lib/admin/panel-routes.mjs`、`src/lib/admin/panel-acl.mjs` 与 `src/server.mjs` 补齐 Gemini 商城权限映射、路由挂载与 Leader 定时轮询。
+- **CRAGGemini 宿主订阅订单台账、认领、迁移、身份重建与 CSRF 安全加固（#2022）**：
+  - `src/lib/gemini/subscription.mjs` 修复 `migrate` 请求体携带多余 `host_id` 触发权威端 `#[serde(deny_unknown_fields)]` 拒绝的问题；新增 `purchaseDeviceId`、`orders()`、`claimByOrder()`（遇到 `host_id_collision` 自动触发一次身份重建并重领）、`migrate()`、`rebuildIdentity()`、`renewalProof()`、`redeemRenewal()` 与 `callAuthorityWithRecovery()` 结构化错误透传（含 `details: { recovery, authority_request_id }`）。
+  - `src/lib/gemini/routes.mjs` 新增 `GET /api/panel/gemini/crag-subscription/orders`、`POST .../claim-by-order`、`POST .../migrate`、`POST .../rebuild-identity`，并将非 master 调用的 `sameOriginPost` CSRF 校验收口为无条件强制执行（不再依赖 `publicBaseUrl` 是否配置）。
+- **前端双产品 CRAG 订阅与购买/兑换工作台（#2022）**：
+  - `web/src/features/crag/crag-shop.tsx` 与 `web/src/routes/_authenticated/crag-subscription.tsx` 新增 `Claude CRAG` / `CRAGGemini` 双产品切换（支持 `?product=craggemini` 深链）、`GeminiHostSummary`、`GeminiHostOverview`、`GeminiSubscriptionView` 及主览回退展示；`web/src/features/import/gemini-environments.tsx` 增加直达购买 CRAGGemini 订阅入口。
+  - `web/src/features/crag/{crag-commerce,crag-cloud-orders,gemini-redeem-dialog}.tsx` 与 `web/src/features/import/gemini-environments-queries.ts` 补齐 `GeminiHostStatus`、按产品隔离的查询键、自定义报价端点、CRAGGemini 云端订单认领与主机身份冲突一键重建交互。
+- 部署说明：本次改动仅涉及控制面（`src/`）与前端（`web/src/`），零数据库迁移，零 `deploy/payload.json`、Rust `kin-scheduler`、Gemini 宿主脚本或 `bin/` / `share/wrap-cli` 变更。预期 **`SLOT_SYNC=skip`**，无需重启既有 Claude/Codex 槽位或 `vm2api-gemini`，更新并重启 `vm2api` 一次即可生效；如需启用 CRAGGemini 在线购买，需在商城侧部署支持 `CRAG_SHOP_PATH_PREFIX=/gemini` 与 `CRAG_SHOP_PRODUCT=craggemini` 的 `crag-shop` 实例并将 `/gemini/shop/*` 路由至该实例。
+
 ## 1.4.242 — 2026-11-28 · WU-3 物理机深度去虚拟化、每槽随机用户名与实时时区同步、钉死版 Linux `6.12.118-1` `prctl()` 写一次自定义内核轨与新版 `kin-computer` / `crag-debian13` 1.1.0 载荷钉选
 
 - **WU-3 Phase A — 物理机去虚拟化、每槽随机 Linux 用户名与实时时区/预设同步（#2015）**：
