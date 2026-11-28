@@ -673,16 +673,19 @@ const guestSetup = (cache) =>
   `  mount_9p kinclaude /home/kincli/.claude ${cache}\nfi\n` +
   'mount_9p kinrun /run/kin none\nmount_9p kinpayload /opt/kin-payload loose\n'
 
-unixTest('existing guests get kinhome/kinclaude switched from cache=mmap to cache=none for the next boot (#1877)', (context) => {
-  const fx = fixture(context)
-  fx.write(guestSetupPath, guestSetup('mmap'), 0o755)
-  assert.equal(successful(fx.run({ restart: true })).guest_9p_cache, 'upgraded-next-boot')
-  assert.equal(fx.read(guestSetupPath), guestSetup('none'))
-  assert.equal(fs.statSync(fx.file(guestSetupPath)).mode & 0o777, 0o755)
-  // Only the two home mounts change; kinpayload keeps cache=loose.
-  assert.match(fx.read(guestSetupPath), /mount_9p kinpayload \/opt\/kin-payload loose/)
-  assert.equal(successful(fx.run()).guest_9p_cache, 'current')
-})
+unixTest(
+  'existing guests get kinhome/kinclaude switched from cache=mmap to cache=none for the next boot (#1877)',
+  (context) => {
+    const fx = fixture(context)
+    fx.write(guestSetupPath, guestSetup('mmap'), 0o755)
+    assert.equal(successful(fx.run({ restart: true })).guest_9p_cache, 'upgraded-next-boot')
+    assert.equal(fx.read(guestSetupPath), guestSetup('none'))
+    assert.equal(fs.statSync(fx.file(guestSetupPath)).mode & 0o777, 0o755)
+    // Only the two home mounts change; kinpayload keeps cache=loose.
+    assert.match(fx.read(guestSetupPath), /mount_9p kinpayload \/opt\/kin-payload loose/)
+    assert.equal(successful(fx.run()).guest_9p_cache, 'current')
+  },
+)
 
 unixTest('the 9p cache upgrade also runs when the slot is not on CRAG v2', (context) => {
   const fx = fixture(context, { config: { dataplane: 'wrap' } })
