@@ -338,6 +338,7 @@ function known(error) {
     if (Number.isFinite(error.retryAfterMs) && error.retryAfterMs > 0) out.retryAfterMs = error.retryAfterMs
     if (error.retryAfter != null) out.retryAfter = error.retryAfter
     if (typeof error.upstreamReason === 'string' && error.upstreamReason) out.upstreamReason = error.upstreamReason
+    if (typeof error.upstreamCode === 'string' && error.upstreamCode) out.upstreamCode = error.upstreamCode
     if (error.contentRejected === true) out.contentRejected = true
     if (typeof error.workerCode === 'string' && error.workerCode) out.workerCode = error.workerCode
     if (error.bridgeDisconnected === true) out.bridgeDisconnected = true
@@ -491,21 +492,25 @@ async function consumeStreamResponse(
   }
   const result = collector.result()
   if (streamError) {
-    const code = Object.hasOwn(FAILURES, streamError.code)
-      ? streamError.code
-      : streamError.status === 429
-        ? 'gemini_quota_exhausted'
-        : streamError.status === 401
-          ? 'gemini_oauth_required'
-          : streamError.status === 403
-            ? 'gemini_location_unsupported'
-            : streamError.status === 404
-              ? 'gemini_model_unavailable'
-              : streamError.status === 400
-                ? 'gemini_invalid_request'
-                : 'gemini_inference_failed'
+    const code = Object.hasOwn(FAILURES, streamError.reason)
+      ? streamError.reason
+      : Object.hasOwn(FAILURES, streamError.code)
+        ? streamError.code
+        : streamError.status === 429
+          ? 'gemini_quota_exhausted'
+          : streamError.status === 401
+            ? 'gemini_oauth_required'
+            : streamError.status === 403
+              ? 'gemini_location_unsupported'
+              : streamError.status === 404
+                ? 'gemini_model_unavailable'
+                : streamError.status === 400
+                  ? 'gemini_invalid_request'
+                  : 'gemini_inference_failed'
     const err = fail(streamError.status || FAILURES[code][0], code, streamError.message)
     if (Number.isInteger(streamError.status)) err.upstreamStatus = streamError.status
+    if (streamError.reason) err.upstreamReason = streamError.reason
+    if (streamError.code) err.upstreamCode = streamError.code
     err.timing = timing.snapshot()
     err.usage = result.usage
     throw err
