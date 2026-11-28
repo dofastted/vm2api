@@ -300,6 +300,9 @@ fn switch_heartbeat_commit_release_roundtrip() {
             is_admin_diagnostic: false,
             pin_node_key: None,
             exclude_nodes: vec![CompactString::const_new("claude_vm:vm1")],
+            keep_pin_on_model_gate: false,
+            model_gated_node_keys: vec![],
+            skip_session_gate: false,
         },
     };
     let encoded = serde_json::to_string(&sw).unwrap();

@@ -107,6 +107,9 @@ fn make_req(req_id: &str, pool_id: &str, family: ModelFamily, sid: &str) -> Acqu
         is_admin_diagnostic: false,
         pin_node_key: None,
         exclude_nodes: vec![],
+        keep_pin_on_model_gate: false,
+        model_gated_node_keys: vec![],
+        skip_session_gate: false,
     }
 }
 
@@ -709,4 +712,46 @@ async fn gate_rearm_preserves_original_key_and_token_across_switch() {
     assert_eq!(table.peek(&key), (true, 0));
     drop(g2);
     assert_eq!(table.active_count(), 0);
+}
+
+/// 238 batchMember: members of a batch group are sticky to one node but two
+/// requests of the same member run concurrently (no SessionGate FIFO).
+#[tokio::test]
+async fn batch_member_skips_session_gate_but_stays_sticky_and_counted() {
+    let engine = build_two_node_engine();
+    let member = "batch:key_x:group#0";
+    let mk = |id: &str| {
+        let mut r = make_req(id, "pool_1", ModelFamily::Claude, member);
+        r.skip_session_gate = true;
+        r.no_queue = true;
+        r
+    };
+    let r1 = engine.acquire(mk("req_b1")).await.unwrap();
+    engine.commit(CommitRequest {
+        lease_id: r1.lease_id.clone(),
+    });
+    // Same member while r1 is in flight: no session_in_flight, same node.
+    let r2 = engine.acquire(mk("req_b2")).await.unwrap();
+    assert_eq!(r2.selected_node.node_key, r1.selected_node.node_key);
+    assert_eq!(r2.explain.affinity.why, Some(AffinityWhy::SessionHit));
+    assert_eq!(
+        engine.node_active_sessions(&r1.selected_node.node_key),
+        1,
+        "the member is one session on its node"
+    );
+    for lid in [r1.lease_id, r2.lease_id] {
+        engine.release(ReleaseRequest {
+            lease_id: lid,
+            outcome: ReleaseOutcome::Ok,
+            http_status: None,
+            error_class: None,
+            error_signature: None,
+            error_message: None,
+            retry_after_sec: None,
+            ttft_ms: None,
+            tokens_used: None,
+            quota_headers: None,
+        });
+    }
+    assert_eq!(engine.health().active_session_gates, 0);
 }

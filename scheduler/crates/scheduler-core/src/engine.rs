@@ -454,22 +454,23 @@ impl SchedulerEngine {
         //    Key uses `start_pool.id` so Turn 1 fallback to P2 and Turn 2 share the exact same gate.
         let gate_key = ScopedSessionKey::new(&start_pool.id, req.model_family, &req.session_id);
         let mut gate_wait_ms = 0u64;
-        let gate_guard: Option<GateHoldGuard> = if !dry_run && !req.is_ephemeral_probe {
-            let t_gate = Instant::now();
-            let g = self
-                .session_gates
-                .acquire(
-                    &gate_key,
-                    req.no_queue,
-                    start_pool.session_queue_max,
-                    start_pool.session_queue_timeout_ms,
-                )
-                .await?;
-            gate_wait_ms = t_gate.elapsed().as_millis() as u64;
-            Some(g)
-        } else {
-            None
-        };
+        let gate_guard: Option<GateHoldGuard> =
+            if !dry_run && !req.is_ephemeral_probe && !req.skip_session_gate {
+                let t_gate = Instant::now();
+                let g = self
+                    .session_gates
+                    .acquire(
+                        &gate_key,
+                        req.no_queue,
+                        start_pool.session_queue_max,
+                        start_pool.session_queue_timeout_ms,
+                    )
+                    .await?;
+                gate_wait_ms = t_gate.elapsed().as_millis() as u64;
+                Some(g)
+            } else {
+                None
+            };
 
         self.plan_and_reserve_holding_gate(
             &snap,
@@ -654,7 +655,7 @@ impl SchedulerEngine {
         );
         explain.session_gate.wait_ms = gate_wait_ms;
 
-        if dry_run && !req.is_ephemeral_probe {
+        if dry_run && !req.is_ephemeral_probe && !req.skip_session_gate {
             let gk = ScopedSessionKey::new(&start_pool.id, req.model_family, &req.session_id);
             let (busy, depth) = self.session_gates.peek(&gk);
             explain.set_gate_peek(busy, depth);
@@ -673,17 +674,82 @@ impl SchedulerEngine {
             visited_pools.push(cur_pool.id.clone());
             explain.resolved_pool_id = cur_pool.id.clone();
 
-            // Stage 0: Hard admission filter
-            let (admitted, excluded) =
-                admission::filter_members(snap, cur_pool, req, &self.nodes, now);
+            // Stage 0: Hard admission filter. The node this conversation (or its
+            // parent) is pinned to keeps the new-session-only gates open.
+            let s_key = ScopedSessionKey::new(&cur_pool.id, req.model_family, &req.session_id);
+            let continuing_node = if cur_pool.session_sticky_enabled {
+                affinity::get_live_session_stick(&self.session_sticks, &s_key, now)
+                    .map(|s| s.pinned_node)
+                    .or_else(|| {
+                        let pid = req.parent_session_id.as_deref().filter(|s| !s.is_empty())?;
+                        let p_key = ScopedSessionKey::new(&cur_pool.id, req.model_family, pid);
+                        affinity::get_live_session_stick(&self.session_sticks, &p_key, now)
+                            .map(|s| s.pinned_node)
+                    })
+            } else {
+                None
+            };
+            let (admitted, excluded) = admission::filter_members_for(
+                snap,
+                cur_pool,
+                req,
+                &self.nodes,
+                now,
+                continuing_node.as_ref(),
+            );
             explain.excluded.extend(excluded);
 
             if !admitted.is_empty() {
-                let s_key = ScopedSessionKey::new(&cur_pool.id, req.model_family, &req.session_id);
                 let mut skip_machine_stage = false;
                 let mut preserve_machine_home = is_downgraded;
                 let mut spill_exclude = SmallVec::<[NodeKey; 4]>::new();
                 let mut machine_home_node_key: Option<NodeKey> = None;
+                let mut borrow_session_pin = false;
+
+                // Ephemeral (summary fork, seatless probe): read-only follow of the
+                // session's pin, else the parent's. No stick, gate or session count.
+                if req.is_ephemeral_probe && cur_pool.session_sticky_enabled {
+                    let pinned =
+                        affinity::get_live_session_stick(&self.session_sticks, &s_key, now)
+                            .map(|s| s.pinned_node)
+                            .or_else(|| {
+                                let pid =
+                                    req.parent_session_id.as_deref().filter(|s| !s.is_empty())?;
+                                let p_key =
+                                    ScopedSessionKey::new(&cur_pool.id, req.model_family, pid);
+                                affinity::get_live_session_stick(&self.session_sticks, &p_key, now)
+                                    .map(|s| s.pinned_node)
+                            });
+                    if let Some(cand) = pinned
+                        .as_ref()
+                        .and_then(|p| admitted.iter().find(|c| c.node_key == *p))
+                    {
+                        if let Some(lease) = self.try_reserve_node(
+                            cand,
+                            cur_pool,
+                            req,
+                            &s_key,
+                            true,
+                            true,
+                            &mut gate_guard,
+                            dry_run,
+                        ) {
+                            explain
+                                .set_affinity(AffinityWhy::EphemeralFollowSession, &cand.node_key);
+                            return Ok(self.finalize_acquire(
+                                lease,
+                                cand,
+                                snap,
+                                cur_pool,
+                                gate_wait_ms,
+                                explain,
+                                dry_run,
+                                t_total,
+                                event_kind,
+                            ));
+                        }
+                    }
+                }
 
                 // Stage 1: L1 session_id 1:1 stickiness
                 if cur_pool.session_sticky_enabled && !req.is_ephemeral_probe {
@@ -831,6 +897,8 @@ impl SchedulerEngine {
                         } else {
                             skip_machine_stage = true;
                             preserve_machine_home = true;
+                            borrow_session_pin = req.keep_pin_on_model_gate
+                                && pinned_node_model_gated(req, &explain, &stick.pinned_node);
                             explain.note(AffinityWhy::SessionNodeUnavailable, &stick.pinned_node);
                         }
                     } else if let Some(parent_sid) =
@@ -952,7 +1020,7 @@ impl SchedulerEngine {
                 );
 
                 for cand in &ranked {
-                    if let Some(lease) = self.try_reserve_node(
+                    if let Some(mut lease) = self.try_reserve_node(
                         cand,
                         cur_pool,
                         req,
@@ -962,6 +1030,9 @@ impl SchedulerEngine {
                         &mut gate_guard,
                         dry_run,
                     ) {
+                        if borrow_session_pin {
+                            self.mark_session_pin_borrowed(&mut lease, dry_run);
+                        }
                         let why = if cand.is_probe_one {
                             AffinityWhy::ProbeOne
                         } else if !spill_exclude.is_empty() && machine_home_node_key.is_some() {
@@ -1009,7 +1080,7 @@ impl SchedulerEngine {
                         )
                     };
 
-                    if let Some((lease, cand)) = self
+                    if let Some((mut lease, cand)) = self
                         .wait_any_ready_node(
                             cur_pool,
                             &wait_candidates,
@@ -1022,6 +1093,9 @@ impl SchedulerEngine {
                         )
                         .await?
                     {
+                        if borrow_session_pin {
+                            self.mark_session_pin_borrowed(&mut lease, false);
+                        }
                         explain.set_affinity(AffinityWhy::PoolFullQueueWake, &cand.node_key);
                         tier_rank::commit_swrr_pick(cur_pool, cand, &admitted, &self.swrr_states);
                         return Ok(self.finalize_acquire(
@@ -1071,6 +1145,15 @@ impl SchedulerEngine {
                         explain: Box::new(explain),
                     });
                 }
+            }
+        }
+    }
+
+    fn mark_session_pin_borrowed(&self, lease: &mut ActiveLease, dry_run: bool) {
+        lease.keep_session_pin = true;
+        if !dry_run {
+            if let Some(mut entry) = self.leases.get_mut(&lease.lease_id) {
+                entry.keep_session_pin = true;
             }
         }
     }
@@ -1211,6 +1294,7 @@ impl SchedulerEngine {
             is_probe_one: cand.is_probe_one,
             stood_in,
             preserve_machine_home,
+            keep_session_pin: false,
             committed: false,
             strict_session_overflow: pool.session_overflow_policy == SessionOverflowPolicy::Strict,
             gate_hold,
@@ -1484,14 +1568,18 @@ impl SchedulerEngine {
                                 hits: 0,
                                 generation: 1,
                             });
-                    if entry.pinned_node != lease_snapshot.node_key {
+                    if entry.pinned_node != lease_snapshot.node_key
+                        && !lease_snapshot.keep_session_pin
+                    {
                         entry.pinned_node = lease_snapshot.node_key.clone();
                         entry.node_type = lease_snapshot.node_type;
                         entry.node_id = lease_snapshot.node_id.clone();
                         entry.generation = entry.generation.saturating_add(1);
                     }
-                    entry.machine_id = lease_snapshot.machine_id.clone();
-                    entry.stood_in = lease_snapshot.stood_in;
+                    if !lease_snapshot.keep_session_pin {
+                        entry.machine_id = lease_snapshot.machine_id.clone();
+                        entry.stood_in = lease_snapshot.stood_in;
+                    }
                     entry.last_seen_ms = now;
                     entry.expires_at_ms = now.saturating_add(sess_ttl_ms);
                     entry.hits = entry.hits.saturating_add(1);
@@ -1989,4 +2077,26 @@ impl SchedulerEngine {
     pub fn poison_tracker_len(&self) -> usize {
         self.poison_tracker.len()
     }
+}
+
+/// The session's pinned node was excluded only because it cannot serve this
+/// model: either the caller reported it as model-gated, or Rust admission
+/// dropped it for a model reason (and for nothing else).
+fn pinned_node_model_gated(
+    req: &AcquireRequest,
+    explain: &DecisionExplain,
+    pinned: &NodeKey,
+) -> bool {
+    if req.model_gated_node_keys.iter().any(|k| k == pinned) {
+        return true;
+    }
+    let mut any = false;
+    for e in explain.excluded.iter().filter(|e| e.node == *pinned) {
+        match e.reason {
+            scheduler_proto::ExcludeReason::ModelCooldown
+            | scheduler_proto::ExcludeReason::ModelUnsupported => any = true,
+            _ => return false,
+        }
+    }
+    any
 }

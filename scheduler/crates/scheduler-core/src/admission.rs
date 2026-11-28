@@ -43,6 +43,20 @@ pub fn filter_members<'a>(
     nodes: &DashMap<NodeKey, Arc<NodeRuntimeState>>,
     now_ms: u64,
 ) -> (Vec<AdmittedCandidate<'a>>, Vec<ExcludedEntry>) {
+    filter_members_for(snap, pool, req, nodes, now_ms, None)
+}
+
+/// `filter_members` for a request whose conversation is already pinned to
+/// `continuing_node`: that node is exempt from the new-session-only gates
+/// (host memory pressure, quota guard band), as 238 kept sticky VMs there.
+pub fn filter_members_for<'a>(
+    snap: &'a IndexedSnapshot,
+    pool: &PoolConfig,
+    req: &AcquireRequest,
+    nodes: &DashMap<NodeKey, Arc<NodeRuntimeState>>,
+    now_ms: u64,
+    continuing_node: Option<&NodeKey>,
+) -> (Vec<AdmittedCandidate<'a>>, Vec<ExcludedEntry>) {
     let mut admitted = Vec::with_capacity(pool.members.len());
     let mut excluded = Vec::new();
     let mut cooled: Vec<CooledCandidate<'a>> = Vec::new();
@@ -238,12 +252,22 @@ pub fn filter_members<'a>(
                 });
                 continue;
             }
-            if st.host_memory_pressure {
+            let continuing = continuing_node == Some(&node.node_key);
+            if st.host_memory_pressure && !continuing {
                 excluded.push(ExcludedEntry {
                     pool_id: pool.id.clone(),
                     node: node.node_key.clone(),
                     reason: ExcludeReason::MemoryPressure,
                     detail: "host_memory_pressure=true".to_owned(),
+                });
+                continue;
+            }
+            if st.new_sessions_blocked && !continuing {
+                excluded.push(ExcludedEntry {
+                    pool_id: pool.id.clone(),
+                    node: node.node_key.clone(),
+                    reason: ExcludeReason::NewSessionBlocked,
+                    detail: "new_sessions_blocked=true".to_owned(),
                 });
                 continue;
             }

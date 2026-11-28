@@ -54,7 +54,7 @@ import { isLeftoverQuotaScheduleOff } from '../pool/availability.mjs'
 import { isCodexSlotParked } from '../pool/codex-slot-pool.mjs'
 import { normalizeOpenAIQuotaPolicy } from '../pool/openai-quota-policy.mjs'
 import { resolveCredentialScheduleLevel } from '../pool/credential-weight.mjs'
-import { modelMatchesAllowlist } from '../pool/slot-model-gate.mjs'
+import { fableRequiresMaxEnabled, modelMatchesAllowlist, slotAllowsModel } from '../pool/slot-model-gate.mjs'
 import { isConcurrencyPinned } from '../pool/tier-limits.mjs'
 import { normalizeCragPersonaPreset } from '../protocol/crag-print-prompt.mjs'
 import { resolveGlobalZeroInject } from '../protocol/pool-prompt-policy.mjs'
@@ -71,7 +71,17 @@ import { isKvmRuntime } from '../vm/runtime-kind.mjs'
 import { effectiveSlotCount, isHeadlessBridgeSlot } from '../vm/slot-capacity.mjs'
 import { activeCragManifestForSlot, resolveKernelDataplane } from '../vm/slot-engine.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
-import { listVms } from '../vm/vm-registry.mjs'
+import { getVm, listVms } from '../vm/vm-registry.mjs'
+import { readWorkerEgressMode, readWorkerProxyEndpoint } from '../vm/vm-runtime.mjs'
+import { kernelFaults } from '../transport/rust-kernel-client.mjs'
+import {
+  MODEL_GATE_REASONS,
+  MODEL_WAIT_REASONS,
+  accountIdOf,
+  quotaGuardConfigOf,
+  quotaGuardLevel,
+} from '../pool/pool-scheduler.mjs'
+import { claudeNodeGate, claudeModelWaitGate } from './node-gates.mjs'
 
 export { SchedulerApiError, SchedulerUnavailableError }
 
@@ -752,6 +762,55 @@ export function buildVmRuntimeCapabilities(vm, { projectRoot = '', health = null
   return Object.keys(caps).length > 0 ? caps : null
 }
 
+/**
+ * The account record 238's PoolScheduler handed to `slotAllowsModel`
+ * (accounts row with `unified`), looked up the way the VM is bound.
+ */
+function rawAccountForVm(accountQuota, vm, accountId = null) {
+  const repo = accountQuota?.repo
+  if (!repo || !vm) return null
+  for (const k of [accountId, vm?.claude?.account_uuid, vm?.account_uuid, vm?.id]) {
+    if (!k) continue
+    try {
+      const hit = repo.get?.(String(k))
+      if (hit) return hit
+    } catch {}
+  }
+  return null
+}
+
+const JS_GATE = Symbol('jsGate')
+
+/**
+ * Rust returned `pool_exhausted`. When the members Rust dropped as
+ * `key_scope_filtered` were dropped by the JS model gate for
+ * `fable_requires_max`, the caller hears 238's answer instead: an immediate
+ * 429 `fable_requires_max`. A cooldown still names the cause first, as
+ * 238's `emptyPoolFailure` did.
+ */
+function fableRequiresMaxFromExhausted(explain, gate) {
+  const denied = gate?.denied?.fable_requires_max
+  if (!denied || denied.size === 0) return false
+  // A Max slot that only waits (model cooldown, Fable window) is not "no Max":
+  // 238 queued on it instead of answering fable_requires_max.
+  if (gate.waited === true) return false
+  const excluded = Array.isArray(explain?.excluded) ? explain.excluded : null
+  if (!excluded) return gate.matchedNone === true
+  if (excluded.some((e) => e?.reason === 'node_cooldown')) return false
+  return excluded.some(
+    (e) => e?.reason === 'key_scope_filtered' && (denied.has(String(e.node || '')) || gate.matchedNone === true),
+  )
+}
+
+function fableRequiresMaxError(explain) {
+  return new SchedulerApiError({
+    status: 429,
+    code: 'fable_requires_max',
+    message: 'Fable requires an available Max account',
+    ...(explain !== undefined ? { explain } : {}),
+  })
+}
+
 function collectFallbackChainPoolIds(startPoolId, poolsById, maxDepth = 4) {
   const out = []
   const seen = new Set()
@@ -1372,6 +1431,7 @@ export class SchedulerRuntime {
     const externalVms = this.#externalLoadProvider?.() || {}
     const routing = this.#getRoutingConfig() || {}
     const quotaPolicy = normalizeOpenAIQuotaPolicy(routing.codex?.quota || {})
+    const gateCtx = this.#claudeNodeGateContext()
 
     for (const vm of vms) {
       if (!vm?.id) continue
@@ -1414,6 +1474,27 @@ export class SchedulerRuntime {
         unschedReason = 'codex_slot_parked'
       }
 
+      // Node gates read vm.json, worker.json and cli-home under the project
+      // root (as 238 did); without one there is nothing to read.
+      let newSessionsBlocked = false
+      if (schedulable && !codex && gateCtx.projectRoot) {
+        const gateReason = this.#claudeNodeGateReason(vm, acct, gateCtx, now)
+        if (gateReason) {
+          schedulable = false
+          unschedReason = gateReason
+        } else {
+          // 238 quotaGuardLevel: `stop` removes the account, `continuing` keeps
+          // only conversations already pinned to it.
+          const guard = this.#claudeQuotaGuardLevel(vm, gateCtx, now)
+          if (guard === 'stop') {
+            schedulable = false
+            unschedReason = 'quota_guard_stop'
+          } else if (guard === 'continuing') {
+            newSessionsBlocked = true
+          }
+        }
+      }
+
       const activeHoursRes = evaluateActiveHours(activeHoursOf(vm), now, vm.timezone)
       const memLevel = this.#hostMemoryPressure?.levelForVm?.(vm) ?? hostMemoryLevelForVm(vm)
       const hostMemoryPressure = memLevel === HOST_PRESSURE_CRITICAL
@@ -1438,6 +1519,7 @@ export class SchedulerRuntime {
         unschedulable_reason: unschedReason,
         active_hours_ok: Boolean(activeHoursRes.active),
         host_memory_pressure: Boolean(hostMemoryPressure),
+        new_sessions_blocked: newSessionsBlocked,
         proxy_ready: !blockedProxy,
         crag_license_ok: cragLicenseOk,
         external_in_flight: Number.isFinite(extCount) && extCount > 0 ? Math.floor(extCount) : 0,
@@ -1500,6 +1582,79 @@ export class SchedulerRuntime {
     }
 
     return updates
+  }
+
+  /** vm.json as 238 read it (`getVm`); `listVms` hands out summaries. */
+  #rawVm(vm, { strict = false } = {}) {
+    const projectRoot = this.#cfg?.paths?.project || ''
+    if (!projectRoot || !vm?.id) return strict ? null : vm
+    try {
+      return getVm(projectRoot, vm.id) || (strict ? null : vm)
+    } catch {
+      return strict ? null : vm
+    }
+  }
+
+  /** Shared per-batch inputs for `claudeNodeGate` (one runtime-table read per batch). */
+  #claudeNodeGateContext() {
+    const projectRoot = this.#cfg?.paths?.project || ''
+    const poolScheduler = this.#resolvePoolScheduler()
+    const runtimeById = new Map()
+    try {
+      const repo = this.#accountQuota?.runtimeRepo || poolScheduler?.runtimeRepo
+      for (const row of repo?.list?.() || []) {
+        if (row?.account_id) runtimeById.set(String(row.account_id), row)
+        if (row?.vm_id && !runtimeById.has(`vm:${row.vm_id}`)) runtimeById.set(`vm:${row.vm_id}`, row)
+      }
+    } catch {}
+    return { projectRoot, poolScheduler, runtimeById }
+  }
+
+  #claudeNodeGateReason(vm, acct, ctx, now) {
+    const { projectRoot, poolScheduler, runtimeById } = ctx
+    // Judge vm.json only; a flattened summary lacks proxy/credential fields.
+    const raw = this.#rawVm(vm, { strict: true })
+    if (!raw) return null
+    const accountId = accountIdOf(raw, projectRoot || null)
+    const account = rawAccountForVm(this.#accountQuota, raw, accountId) || null
+    const state = runtimeById.get(String(accountId)) || runtimeById.get(`vm:${vm.id}`) || null
+    const ttl = Math.max(5_000, Number(poolScheduler?.config?.worker_health_ttl_ms) || 5_000)
+    const cached = poolScheduler?.healthCache?.get?.(vm.id)
+    const health = cached && now - Number(cached.at || 0) <= ttl * 6 ? cached.value : undefined
+    const unreachableAt = Number(poolScheduler?.workerUnreachable?.get?.(vm.id)?.at || 0)
+    const unreachable = unreachableAt > 0 && now - unreachableAt <= ttl * 6
+    let maxConcurrency = null
+    try {
+      const fallback = Number(poolScheduler?.config?.default_max_per_account)
+      maxConcurrency =
+        poolScheduler?.effectiveMaxConcurrency?.(raw, account, Number.isFinite(fallback) ? fallback : 2) ?? null
+    } catch {}
+    return claudeNodeGate({
+      vm: raw,
+      account,
+      state,
+      health,
+      unreachable,
+      kernelFaulted: kernelFaults.has(vm.id),
+      workerProxyEndpoint: projectRoot ? readWorkerProxyEndpoint(projectRoot, vm.id) : undefined,
+      egressMode: projectRoot ? readWorkerEgressMode(projectRoot, vm.id) : '',
+      maxConcurrency,
+      now,
+    })
+  }
+
+  #claudeQuotaGuardLevel(vm, ctx, now) {
+    const raw = this.#rawVm(vm, { strict: true })
+    if (!raw) return 'open'
+    const accountId = accountIdOf(raw, ctx.projectRoot || null)
+    const account = rawAccountForVm(this.#accountQuota, raw, accountId)
+    if (!account?.unified) return 'open'
+    try {
+      const config = quotaGuardConfigOf(this.#getRoutingConfig()?.quota || {})
+      return quotaGuardLevel(account.unified, config, now)?.level || 'open'
+    } catch {
+      return 'open'
+    }
   }
 
   #buildBootstrapPayload({ controllerEpoch, role }) {
@@ -1737,6 +1892,8 @@ export class SchedulerRuntime {
     apiKeyRecord,
     apiKeyKind,
     poolAccess,
+    pinned = false,
+    gate = null,
   }) {
     const isMaster = apiKeyKind === 'master' || !apiKeyRecord
     const explicitSet = Array.isArray(explicitAllowedNodeKeys)
@@ -1751,6 +1908,33 @@ export class SchedulerRuntime {
     // Fast path: if snapshot has no inventory indexed yet, preserve explicit list as-is.
     if (this.#nodesByKey.size === 0) {
       return explicitSet ? [...explicitSet] : []
+    }
+
+    // 238 PoolScheduler.checkEligibility: `slotAllowsModel` (plan, per-account
+    // model denial, slot allowlist) for every Claude candidate, skipped for a
+    // master pin.
+    const routing = this.#getRoutingConfig() || {}
+    const fableRequiresMax = fableRequiresMaxEnabled(routing)
+    const gateNow = Date.now()
+    const runtimeRepo = this.#accountQuota?.runtimeRepo || this.#resolvePoolScheduler()?.runtimeRepo || null
+    const snapshotCache = new Map()
+    const runtimeSnapshot = (accountId) => {
+      if (!accountId || !runtimeRepo?.schedulingSnapshot) return null
+      const key = String(accountId)
+      if (!snapshotCache.has(key)) {
+        let hit = null
+        try {
+          hit = runtimeRepo.schedulingSnapshot([key])?.get?.(key) || null
+        } catch {}
+        snapshotCache.set(key, hit)
+      }
+      return snapshotCache.get(key)
+    }
+    const denyNode = (reason, nodeKey) => {
+      if (!gate) return
+      gate.denied ||= {}
+      gate.denied[reason] ||= new Set()
+      gate.denied[reason].add(nodeKey)
     }
 
     const useLegacyNodePins = Boolean(
@@ -1786,6 +1970,32 @@ export class SchedulerRuntime {
           if (Array.isArray(allowlist) && allowlist.length > 0 && !modelMatchesAllowlist(model, allowlist)) {
             continue
           }
+          if (!pinned && inv?.item) {
+            const raw = this.#rawVm(inv.item)
+            const accountId = accountIdOf(raw, this.#cfg?.paths?.project || null)
+            const snapshot = runtimeSnapshot(accountId)
+            const account = snapshot?.account || rawAccountForVm(this.#accountQuota, raw, accountId)
+            const verdict = slotAllowsModel({ vm: raw, account, model, fableRequiresMax })
+            if (!verdict.ok) {
+              denyNode(verdict.reason, nodeKey)
+              continue
+            }
+            // 238 checkEligibility markWait: per-model cooldown (incl. the
+            // Fable family key), Fable 7d_oi window, weekly split.
+            const wait = claudeModelWaitGate({
+              accountId,
+              account,
+              state: snapshot?.state || null,
+              model,
+              accountQuota: this.#accountQuota,
+              now: gateNow,
+            })
+            if (wait) {
+              if (gate) gate.waited = true
+              denyNode(wait, nodeKey)
+              continue
+            }
+          }
         } else if (nodeCfg.node_type === 'codex_vm') {
           if (modelFamily === 'claude' || modelFamily === 'gemini') continue
           const allowlist = inv?.item?.policy?.allowed_models ?? inv?.item?.allowed_models
@@ -1805,6 +2015,7 @@ export class SchedulerRuntime {
 
     // If every node was filtered out, emit a non-matching sentinel so Rust does NOT treat [] as "allow all".
     if (matched.length === 0) {
+      if (gate) gate.matchedNone = true
       return ['__no_eligible_node__']
     }
     // If every node in the snapshot matched and no explicit list was passed, return [] to keep payload compact.
@@ -1840,6 +2051,8 @@ export class SchedulerRuntime {
 
     const fallbackChain = collectFallbackChainPoolIds(originPoolId, this.#poolsById)
 
+    const pinNodeKey = params.pinNodeKey ?? params.pin_node_key ?? null
+    const gate = {}
     let api_key_scope = params.apiKeyScope || params.api_key_scope || null
     if (!api_key_scope) {
       const explicitKeys = params.allowedNodeKeys || params.allowed_node_keys || null
@@ -1851,6 +2064,8 @@ export class SchedulerRuntime {
         apiKeyRecord,
         apiKeyKind,
         poolAccess,
+        pinned: Boolean(pinNodeKey),
+        gate,
       })
       api_key_scope = buildApiKeyScope({
         apiKeyRecord,
@@ -1876,7 +2091,6 @@ export class SchedulerRuntime {
             ? 'google'
             : 'http')
     const isAdminDiagnostic = Boolean(params.isAdminDiagnostic ?? params.is_admin_diagnostic ?? false)
-    const pinNodeKey = params.pinNodeKey ?? params.pin_node_key ?? null
     const requestId = scopeSchedulerRequestId(rawRequestId, {
       api_key_scope,
       origin_pool_id: originPoolId,
@@ -1909,13 +2123,37 @@ export class SchedulerRuntime {
       parent_session_id: params.parentSessionId ?? params.parent_session_id ?? null,
       is_ephemeral_probe: Boolean(params.isEphemeralProbe ?? params.is_ephemeral_probe ?? false),
       no_queue: Boolean(params.noQueue ?? params.no_queue ?? false),
+      skip_session_gate: Boolean(params.skipSessionGate ?? params.skip_session_gate ?? false),
       is_admin_diagnostic: isAdminDiagnostic,
       pin_node_key: pinNodeKey,
       exclude_nodes: Array.isArray(params.excludeNodes ?? params.exclude_nodes)
         ? [...new Set((params.excludeNodes ?? params.exclude_nodes).map(String).filter(Boolean))]
         : [],
     }
+    // 238 keep_pin_on_model_gate: tell Rust which nodes were dropped only for
+    // this model, so a session whose home is among them borrows and keeps its pin.
+    if (this.#getRoutingConfig()?.pool?.keep_pin_on_model_gate === true) {
+      req.keep_pin_on_model_gate = true
+      const gated = new Set()
+      for (const [reason, nodes] of Object.entries(gate.denied || {})) {
+        if (MODEL_GATE_REASONS.has(reason) || MODEL_WAIT_REASONS.has(reason)) for (const k of nodes) gated.add(k)
+      }
+      if (gated.size) req.model_gated_node_keys = [...gated]
+    }
+    // Out-of-band (non-enumerable, never serialized): which nodes the JS gate dropped and why.
+    Object.defineProperty(req, JS_GATE, { value: gate, enumerable: false })
     return req
+  }
+
+  #rethrowGated(err, req) {
+    if (
+      err instanceof SchedulerApiError &&
+      err.code === 'pool_exhausted' &&
+      fableRequiresMaxFromExhausted(err.explain, req?.[JS_GATE])
+    ) {
+      throw fableRequiresMaxError(err.explain)
+    }
+    throw err
   }
 
   #poolTimeoutsFor(poolId, opts = {}) {
@@ -1933,7 +2171,12 @@ export class SchedulerRuntime {
   async acquireNode(params = {}, opts = {}) {
     const req = this.#buildAcquireRequest(params)
     const callOpts = this.#poolTimeoutsFor(req.jev_downgrade_pool_id || req.origin_pool_id, opts)
-    const res = await this.#client.acquire(req, callOpts)
+    let res
+    try {
+      res = await this.#client.acquire(req, callOpts)
+    } catch (err) {
+      this.#rethrowGated(err, req)
+    }
     return { ...res, _request: req }
   }
 
@@ -1971,7 +2214,12 @@ export class SchedulerRuntime {
     })
 
     const callOpts = this.#poolTimeoutsFor(next_attempt.jev_downgrade_pool_id || next_attempt.origin_pool_id, opts)
-    const res = await this.#client.switchLease({ release_lease_id, failure, next_attempt }, callOpts)
+    let res
+    try {
+      res = await this.#client.switchLease({ release_lease_id, failure, next_attempt }, callOpts)
+    } catch (err) {
+      this.#rethrowGated(err, next_attempt)
+    }
     return { ...res, _request: next_attempt }
   }
 
@@ -2049,7 +2297,21 @@ export class SchedulerRuntime {
 
   async explainDispatch(params = {}, opts = {}) {
     const req = this.#buildAcquireRequest(params)
-    return this.#client.explain(req, opts)
+    let res
+    try {
+      res = await this.#client.explain(req, opts)
+    } catch (err) {
+      this.#rethrowGated(err, req)
+    }
+    if (
+      res &&
+      res.ok === false &&
+      res.error_code === 'pool_exhausted' &&
+      fableRequiresMaxFromExhausted(res.explain, req[JS_GATE])
+    ) {
+      return { ...res, error_code: 'fable_requires_max' }
+    }
+    return res
   }
 
   explain(params = {}, opts = {}) {
