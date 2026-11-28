@@ -200,6 +200,8 @@ pub enum ErrorClass {
     Server5xx,
     Client4xx,
     ContextTooLong,
+    /// Locally detected request/response contract failure, not evidence of node health.
+    RequestProtocol,
     JevBlocked,
     Refusal,
     PermanentBan,

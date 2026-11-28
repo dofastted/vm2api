@@ -425,6 +425,7 @@ pub fn apply_failure(
             ErrorClass::JevBlocked
             | ErrorClass::Refusal
             | ErrorClass::ContextTooLong
+            | ErrorClass::RequestProtocol
             | ErrorClass::PermanentBan => {}
         }
     }
@@ -561,11 +562,14 @@ pub fn infer_error_class(f: &FailureReport) -> ErrorClass {
     }
 }
 
-/// Request-side faults (bad prompt, JEV, refusal, context overflow, plain 4xx except 403/429)
+/// Request-side faults (including local protocol validation and plain 4xx except 403/429)
 /// are never the node's fault: no cooldown, no Sink, no sticky unbinding.
 pub fn is_request_fault(effective_class: ErrorClass, http_status: u16) -> bool {
     match effective_class {
-        ErrorClass::JevBlocked | ErrorClass::Refusal | ErrorClass::ContextTooLong => true,
+        ErrorClass::JevBlocked
+        | ErrorClass::Refusal
+        | ErrorClass::ContextTooLong
+        | ErrorClass::RequestProtocol => true,
         ErrorClass::Client4xx => http_status != 403 && http_status != 429,
         _ => false,
     }
