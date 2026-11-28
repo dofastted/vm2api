@@ -590,6 +590,9 @@ accountQuota = new AccountQuota({
   })),
 })
 accountQuota.loadVmQuotaOverrides(listVms(cfg.paths.project))
+if (getDbEngine() === 'postgres' && getPgPool()) {
+  accountQuota.startQuotaFlusher?.()
+}
 
 const apiKeyStore = new ApiKeyStore({ dataDir: cfg.paths.data })
 apiKeyStore.startUsageFlusher()
@@ -1961,7 +1964,9 @@ async function handoverLeadership() {
   }
   if (handoverRole() !== 'leader' || !standbyActive) return false
   stopLeaderJobs()
-  // Flush final dirty sticky/penalty deltas while still holding the leader flock.
+  // Flush final dirty sticky/penalty/quota deltas while still holding the leader flock.
+  await accountQuota?.flushQuota?.().catch(() => {})
+  await stickyRouter?.flushPendingWrites?.().catch(() => {})
   await schedulerRuntime?.drainPersistenceNow?.().catch(() => {})
   schedulerRuntime?.demoteToStandby?.()
   setHandoverRole('draining')
@@ -2039,6 +2044,17 @@ const gracefulShutdown = createGracefulShutdown({
       await schedulerRuntime?.shutdown?.({ drain: handoverRole() !== 'draining', stopProcess: true })
     } catch (e) {
       console.warn('[shutdown] scheduler-runtime shutdown failed', e?.message || e)
+    }
+    try {
+      accountQuota?.stopQuotaFlusher?.()
+      await accountQuota?.flushQuota?.()
+    } catch (e) {
+      console.warn('[shutdown] account-quota flush failed', e?.message || e)
+    }
+    try {
+      await stickyRouter?.flushPendingWrites?.()
+    } catch (e) {
+      console.warn('[shutdown] sticky-router flush failed', e?.message || e)
     }
     try {
       await apiKeyStore.close()

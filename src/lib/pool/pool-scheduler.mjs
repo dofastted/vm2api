@@ -1,5 +1,7 @@
 import crypto from 'node:crypto'
 import { EventEmitter } from 'node:events'
+import { getDb, getPgPool, isDbOpen } from '../db/database.mjs'
+import { getCacheRuntime, notifyDbTablesMutated } from '../cache/index.mjs'
 import { effectiveSlotCount } from '../vm/slot-capacity.mjs'
 import { getVm, listVms, migrateVmSchedule } from '../vm/vm-registry.mjs'
 import { vmCliHomePath, vmJsonPath } from '../vm/execution-context.mjs'
@@ -401,6 +403,21 @@ function allowedClaudeNodeKeysFromScope(keyScope) {
  * 3. Background worker health probing & quota/cooldown telemetry reporting to Rust.
  * 4. Lightweight in-flight observability gauges (`vmInflight`, `snapshot`, `seatSnapshot`).
  */
+function toIsoMs(ms) {
+  const n = Number(ms)
+  if (!Number.isFinite(n) || n <= 0) return null
+  return new Date(Math.min(n, 8.64e15)).toISOString()
+}
+
+function parseJsonSafe(raw, fallback = null) {
+  if (raw == null) return fallback
+  try {
+    return typeof raw === 'string' ? JSON.parse(raw) : raw
+  } catch {
+    return fallback
+  }
+}
+
 export class PoolScheduler extends EventEmitter {
   constructor({
     projectRoot,
@@ -411,6 +428,7 @@ export class PoolScheduler extends EventEmitter {
     getRouting = () => ({}),
     config = {},
     schedulerRuntime = null,
+    pgPool = null,
   } = {}) {
     super()
     this.setMaxListeners(100)
@@ -422,6 +440,8 @@ export class PoolScheduler extends EventEmitter {
     this.getRouting = getRouting
     this.config = normalizePoolConfig(config)
     this.schedulerRuntime = schedulerRuntime || null
+    this._explicitPgPool = pgPool || null
+    this._pgRuntimeStateCache = new Map() // accountId -> merged runtime state (PG async cache)
     // Observability gauges only (panel live stream & graceful drain check).
     this.inflight = new Map()
     this.vmInflight = new Map()
@@ -444,6 +464,30 @@ export class PoolScheduler extends EventEmitter {
     this.lastUsed = new Map()
     this.unitCircuit = unitCircuit
     if (runtimeRepo) this.unitCircuit.bindRepo(runtimeRepo)
+  }
+
+  _resolvePgPool() {
+    if (this._explicitPgPool !== null) return this._explicitPgPool
+    const db = this.runtimeRepo?.db
+    if (db?.engine === 'postgres' && isDbOpen() && db === getDb()) return getPgPool()
+    return null
+  }
+
+  _getRuntimeStateCached(accountId) {
+    if (!accountId) return null
+    const pgPool = this._resolvePgPool()
+    try {
+      const snap = getCacheRuntime()?.scheduler?.getSchedulingSnapshotSync?.()
+      const entry = snap?.byAccountId?.get?.(accountId)
+      if (entry?.state) return entry.state
+      if (pgPool && snap?.byAccountId instanceof Map && snap.byAccountId.size > 0) {
+        return this._pgRuntimeStateCache.get(accountId) || null
+      }
+    } catch {}
+    if (pgPool) {
+      return this._pgRuntimeStateCache.get(accountId) || null
+    }
+    return this.runtimeRepo?.get?.(accountId) || null
   }
 
   setSchedulerRuntime(rt) {
@@ -528,11 +572,12 @@ export class PoolScheduler extends EventEmitter {
       explain = null,
       quotaRequest = null,
       release = null,
+      vm: preloadedVm = null,
     } = {},
   ) {
     const vmId = String(selectedNode?.node_id || '')
-    let vm = null
-    if (this.projectRoot && vmId) {
+    let vm = preloadedVm || null
+    if (!vm && this.projectRoot && vmId) {
       try {
         vm = getVm(this.projectRoot, vmId)
       } catch {
@@ -541,7 +586,7 @@ export class PoolScheduler extends EventEmitter {
     }
     const accountId = vm ? accountIdOf(vm, this.projectRoot) : vmId
     const exec = vm && this.projectRoot ? this.executionContext(vm, accountId) : null
-    const state = accountId ? this.runtimeRepo?.get?.(accountId) || null : null
+    const state = accountId ? this._getRuntimeStateCached(accountId) : null
     const workerStatus = this.healthCache.get(vmId)?.value || state?.worker_status || null
     const schedulingMs = Number.isFinite(Number(explain?.decide_us)) ? Math.round(Number(explain.decide_us) / 1000) : 0
     return {
@@ -657,6 +702,7 @@ export class PoolScheduler extends EventEmitter {
       void rt.releaseLease(acquired.lease_id, payload).catch(() => {})
     }
     return this.resolveCandidateForNode(acquired.selected_node, {
+      vm,
       model: args.model,
       resolvedPoolId: acquired.resolved_pool_id,
       promptPolicy: acquired.prompt_policy,
@@ -872,9 +918,306 @@ export class PoolScheduler extends EventEmitter {
     this.maintenanceStopped = true
   }
 
+  async _writeHeartbeatsPgAsync(pgPool, batch) {
+    if (!batch.length) return
+    const nowIso = new Date().toISOString()
+    const accountIds = []
+    const vmIds = []
+    const statuses = []
+    const hbAts = []
+    const workerStatuses = []
+    const credGens = []
+    const refreshStatuses = []
+    const updatedAts = []
+    for (const u of batch) {
+      accountIds.push(String(u.account_id))
+      vmIds.push(String(u.vm_id || u.account_id))
+      statuses.push(String(u.status || 'unknown'))
+      hbAts.push(u.worker_heartbeat_at != null ? Math.trunc(Number(u.worker_heartbeat_at) || 0) : null)
+      workerStatuses.push(u.worker_status != null ? JSON.stringify(u.worker_status) : null)
+      credGens.push(Math.trunc(Number(u.credential_generation) || 0))
+      refreshStatuses.push(u.refresh_status ?? null)
+      updatedAts.push(nowIso)
+    }
+    await pgPool.query(
+      `INSERT INTO account_runtime (
+        account_id, vm_id, status, worker_heartbeat_at, worker_status_json,
+        credential_generation, refresh_status, updated_at
+      )
+      SELECT * FROM UNNEST(
+        $1::text[], $2::text[], $3::text[], $4::bigint[], $5::text[],
+        $6::bigint[], $7::text[], $8::text[]
+      )
+      ON CONFLICT (account_id) DO UPDATE SET
+        status = CASE
+          WHEN account_runtime.status IN ('disabled', 'cooldown', 'rate_limited')
+          THEN account_runtime.status
+          ELSE EXCLUDED.status
+        END,
+        worker_heartbeat_at = EXCLUDED.worker_heartbeat_at,
+        worker_status_json = EXCLUDED.worker_status_json,
+        credential_generation = GREATEST(account_runtime.credential_generation, EXCLUDED.credential_generation),
+        refresh_status = EXCLUDED.refresh_status,
+        updated_at = EXCLUDED.updated_at
+      WHERE COALESCE(account_runtime.worker_heartbeat_at, 0) <= EXCLUDED.worker_heartbeat_at`,
+      [accountIds, vmIds, statuses, hbAts, workerStatuses, credGens, refreshStatuses, updatedAts],
+    )
+    for (const u of batch) {
+      const prev = this._pgRuntimeStateCache.get(u.account_id) || { account_id: u.account_id, vm_id: u.vm_id }
+      const preserveStatus = ['disabled', 'cooldown', 'rate_limited'].includes(prev.status)
+      this._pgRuntimeStateCache.set(u.account_id, {
+        ...prev,
+        vm_id: u.vm_id || prev.vm_id,
+        status: preserveStatus ? prev.status : u.status,
+        worker_heartbeat_at: u.worker_heartbeat_at,
+        worker_status: u.worker_status,
+        credential_generation: Math.max(Number(prev.credential_generation) || 0, Number(u.credential_generation) || 0),
+        refresh_status: u.refresh_status,
+        updated_at: nowIso,
+      })
+    }
+  }
+
+  async _clearExpiredPgAsync(pgPool, now = Date.now()) {
+    const nowIso = new Date(now).toISOString()
+    let changed = false
+    const accRes = await pgPool.query(
+      `UPDATE accounts
+      SET
+        temp_unschedulable_until = CASE
+          WHEN temp_unschedulable_until IS NOT NULL AND temp_unschedulable_until <= $1::text THEN NULL
+          ELSE temp_unschedulable_until
+        END,
+        temp_unschedulable_reason = CASE
+          WHEN temp_unschedulable_until IS NOT NULL AND temp_unschedulable_until <= $1::text THEN NULL
+          ELSE temp_unschedulable_reason
+        END,
+        rate_limit_reset_at = CASE
+          WHEN rate_limit_reset_at IS NOT NULL AND rate_limit_reset_at <= $1::text THEN NULL
+          ELSE rate_limit_reset_at
+        END,
+        overload_until = CASE
+          WHEN overload_until IS NOT NULL AND overload_until <= $1::text THEN NULL
+          ELSE overload_until
+        END,
+        updated_at = $1::text
+      WHERE (temp_unschedulable_until IS NOT NULL AND temp_unschedulable_until <= $1::text)
+         OR (rate_limit_reset_at IS NOT NULL AND rate_limit_reset_at <= $1::text)
+         OR (overload_until IS NOT NULL AND overload_until <= $1::text)
+      RETURNING id, (temp_unschedulable_until IS NULL) AS cooldown_cleared`,
+      [nowIso],
+    )
+    const clearedIds = (accRes?.rows || []).map((r) => r.id).filter(Boolean)
+    if (clearedIds.length > 0) {
+      changed = true
+      await pgPool.query(
+        `UPDATE account_runtime
+        SET status = 'ready', updated_at = $2::text
+        WHERE account_id = ANY($1::text[]) AND status IN ('cooldown', 'rate_limited')`,
+        [clearedIds, nowIso],
+      )
+      for (const id of clearedIds) {
+        const cached = this._pgRuntimeStateCache.get(id)
+        if (cached) {
+          this._pgRuntimeStateCache.set(id, {
+            ...cached,
+            status: cached.status === 'disabled' ? 'disabled' : 'ready',
+            cooldown_until: null,
+            cooldown_reason: null,
+            rate_limit_reset_at:
+              cached.rate_limit_reset_at && cached.rate_limit_reset_at <= now ? null : cached.rate_limit_reset_at,
+            overload_until: cached.overload_until && cached.overload_until <= now ? null : cached.overload_until,
+          })
+        }
+      }
+    }
+
+    const rtRes = await pgPool.query(
+      `SELECT account_id, model_states_json
+      FROM account_runtime
+      WHERE model_states_json IS NOT NULL AND model_states_json <> '' AND model_states_json <> '{}'`,
+    )
+    const modIds = []
+    const modJsons = []
+    for (const row of rtRes?.rows || []) {
+      const models = parseJsonSafe(row.model_states_json, {})
+      if (!models || typeof models !== 'object') continue
+      let rowChanged = false
+      for (const [model, modelState] of Object.entries(models)) {
+        if (modelState?.cooldown_until && Number(modelState.cooldown_until) <= now) {
+          delete models[model]
+          rowChanged = true
+        }
+      }
+      if (rowChanged) {
+        modIds.push(String(row.account_id))
+        modJsons.push(JSON.stringify(models))
+        const cached = this._pgRuntimeStateCache.get(row.account_id)
+        if (cached) cached.model_states = models
+      }
+    }
+    if (modIds.length > 0) {
+      changed = true
+      await pgPool.query(
+        `UPDATE account_runtime AS r
+        SET model_states_json = v.model_states_json, updated_at = $3::text
+        FROM UNNEST($1::text[], $2::text[]) AS v(account_id, model_states_json)
+        WHERE r.account_id = v.account_id`,
+        [modIds, modJsons, nowIso],
+      )
+    }
+    if (changed) {
+      notifyDbTablesMutated(['accounts', 'account_runtime'])
+    }
+  }
+
+  async _fetchSchedulingSnapshotsPgAsync(pgPool, accountIds) {
+    const out = new Map()
+    const unique = [...new Set((accountIds || []).filter(Boolean).map(String))]
+    if (!unique.length) return out
+    const res = await pgPool.query(
+      `SELECT a.id, a.vm_id, a.email, a.name, a.platform, a.type,
+        a.status, a.schedulable, a.priority, a.rate_multiplier, a.concurrency,
+        a.concurrency_override, a.max_rpm, a.rpm_override, a.requests,
+        a.tokens_in, a.tokens_out, a.cache_read_tokens, a.cache_creation_tokens,
+        a.extra, a.updated_at, a.load_factor, a.last_used_at, a.created_at,
+        a.temp_unschedulable_until, a.temp_unschedulable_reason, a.rate_limited_at,
+        a.rate_limit_reset_at, a.overload_until, a.session_window_start,
+        a.session_window_end, a.session_window_status,
+        r.account_id AS rt_account_id, r.vm_id AS rt_vm_id, r.status AS rt_status,
+        r.updated_at AS rt_updated_at, r.model_states_json, r.credential_generation,
+        r.refresh_status, r.worker_heartbeat_at, r.worker_status_json
+      FROM (SELECT * FROM accounts WHERE id = ANY($1::text[])) a
+      FULL JOIN (SELECT * FROM account_runtime WHERE account_id = ANY($1::text[])) r
+        ON r.account_id = a.id`,
+      [unique],
+    )
+    for (const row of res?.rows || []) {
+      const id = row.id ?? row.rt_account_id
+      if (!id) continue
+      const mapped =
+        typeof this.runtimeRepo?.snapshotRow === 'function'
+          ? this.runtimeRepo.snapshotRow(row)
+          : {
+              account: null,
+              state: {
+                account_id: id,
+                vm_id: row.rt_vm_id ?? row.vm_id ?? null,
+                status: row.rt_status || 'unknown',
+                credential_generation: Number(row.credential_generation) || 0,
+                worker_heartbeat_at: row.worker_heartbeat_at == null ? null : Number(row.worker_heartbeat_at),
+                worker_status: parseJsonSafe(row.worker_status_json),
+                model_states: parseJsonSafe(row.model_states_json, {}),
+              },
+            }
+      out.set(id, mapped)
+      if (mapped?.state) this._pgRuntimeStateCache.set(id, mapped.state)
+    }
+    return out
+  }
+
+  async _markSuccessPgAsync(pgPool, payload) {
+    const nowIso = new Date().toISOString()
+    const lastUsedIso = toIsoMs(payload.last_used_at)
+    await pgPool.query(
+      `INSERT INTO accounts (id, vm_id, name, extra, created_at, updated_at)
+      VALUES ($1, $2, $1, '{}', $3, $3)
+      ON CONFLICT (id) DO NOTHING`,
+      [payload.account_id, payload.vm_id, nowIso],
+    )
+    await pgPool.query(
+      `UPDATE accounts
+      SET
+        vm_id = COALESCE($2, vm_id),
+        last_used_at = COALESCE($3, last_used_at),
+        temp_unschedulable_until = NULL,
+        temp_unschedulable_reason = NULL,
+        updated_at = $4
+      WHERE id = $1`,
+      [payload.account_id, payload.vm_id, lastUsedIso, nowIso],
+    )
+    await pgPool.query(
+      `INSERT INTO account_runtime (
+        account_id, vm_id, status, model_states_json, credential_generation,
+        worker_heartbeat_at, worker_status_json, updated_at
+      )
+      VALUES ($1, $2, 'ready', '{}', 0, $3, $4, $5)
+      ON CONFLICT (account_id) DO UPDATE SET
+        vm_id = COALESCE(EXCLUDED.vm_id, account_runtime.vm_id),
+        status = 'ready',
+        worker_heartbeat_at = GREATEST(COALESCE(account_runtime.worker_heartbeat_at, 0), COALESCE(EXCLUDED.worker_heartbeat_at, 0)),
+        worker_status_json = CASE
+          WHEN EXCLUDED.worker_status_json IS NOT NULL
+            AND COALESCE(EXCLUDED.worker_heartbeat_at, 0) >= COALESCE(account_runtime.worker_heartbeat_at, 0)
+          THEN EXCLUDED.worker_status_json
+          ELSE account_runtime.worker_status_json
+        END,
+        updated_at = EXCLUDED.updated_at`,
+      [
+        payload.account_id,
+        payload.vm_id,
+        payload.worker_heartbeat_at ?? null,
+        payload.worker_status != null ? JSON.stringify(payload.worker_status) : null,
+        nowIso,
+      ],
+    )
+  }
+
+  async _markCooldownPgAsync(pgPool, accountId, { vmId, until, reason, model = null, status = 'cooldown' } = {}) {
+    const nowIso = new Date().toISOString()
+    const untilMs = Number(until) || null
+    const untilIso = toIsoMs(untilMs)
+    const effectiveVmId = vmId || accountId
+    await pgPool.query(
+      `INSERT INTO accounts (id, vm_id, name, extra, created_at, updated_at)
+      VALUES ($1, $2, $1, '{}', $3, $3)
+      ON CONFLICT (id) DO NOTHING`,
+      [accountId, effectiveVmId, nowIso],
+    )
+    if (model) {
+      const cur = await pgPool.query('SELECT model_states_json FROM account_runtime WHERE account_id = $1', [accountId])
+      const models = parseJsonSafe(cur?.rows?.[0]?.model_states_json, {}) || {}
+      models[model] = { status, cooldown_until: untilMs, reason: reason || null, updated_at: nowIso }
+      await pgPool.query(
+        `INSERT INTO account_runtime (account_id, vm_id, status, model_states_json, credential_generation, updated_at)
+        VALUES ($1, $2, 'ready', $3, 0, $4)
+        ON CONFLICT (account_id) DO UPDATE SET
+          vm_id = COALESCE(EXCLUDED.vm_id, account_runtime.vm_id),
+          model_states_json = EXCLUDED.model_states_json,
+          updated_at = EXCLUDED.updated_at`,
+        [accountId, effectiveVmId, JSON.stringify(models), nowIso],
+      )
+    } else {
+      const isRl = /rate_limited|quota_exhausted/i.test(String(reason || ''))
+      await pgPool.query(
+        `UPDATE accounts
+        SET
+          vm_id = COALESCE($2, vm_id),
+          temp_unschedulable_until = $3,
+          temp_unschedulable_reason = $4,
+          rate_limited_at = CASE WHEN $5::boolean THEN $6 ELSE rate_limited_at END,
+          rate_limit_reset_at = CASE WHEN $5::boolean THEN $3 ELSE rate_limit_reset_at END,
+          updated_at = $6
+        WHERE id = $1`,
+        [accountId, effectiveVmId, untilIso, reason || null, isRl, nowIso],
+      )
+      await pgPool.query(
+        `INSERT INTO account_runtime (account_id, vm_id, status, model_states_json, credential_generation, updated_at)
+        VALUES ($1, $2, $3, '{}', 0, $4)
+        ON CONFLICT (account_id) DO UPDATE SET
+          vm_id = COALESCE(EXCLUDED.vm_id, account_runtime.vm_id),
+          status = EXCLUDED.status,
+          updated_at = EXCLUDED.updated_at`,
+        [accountId, effectiveVmId, status, nowIso],
+      )
+    }
+    notifyDbTablesMutated(['accounts', 'account_runtime'])
+  }
+
   async flushHealthWrites() {
-    if (this.maintenanceStopped || !this.runtimeRepo) return
+    if (this.maintenanceStopped || (!this.runtimeRepo && !this._resolvePgPool())) return
     const quietMs = Math.max(0, Number(this.heartbeatQuietWindowMs) || 0)
+    const due = []
     for (const [accountId, update] of this.healthWrites) {
       const fp = heartbeatFingerprint(update)
       const now = Number(update?.worker_heartbeat_at) || Date.now()
@@ -883,6 +1226,22 @@ export class PoolScheduler extends EventEmitter {
         if (this.healthWrites.get(accountId) === update) this.healthWrites.delete(accountId)
         continue
       }
+      due.push({ accountId, update, fp, now })
+    }
+    if (!due.length) return
+    const pgPool = this._resolvePgPool()
+    if (pgPool && typeof pgPool.query === 'function') {
+      await this._writeHeartbeatsPgAsync(
+        pgPool,
+        due.map((d) => d.update),
+      )
+      for (const { accountId, update, fp, now } of due) {
+        this._lastWrittenHeartbeats.set(accountId, { fingerprint: fp, at: now })
+        if (this.healthWrites.get(accountId) === update) this.healthWrites.delete(accountId)
+      }
+      return
+    }
+    for (const { accountId, update, fp, now } of due) {
       await this.runtimeRepo.writeHeartbeat(update)
       this._lastWrittenHeartbeats.set(accountId, { fingerprint: fp, at: now })
       if (this.healthWrites.get(accountId) === update) this.healthWrites.delete(accountId)
@@ -892,18 +1251,40 @@ export class PoolScheduler extends EventEmitter {
   async maintain() {
     const now = Date.now()
     const cleanupDue = !this.lastCleanupAt || now - this.lastCleanupAt >= 30000
+    const pgPool = this._resolvePgPool()
     await this.flushHealthWrites()
     if (cleanupDue) {
-      await this.runtimeRepo?.clearExpired?.(now)
-      await this.stickyRouter?.repo?.purgeExpired?.(now)
+      if (pgPool && typeof pgPool.query === 'function') {
+        await this._clearExpiredPgAsync(pgPool, now)
+      } else {
+        await this.runtimeRepo?.clearExpired?.(now)
+      }
+      if (typeof this.stickyRouter?.purgeExpiredAsync === 'function') {
+        await this.stickyRouter.purgeExpiredAsync(now)
+      } else {
+        await this.stickyRouter?.repo?.purgeExpired?.(now)
+      }
       this.lastCleanupAt = now
     }
     if (!this.projectRoot) return
     const vms = listVms(this.projectRoot)
       .map((summary) => getVm(this.projectRoot, summary.id))
       .filter((vm) => vm && vm.schedulable !== false && vm.status === 'running' && !isCodexVm(vm))
-    const snapshots =
-      (await this.runtimeRepo?.schedulingSnapshot?.(vms.map((vm) => accountIdOf(vm, this.projectRoot)))) || new Map()
+    const accountIds = vms.map((vm) => accountIdOf(vm, this.projectRoot))
+    let snapshots = null
+    try {
+      const cachedSnap = getCacheRuntime()?.scheduler?.getSchedulingSnapshotSync?.()
+      if (cachedSnap?.byAccountId instanceof Map && cachedSnap.byAccountId.size > 0) {
+        snapshots = cachedSnap.byAccountId
+      }
+    } catch {}
+    if (!snapshots) {
+      if (pgPool && typeof pgPool.query === 'function') {
+        snapshots = await this._fetchSchedulingSnapshotsPgAsync(pgPool, accountIds)
+      } else {
+        snapshots = (await this.runtimeRepo?.schedulingSnapshot?.(accountIds)) || new Map()
+      }
+    }
     await Promise.allSettled(
       vms.map((vm) => {
         if (this.maintenanceStopped || vmNodeDataPath(vm) === 'offline') return null
@@ -1047,9 +1428,9 @@ export class PoolScheduler extends EventEmitter {
   markSuccess(candidate, { workerStatus = null, countUsage = true } = {}) {
     const now = Date.now()
     if (countUsage !== false) this.accountQuota?.noteBandSettled?.(candidate.accountId, candidate.quotaToken)
-    const prev = this.runtimeRepo?.get?.(candidate.accountId)
+    const prev = this._getRuntimeStateCached(candidate.accountId)
     if (countUsage !== false) this.lastUsed.set(candidate.accountId, now)
-    this.runtimeRepo?.upsert?.({
+    const payload = {
       account_id: candidate.accountId,
       vm_id: candidate.vmId,
       status: 'ready',
@@ -1060,7 +1441,14 @@ export class PoolScheduler extends EventEmitter {
       last_used_at: countUsage === false ? prev?.last_used_at || this.lastUsed.get(candidate.accountId) || null : now,
       worker_heartbeat_at: workerStatus ? now : candidate.state?.worker_heartbeat_at,
       worker_status: workerStatus || candidate.state?.worker_status || null,
-    })
+    }
+    const pgPool = this._resolvePgPool()
+    if (pgPool && typeof pgPool.query === 'function') {
+      this._pgRuntimeStateCache.set(candidate.accountId, { ...(prev || {}), ...payload })
+      void this._markSuccessPgAsync(pgPool, payload).catch(() => {})
+    } else {
+      this.runtimeRepo?.upsert?.(payload)
+    }
     if (this.projectRoot && candidate.vmId) {
       try {
         clearVmAuthCooldown(vmJsonPath(this.projectRoot, candidate.vmId))
@@ -1070,13 +1458,46 @@ export class PoolScheduler extends EventEmitter {
 
   markCooldown(candidate, { until, reason, model = null, status = 'cooldown' } = {}) {
     if (candidate?.accountId) this._lastWrittenHeartbeats.delete(candidate.accountId)
-    this.runtimeRepo?.markCooldown?.(candidate.accountId, {
-      vmId: candidate.vmId,
-      until,
-      reason,
-      model: model ? normalizeModel(model) : null,
-      status,
-    })
+    const normModel = model ? normalizeModel(model) : null
+    const pgPool = this._resolvePgPool()
+    if (pgPool && typeof pgPool.query === 'function') {
+      const prev = this._pgRuntimeStateCache.get(candidate.accountId) || {
+        account_id: candidate.accountId,
+        vm_id: candidate.vmId,
+        model_states: {},
+      }
+      if (normModel) {
+        this._pgRuntimeStateCache.set(candidate.accountId, {
+          ...prev,
+          model_states: {
+            ...(prev.model_states || {}),
+            [normModel]: { status, cooldown_until: Number(until) || null, reason: reason || null },
+          },
+        })
+      } else {
+        this._pgRuntimeStateCache.set(candidate.accountId, {
+          ...prev,
+          status,
+          cooldown_until: Number(until) || null,
+          cooldown_reason: reason || null,
+        })
+      }
+      void this._markCooldownPgAsync(pgPool, candidate.accountId, {
+        vmId: candidate.vmId,
+        until,
+        reason,
+        model: normModel,
+        status,
+      }).catch(() => {})
+    } else {
+      this.runtimeRepo?.markCooldown?.(candidate.accountId, {
+        vmId: candidate.vmId,
+        until,
+        reason,
+        model: normModel,
+        status,
+      })
+    }
     if (isAuthCooldownReason(reason) && this.projectRoot && candidate.vmId) {
       try {
         markVmAuthCooldown(vmJsonPath(this.projectRoot, candidate.vmId), {
@@ -1108,11 +1529,13 @@ export class PoolScheduler extends EventEmitter {
   syncQuotaSchedule(vm, account = null, state = undefined) {
     if (!this.projectRoot || !vm?.id) return { action: 'keep', reason: null }
     const accountId = account?.account_id || vm.claude?.account_uuid || vm.id
-    account = account || this.accountQuota?.repo?.get?.(accountId) || null
+    account =
+      account || this.accountQuota?.getAccountCached?.(accountId) || this.accountQuota?.repo?.get?.(accountId) || null
     if (!account) return { action: 'keep', reason: null }
+    const effectiveState = state === undefined ? this._getRuntimeStateCached(accountId) : state
     const now = Date.now()
     const lastUsedAt = this.lastUsed.get(accountId) || account.last_used_at || 0
-    const runtimeWorkerStatus = state?.worker_status || account.worker_status || null
+    const runtimeWorkerStatus = effectiveState?.worker_status || account.worker_status || null
     const ev = evaluateAccount({
       vm: {
         ...vm,
@@ -1135,7 +1558,7 @@ export class PoolScheduler extends EventEmitter {
       refreshError: vm.claude?.refresh_error,
       expiresAt: vm.claude?.expires_at || vm.expires_at || null,
       refreshedAt: vm.claude?.refreshed_at || vm.refreshed_at || null,
-      workerCredential: state?.worker_status?.credential || account.worker_status?.credential || null,
+      workerCredential: effectiveState?.worker_status?.credential || account.worker_status?.credential || null,
       quota: account.unified
         ? {
             ...listQuotaFromHeaders(account.unified, { now }),
@@ -1161,7 +1584,7 @@ export class PoolScheduler extends EventEmitter {
       return { action: 'restrict', reason: ev.reason, until }
     }
     if (ev.accept) {
-      this.clearQuotaRestriction(vm, accountId, file, state)
+      this.clearQuotaRestriction(vm, accountId, file, effectiveState)
       if (leftover) {
         migrateVmSchedule(this.projectRoot, vm.id)
         vm.schedulable = true
@@ -1180,12 +1603,30 @@ export class PoolScheduler extends EventEmitter {
   }
 
   applyQuotaRestriction(vm, accountId, { until, reason, file }) {
-    this.runtimeRepo?.markCooldown?.(accountId, {
-      vmId: vm.id,
-      until,
-      reason,
-      status: 'cooldown',
-    })
+    const pgPool = this._resolvePgPool()
+    if (pgPool && typeof pgPool.query === 'function') {
+      const prev = this._pgRuntimeStateCache.get(accountId) || { account_id: accountId, vm_id: vm.id }
+      this._pgRuntimeStateCache.set(accountId, {
+        ...prev,
+        vm_id: vm.id,
+        status: 'cooldown',
+        cooldown_until: Number(until) || null,
+        cooldown_reason: reason || null,
+      })
+      void this._markCooldownPgAsync(pgPool, accountId, {
+        vmId: vm.id,
+        until,
+        reason,
+        status: 'cooldown',
+      }).catch(() => {})
+    } else {
+      this.runtimeRepo?.markCooldown?.(accountId, {
+        vmId: vm.id,
+        until,
+        reason,
+        status: 'cooldown',
+      })
+    }
     const next = markVmRestriction(file, { until, reason })
     if (next) {
       vm.claude = next.claude || vm.claude
@@ -1202,19 +1643,32 @@ export class PoolScheduler extends EventEmitter {
   }
 
   clearQuotaRestriction(vm, accountId, file, state = undefined) {
-    if (state === undefined) state = this.runtimeRepo?.get?.(accountId)
+    if (state === undefined) state = this._getRuntimeStateCached(accountId)
     if (hardBlockOf(state)) return false
     const reason = state?.cooldown_reason || vm.claude?.temp_unschedulable_reason || vm.temp_unschedulable_reason
     if (reason && !isAccountRestrictionReason(reason) && !isQuotaWindowReason(reason)) return false
     if (isAuthCooldownReason(reason)) return false
     if (state && isAccountRestrictionReason(state.cooldown_reason)) {
-      this.runtimeRepo?.upsert?.({
-        account_id: accountId,
-        vm_id: vm.id,
-        cooldown_until: null,
-        cooldown_reason: null,
-        status: 'ready',
-      })
+      const pgPool = this._resolvePgPool()
+      if (pgPool && typeof pgPool.query === 'function') {
+        const nextState = { ...state, cooldown_until: null, cooldown_reason: null, status: 'ready' }
+        this._pgRuntimeStateCache.set(accountId, nextState)
+        void this._markSuccessPgAsync(pgPool, {
+          account_id: accountId,
+          vm_id: vm.id,
+          last_used_at: state.last_used_at || null,
+          worker_heartbeat_at: state.worker_heartbeat_at || null,
+          worker_status: state.worker_status || null,
+        }).catch(() => {})
+      } else {
+        this.runtimeRepo?.upsert?.({
+          account_id: accountId,
+          vm_id: vm.id,
+          cooldown_until: null,
+          cooldown_reason: null,
+          status: 'ready',
+        })
+      }
     }
     const next = clearVmQuotaRestriction(file)
     if (next) {

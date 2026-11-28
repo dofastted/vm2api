@@ -93,6 +93,24 @@ function createMockRedis() {
       if (!h || !h.size) return {}
       return Object.fromEntries(h.entries())
     }
+    if (cmd === 'zremrangebyscore') {
+      const [key, , maxScore] = args
+      const z = zsets.get(key)
+      if (!z) return 0
+      const cutoff = Number(maxScore)
+      let removed = 0
+      for (const [m, sc] of z) {
+        if (sc <= cutoff) {
+          z.delete(m)
+          removed += 1
+        }
+      }
+      return removed
+    }
+    if (cmd === 'zcard') {
+      const z = zsets.get(args[0])
+      return z ? z.size : 0
+    }
     if (cmd === 'eval') {
       const [script, numKeys, ...rest] = args
       const keys = rest.slice(0, numKeys)
@@ -182,6 +200,8 @@ function createMockRedis() {
       incr: (...a) => (queue.push(['incr', a]), chain),
       expire: (...a) => (queue.push(['expire', a]), chain),
       hgetall: (...a) => (queue.push(['hgetall', a]), chain),
+      zremrangebyscore: (...a) => (queue.push(['zremrangebyscore', a]), chain),
+      zcard: (...a) => (queue.push(['zcard', a]), chain),
       eval: (...a) => (queue.push(['eval', a]), chain),
       exec: async () => queue.map(([c, a]) => [null, execCommand(c, a)]),
     }
@@ -1149,4 +1169,171 @@ test('FailoverRunner emits non-blocking requestLog.updatePhase transitions (rout
     true,
     'OAuth VM phases must not pass literal active_provider="claude" that shadows VM names in UI',
   )
+})
+
+test('ConcurrencyCache.getBatchConcurrency coalesces concurrent queries via singleflight, caches for 200ms, and supports { fresh: true } bypass', async () => {
+  await withMockRedis(async (rt, mock) => {
+    await rt.concurrency.acquire('account:a1', 'r1', 5)
+    await rt.concurrency.acquire('account:a1', 'r2', 5)
+    await rt.concurrency.acquire('account:a2', 'r3', 5)
+
+    // Delay pipeline exec slightly so concurrent calls overlap on singleflight
+    let pipelineExecs = 0
+    const origPipeline = mock.pipeline.bind(mock)
+    mock.pipeline = () => {
+      const chain = origPipeline()
+      const origExec = chain.exec.bind(chain)
+      chain.exec = async () => {
+        pipelineExecs += 1
+        await new Promise((r) => setTimeout(r, 15))
+        return origExec()
+      }
+      return chain
+    }
+
+    // 1. 10 concurrent calls coalesce into 1 Redis Pipeline
+    const concurrent = await Promise.all(
+      Array.from({ length: 10 }, () => rt.concurrency.getBatchConcurrency('account', ['a1', 'a2', 'a3'])),
+    )
+    assert.equal(pipelineExecs, 1, '10 concurrent calls must coalesce into 1 Redis Pipeline')
+    assert.equal(rt.concurrency.batchSingleflightCoalesced, 9)
+    for (const m of concurrent) {
+      assert.equal(m.get('a1'), 2)
+      assert.equal(m.get('a2'), 1)
+      assert.equal(m.get('a3'), 0)
+    }
+
+    // 2. Subsequent call within 200ms hits in-process short-TTL cache (0 Redis pipelines)
+    await rt.concurrency.acquire('account:a1', 'r4', 5)
+    const cached = await rt.concurrency.getBatchConcurrency('account', ['a1', 'a2'])
+    assert.equal(pipelineExecs, 1, 'read within 200ms TTL must hit in-process cache')
+    assert.equal(cached.get('a1'), 2)
+
+    // 3. { fresh: true } bypasses 200ms cache on contention and refreshes cache
+    const fresh = await rt.concurrency.getBatchConcurrency('account', ['a1', 'a2'], { fresh: true })
+    assert.equal(pipelineExecs, 2, '{ fresh: true } must bypass 200ms cache')
+    assert.equal(fresh.get('a1'), 3)
+    const afterFresh = await rt.concurrency.getBatchConcurrency('account', ['a1'])
+    assert.equal(pipelineExecs, 2, 'subsequent read reuses refreshed cache entry')
+    assert.equal(afterFresh.get('a1'), 3)
+  })
+})
+
+test('PoolScheduler PG mode offloads heartbeats, clearExpired, schedulingSnapshot, and markSuccess to async pgPool and reads cache.scheduler snapshot', async (t) => {
+  t.after(async () => {
+    await closeCacheRuntime()
+  })
+  await closeCacheRuntime()
+  const rt = await initCacheRuntime({ redisConfig: null })
+
+  const pgQueries = []
+  const mockPgPool = {
+    query: async (sql, params = []) => {
+      pgQueries.push({ sql, params })
+      if (/FROM account_runtime[\s\S]*model_states_json/i.test(sql)) {
+        return { rows: [] }
+      }
+      if (/UPDATE accounts[\s\S]*RETURNING id/i.test(sql)) {
+        return { rows: [{ id: 'acc-1', cooldown_cleared: true }] }
+      }
+      return { rows: [], rowCount: 1 }
+    },
+  }
+
+  let syncRepoCalls = 0
+  const syncTrapRepo = {
+    get: () => {
+      syncRepoCalls += 1
+      return null
+    },
+    upsert: () => {
+      syncRepoCalls += 1
+      return null
+    },
+    writeHeartbeat: () => {
+      syncRepoCalls += 1
+    },
+    clearExpired: () => {
+      syncRepoCalls += 1
+    },
+    schedulingSnapshot: () => {
+      syncRepoCalls += 1
+      return new Map()
+    },
+  }
+
+  let stickyAsyncPurges = 0
+  let stickySyncPurges = 0
+  const mockSticky = {
+    purgeExpiredAsync: async () => {
+      stickyAsyncPurges += 1
+      return 0
+    },
+    repo: {
+      purgeExpired: () => {
+        stickySyncPurges += 1
+      },
+    },
+  }
+
+  // Provide scheduler L1 snapshot hook (matching stage1-sched contract)
+  const snapState = {
+    account_id: 'acc-1',
+    vm_id: 'vm-1',
+    status: 'ready',
+    worker_status: { ok: true, from: 'sched-snap' },
+  }
+  rt.scheduler.getSchedulingSnapshotSync = () => ({
+    byAccountId: new Map([['acc-1', { account: null, state: snapState }]]),
+  })
+
+  const scheduler = new PoolScheduler({
+    runtimeRepo: syncTrapRepo,
+    stickyRouter: mockSticky,
+    pgPool: mockPgPool,
+    config: { heartbeat_quiet_window_ms: 0 },
+  })
+
+  // 1. resolveCandidateForNode consumes cache.scheduler.getSchedulingSnapshotSync with 0 sync repo calls
+  const cand = scheduler.resolveCandidateForNode({ node_id: 'acc-1', node_key: 'claude_vm:acc-1' })
+  assert.equal(cand.state?.worker_status?.from, 'sched-snap')
+  assert.equal(syncRepoCalls, 0)
+
+  // 2. flushHealthWrites batches multiple accounts into 1 async pgPool UNNEST query
+  const now = Date.now()
+  scheduler.healthWrites.set('acc-1', {
+    account_id: 'acc-1',
+    vm_id: 'vm-1',
+    status: 'ready',
+    worker_heartbeat_at: now,
+    worker_status: { ok: true },
+    credential_generation: 2,
+    refresh_status: 'fresh',
+  })
+  scheduler.healthWrites.set('acc-2', {
+    account_id: 'acc-2',
+    vm_id: 'vm-2',
+    status: 'ready',
+    worker_heartbeat_at: now,
+    worker_status: { ok: true },
+    credential_generation: 3,
+    refresh_status: 'fresh',
+  })
+  await scheduler.flushHealthWrites()
+  assert.equal(syncRepoCalls, 0, 'PG flushHealthWrites must not call sync runtimeRepo.writeHeartbeat')
+  assert.equal(pgQueries.filter((q) => /INSERT INTO account_runtime[\s\S]*UNNEST/i.test(q.sql)).length, 1)
+
+  // 3. maintain() runs async PG clearExpired + stickyRouter.purgeExpiredAsync (0 sync calls)
+  await scheduler.maintain()
+  assert.equal(syncRepoCalls, 0, 'PG maintain() must not call sync runtimeRepo.clearExpired')
+  assert.equal(stickyAsyncPurges, 1)
+  assert.equal(stickySyncPurges, 0)
+  assert.ok(pgQueries.some((q) => /UPDATE accounts[\s\S]*temp_unschedulable_until/i.test(q.sql)))
+
+  // 4. markSuccess() offloads runtime write to async pgPool (0 sync runtimeRepo.get/upsert)
+  pgQueries.length = 0
+  scheduler.markSuccess({ accountId: 'acc-1', vmId: 'vm-1', state: snapState })
+  await new Promise((r) => setTimeout(r, 10))
+  assert.equal(syncRepoCalls, 0, 'PG markSuccess() must not call sync runtimeRepo.get/upsert')
+  assert.ok(pgQueries.some((q) => /INSERT INTO account_runtime/i.test(q.sql)))
 })
