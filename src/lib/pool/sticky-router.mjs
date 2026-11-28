@@ -5,14 +5,31 @@
 
 import crypto from 'node:crypto'
 import { ENVELOPE_NEEDLES, extractPrompt } from '../core/distill-detect.mjs'
-import { DB_INSTANCE_ID, getDb, isDbOpen, resolveStoreDb } from '../db/database.mjs'
+import { DB_INSTANCE_ID, getDb, getPgPool, isDbOpen, resolveStoreDb } from '../db/database.mjs'
 import { enqueueWrite, writeBehindArmed } from '../db/write-behind.mjs'
 import { getCacheRuntime } from '../cache/index.mjs'
 import { StickyRepo } from '../db/repos/sticky-repo.mjs'
 
 const STICKY_REDIS_TTL_MS = 3_600_000
 const STICKY_L1_MAX = 16_384
+const STICKY_L1_NEG_MAX = 16_384
+const STICKY_L1_NEG_TTL_MS = 15_000
 const STICKY_RENEW_MIN_GAP_MS = 60_000
+
+function rowToStickyEntry(row) {
+  if (!row) return null
+  return {
+    account_id: row.account_id,
+    vm_id: row.vm_id,
+    session_id: row.session_id,
+    device_id: row.device_id || null,
+    bound_at: row.bound_at == null ? null : Number(row.bound_at),
+    expires_at: row.expires_at == null ? null : Number(row.expires_at),
+    hits: Number(row.hits) || 0,
+    generation: Number(row.generation) || 0,
+    slot_index: row.slot_index == null ? null : Number(row.slot_index),
+  }
+}
 import {
   claudeCodeAgentRootSession,
   extractCallerSession,
@@ -278,16 +295,24 @@ export function childDeclaredWithoutParent(body = {}, headers = {}) {
 }
 
 export class StickyRouter {
-  constructor({ dataDir, db, config, writeBehind = null }) {
+  constructor({ dataDir, db, config, writeBehind = null, pgPool = null }) {
     this.db = resolveStoreDb({ db, dataDir })
     this.repo = new StickyRepo(this.db)
     this.config = mergeStickyConfig(config)
     this._explicitWriteBehind = typeof writeBehind === 'boolean' ? writeBehind : null
+    this._explicitPgPool = pgPool || null
     this._l1 = new Map() // key -> { ent, renewedAt }
+    this._l1Neg = new Map() // key -> expiresAtMs
     this._latestByDevice = new Map() // `${prefix}\0${device}` -> { key, bound_at, expires_at }
+    this._pendingPgWrites = new Set()
     this._stmtLatestByDevice = null
     this._prepareAuxStatements()
-    this.repo.dropAliasKeys()
+    const resolvedPg = this._resolvePgPool()
+    if (resolvedPg && typeof resolvedPg.query === 'function') {
+      this._trackPgWrite(this._dropAliasKeysPgAsync(resolvedPg))
+    } else {
+      this.repo.dropAliasKeys()
+    }
   }
 
   _prepareAuxStatements() {
@@ -308,6 +333,92 @@ export class StickyRouter {
     return isDbOpen() && this.db === getDb()
   }
 
+  _resolvePgPool() {
+    if (this._explicitPgPool !== null) return this._explicitPgPool
+    if (this.db?.engine === 'postgres' && this._isPrimaryDb()) return getPgPool()
+    return null
+  }
+
+  _trackPgWrite(promise) {
+    if (!promise || typeof promise.then !== 'function') return
+    const p = promise
+      .catch(() => {})
+      .finally(() => {
+        this._pendingPgWrites.delete(p)
+      })
+    this._pendingPgWrites.add(p)
+  }
+
+  /** Wait for all in-flight async PG sticky write-backs to finish (graceful shutdown & tests). */
+  async flushPendingWrites() {
+    while (this._pendingPgWrites.size > 0) {
+      await Promise.allSettled([...this._pendingPgWrites])
+    }
+  }
+
+  async _dropAliasKeysPgAsync(pgPool) {
+    await pgPool.query(
+      `DELETE FROM sticky_sessions
+       WHERE key = 'envelope'
+         OR key LIKE 'ch:%'
+         OR key LIKE 'dev:%'
+         OR key LIKE '%:envelope'
+         OR key LIKE '%:ch:%'
+         OR key LIKE '%:dev:%'`,
+    )
+  }
+
+  async _getFromPgAsync(pgPool, key) {
+    try {
+      const res = await pgPool.query('SELECT * FROM sticky_sessions WHERE key = $1', [key])
+      return rowToStickyEntry(res?.rows?.[0] || null)
+    } catch {
+      return null
+    }
+  }
+
+  async _getManyFromPgAsync(pgPool, keys) {
+    const out = new Map()
+    if (!keys?.length) return out
+    try {
+      const res = await pgPool.query('SELECT * FROM sticky_sessions WHERE key = ANY($1::text[])', [keys])
+      for (const row of res?.rows || []) {
+        const ent = rowToStickyEntry(row)
+        if (ent && row.key) out.set(row.key, ent)
+      }
+    } catch {}
+    return out
+  }
+
+  async _upsertPgAsync(pgPool, key, ent) {
+    await pgPool.query(
+      `INSERT INTO sticky_sessions (key, account_id, vm_id, session_id, device_id, bound_at, expires_at, hits, generation, slot_index)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+       ON CONFLICT (key) DO UPDATE SET
+         account_id = EXCLUDED.account_id,
+         vm_id = EXCLUDED.vm_id,
+         session_id = EXCLUDED.session_id,
+         device_id = COALESCE(EXCLUDED.device_id, sticky_sessions.device_id),
+         bound_at = EXCLUDED.bound_at,
+         expires_at = EXCLUDED.expires_at,
+         hits = EXCLUDED.hits,
+         generation = EXCLUDED.generation,
+         slot_index = EXCLUDED.slot_index`,
+      [
+        key,
+        ent.account_id ?? null,
+        ent.vm_id ?? null,
+        ent.session_id ?? null,
+        ent.device_id ?? null,
+        ent.bound_at != null ? Math.trunc(Number(ent.bound_at) || Date.now()) : Date.now(),
+        ent.expires_at != null ? Math.trunc(Number(ent.expires_at) || 0) : null,
+        Math.trunc(Number(ent.hits) || 0),
+        Math.trunc(Number(ent.generation) || 0),
+        ent.slot_index == null ? null : Math.trunc(Number(ent.slot_index) || 0),
+      ],
+    )
+  }
+
   _redisStickyKey(key) {
     if (!key) return ''
     if (this._isPrimaryDb()) return String(key)
@@ -321,6 +432,7 @@ export class StickyRouter {
 
   _putL1(key, ent, now = Date.now()) {
     if (!key || !ent) return
+    this._l1Neg.delete(key)
     if (this._l1.has(key)) this._l1.delete(key)
     while (this._l1.size >= STICKY_L1_MAX) {
       const oldest = this._l1.keys().next().value
@@ -329,6 +441,27 @@ export class StickyRouter {
     }
     this._l1.set(key, { ent: { ...ent }, renewedAt: now })
     this._indexLatestParent(key, ent)
+  }
+
+  _putL1Neg(key, now = Date.now()) {
+    if (!key) return
+    if (this._l1Neg.has(key)) this._l1Neg.delete(key)
+    while (this._l1Neg.size >= STICKY_L1_NEG_MAX) {
+      const oldest = this._l1Neg.keys().next().value
+      if (oldest === undefined) break
+      this._l1Neg.delete(oldest)
+    }
+    this._l1Neg.set(key, now + STICKY_L1_NEG_TTL_MS)
+  }
+
+  _isL1Neg(key, now = Date.now()) {
+    const exp = this._l1Neg.get(key)
+    if (exp === undefined) return false
+    if (exp <= now) {
+      this._l1Neg.delete(key)
+      return false
+    }
+    return true
   }
 
   _indexLatestParent(key, ent) {
@@ -354,6 +487,8 @@ export class StickyRouter {
   _getEntrySync(key) {
     const cached = this._l1.get(key)
     if (cached) return cached.ent
+    if (this._isL1Neg(key)) return null
+    if (this._resolvePgPool()) return null
     const fromDb = this.repo.get(key)
     if (fromDb) this._putL1(key, fromDb)
     return fromDb || null
@@ -373,6 +508,7 @@ export class StickyRouter {
   /** Kept for API compat + post-restore hook (state lives in DB). */
   reload() {
     this._l1.clear()
+    this._l1Neg.clear()
     this._latestByDevice.clear()
   }
 
@@ -381,6 +517,7 @@ export class StickyRouter {
     this.db = db
     this.repo = new StickyRepo(db)
     this._l1.clear()
+    this._l1Neg.clear()
     this._latestByDevice.clear()
     this._prepareAuxStatements()
   }
@@ -496,6 +633,36 @@ export class StickyRouter {
         return memo.key
       }
       if (memo.expires_at <= now) this._latestByDevice.delete(mapKey)
+    }
+
+    const pgPool = this._resolvePgPool()
+    if (pgPool && typeof pgPool.query === 'function') {
+      // Non-blocking PG backfill of _latestByDevice; never block main thread with PgSyncDb
+      void pgPool
+        .query(
+          `SELECT key, device_id, bound_at, expires_at
+           FROM sticky_sessions
+           WHERE device_id = $1 AND expires_at > $2 AND bound_at >= $3
+           ORDER BY bound_at DESC
+           LIMIT 50`,
+          [device, now, now - withinMs],
+        )
+        .then((res) => {
+          for (const row of res?.rows || []) {
+            const key = String(row.key || '')
+            if (!key.startsWith(prefix)) continue
+            const rest = key.slice(prefix.length)
+            if (!rest || /^(fam:|ch:|dev:|envelope$|login$)/.test(rest)) continue
+            this._latestByDevice.set(mapKey, {
+              key,
+              bound_at: Number(row.bound_at) || 0,
+              expires_at: Number(row.expires_at) || 0,
+            })
+            break
+          }
+        })
+        .catch(() => {})
+      return null
     }
 
     if (this._stmtLatestByDevice) {
@@ -638,6 +805,16 @@ export class StickyRouter {
       return this._formatBinding(key, ent)
     }
 
+    if (this._isL1Neg(key, now)) return null
+
+    // In PG mode, never block the main thread with synchronous PgSyncDb Atomics.wait;
+    // hot paths prewarm via `prewarmKeys()` / `resolveAsync()` (Redis -> async pgPool).
+    const pgPool = this._resolvePgPool()
+    if (pgPool && typeof pgPool.query === 'function') {
+      void this.resolveAsync(key).catch(() => {})
+      return null
+    }
+
     const ent = this.repo.get(key)
     if (!ent) return null
     if (now > ent.expires_at) {
@@ -652,7 +829,7 @@ export class StickyRouter {
   }
 
   /**
-   * Async Redis-first sticky lookup: L1 -> Redis `getSticky` (auto-renews 1h TTL) -> DB backfill.
+   * Async Redis-first sticky lookup: L1 -> Redis `getSticky` (auto-renews 1h TTL) -> async pgPool / SQLite backfill.
    */
   async resolveAsync(key) {
     if (!key || !this.config.enabled) return null
@@ -685,17 +862,91 @@ export class StickyRouter {
       }
     }
 
+    const pgPool = this._resolvePgPool()
+    if (pgPool && typeof pgPool.query === 'function') {
+      const fromPg = await this._getFromPgAsync(pgPool, key)
+      if (fromPg && (!fromPg.expires_at || now <= Number(fromPg.expires_at))) {
+        this._putL1(key, fromPg, now)
+        if (hasRedis) {
+          const ttlMs = Math.min(
+            STICKY_REDIS_TTL_MS,
+            Math.max(1_000, Number(fromPg.expires_at || now + STICKY_REDIS_TTL_MS) - now),
+          )
+          cache.concurrency.setSticky(this._redisStickyKey(key), fromPg, { ttlMs }).catch(() => {})
+        }
+        return this._formatBinding(key, fromPg)
+      }
+      this._putL1Neg(key, now)
+      return null
+    }
+
     return this.resolve(key)
   }
 
-  /** Prewarm candidate sticky keys from Redis into L1 in parallel (no-op without Redis). */
+  /** Prewarm candidate sticky keys from Redis + batched async PG into L1 (0 Atomics.wait in PG mode). */
   async prewarmKeys(keys) {
     if (!this.config.enabled || !Array.isArray(keys) || !keys.length) return
     const cache = getCacheRuntime()
-    if (!cache?.client?.hasRedis) return
-    const unique = [...new Set(keys.filter((k) => k && !this._l1.has(k)))]
+    const hasRedis = Boolean(cache?.client?.hasRedis)
+    const pgPool = this._resolvePgPool()
+    if (!hasRedis && !pgPool) return
+    const now = Date.now()
+    const unique = [...new Set(keys.filter((k) => k && !this._l1.has(k) && !this._isL1Neg(k, now)))]
     if (!unique.length) return
-    await Promise.all(unique.map((k) => this.resolveAsync(k).catch(() => null)))
+
+    let misses = unique
+    if (hasRedis) {
+      const redisResults = await Promise.all(
+        unique.map(async (k) => {
+          try {
+            const ent = await cache.concurrency.getSticky(this._redisStickyKey(k), {
+              renewTtlMs: STICKY_REDIS_TTL_MS,
+            })
+            return { k, ent }
+          } catch {
+            return { k, ent: null }
+          }
+        }),
+      )
+      misses = []
+      for (const { k, ent } of redisResults) {
+        if (
+          ent &&
+          typeof ent === 'object' &&
+          ent.account_id &&
+          ent.vm_id &&
+          (!ent.expires_at || now <= Number(ent.expires_at))
+        ) {
+          this._putL1(k, ent, now)
+        } else {
+          misses.push(k)
+        }
+      }
+    }
+
+    if (!misses.length) return
+    if (pgPool && typeof pgPool.query === 'function') {
+      const fromPg = await this._getManyFromPgAsync(pgPool, misses)
+      for (const k of misses) {
+        const ent = fromPg.get(k)
+        if (ent && (!ent.expires_at || now <= Number(ent.expires_at))) {
+          this._putL1(k, ent, now)
+          if (hasRedis) {
+            const ttlMs = Math.min(
+              STICKY_REDIS_TTL_MS,
+              Math.max(1_000, Number(ent.expires_at || now + STICKY_REDIS_TTL_MS) - now),
+            )
+            cache.concurrency.setSticky(this._redisStickyKey(k), ent, { ttlMs }).catch(() => {})
+          }
+        } else {
+          this._putL1Neg(k, now)
+        }
+      }
+      return
+    }
+    for (const k of misses) {
+      this.resolve(k)
+    }
   }
 
   _persistUpsert(key, entry) {
@@ -705,6 +956,12 @@ export class StickyRouter {
       cache.concurrency.setSticky(this._redisStickyKey(key), entry, { ttlMs }).catch(() => {})
     }
     this._putL1(key, entry)
+    const pgPool = this._resolvePgPool()
+    if (pgPool && typeof pgPool.query === 'function') {
+      const snapshot = { ...entry }
+      this._trackPgWrite(this._upsertPgAsync(pgPool, key, snapshot))
+      return
+    }
     if (this._shouldWriteBehind()) {
       const snapshot = { ...entry }
       enqueueWrite(() => this.repo.upsert(key, snapshot))
@@ -864,15 +1121,25 @@ export class StickyRouter {
     return result
   }
 
+  clear(key) {
+    return this.unbind(key)
+  }
+
   unbind(key) {
     if (!key) return
     this._l1.delete(key)
+    this._putL1Neg(key)
     for (const [mk, rec] of this._latestByDevice) {
       if (rec.key === key) this._latestByDevice.delete(mk)
     }
     const cache = getCacheRuntime()
     if (cache?.client?.hasRedis) {
       cache.concurrency.delSticky(this._redisStickyKey(key)).catch(() => {})
+    }
+    const pgPool = this._resolvePgPool()
+    if (pgPool && typeof pgPool.query === 'function') {
+      this._trackPgWrite(pgPool.query('DELETE FROM sticky_sessions WHERE key = $1', [key]))
+      return
     }
     if (this._shouldWriteBehind()) {
       enqueueWrite(() => this.repo.remove(key))
@@ -882,18 +1149,46 @@ export class StickyRouter {
   }
 
   unbindByAccount({ accountId = null, vmId = null } = {}) {
+    if (!accountId && !vmId) return 0
     const keysToDelete = new Set()
     for (const [k, { ent }] of this._l1) {
       if ((accountId && ent?.account_id === accountId) || (vmId && ent?.vm_id === vmId)) {
         keysToDelete.add(k)
         this._l1.delete(k)
+        this._putL1Neg(k)
       }
     }
     for (const [mk, rec] of this._latestByDevice) {
       if (keysToDelete.has(rec.key)) this._latestByDevice.delete(mk)
     }
     const cache = getCacheRuntime()
-    if (cache?.client?.hasRedis) {
+    const hasRedis = Boolean(cache?.client?.hasRedis)
+    const pgPool = this._resolvePgPool()
+    if (pgPool && typeof pgPool.query === 'function') {
+      if (hasRedis) {
+        for (const k of keysToDelete) {
+          cache.concurrency.delSticky(this._redisStickyKey(k)).catch(() => {})
+        }
+      }
+      this._trackPgWrite(
+        pgPool
+          .query('DELETE FROM sticky_sessions WHERE account_id = $1 OR vm_id = $2 RETURNING key', [
+            accountId || '',
+            vmId || '',
+          ])
+          .then((res) => {
+            if (!hasRedis) return
+            for (const row of res?.rows || []) {
+              if (row?.key && !keysToDelete.has(row.key)) {
+                this._putL1Neg(row.key)
+                cache.concurrency.delSticky(this._redisStickyKey(row.key)).catch(() => {})
+              }
+            }
+          }),
+      )
+      return keysToDelete.size
+    }
+    if (hasRedis) {
       try {
         for (const [k, ent] of Object.entries(this.repo.all() || {})) {
           if ((accountId && ent?.account_id === accountId) || (vmId && ent?.vm_id === vmId)) {
@@ -917,8 +1212,40 @@ export class StickyRouter {
       .map(([key, ent]) => ({ key, accountId: ent.account_id, vmId: ent.vm_id }))
   }
 
+  _pruneLocalExpired(now = Date.now()) {
+    for (const [k, { ent }] of this._l1) {
+      if (ent?.expires_at && now > ent.expires_at) this._l1.delete(k)
+    }
+    for (const [k, exp] of this._l1Neg) {
+      if (exp <= now) this._l1Neg.delete(k)
+    }
+    for (const [mk, rec] of this._latestByDevice) {
+      if (rec?.expires_at && now > rec.expires_at) this._latestByDevice.delete(mk)
+    }
+  }
+
+  async purgeExpiredAsync(now = Date.now()) {
+    this._pruneLocalExpired(now)
+    const pgPool = this._resolvePgPool()
+    if (pgPool && typeof pgPool.query === 'function') {
+      const res = await pgPool.query('DELETE FROM sticky_sessions WHERE expires_at < $1', [now])
+      return Number(res?.rowCount) || 0
+    }
+    return this.repo.purgeExpired(now)
+  }
+
+  purgeExpired(now = Date.now()) {
+    this._pruneLocalExpired(now)
+    const pgPool = this._resolvePgPool()
+    if (pgPool && typeof pgPool.query === 'function') {
+      this._trackPgWrite(this.purgeExpiredAsync(now))
+      return 0
+    }
+    return this.repo.purgeExpired(now)
+  }
+
   _purge() {
-    this.repo.purgeExpired(Date.now())
+    this.purgeExpired(Date.now())
   }
 
   stats() {

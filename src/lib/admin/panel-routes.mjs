@@ -3686,7 +3686,19 @@ export function createPanelHandler(ctx) {
           },
           { freshTtlMs: 15_000, ttlMs: 30_000, bypass },
         )
-        return sendCachedJson(req, res, 200, payload)
+        let responsePayload = payload
+        if (!tenant && payload && typeof payload === 'object') {
+          const liveCfg = requestLog.snapshot()
+          responsePayload = {
+            ...payload,
+            config: {
+              ...(payload.config || liveCfg),
+              inflight_count: liveCfg.inflight_count,
+              pg_log_writer: liveCfg.pg_log_writer,
+            },
+          }
+        }
+        return sendCachedJson(req, res, 200, responsePayload)
       }
       if (req.method === 'GET' && /^\/api\/panel\/request-logs\/[^/]+\/attempts$/.test(p)) {
         const requestId = p.split('/')[4]
@@ -5485,7 +5497,8 @@ export function createPanelHandler(ctx) {
         if (!requireAuth(req, res)) return
         const id = p.split('/')[4]
         const body = await readBody(req).catch(() => ({}))
-        if (isCodexVm(getVm(cfg.paths.project, id) || { id })) return json(res, 400, { ok: false, error: { message: 'warmup 仅支持 Claude 槽位' } })
+        if (isCodexVm(getVm(cfg.paths.project, id) || { id }))
+          return json(res, 400, { ok: false, error: { message: 'warmup 仅支持 Claude 槽位' } })
         const cfg2 = normalizeWarmupConfig(ctx.routingConfig?.warmup)
         const targetRpm = body?.target_rpm != null ? Number(body.target_rpm) : undefined
         const vmPath = path.join(cfg.paths.project, 'vms', `${id}.json`)
@@ -5503,7 +5516,16 @@ export function createPanelHandler(ctx) {
           })
           atomicWriteJson(vmPath, vm, { mode: 0o600 })
           accountQuota.setMaxRpmForVm(id, segment.target_rpm, { override: true })
-          return { status: 200, body: { ok: true, warmup: warmupSummary(vm.policy, { schedulable: vm.schedulable !== false, fatalWindowHours: cfg2.fatal_window_hours }) } }
+          return {
+            status: 200,
+            body: {
+              ok: true,
+              warmup: warmupSummary(vm.policy, {
+                schedulable: vm.schedulable !== false,
+                fatalWindowHours: cfg2.fatal_window_hours,
+              }),
+            },
+          }
         })
         return json(res, result.status, result.body)
       }

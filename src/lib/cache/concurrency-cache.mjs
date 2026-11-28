@@ -17,8 +17,10 @@ const RPM_PREFIX = 'rpm:'
 const STICKY_PREFIX = 'sticky:'
 const DEFAULT_TTL_SEC = 300
 const DEFAULT_STICKY_TTL_MS = 3_600_000
+const DEFAULT_BATCH_CACHE_TTL_MS = 200
 const MAX_LOCAL_RPM_ENTRIES = 16_384
 const MAX_LOCAL_STICKY_ENTRIES = 16_384
+const MAX_BATCH_CACHE_ENTRIES = 16_384
 
 const ACQUIRE_SLOT_LUA = `
 local t = redis.call('TIME')
@@ -70,15 +72,42 @@ return redis.call('ZCARD', KEYS[1])
 `
 
 export class ConcurrencyCache {
-  constructor(cacheClient, { slotTtlSec = DEFAULT_TTL_SEC } = {}) {
+  constructor(cacheClient, { slotTtlSec = DEFAULT_TTL_SEC, batchCacheTtlMs = DEFAULT_BATCH_CACHE_TTL_MS } = {}) {
     this.cache = cacheClient
     this.slotTtlSec = Math.max(10, Number(slotTtlSec) || DEFAULT_TTL_SEC)
+    this.batchCacheTtlMs = Math.max(0, Number(batchCacheTtlMs ?? DEFAULT_BATCH_CACHE_TTL_MS) || 0)
     /** Fallback in-process slots: scope -> Map<reqId, expiresAtMs> */
     this.local = new Map()
     /** Fallback in-process RPM buckets: bucketKey -> { count, expiresAtMs } */
     this.localRpm = new Map()
     /** Fallback in-process Sticky sessions (used only when Redis is unavailable) */
     this.localSticky = new BoundedLruCache(MAX_LOCAL_STICKY_ENTRIES)
+    /** Short-TTL (200ms) in-process batch concurrency cache: `${prefix}${id}:${ttl}` -> { count, expiresAt } */
+    this._batchCache = new Map()
+    /** Singleflight map for concurrent Redis batch reads: `${prefix}|${ttl}|${sortedIds}` -> Promise */
+    this._batchInflight = new Map()
+    this.batchCacheHits = 0
+    this.batchSingleflightCoalesced = 0
+  }
+
+  clearBatchCache() {
+    this._batchCache.clear()
+  }
+
+  _putBatchCache(prefix, ttl, id, count, cacheTtlMs, now) {
+    if (cacheTtlMs <= 0) return
+    const key = `${prefix}${id}:${ttl}`
+    if (!this._batchCache.has(key) && this._batchCache.size >= MAX_BATCH_CACHE_ENTRIES) {
+      for (const [k, v] of this._batchCache) {
+        if (v.expiresAt <= now) this._batchCache.delete(k)
+      }
+      while (this._batchCache.size >= MAX_BATCH_CACHE_ENTRIES) {
+        const oldest = this._batchCache.keys().next().value
+        if (oldest === undefined) break
+        this._batchCache.delete(oldest)
+      }
+    }
+    this._batchCache.set(key, { count, expiresAt: now + cacheTtlMs })
   }
 
   _pruneLocal(scope, now = Date.now()) {
@@ -204,37 +233,114 @@ export class ConcurrencyCache {
   /**
    * Pipeline-batched active concurrency count for multiple IDs under `scope`
    * (e.g. scope='account'|'user'|'key', or '' if ids are already full scopes).
+   *
+   * Applies a 200ms in-process short-TTL cache + singleflight Promise coalescing
+   * in Redis mode (modeled on sub2api) so concurrent requests collapse into 1
+   * Redis Pipeline per 200ms window. Pass `{ fresh: true }` on slot-acquire
+   * contention to bypass the cache and read fresh counts directly from Redis.
+   *
+   * @param {string} scope
+   * @param {string[]} ids
+   * @param {number | { ttlSec?: number, fresh?: boolean, cacheTtlMs?: number }} [opts]
    * @returns {Promise<Map<string, number>>}
    */
-  async getBatchConcurrency(scope, ids, ttlSec = this.slotTtlSec) {
+  async getBatchConcurrency(scope, ids, opts = this.slotTtlSec) {
     const out = new Map()
     if (!Array.isArray(ids) || !ids.length) return out
     const uniqueIds = [...new Set(ids.filter((id) => id != null && id !== '').map(String))]
     if (!uniqueIds.length) return out
 
+    let ttlSec = this.slotTtlSec
+    let fresh = false
+    let cacheTtlMs = this.batchCacheTtlMs
+    if (opts && typeof opts === 'object') {
+      if (opts.ttlSec != null) ttlSec = opts.ttlSec
+      fresh = opts.fresh === true
+      if (opts.cacheTtlMs != null) cacheTtlMs = Math.max(0, Number(opts.cacheTtlMs) || 0)
+    } else if (opts != null) {
+      ttlSec = opts
+    }
+
     const ttl = Math.max(5, Number(ttlSec) || this.slotTtlSec)
     const prefix = scope ? `${scope}:` : ''
 
     if (this.cache?.hasRedis) {
-      try {
-        const nowSec = await this._redisNowSec()
-        const cutoff = nowSec - ttl
-        const pipe = this.cache.redis.pipeline()
+      const nowMs = Date.now()
+      const cachedHits = new Map()
+      const missingIds = []
+      if (!fresh && cacheTtlMs > 0) {
         for (const id of uniqueIds) {
-          const rKey = this.cache.redisKey(`${SLOT_PREFIX}${prefix}${id}`)
-          pipe.zremrangebyscore(rKey, '-inf', cutoff)
-          pipe.zcard(rKey)
-        }
-        const results = await pipe.exec()
-        if (Array.isArray(results)) {
-          for (let i = 0; i < uniqueIds.length; i += 1) {
-            const [cardErr, cardVal] = results[i * 2 + 1] || []
-            out.set(uniqueIds[i], !cardErr ? Number(cardVal) || 0 : 0)
+          const entry = this._batchCache.get(`${prefix}${id}:${ttl}`)
+          if (entry && entry.expiresAt > nowMs) {
+            cachedHits.set(id, entry.count)
+          } else {
+            if (entry) this._batchCache.delete(`${prefix}${id}:${ttl}`)
+            missingIds.push(id)
           }
+        }
+        if (missingIds.length === 0) {
+          this.batchCacheHits += 1
+          for (const id of uniqueIds) out.set(id, cachedHits.get(id) ?? 0)
           return out
         }
-      } catch {
-        this.cache.l2Errors += 1
+      } else {
+        missingIds.push(...uniqueIds)
+      }
+
+      const fetchFromRedis = async (targetIds) => {
+        const fetched = new Map()
+        try {
+          const nowSec = await this._redisNowSec()
+          const cutoff = nowSec - ttl
+          const pipe = this.cache.redis.pipeline()
+          for (const id of targetIds) {
+            const rKey = this.cache.redisKey(`${SLOT_PREFIX}${prefix}${id}`)
+            pipe.zremrangebyscore(rKey, '-inf', cutoff)
+            pipe.zcard(rKey)
+          }
+          const results = await pipe.exec()
+          if (Array.isArray(results)) {
+            const fetchedAt = Date.now()
+            for (let i = 0; i < targetIds.length; i += 1) {
+              const [cardErr, cardVal] = results[i * 2 + 1] || []
+              const count = !cardErr ? Number(cardVal) || 0 : 0
+              fetched.set(targetIds[i], count)
+              this._putBatchCache(prefix, ttl, targetIds[i], count, cacheTtlMs, fetchedAt)
+            }
+            return { ok: true, map: fetched }
+          }
+        } catch {
+          this.cache.l2Errors += 1
+        }
+        return { ok: false, map: null }
+      }
+
+      let redisRes
+      if (fresh) {
+        redisRes = await fetchFromRedis(uniqueIds)
+      } else {
+        const sortedMissing = [...missingIds].sort()
+        const flightKey = `${prefix}|${ttl}|${sortedMissing.join(',')}`
+        let inflight = this._batchInflight.get(flightKey)
+        if (inflight) {
+          this.batchSingleflightCoalesced += 1
+        } else {
+          inflight = fetchFromRedis(sortedMissing).finally(() => {
+            if (this._batchInflight.get(flightKey) === inflight) {
+              this._batchInflight.delete(flightKey)
+            }
+          })
+          this._batchInflight.set(flightKey, inflight)
+        }
+        redisRes = await inflight
+      }
+
+      if (redisRes?.ok && redisRes.map) {
+        for (const id of uniqueIds) {
+          if (cachedHits.has(id)) out.set(id, cachedHits.get(id))
+          else out.set(id, redisRes.map.get(id) ?? 0)
+        }
+        return out
       }
     }
 

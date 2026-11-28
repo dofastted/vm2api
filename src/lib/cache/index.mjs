@@ -234,6 +234,9 @@ export async function closeCacheRuntime() {
   if (!runtime) return
   const closing = runtime
   runtime = null
+  try {
+    await closing.liveLogs?.flushPending?.()
+  } catch {}
   closing.liveLogs?.clearLocal()
   await closing.client.close()
 }
