@@ -1069,13 +1069,18 @@ export function verifyOfficialClaudeCode(reqOrHeaders = {}, body = {}, opts = {}
     const anchorBlock = blocks[anchorIdx] || ''
     const requestClass = headerStr(h, 'x-claude-code-request-class').toLowerCase()
 
-    // Tier 2e: Compaction / title / summary / explore child side-calls (0 tools, non-main child/title prefix or explicit auxiliary request class)
+    // Tier 2e: Compaction / title / summary / explore child side-calls without claude-code beta.
+    // Both explicit auxiliary request classes and 0-tool child/title side-calls MUST carry an
+    // anchored official system prefix (matches Go protofront isDirectAuxiliaryRequest 1:1).
     const anchorTrimmed = String(anchorBlock || '').trimStart()
     const isChildOrTitleOnly =
       OFFICIAL_CHILD_ONLY_PREFIXES.some((p) => anchorTrimmed.startsWith(p)) ||
       anchorTrimmed.startsWith(OFFICIAL_TITLE_PREFIX)
-    if (zeroTools && (isChildOrTitleOnly || AUXILIARY_REQUEST_CLASSES.has(requestClass))) {
-      if (!headerCheck.hasCodeBeta) return makeResult('official_auxiliary')
+    const isExplicitAuxClass =
+      AUXILIARY_REQUEST_CLASSES.has(requestClass) &&
+      isAnchoredOfficialPrefix(anchorBlock, { allowChild: true, allowTitle: zeroTools })
+    if (!headerCheck.hasCodeBeta && (isExplicitAuxClass || (zeroTools && isChildOrTitleOnly))) {
+      return makeResult('official_auxiliary')
     }
 
     // Tier 1: Standard Direct Official CC
