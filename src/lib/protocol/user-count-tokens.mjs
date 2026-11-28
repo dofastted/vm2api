@@ -11,7 +11,11 @@ import { RefusalSessionBlocksRepo } from '../db/repos/refusal-session-blocks-rep
 import { SettingsRepo } from '../db/repos/settings-repo.mjs'
 import { findAccount } from '../admin/panel-api.mjs'
 import { readJevConfig, scopeAccountFromVm } from './jev-intercept.mjs'
-import { recordUpstream400SessionBlock, runProtocolIntercept } from './intercept-gate.mjs'
+import {
+  clearUpstreamSessionErrorStrikes,
+  recordUpstream400SessionBlock,
+  runProtocolIntercept,
+} from './intercept-gate.mjs'
 import { inboundBodyLimit, readRoutingConfigFile } from '../core/config.mjs'
 import { verifyOfficialClaudeCode } from '../identity/official-cc-verifier.mjs'
 import {
@@ -485,20 +489,32 @@ export async function handleUserCountTokens(req, res, deps) {
     }
   }
   const observeCountTokens400 = (hop) => {
-    if (!hop || hop.ok === true) return
+    if (!hop) return
+    const identity = refusalAuditIdentity({
+      inbound,
+      body: parsed.body,
+      headers: req?.headers,
+      principal: riskPrincipal(req),
+    })
+    const devices = deviceRepo(deps)
+    if (hop.ok === true) {
+      clearUpstreamSessionErrorStrikes({
+        inbound,
+        body: parsed.body,
+        headers: req?.headers,
+        identity,
+        devices,
+      })
+      return
+    }
     recordUpstream400SessionBlock({
       inbound,
       body: parsed.body,
       headers: req?.headers,
-      identity: refusalAuditIdentity({
-        inbound,
-        body: parsed.body,
-        headers: req?.headers,
-        principal: riskPrincipal(req),
-      }),
+      identity,
       result: hop,
       policy: refusalPolicy(deps),
-      devices: deviceRepo(deps),
+      devices,
     })
   }
   const outboundBody = officialTraffic ? parsed.body : sanitizeThirdPartyCountTokensBody(parsed.body, { routing })

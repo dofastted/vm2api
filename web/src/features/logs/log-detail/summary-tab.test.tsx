@@ -157,7 +157,52 @@ describe('SummaryTab structured error diagnostics (#1845)', () => {
         />
       </TooltipProvider>
     )
-    expect(html).toContain('400 分类：工具调用历史配对损坏')
+    expect(html).toContain('错误分类：工具调用历史配对损坏')
     expect(html).toContain('已封锁会话 10 分钟')
+  })
+
+  it('renders upstream 500 strike and poison_abort badges in risk audit card', () => {
+    const strikeHtml = renderToStaticMarkup(
+      <TooltipProvider>
+        <SummaryTab
+          row={baseRow({
+            statusCode: 500,
+            upstreamStatus: 500,
+            via: 'rust-kernel',
+            finalState: 'upstream_error',
+            errorCode: 'upstream_500',
+            errorDetails: {
+              upstream_error_category: 'internal_server_error',
+              upstream_error_action: 'strike_1_of_2',
+            },
+          })}
+          scrollToRedirect={false}
+        />
+      </TooltipProvider>
+    )
+    expect(strikeHtml).toContain('错误分类：上游 500 服务端内部错误')
+    expect(strikeHtml).toContain('可自愈放行（计 1/2 次）')
+
+    const poisonHtml = renderToStaticMarkup(
+      <TooltipProvider>
+        <SummaryTab
+          row={baseRow({
+            statusCode: 422,
+            upstreamStatus: 422,
+            via: 'rust-kernel',
+            finalState: 'poison_abort',
+            errorCode: 'poison_abort',
+            errorDetails: {
+              upstream_error_category: 'poison_abort',
+              upstream_error_action: 'session_10m',
+              punishment: 'session_10m_500',
+            },
+          })}
+          scrollToRedirect={false}
+        />
+      </TooltipProvider>
+    )
+    expect(poisonHtml).toContain('错误分类：跨多槽位 5xx 毒请求熔断')
+    expect(poisonHtml).toContain('已封锁会话 10 分钟')
   })
 })

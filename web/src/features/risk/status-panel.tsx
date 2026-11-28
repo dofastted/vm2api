@@ -213,7 +213,7 @@ export function RiskStatus({
 
       <AuditFeed
         title='上游 4xx 错误与风控复核'
-        hint='涵盖上游 400 / 401 / 403 / 422；上游 400 按错误类型清洗分类，账号/额度/凭据/模型类跳过，其余会话级 400 临时封锁 10 分钟并计次。'
+        hint='涵盖上游 400 / 401 / 403 / 422；上游 400/500 按三档清洗：非会话/502-529 跳过，可自愈 400 与终态 500 容忍 1 次自愈、连续 2 次封 10 分钟，不可恢复 400 与毒请求 1 次即封。'
         rows={upstream400.data?.logs ?? []}
         loading={stats.isLoading || upstream400.isLoading}
         error={stats.error || upstream400.error}

@@ -29,7 +29,12 @@ import { RefusalSessionBlocksRepo } from '../db/repos/refusal-session-blocks-rep
 import { SettingsRepo } from '../db/repos/settings-repo.mjs'
 import { makeApiKeyGateError } from '../admin/api-keys.mjs'
 import { readJevConfig } from './jev-intercept.mjs'
-import { observeUpstreamRisk, recordUpstream400SessionBlock, upstreamRiskClientError } from './intercept-gate.mjs'
+import {
+  clearUpstreamSessionErrorStrikes,
+  observeUpstreamRisk,
+  recordUpstream400SessionBlock,
+  upstreamRiskClientError,
+} from './intercept-gate.mjs'
 import {
   clientBlockErrorOf,
   isTrustedGateDecision,
@@ -1991,6 +1996,14 @@ export function createHandleProtocol(deps) {
       return
     }
     let observedHop = false
+    const clearSessionErrorStrikes = () =>
+      clearUpstreamSessionErrorStrikes({
+        ...riskState,
+        inbound,
+        body: inbound,
+        headers: req.headers,
+        identity: auditIdentity,
+      })
     const recordFinal400 = (result) => {
       if (!result || result.ok === true || isClientCancelledResult(result)) return null
       return recordUpstream400SessionBlock({
@@ -2006,7 +2019,16 @@ export function createHandleProtocol(deps) {
       })
     }
     if (imageModel) {
-      return serveImageModelTurn({ req, res, protocol, body: ctx.body, logBag, keyScope, recordFinal400 })
+      return serveImageModelTurn({
+        req,
+        res,
+        protocol,
+        body: ctx.body,
+        logBag,
+        keyScope,
+        recordFinal400,
+        onSessionSuccess: clearSessionErrorStrikes,
+      })
     }
     const afterHop = (result, { blockSessionOn400 = true } = {}) => {
       observedHop = true
@@ -2166,6 +2188,7 @@ export function createHandleProtocol(deps) {
         keyScope,
         afterHop,
         recordFinal400,
+        onSessionSuccess: clearSessionErrorStrikes,
         poolAccess: activePoolAccess,
         originPoolId: activePoolAccess.originPool?.id || effectivePool?.id || null,
         jevDowngradePoolId:
@@ -2875,6 +2898,15 @@ export function createHandleProtocol(deps) {
         logBag.error_message = formatted.body?.error?.message || null
         if (formatted.explain) logBag.scheduler_explain = formatted.explain
         logBag.final_state = formatted.status === 422 ? 'poison_abort' : 'failed'
+        if (formatted.status === 422 || formatted.code === 'poison_abort') {
+          recordFinal400({
+            ok: false,
+            status: 422,
+            upstreamStatus: 422,
+            finalState: 'poison_abort',
+            body: formatted.body || { error: { code: 'poison_abort', message: logBag.error_message || '' } },
+          })
+        }
         if (formatted.retryAfterSec != null) res.setHeader?.('retry-after', String(formatted.retryAfterSec))
         return json(res, formatted.status, formatted.body)
       }
@@ -3133,7 +3165,8 @@ export function createHandleProtocol(deps) {
       logBag.generation_ms = result?.generationMs ?? null
       logBag.final_state = result?.terminalState || null
       logBag.attempt_count = apiAttempts || (result?.endpointId ? 1 : 0)
-      if (result?.upstreamStatus != null || (result && !result.ok && result.upstreamError)) afterHop(result)
+      if (result?.ok && !logBag.risk_upstream_reason) clearSessionErrorStrikes()
+      else if (result?.upstreamStatus != null || (result && !result.ok && result.upstreamError)) afterHop(result)
       attachPricing(logBag, {
         managedKey,
         rateMultiplier: deps.groupsRepo.rateMultiplier(managedKey?.group_id ?? 1),
@@ -4287,8 +4320,11 @@ export function createHandleProtocol(deps) {
       logBag.error_message = logBag.error_message || 'upstream stop_reason=refusal'
     }
     if (result?.attemptCount > 0 && !isClientCancelledResult(result)) {
-      if (!observedHop) afterHop(result, { blockSessionOn400: true })
+      if (result?.ok && !logBag.risk_upstream_reason) clearSessionErrorStrikes()
+      else if (!observedHop) afterHop(result, { blockSessionOn400: true })
       else if (!result?.ok) recordFinal400(result)
+    } else if (result?.finalState === 'poison_abort' && !isClientCancelledResult(result)) {
+      recordFinal400(result)
     }
 
     // Zero-execution rejections (e.g. session_home_slot_busy) and opaque CRAG 429s never reached generation.
@@ -4602,6 +4638,14 @@ export function createHandleProtocol(deps) {
         poolAccess: searchPoolAccess,
         originPoolId: searchPoolAccess.originPool?.id || searchPoolAccess.effectivePool?.id || null,
         schedulerRuntime: getSchedulerRuntime(req),
+        onSessionSuccess: () =>
+          clearUpstreamSessionErrorStrikes({
+            ...searchRiskState,
+            inbound: body,
+            body,
+            headers: req.headers,
+            identity: searchIdentity,
+          }),
         recordFinal400: (result) =>
           recordUpstream400SessionBlock({
             ...searchRiskState,
@@ -4635,7 +4679,16 @@ export function createHandleProtocol(deps) {
    * when the last user message carries images) answered in the caller's protocol. The row is
    * an Images row, so it bills image usage alone like /v1/images.
    */
-  async function serveImageModelTurn({ req, res, protocol, body, logBag, keyScope = null, recordFinal400 = null }) {
+  async function serveImageModelTurn({
+    req,
+    res,
+    protocol,
+    body,
+    logBag,
+    keyScope = null,
+    recordFinal400 = null,
+    onSessionSuccess = null,
+  }) {
     const turn = imagesRequestFromTurn(protocol, body)
     if (!turn.ok) {
       stats.errors++
@@ -4695,6 +4748,7 @@ export function createHandleProtocol(deps) {
           originPoolId: req._poolAccess?.originPool?.id || req._poolAccess?.effectivePool?.id || null,
           schedulerRuntime: getSchedulerRuntime(req),
           recordFinal400,
+          onSessionSuccess,
           ops: deps.codexOps || {},
           ...(keyScope ? { keyScope } : {}),
         })
@@ -4893,6 +4947,14 @@ export function createHandleProtocol(deps) {
         poolAccess: imagesPoolAccess,
         originPoolId: imagesPoolAccess.originPool?.id || imagesPoolAccess.effectivePool?.id || null,
         schedulerRuntime: getSchedulerRuntime(req),
+        onSessionSuccess: () =>
+          clearUpstreamSessionErrorStrikes({
+            ...imagesRiskState,
+            inbound: body,
+            body,
+            headers: req.headers,
+            identity: imagesIdentity,
+          }),
         recordFinal400: (result) =>
           recordUpstream400SessionBlock({
             ...imagesRiskState,

@@ -29,64 +29,242 @@ export const REFUSAL_SIMILARITY_CHOICES = Object.freeze([80, 85, 90, 95])
 export const RISK_AUDIT_SETTING = 'risk_audit_policy'
 export const DEFAULT_BAN_STEPS = Object.freeze([10, 10, 0])
 export const UPSTREAM_400_SESSION_BLOCK_MS = 10 * 60_000
+export const UPSTREAM_ERROR_REPEAT_WINDOW_MS = 5 * 60_000
+export const UPSTREAM_ERROR_REPEAT_THRESHOLD = 2
 export const UPSTREAM_400_SESSION_REASON = 'upstream_400'
+export const UPSTREAM_500_SESSION_REASON = 'upstream_500'
 
 /**
- * Single source of truth for upstream HTTP 400 classification & session-block sanitization.
+ * Single source of truth for upstream HTTP 400 + 500/5xx session-block classification.
  *
- * - `blockSession: false` (cleaned/excluded): account, billing, credential, gateway-local,
- *   or model-availability errors that are NOT caused by a poisoned caller session.
- * - `blockSession: true` (10m session cooldown): session-history corruption, deterministic
- *   client schema/structure errors, third-party rejections, policy refusals, or unclassified
- *   real upstream 400s that would otherwise loop and keep hammering upstream.
+ * Three tiers:
+ * - `immediate` (`threshold: 1`): unrecoverable 400s (`policy_refusal`, `third_party_client`,
+ *   `state_reference_invalid`) and multi-slot confirmed 5xx poison aborts (`poison_abort`)
+ *   block the session for 10m immediately.
+ * - `repeat` (`threshold: 2` within 5m, reset on any HTTP 200): client-recoverable 400s
+ *   (`context_too_long`, `param_range_invalid`, `tool_pair_broken`, etc.) and terminal upstream
+ *   HTTP 500 (`internal_server_error`) allow 1 self-recovery attempt (e.g. `/compact`, fixing
+ *   `max_tokens`, or transient 500 recovery) and block for 10m on consecutive failure.
+ * - `skip` (`threshold: 0`): account/billing/credential/model/gateway-local 400s and
+ *   infrastructure 502/503/504/529/local-worker errors NEVER block the caller session.
  */
-export const UPSTREAM_400_CATEGORIES = Object.freeze({
-  // --- Cleaned / Excluded (do NOT block caller session) ---
-  auto_mode_classifier: Object.freeze({ label: '自动模式分类器侧请求', blockSession: false, group: 'skip' }),
-  gateway_local: Object.freeze({ label: '网关/内核本地前置拒绝', blockSession: false, group: 'skip' }),
-  account_disabled: Object.freeze({ label: '上游账号/组织被禁用或受限', blockSession: false, group: 'skip' }),
-  auth_credential: Object.freeze({ label: '上游凭据或鉴权失效', blockSession: false, group: 'skip' }),
-  billing_credit: Object.freeze({ label: '上游账号余额或额度不足', blockSession: false, group: 'skip' }),
-  model_unavailable: Object.freeze({ label: '上游模型不可用或无权限', blockSession: false, group: 'skip' }),
+export const UPSTREAM_ERROR_CATEGORIES = Object.freeze({
+  // --- Tier 3: Cleaned / Excluded (NEVER block caller session) ---
+  auto_mode_classifier: Object.freeze({
+    label: '自动模式分类器侧请求',
+    tier: 'skip',
+    threshold: 0,
+    statusFamily: '400',
+    blockSession: false,
+    group: 'skip',
+  }),
+  gateway_local: Object.freeze({
+    label: '网关/内核本地前置拒绝',
+    tier: 'skip',
+    threshold: 0,
+    statusFamily: '400',
+    blockSession: false,
+    group: 'skip',
+  }),
+  account_disabled: Object.freeze({
+    label: '上游账号/组织被禁用或受限',
+    tier: 'skip',
+    threshold: 0,
+    statusFamily: '400',
+    blockSession: false,
+    group: 'skip',
+  }),
+  auth_credential: Object.freeze({
+    label: '上游凭据或鉴权失效',
+    tier: 'skip',
+    threshold: 0,
+    statusFamily: '400',
+    blockSession: false,
+    group: 'skip',
+  }),
+  billing_credit: Object.freeze({
+    label: '上游账号余额或额度不足',
+    tier: 'skip',
+    threshold: 0,
+    statusFamily: '400',
+    blockSession: false,
+    group: 'skip',
+  }),
+  model_unavailable: Object.freeze({
+    label: '上游模型不可用或无权限',
+    tier: 'skip',
+    threshold: 0,
+    statusFamily: '400',
+    blockSession: false,
+    group: 'skip',
+  }),
+  upstream_502_bad_gateway: Object.freeze({
+    label: '上游 502 网关/代理或流中断',
+    tier: 'skip',
+    threshold: 0,
+    statusFamily: '500',
+    blockSession: false,
+    group: 'skip',
+  }),
+  upstream_503_unavailable: Object.freeze({
+    label: '上游 503 服务不可用或调度繁忙',
+    tier: 'skip',
+    threshold: 0,
+    statusFamily: '500',
+    blockSession: false,
+    group: 'skip',
+  }),
+  upstream_504_timeout: Object.freeze({
+    label: '上游 504 网关或推理超时',
+    tier: 'skip',
+    threshold: 0,
+    statusFamily: '500',
+    blockSession: false,
+    group: 'skip',
+  }),
+  upstream_529_overloaded: Object.freeze({
+    label: '上游 529 过载限流',
+    tier: 'skip',
+    threshold: 0,
+    statusFamily: '500',
+    blockSession: false,
+    group: 'skip',
+  }),
+  worker_local_5xx: Object.freeze({
+    label: '本地 Worker 进程异常或连接中断',
+    tier: 'skip',
+    threshold: 0,
+    statusFamily: '500',
+    blockSession: false,
+    group: 'skip',
+  }),
 
-  // --- Blocked for 10m (prevent repeat upstream 400 loops) ---
-  policy_refusal: Object.freeze({ label: '上游内容/使用政策拒答', blockSession: true, group: 'session_block' }),
-  third_party_client: Object.freeze({ label: '第三方客户端计费拒绝', blockSession: true, group: 'session_block' }),
-  context_too_long: Object.freeze({ label: '上下文或 Token 超限', blockSession: true, group: 'session_block' }),
-  tool_pair_broken: Object.freeze({ label: '工具调用历史配对损坏', blockSession: true, group: 'session_block' }),
-  thinking_history_broken: Object.freeze({
-    label: 'Thinking/推理签名或配置损坏',
+  // --- Tier 1: Immediate 10m session block (threshold = 1) ---
+  policy_refusal: Object.freeze({
+    label: '上游内容/使用政策拒答',
+    tier: 'immediate',
+    threshold: 1,
+    statusFamily: '400',
     blockSession: true,
     group: 'session_block',
   }),
-  search_or_cache_invalid: Object.freeze({
-    label: '搜索加密块或缓存标记非法',
-    blockSession: true,
-    group: 'session_block',
-  }),
-  media_invalid: Object.freeze({ label: '图片/文档附件超限或损坏', blockSession: true, group: 'session_block' }),
-  message_structure_invalid: Object.freeze({
-    label: '消息角色或空内容结构损坏',
-    blockSession: true,
-    group: 'session_block',
-  }),
-  tool_schema_invalid: Object.freeze({
-    label: '工具 Schema 或参数校验失败',
+  third_party_client: Object.freeze({
+    label: '第三方客户端计费拒绝',
+    tier: 'immediate',
+    threshold: 1,
+    statusFamily: '400',
     blockSession: true,
     group: 'session_block',
   }),
   state_reference_invalid: Object.freeze({
     label: '会话/响应引用 ID 已失效',
+    tier: 'immediate',
+    threshold: 1,
+    statusFamily: '400',
     blockSession: true,
     group: 'session_block',
+  }),
+  poison_abort: Object.freeze({
+    label: '跨多槽位 5xx 毒请求熔断',
+    tier: 'immediate',
+    threshold: 1,
+    statusFamily: '500',
+    blockSession: true,
+    group: 'session_block',
+  }),
+
+  // --- Tier 2: Recoverable / Repeat 10m session block (threshold = 2 in 5m, cleared on 200) ---
+  context_too_long: Object.freeze({
+    label: '上下文或 Token 超限',
+    tier: 'repeat',
+    threshold: UPSTREAM_ERROR_REPEAT_THRESHOLD,
+    statusFamily: '400',
+    blockSession: true,
+    group: 'session_repeat_block',
+  }),
+  param_range_invalid: Object.freeze({
+    label: '请求参数范围或采样参数非法',
+    tier: 'repeat',
+    threshold: UPSTREAM_ERROR_REPEAT_THRESHOLD,
+    statusFamily: '400',
+    blockSession: true,
+    group: 'session_repeat_block',
   }),
   beta_or_header_invalid: Object.freeze({
-    label: 'Beta 请求头或采样参数非法',
+    label: 'Beta 请求头非法或不支持',
+    tier: 'repeat',
+    threshold: UPSTREAM_ERROR_REPEAT_THRESHOLD,
+    statusFamily: '400',
     blockSession: true,
-    group: 'session_block',
+    group: 'session_repeat_block',
   }),
-  unknown: Object.freeze({ label: '其他上游 400 请求错误', blockSession: true, group: 'session_block' }),
+  tool_pair_broken: Object.freeze({
+    label: '工具调用历史配对损坏',
+    tier: 'repeat',
+    threshold: UPSTREAM_ERROR_REPEAT_THRESHOLD,
+    statusFamily: '400',
+    blockSession: true,
+    group: 'session_repeat_block',
+  }),
+  thinking_history_broken: Object.freeze({
+    label: 'Thinking/推理签名或配置损坏',
+    tier: 'repeat',
+    threshold: UPSTREAM_ERROR_REPEAT_THRESHOLD,
+    statusFamily: '400',
+    blockSession: true,
+    group: 'session_repeat_block',
+  }),
+  search_or_cache_invalid: Object.freeze({
+    label: '搜索加密块或缓存标记非法',
+    tier: 'repeat',
+    threshold: UPSTREAM_ERROR_REPEAT_THRESHOLD,
+    statusFamily: '400',
+    blockSession: true,
+    group: 'session_repeat_block',
+  }),
+  media_invalid: Object.freeze({
+    label: '图片/文档附件超限或损坏',
+    tier: 'repeat',
+    threshold: UPSTREAM_ERROR_REPEAT_THRESHOLD,
+    statusFamily: '400',
+    blockSession: true,
+    group: 'session_repeat_block',
+  }),
+  message_structure_invalid: Object.freeze({
+    label: '消息角色或空内容结构损坏',
+    tier: 'repeat',
+    threshold: UPSTREAM_ERROR_REPEAT_THRESHOLD,
+    statusFamily: '400',
+    blockSession: true,
+    group: 'session_repeat_block',
+  }),
+  tool_schema_invalid: Object.freeze({
+    label: '工具 Schema 或参数校验失败',
+    tier: 'repeat',
+    threshold: UPSTREAM_ERROR_REPEAT_THRESHOLD,
+    statusFamily: '400',
+    blockSession: true,
+    group: 'session_repeat_block',
+  }),
+  unknown: Object.freeze({
+    label: '其他上游 400 请求错误',
+    tier: 'repeat',
+    threshold: UPSTREAM_ERROR_REPEAT_THRESHOLD,
+    statusFamily: '400',
+    blockSession: true,
+    group: 'session_repeat_block',
+  }),
+  internal_server_error: Object.freeze({
+    label: '上游 500 服务端内部错误',
+    tier: 'repeat',
+    threshold: UPSTREAM_ERROR_REPEAT_THRESHOLD,
+    statusFamily: '500',
+    blockSession: true,
+    group: 'session_repeat_block',
+  }),
 })
+
+export const UPSTREAM_400_CATEGORIES = UPSTREAM_ERROR_CATEGORIES
 
 export function isUpstream400Reason(reason) {
   return (
@@ -95,21 +273,53 @@ export function isUpstream400Reason(reason) {
   )
 }
 
+export function isUpstream500Reason(reason) {
+  return (
+    typeof reason === 'string' &&
+    (reason === UPSTREAM_500_SESSION_REASON || reason.startsWith(`${UPSTREAM_500_SESSION_REASON}:`))
+  )
+}
+
+export function isUpstreamSessionCooldownReason(reason) {
+  return isUpstream400Reason(reason) || isUpstream500Reason(reason)
+}
+
+export function upstreamErrorReasonFor(category) {
+  const key = Object.hasOwn(UPSTREAM_ERROR_CATEGORIES, category) ? category : 'unknown'
+  const meta = UPSTREAM_ERROR_CATEGORIES[key]
+  const prefix = meta.statusFamily === '500' ? UPSTREAM_500_SESSION_REASON : UPSTREAM_400_SESSION_REASON
+  return `${prefix}:${key}`
+}
+
 export function upstream400ReasonFor(category) {
-  const key = Object.hasOwn(UPSTREAM_400_CATEGORIES, category) ? category : 'unknown'
-  return `${UPSTREAM_400_SESSION_REASON}:${key}`
+  return upstreamErrorReasonFor(category)
+}
+
+export function upstreamErrorCategoryFromReason(reason) {
+  if (isUpstream400Reason(reason)) {
+    if (reason === UPSTREAM_400_SESSION_REASON) return 'unknown'
+    const suffix = reason.slice(UPSTREAM_400_SESSION_REASON.length + 1).trim()
+    return Object.hasOwn(UPSTREAM_ERROR_CATEGORIES, suffix) ? suffix : 'unknown'
+  }
+  if (isUpstream500Reason(reason)) {
+    if (reason === UPSTREAM_500_SESSION_REASON) return 'internal_server_error'
+    const suffix = reason.slice(UPSTREAM_500_SESSION_REASON.length + 1).trim()
+    return Object.hasOwn(UPSTREAM_ERROR_CATEGORIES, suffix) ? suffix : 'internal_server_error'
+  }
+  return ''
 }
 
 export function upstream400CategoryFromReason(reason) {
-  if (!isUpstream400Reason(reason)) return ''
-  if (reason === UPSTREAM_400_SESSION_REASON) return 'unknown'
-  const suffix = reason.slice(UPSTREAM_400_SESSION_REASON.length + 1).trim()
-  return Object.hasOwn(UPSTREAM_400_CATEGORIES, suffix) ? suffix : 'unknown'
+  return upstreamErrorCategoryFromReason(reason)
+}
+
+export function upstreamErrorCategoryLabel(category) {
+  const meta = Object.hasOwn(UPSTREAM_ERROR_CATEGORIES, category) ? UPSTREAM_ERROR_CATEGORIES[category] : null
+  return meta ? meta.label : ''
 }
 
 export function upstream400CategoryLabel(category) {
-  const meta = Object.hasOwn(UPSTREAM_400_CATEGORIES, category) ? UPSTREAM_400_CATEGORIES[category] : null
-  return meta ? meta.label : ''
+  return upstreamErrorCategoryLabel(category)
 }
 const DEFAULT_RISK_POLICY = Object.freeze({
   ban_steps: DEFAULT_BAN_STEPS,
@@ -361,14 +571,18 @@ const UPSTREAM_400_MODEL_UNAVAILABLE_CODES = new Set([
 ])
 const UPSTREAM_400_MODEL_UNAVAILABLE_RE =
   /\bthe model\b[^.\n]{0,80}\b(?:does not exist|not found|is not supported|not supported|not available|has been (?:deprecated|decommissioned|retired)|access)\b|\b(?:unknown|invalid|unsupported)\s+model(?:\s+(?:id|name))?\b|\bmodel\b[^.\n]{0,60}\b(?:not found|does not exist|is not supported|has been deprecated|has been retired|decommissioned)\b/i
-const UPSTREAM_400_CONTEXT_TOO_LONG_CODES = new Set([
-  'context_length_exceeded',
-  'prompt_too_long',
-  'request_too_large',
-  'max_tokens_exceeded',
-])
+const UPSTREAM_400_CONTEXT_TOO_LONG_CODES = new Set(['context_length_exceeded', 'prompt_too_long', 'request_too_large'])
 const UPSTREAM_400_CONTEXT_TOO_LONG_RE =
   /prompt is too long|input is too long|context[_\s-]?length[_\s-]?exceeded|maximum context length|exceeds? (?:the )?(?:maximum|max) (?:number of )?(?:tokens|context|input|length)|too many (?:input )?tokens|token count exceeds|request (?:payload )?size exceeds|input exceeds the context window/i
+const UPSTREAM_400_PARAM_RANGE_CODES = new Set([
+  'max_tokens_exceeded',
+  'invalid_max_tokens',
+  'invalid_parameter',
+  'invalid_value',
+  'out_of_range',
+])
+const UPSTREAM_400_PARAM_RANGE_RE =
+  /\b(?:max_tokens|max_output_tokens|max_completion_tokens|maxOutputTokens)\b[^.\n]{0,80}(?:>|exceed|greater than|less than|must be|at least|at most|maximum|minimum|too large|too small|invalid|out of range|below|above)|\b(?:stop_sequences|top_k|top_p|temperature|frequency_penalty|presence_penalty)\b[^.\n]{0,80}(?:not supported|deprecated|may only be set to|must be|between|out of range|invalid|exceed|maximum|minimum)|(?:does not support|unsupported)[^.\n]{0,60}\b(?:temperature|top_p|top_k|max_tokens|max_output_tokens)\b/i
 const UPSTREAM_400_TOOL_PAIR_RE =
   /tool_use_id|tool_use[^.\n]{0,120}tool_result|tool_result[^.\n]{0,120}(?:required|missing|expected|without)|no tool (?:output|call) found for function call|function[_\s-]?(?:call|response) turn (?:must come|comes) immediately|number of function response parts|tool_call_id/i
 const UPSTREAM_400_THINKING_CODES = new Set(['thinking_incompatible'])
@@ -404,29 +618,68 @@ const UPSTREAM_400_STATE_REF_CODES = new Set([
 ])
 const UPSTREAM_400_STATE_REF_RE =
   /previous_response_id[^.\n]{0,60}(?:not found|invalid|expired)|item with id [^\s]+ not found|response [`'"]?resp_[^`'"]+['"`]? not found|conversation (?:id )?[^.\n]{0,60}not found|thread (?:id )?[^.\n]{0,60}not found/i
-const UPSTREAM_400_BETA_OR_HEADER_RE =
-  /anthropic-beta|unexpected value\(s\)[^.\n]{0,80}beta|invalid beta|beta header|(?:does not support|unsupported)[^.\n]{0,60}\b(?:temperature|top_p|top_k)\b|`?(?:temperature|top_p|top_k)`?\s+(?:is|are|may only be)\s+(?:deprecated|not supported|set to)/i
+const UPSTREAM_400_BETA_OR_HEADER_RE = /anthropic-beta|unexpected value\(s\)[^.\n]{0,80}beta|invalid beta|beta header/i
+const WORKER_LOCAL_5XX_CODES = new Set([
+  'process_error',
+  'wrap_connection_error',
+  'cli_error',
+  'kernel_unavailable',
+  'kernel_error',
+  'cluster_slot_reconnecting',
+  'cluster_delivery_unconfirmed',
+  'native_handoff_missing',
+  'native_handoff_invalid',
+  'native_handoff_conflict',
+  'native_handoff_incomplete',
+  'worker_transport_failure',
+  'worker_timeout',
+])
+const WORKER_LOCAL_5XX_RE =
+  /native process exited|claude process exited|provider error:.*connection error|wrap cli connection error/i
+const UPSTREAM_529_CODES = new Set(['overloaded_error', 'provider_overloaded', 'pool_overloaded'])
+const UPSTREAM_504_CODES = new Set(['upstream_timeout', 'gemini_inference_timeout', 'gateway_timeout'])
+const UPSTREAM_503_CODES = new Set([
+  'slot_busy',
+  'scheduler_unavailable',
+  'service_unavailable',
+  'pool_unavailable',
+  'gemini_upstream_unavailable',
+  'gemini_operation_busy',
+  'gemini_native_worker_unavailable',
+])
+const UPSTREAM_502_CODES = new Set([
+  'incomplete_response',
+  'upstream_stream_incomplete',
+  'stream_incomplete',
+  'upstream_empty_stream',
+  'upstream_network_error',
+  'bad_gateway',
+  'gemini_proxy_error',
+])
 
-function makeUpstream400Verdict(category, status = 400) {
-  const key = Object.hasOwn(UPSTREAM_400_CATEGORIES, category) ? category : 'unknown'
-  const meta = UPSTREAM_400_CATEGORIES[key]
+function makeUpstreamErrorVerdict(category, status = 400) {
+  const key = Object.hasOwn(UPSTREAM_ERROR_CATEGORIES, category) ? category : 'unknown'
+  const meta = UPSTREAM_ERROR_CATEGORIES[key]
   return {
     status,
+    statusFamily: meta.statusFamily,
     category: key,
+    tier: meta.tier,
+    threshold: meta.threshold,
     group: meta.group,
     blockSession: meta.blockSession,
     skipReason: meta.blockSession ? '' : key,
-    reason: meta.blockSession ? upstream400ReasonFor(key) : '',
+    reason: meta.blockSession ? upstreamErrorReasonFor(key) : '',
     label: meta.label,
   }
 }
 
 /**
- * Classify a real upstream HTTP 400 response and decide whether the caller session
- * must be blocked for 10 minutes (`blockSession: true`) or cleaned/skipped (`false`).
- * Returns `null` when `result` is not a real upstream HTTP 400.
+ * Unified 3-tier classifier for upstream HTTP 400 + 500/5xx + `poison_abort` (422).
+ *
+ * Returns `null` when `result` is not a real upstream 400 / 5xx / poison_abort error.
  */
-export function classifyUpstream400(result, { phrases = [], classifier = null } = {}) {
+export function classifyUpstreamErrorForSessionBlock(result, { phrases = [], classifier = null } = {}) {
   if (
     !result ||
     result.ok === true ||
@@ -436,11 +689,6 @@ export function classifyUpstream400(result, { phrases = [], classifier = null } 
   ) {
     return null
   }
-  const status = Number(result?.providerResult?.http_status ?? result?.upstreamStatus ?? result?.status) || 0
-  if (status !== 400) return null
-  if (classifier?.purpose === 'auto_mode_classifier') return makeUpstream400Verdict('auto_mode_classifier', status)
-  if (result.credential_ensure_failed === true) return makeUpstream400Verdict('auth_credential', status)
-
   const error = result?.body?.error
   const codes = [
     error?.code,
@@ -466,72 +714,130 @@ export function classifyUpstream400(result, { phrases = [], classifier = null } 
   ]
     .filter(Boolean)
     .join('\n')
+  const status = Number(result?.providerResult?.http_status ?? result?.upstreamStatus ?? result?.status) || 0
 
-  // 1. Non-session exclusions (cleaned out so account/billing/credential/gateway issues never lock user sessions).
+  // 0. Confirmed multi-slot 5xx poison abort (Rust scheduler HTTP 422 `poison_abort`): Tier 1 immediate 10m block.
+  if (
+    result.finalState === 'poison_abort' ||
+    result.terminalState === 'poison_abort' ||
+    codes.includes('poison_abort') ||
+    (status === 422 && /\bpoison_abort\b/i.test(text))
+  ) {
+    if (classifier?.purpose === 'auto_mode_classifier') {
+      return makeUpstreamErrorVerdict('auto_mode_classifier', status || 422)
+    }
+    return makeUpstreamErrorVerdict('poison_abort', status || 422)
+  }
+
+  // 1. Upstream 5xx / 408 error taxonomy.
+  if (status >= 500 || status === 408) {
+    if (classifier?.purpose === 'auto_mode_classifier') {
+      return makeUpstreamErrorVerdict('auto_mode_classifier', status)
+    }
+    if (codes.some((code) => WORKER_LOCAL_5XX_CODES.has(code)) || WORKER_LOCAL_5XX_RE.test(text)) {
+      return makeUpstreamErrorVerdict('worker_local_5xx', status)
+    }
+    if (status === 529 || codes.some((code) => UPSTREAM_529_CODES.has(code)) || /\boverloaded\b/i.test(text)) {
+      return makeUpstreamErrorVerdict('upstream_529_overloaded', status)
+    }
+    if (
+      status === 504 ||
+      status === 408 ||
+      codes.some((code) => UPSTREAM_504_CODES.has(code)) ||
+      /gateway timeout|timed out|deadline exceeded/i.test(text)
+    ) {
+      return makeUpstreamErrorVerdict('upstream_504_timeout', status)
+    }
+    if (status === 503 || codes.some((code) => UPSTREAM_503_CODES.has(code))) {
+      return makeUpstreamErrorVerdict('upstream_503_unavailable', status)
+    }
+    if (status === 502 || codes.some((code) => UPSTREAM_502_CODES.has(code))) {
+      return makeUpstreamErrorVerdict('upstream_502_bad_gateway', status)
+    }
+    if (status === 500) {
+      return makeUpstreamErrorVerdict('internal_server_error', status)
+    }
+    return makeUpstreamErrorVerdict('upstream_502_bad_gateway', status)
+  }
+
+  if (status !== 400) return null
+  if (classifier?.purpose === 'auto_mode_classifier') return makeUpstreamErrorVerdict('auto_mode_classifier', status)
+  if (result.credential_ensure_failed === true) return makeUpstreamErrorVerdict('auth_credential', status)
+
+  // 2. Non-session 400 exclusions (Tier 3 skip — NEVER lock user sessions).
   if (codes.some((code) => UPSTREAM_400_GATEWAY_LOCAL_CODES.has(code) || UPSTREAM_400_LICENSE_CODE_RE.test(code))) {
-    return makeUpstream400Verdict('gateway_local', status)
+    return makeUpstreamErrorVerdict('gateway_local', status)
   }
   if (AUTH_ACCOUNT_BAN_RE.test(text) || UPSTREAM_400_ACCOUNT_DISABLED_RE.test(text)) {
-    return makeUpstream400Verdict('account_disabled', status)
+    return makeUpstreamErrorVerdict('account_disabled', status)
   }
   if (
     codes.some((code) => UPSTREAM_400_AUTH_CREDENTIAL_CODES.has(code)) ||
     UPSTREAM_400_AUTH_CREDENTIAL_RE.test(text)
   ) {
-    return makeUpstream400Verdict('auth_credential', status)
+    return makeUpstreamErrorVerdict('auth_credential', status)
   }
   // Check third-party extra-usage rejection BEFORE account billing_credit because its wording mentions "extra usage".
   if (isThirdPartyClientMessage(text)) {
-    return makeUpstream400Verdict('third_party_client', status)
+    return makeUpstreamErrorVerdict('third_party_client', status)
   }
   if (codes.some((code) => UPSTREAM_400_BILLING_CREDIT_CODES.has(code)) || UPSTREAM_400_BILLING_CREDIT_RE.test(text)) {
-    return makeUpstream400Verdict('billing_credit', status)
+    return makeUpstreamErrorVerdict('billing_credit', status)
   }
   if (
     codes.some((code) => UPSTREAM_400_MODEL_UNAVAILABLE_CODES.has(code)) ||
     UPSTREAM_400_MODEL_UNAVAILABLE_RE.test(text)
   ) {
-    return makeUpstream400Verdict('model_unavailable', status)
+    return makeUpstreamErrorVerdict('model_unavailable', status)
   }
 
-  // 2. Session-poisoned / deterministic loop 400 categories (block session for 10m).
+  // 3. Tier 1 immediate-block & Tier 2 repeat-block 400 categories.
   if (upstreamRiskReason(result, phrases)) {
-    return makeUpstream400Verdict('policy_refusal', status)
+    return makeUpstreamErrorVerdict('policy_refusal', status)
+  }
+  if (codes.some((code) => UPSTREAM_400_STATE_REF_CODES.has(code)) || UPSTREAM_400_STATE_REF_RE.test(text)) {
+    return makeUpstreamErrorVerdict('state_reference_invalid', status)
   }
   if (
     codes.some((code) => UPSTREAM_400_CONTEXT_TOO_LONG_CODES.has(code)) ||
     UPSTREAM_400_CONTEXT_TOO_LONG_RE.test(text)
   ) {
-    return makeUpstream400Verdict('context_too_long', status)
+    return makeUpstreamErrorVerdict('context_too_long', status)
   }
   if (UPSTREAM_400_TOOL_PAIR_RE.test(text)) {
-    return makeUpstream400Verdict('tool_pair_broken', status)
+    return makeUpstreamErrorVerdict('tool_pair_broken', status)
   }
   if (codes.some((code) => UPSTREAM_400_THINKING_CODES.has(code)) || UPSTREAM_400_THINKING_RE.test(text)) {
-    return makeUpstream400Verdict('thinking_history_broken', status)
+    return makeUpstreamErrorVerdict('thinking_history_broken', status)
   }
   if (UPSTREAM_400_SEARCH_OR_CACHE_RE.test(text)) {
-    return makeUpstream400Verdict('search_or_cache_invalid', status)
+    return makeUpstreamErrorVerdict('search_or_cache_invalid', status)
   }
   if (codes.some((code) => UPSTREAM_400_MEDIA_CODES.has(code)) || UPSTREAM_400_MEDIA_RE.test(text)) {
-    return makeUpstream400Verdict('media_invalid', status)
+    return makeUpstreamErrorVerdict('media_invalid', status)
   }
   if (
     codes.some((code) => UPSTREAM_400_MESSAGE_STRUCTURE_CODES.has(code)) ||
     UPSTREAM_400_MESSAGE_STRUCTURE_RE.test(text)
   ) {
-    return makeUpstream400Verdict('message_structure_invalid', status)
+    return makeUpstreamErrorVerdict('message_structure_invalid', status)
   }
-  if (codes.some((code) => UPSTREAM_400_TOOL_SCHEMA_CODES.has(code)) || UPSTREAM_400_TOOL_SCHEMA_RE.test(text)) {
-    return makeUpstream400Verdict('tool_schema_invalid', status)
-  }
-  if (codes.some((code) => UPSTREAM_400_STATE_REF_CODES.has(code)) || UPSTREAM_400_STATE_REF_RE.test(text)) {
-    return makeUpstream400Verdict('state_reference_invalid', status)
+  if (codes.some((code) => UPSTREAM_400_PARAM_RANGE_CODES.has(code)) || UPSTREAM_400_PARAM_RANGE_RE.test(text)) {
+    return makeUpstreamErrorVerdict('param_range_invalid', status)
   }
   if (UPSTREAM_400_BETA_OR_HEADER_RE.test(text)) {
-    return makeUpstream400Verdict('beta_or_header_invalid', status)
+    return makeUpstreamErrorVerdict('beta_or_header_invalid', status)
   }
-  return makeUpstream400Verdict('unknown', status)
+  if (codes.some((code) => UPSTREAM_400_TOOL_SCHEMA_CODES.has(code)) || UPSTREAM_400_TOOL_SCHEMA_RE.test(text)) {
+    return makeUpstreamErrorVerdict('tool_schema_invalid', status)
+  }
+  return makeUpstreamErrorVerdict('unknown', status)
+}
+
+/** Backward-compatible 400-only wrapper around `classifyUpstreamErrorForSessionBlock`. */
+export function classifyUpstream400(result, opts = {}) {
+  const verdict = classifyUpstreamErrorForSessionBlock(result, opts)
+  return verdict && verdict.status === 400 ? verdict : null
 }
 
 /**
@@ -576,13 +882,16 @@ function refusalBlockSuffix(match) {
     const expiresAt = match.row?.expires_at
     const session = match.row?.subject_kind === 'session'
     if (session || expiresAt || (match.row?.identity_value && match.row.identity_value !== match.row.device_id)) {
-      const u400Category = isUpstream400Reason(ban) ? upstream400CategoryFromReason(ban) : ''
-      const u400Label = u400Category && u400Category !== 'unknown' ? upstream400CategoryLabel(u400Category) : ''
+      const isU400 = isUpstream400Reason(ban)
+      const isU500 = isUpstream500Reason(ban)
+      const uCategory = isU400 || isU500 ? upstreamErrorCategoryFromReason(ban) : ''
+      const uLabel = uCategory && uCategory !== 'unknown' ? upstreamErrorCategoryLabel(uCategory) : ''
+      const statusText = isU500 ? '500' : '400'
       const sessionMessage = expiresAt
-        ? isUpstream400Reason(ban)
-          ? u400Label
-            ? `此会话因上游 400 错误（${u400Label}）已临时封禁至 ${expiresAt}，请开启新会话或稍后再试。`
-            : `此会话因上游 400 错误已临时封禁至 ${expiresAt}，请开启新会话或稍后再试。`
+        ? isU400 || isU500
+          ? uLabel
+            ? `此会话因上游 ${statusText} 错误（${uLabel}）已临时封禁至 ${expiresAt}，请开启新会话或稍后再试。`
+            : `此会话因上游 ${statusText} 错误已临时封禁至 ${expiresAt}，请开启新会话或稍后再试。`
           : `此会话已临时封禁至 ${expiresAt}，请开启新会话或稍后再试。`
         : '此会话已封禁，请勿继续使用此会话。'
       return {
@@ -591,7 +900,8 @@ function refusalBlockSuffix(match) {
         details: {
           reason: session ? 'session' : 'device',
           ban_reason: ban,
-          ...(u400Category ? { upstream_400_category: u400Category } : {}),
+          ...(uCategory ? { upstream_error_category: uCategory } : {}),
+          ...(isU400 && uCategory ? { upstream_400_category: uCategory } : {}),
           ...(expiresAt ? { expires_at: expiresAt } : {}),
         },
       }

@@ -591,6 +591,7 @@ export async function handleCodexProtocol({
   keyScope = null,
   afterHop = null,
   recordFinal400 = null,
+  onSessionSuccess = null,
   ownerScope = null,
   pinVmId = undefined,
   poolAccess = null,
@@ -1006,7 +1007,18 @@ export async function handleCodexProtocol({
           logBag.final_state = 'cancelled'
           return
         }
-        if (sw.fatalErr) return respondCodexSchedulerError({ res, json, stats, logBag, err: sw.fatalErr })
+        if (sw.fatalErr) {
+          if (sw.fatalErr?.code === 'poison_abort' || sw.fatalErr?.status === 422) {
+            recordFinal400?.({
+              ok: false,
+              status: 422,
+              upstreamStatus: 422,
+              finalState: 'poison_abort',
+              body: { error: { code: 'poison_abort', message: sw.fatalErr?.message || '' } },
+            })
+          }
+          return respondCodexSchedulerError({ res, json, stats, logBag, err: sw.fatalErr })
+        }
         break
       }
       attempts += 1
@@ -1052,7 +1064,18 @@ export async function handleCodexProtocol({
             logBag.final_state = 'cancelled'
             return
           }
-          if (sw.fatalErr) return respondCodexSchedulerError({ res, json, stats, logBag, err: sw.fatalErr })
+          if (sw.fatalErr) {
+            if (sw.fatalErr?.code === 'poison_abort' || sw.fatalErr?.status === 422) {
+              recordFinal400?.({
+                ok: false,
+                status: 422,
+                upstreamStatus: 422,
+                finalState: 'poison_abort',
+                body: { error: { code: 'poison_abort', message: sw.fatalErr?.message || '' } },
+              })
+            }
+            return respondCodexSchedulerError({ res, json, stats, logBag, err: sw.fatalErr })
+          }
           break
         }
         await releaseActiveLeaseNow({ outcome: 'error', http_status: 503, error_class: 'server5xx' })
@@ -1296,6 +1319,7 @@ export async function handleCodexProtocol({
       const delivered = !policyRefusal && !conversionError && result?.ok
 
       if (delivered) {
+        onSessionSuccess?.()
         const serviceTier = normalizeServiceTier(outboundBody.service_tier)
         logBag.upstream_service_tier = responseServiceTier
         const logged = disjointOpenaiUsage(usage ? { ...usage, service_tier: serviceTier } : usage)
@@ -1434,7 +1458,18 @@ export async function handleCodexProtocol({
           logBag.final_state = 'cancelled'
           return
         }
-        if (sw.fatalErr) return respondCodexSchedulerError({ res, json, stats, logBag, err: sw.fatalErr })
+        if (sw.fatalErr) {
+          if (sw.fatalErr?.code === 'poison_abort' || sw.fatalErr?.status === 422) {
+            recordFinal400?.({
+              ok: false,
+              status: 422,
+              upstreamStatus: 422,
+              finalState: 'poison_abort',
+              body: { error: { code: 'poison_abort', message: sw.fatalErr?.message || '' } },
+            })
+          }
+          return respondCodexSchedulerError({ res, json, stats, logBag, err: sw.fatalErr })
+        }
         break
       }
 
@@ -1614,6 +1649,7 @@ export async function handleCodexSearch({
   originPoolId = null,
   schedulerRuntime = null,
   recordFinal400 = null,
+  onSessionSuccess = null,
 }) {
   logBag.via = 'codex-search'
   const reject = (status, type, code, message) => {
@@ -1857,13 +1893,15 @@ export async function handleCodexSearch({
     return reject(502, 'api_error', last?.error || 'upstream_transport', 'Codex search upstream request failed')
   }
   const payload = parseJson(last.text)
-  if (last.status === 400 && !gone.signal.aborted) {
+  if ((last.status === 400 || last.status >= 500) && !gone.signal.aborted) {
     recordFinal400?.({
       ok: false,
-      status: 400,
-      upstreamStatus: 400,
+      status: last.status,
+      upstreamStatus: last.status,
       body: payload ?? last.text,
     })
+  } else if (last.status >= 200 && last.status < 300) {
+    onSessionSuccess?.()
   }
   if (payload === undefined) {
     logBag.final_state = 'upstream_error'
@@ -1911,6 +1949,7 @@ export async function handleCodexImages({
   originPoolId = null,
   schedulerRuntime = null,
   recordFinal400 = null,
+  onSessionSuccess = null,
 }) {
   logBag.via = 'codex-images'
   const reject = (status, type, code, message) => {
@@ -2193,13 +2232,15 @@ export async function handleCodexImages({
     return reject(502, 'api_error', last?.error || 'upstream_transport', 'Codex images upstream request failed')
   }
   const payload = parseJson(last.text)
-  if (last.status === 400 && !gone.signal.aborted) {
+  if ((last.status === 400 || last.status >= 500) && !gone.signal.aborted) {
     recordFinal400?.({
       ok: false,
-      status: 400,
-      upstreamStatus: 400,
+      status: last.status,
+      upstreamStatus: last.status,
       body: payload ?? last.text,
     })
+  } else if (last.status >= 200 && last.status < 300) {
+    onSessionSuccess?.()
   }
   if (payload === undefined) {
     logBag.final_state = 'upstream_error'

@@ -5,8 +5,8 @@ import { RelativeTime } from '@/features/logs/relative-time'
 import { EmptyNotice } from './blocks'
 import { type FeedKind, evidenceOf, feedKindOf } from './model'
 import {
-  UPSTREAM_400_ACTION_LABELS,
   upstream400CategoryLabel,
+  upstreamErrorActionLabel,
 } from './upstream-400'
 
 const KIND_NAME: Record<FeedKind, string> = {
@@ -76,13 +76,17 @@ export function RiskFeed({
         const disguised429 =
           row.statusCode === 429 && (kind === 'jev' || kind === 'refusal')
         const u400Category =
-          typeof row.errorDetails?.upstream_400_category === 'string'
-            ? row.errorDetails.upstream_400_category
-            : ''
+          typeof row.errorDetails?.upstream_error_category === 'string'
+            ? row.errorDetails.upstream_error_category
+            : typeof row.errorDetails?.upstream_400_category === 'string'
+              ? row.errorDetails.upstream_400_category
+              : ''
         const u400Action =
-          typeof row.errorDetails?.upstream_400_action === 'string'
-            ? row.errorDetails.upstream_400_action
-            : ''
+          typeof row.errorDetails?.upstream_error_action === 'string'
+            ? row.errorDetails.upstream_error_action
+            : typeof row.errorDetails?.upstream_400_action === 'string'
+              ? row.errorDetails.upstream_400_action
+              : ''
         const showIdentity =
           hasUpstream4xx || !!row.inboundDeviceId || !!row.clientSessionId
         return (
@@ -122,11 +126,13 @@ export function RiskFeed({
                         u400Action === 'session_10m' ||
                           u400Action === 'permanent_kept'
                           ? 'bg-[var(--status-bad-bg)] text-[var(--status-bad)]'
-                          : 'bg-[var(--status-none-bg)] text-[var(--status-none)]'
+                          : u400Action.startsWith('strike_')
+                            ? 'bg-[var(--status-caution-bg)] text-[var(--status-caution)]'
+                            : 'bg-[var(--status-none-bg)] text-[var(--status-none)]'
                       )}
                       title={
                         u400Action
-                          ? UPSTREAM_400_ACTION_LABELS[u400Action] || u400Action
+                          ? upstreamErrorActionLabel(u400Action)
                           : undefined
                       }
                     >

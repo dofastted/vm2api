@@ -1,6 +1,19 @@
 import { createHash } from 'node:crypto'
 import { getDb } from '../database.mjs'
 
+const MAX_PENDING_SESSION_STRIKES = 2048
+const STRIKE_STORE_BY_DB = new WeakMap()
+
+function strikeStoreFor(db) {
+  if (!db || typeof db !== 'object') return new Map()
+  let store = STRIKE_STORE_BY_DB.get(db)
+  if (!store) {
+    store = new Map()
+    STRIKE_STORE_BY_DB.set(db, store)
+  }
+  return store
+}
+
 function subjectKey(identity, kind, value = kind === 'session' ? identity.sessionId : identity.deviceId) {
   return value
     ? 'risk:' +
@@ -139,11 +152,81 @@ export class RefusalDeviceBlocksRepo {
         effectiveExpiresAt,
       )
       this.db.exec('COMMIT')
+      strikeStoreFor(this.db).delete(sessionKey)
       return this.get(sessionKey)
     } catch (error) {
       this.db.exec('ROLLBACK')
       throw error
     }
+  }
+
+  /**
+   * Track a session-scoped upstream error strike and escalate to a 10m temporary
+   * session block once `threshold` strikes occur within `windowMs`.
+   *
+   * - `threshold <= 1`: immediate 10m block (Tier 1 unrecoverable / poison_abort).
+   * - `threshold >= 2`: strike 1 records an in-memory warning scoped to this DB so
+   *   clients can self-recover (e.g. `/compact` or fixing `max_tokens`); strike 2
+   *   within `windowMs` writes the 10m DB block.
+   * - Never downgrades an existing permanent session ban.
+   */
+  noteSessionErrorStrike(
+    identity,
+    {
+      requestId = null,
+      fingerprint = null,
+      reason = 'upstream_400',
+      category = '',
+      ttlMs = 10 * 60_000,
+      threshold = 2,
+      windowMs = 5 * 60_000,
+      now = Date.now(),
+    } = {},
+  ) {
+    if (!identity?.sessionId) return { blocked: false, strikes: 0, threshold, ban: null }
+    const sessionKey = subjectKey(identity, 'session')
+    if (!sessionKey) return { blocked: false, strikes: 0, threshold, ban: null }
+    const prior = this.get(sessionKey)
+    if (prior?.subject_kind === 'session' && !prior.expires_at) {
+      strikeStoreFor(this.db).delete(sessionKey)
+      return { blocked: true, permanent: true, strikes: 0, threshold, ban: prior }
+    }
+    const need = Math.max(1, Number(threshold) || 1)
+    const store = strikeStoreFor(this.db)
+    if (need <= 1) {
+      store.delete(sessionKey)
+      const ban = this.blockSession(identity, { requestId, fingerprint, reason, ttlMs, now })
+      return { blocked: Boolean(ban), permanent: Boolean(ban && !ban.expires_at), strikes: 1, threshold: 1, ban }
+    }
+    const win = Math.max(1_000, Number(windowMs) || 5 * 60_000)
+    const prev = store.get(sessionKey)
+    const active = prev && now - prev.lastAt <= win
+    const strikes = active ? prev.count + 1 : 1
+    if (strikes >= need) {
+      store.delete(sessionKey)
+      const ban = this.blockSession(identity, { requestId, fingerprint, reason, ttlMs, now })
+      return {
+        blocked: Boolean(ban),
+        permanent: Boolean(ban && !ban.expires_at),
+        strikes,
+        threshold: need,
+        ban,
+      }
+    }
+    store.delete(sessionKey)
+    store.set(sessionKey, { count: strikes, firstAt: active ? prev.firstAt : now, lastAt: now, category })
+    while (store.size > MAX_PENDING_SESSION_STRIKES) {
+      store.delete(store.keys().next().value)
+    }
+    return { blocked: false, permanent: false, strikes, threshold: need, ban: null }
+  }
+
+  /** Clear any pending recoverable error strikes for this session after an HTTP 200 success. */
+  clearSessionStrikes(identity) {
+    if (!identity?.sessionId) return false
+    const sessionKey = subjectKey(identity, 'session')
+    if (!sessionKey) return false
+    return strikeStoreFor(this.db).delete(sessionKey)
   }
 
   recordViolation(

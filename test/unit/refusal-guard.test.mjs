@@ -303,20 +303,37 @@ test('post-hop warms the right front rule and blocks the session for 10m on upst
     )
     assert.equal(opts.logBag.audit_upstream_400, undefined)
     assert.equal(devices.count(), 0)
+    // First hit of a Tier-2 recoverable 400 records strike 1/2 without blocking yet.
     assert.equal(
       observeUpstreamRisk({ ...opts, result: upstream('API Error: invalid tokens. Bearer SENTINEL_SECRET') }),
       '',
     )
     assert.equal(opts.logBag.audit_upstream_400, true)
     assert.equal(opts.logBag.audit_upstream_400_message, 'API Error: invalid tokens. Bearer ***REDACTED***')
-    assert.equal(opts.logBag.error_details.punishment, 'session_10m_400')
+    assert.equal(opts.logBag.error_details.upstream_400_category, 'unknown')
+    assert.equal(opts.logBag.error_details.upstream_400_action, 'strike_1_of_2')
+    assert.equal(repo.count(), 0)
+    assert.equal(devices.count(), 0)
+    // Second consecutive Tier-2 400 within 5m persists the 10m session block without touching device bans.
+    const logBagRepeat = {}
+    assert.equal(
+      observeUpstreamRisk({
+        ...opts,
+        logBag: logBagRepeat,
+        now: start + 1_000,
+        result: upstream('API Error: invalid tokens. Bearer SENTINEL_SECRET'),
+      }),
+      '',
+    )
+    assert.equal(logBagRepeat.error_details.upstream_400_action, 'session_10m')
+    assert.equal(logBagRepeat.error_details.punishment, 'session_10m_400')
     assert.equal(repo.count(), 0)
     assert.equal(devices.count(), 1)
-    assert.equal(devices.findBan(deviceOnly, start), null)
-    const protocol400Ban = devices.findBan(identity, start)
+    assert.equal(devices.findBan(deviceOnly, start + 1_000), null)
+    const protocol400Ban = devices.findBan(identity, start + 1_000)
     assert.equal(protocol400Ban.subject_kind, 'session')
     assert.equal(protocol400Ban.reason, 'upstream_400:unknown')
-    assert.equal(protocol400Ban.expires_at, '2026-11-17T00:10:00.000Z')
+    assert.equal(protocol400Ban.expires_at, '2026-11-17T00:10:01.000Z')
     const thirdParty503Identity = {
       deviceId: 'installation-id',
       sessionId: 'third-party-503-sess',

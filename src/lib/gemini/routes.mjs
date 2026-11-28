@@ -41,7 +41,7 @@ import { resolveCragGeminiPromptPolicy } from './system-prompt.mjs'
 import { configuredDnsUpstream, proxyDnsEmptyTypes } from '../vm/egress.mjs'
 import { compileWithProtoFront, protoFrontMode } from '../transport/proto-front-client.mjs'
 import { resolveAuditSessionIdentity, riskPrincipal } from '../core/refusal-guard.mjs'
-import { observeUpstreamRisk } from '../protocol/intercept-gate.mjs'
+import { clearUpstreamSessionErrorStrikes, observeUpstreamRisk } from '../protocol/intercept-gate.mjs'
 import {
   clientBlockErrorOf,
   isTrustedGateDecision,
@@ -2973,8 +2973,10 @@ export function createGeminiPublicHandler({
 
     const observeGeminiError = (error) => {
       if (!error || controller.signal.aborted) return
-      const upstreamStatus = Number(error.upstreamStatus) || 0
-      if (upstreamStatus !== 400) return
+      const isPoison =
+        error?.code === 'poison_abort' || (error instanceof SchedulerApiError && Number(error.status) === 422)
+      const upstreamStatus = isPoison ? 422 : Number(error.upstreamStatus) || 0
+      if (!isPoison && upstreamStatus !== 400 && upstreamStatus < 500) return
       observeUpstreamRisk({
         ...geminiRiskState,
         inbound: body,
@@ -2985,9 +2987,10 @@ export function createGeminiPublicHandler({
           ok: false,
           status: upstreamStatus,
           upstreamStatus,
+          ...(isPoison ? { finalState: 'poison_abort' } : {}),
           body: {
             error: {
-              code: typeof error.code === 'string' ? error.code : 'gemini_upstream_error',
+              code: isPoison ? 'poison_abort' : typeof error.code === 'string' ? error.code : 'gemini_upstream_error',
               message: String(error.message || ''),
             },
           },
@@ -3030,6 +3033,13 @@ export function createGeminiPublicHandler({
           ...geminiScope,
         })
         applyTurnLog(turn)
+        clearUpstreamSessionErrorStrikes({
+          ...geminiRiskState,
+          inbound: body,
+          body,
+          headers: req.headers,
+          identity: geminiIdentity,
+        })
         if (messages) {
           if (requested.stream) {
             const out = writeStream(res, anthropicStream(turn))
@@ -3253,6 +3263,13 @@ export function createGeminiPublicHandler({
         return
       }
       applyTurnLog(turn)
+      clearUpstreamSessionErrorStrikes({
+        ...geminiRiskState,
+        inbound: body,
+        body,
+        headers: req.headers,
+        identity: geminiIdentity,
+      })
       if (wantStream) {
         writeChunk(encoder.finish())
         if (!headersSent) beginSse(res)

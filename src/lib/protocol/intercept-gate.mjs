@@ -9,10 +9,10 @@ import {
 } from '../core/errors.mjs'
 import {
   blockedRiskTool,
-  classifyUpstream400,
   classifyUpstreamError,
+  classifyUpstreamErrorForSessionBlock,
   DEFAULT_BAN_STEPS,
-  isUpstream400Reason,
+  isUpstreamSessionCooldownReason,
   matchRefusalSession,
   matchStoredRefusal,
   refusalFingerprint,
@@ -23,6 +23,7 @@ import {
   resolveAuditSessionIdentity,
   UPSTREAM_400_SESSION_BLOCK_MS,
   UPSTREAM_400_SESSION_REASON,
+  UPSTREAM_ERROR_REPEAT_WINDOW_MS,
 } from '../core/refusal-guard.mjs'
 import {
   HARD_POLICY_RULES,
@@ -95,7 +96,7 @@ function retryAfterFromExpiry(expiresAt, now, fallbackSec = 600) {
 }
 
 function enforcesBan(policy, row) {
-  if (isJevReason(row?.reason) || isUpstream400Reason(row?.reason)) {
+  if (isJevReason(row?.reason) || isUpstreamSessionCooldownReason(row?.reason)) {
     if (row?.subject_kind === 'session' && policy?.session_block_enabled === false) return false
     return true
   }
@@ -194,7 +195,28 @@ function mergeLogErrorDetails(logBag, patch) {
   logBag.error_details = { ...(logBag.error_details || {}), ...patch }
 }
 
-export function recordUpstream400SessionBlock({
+function upstreamErrorLogPatch(verdict, action, extra = {}) {
+  const is400 = verdict.status === 400
+  return {
+    upstream_error_category: verdict.category,
+    upstream_error_action: action,
+    ...(is400 ? { upstream_400_category: verdict.category, upstream_400_action: action } : {}),
+    ...extra,
+  }
+}
+
+export function clearUpstreamSessionErrorStrikes({ inbound, body = inbound, headers, identity, devices = null } = {}) {
+  if (!devices?.clearSessionStrikes) return false
+  const effectiveIdentity = resolveAuditSessionIdentity({ inbound, body, headers, identity })
+  if (!effectiveIdentity.sessionId) return false
+  try {
+    return devices.clearSessionStrikes(effectiveIdentity)
+  } catch {
+    return false
+  }
+}
+
+export function recordUpstreamErrorSessionBlock({
   inbound,
   body = inbound,
   headers,
@@ -207,64 +229,75 @@ export function recordUpstream400SessionBlock({
   classifier = null,
   now = Date.now(),
 } = {}) {
-  const verdict = classifyUpstream400(result, {
+  const verdict = classifyUpstreamErrorForSessionBlock(result, {
     phrases: policy?.risk_audit?.upstream_policy_phrases,
     classifier,
   })
   if (!verdict) return null
   if (!verdict.blockSession) {
     if (logBag) logBag.risk_session_block_skipped = verdict.skipReason || verdict.category
-    mergeLogErrorDetails(logBag, {
-      upstream_400_category: verdict.category,
-      upstream_400_action: 'skipped',
-    })
+    mergeLogErrorDetails(logBag, upstreamErrorLogPatch(verdict, 'skipped'))
     return null
   }
   if (policy?.session_block_enabled === false) {
-    mergeLogErrorDetails(logBag, {
-      upstream_400_category: verdict.category,
-      upstream_400_action: 'skipped',
-    })
+    mergeLogErrorDetails(logBag, upstreamErrorLogPatch(verdict, 'skipped'))
     return null
   }
   const effectiveIdentity = resolveAuditSessionIdentity({ inbound, body, headers, identity })
   if (!effectiveIdentity.sessionId) {
-    mergeLogErrorDetails(logBag, {
-      upstream_400_category: verdict.category,
-      upstream_400_action: 'no_session',
-    })
+    mergeLogErrorDetails(logBag, upstreamErrorLogPatch(verdict, 'no_session'))
     return null
   }
   try {
-    const ban =
-      devices?.blockSession?.(effectiveIdentity, {
+    const threshold = Number(verdict.threshold) || 1
+    let outcome
+    if (typeof devices?.noteSessionErrorStrike === 'function') {
+      outcome = devices.noteSessionErrorStrike(effectiveIdentity, {
         requestId,
         reason: verdict.reason || UPSTREAM_400_SESSION_REASON,
+        category: verdict.category,
         ttlMs: UPSTREAM_400_SESSION_BLOCK_MS,
+        threshold,
+        windowMs: UPSTREAM_ERROR_REPEAT_WINDOW_MS,
         now,
-      }) || null
+      })
+    } else if (threshold <= 1 && typeof devices?.blockSession === 'function') {
+      const ban =
+        devices.blockSession(effectiveIdentity, {
+          requestId,
+          reason: verdict.reason || UPSTREAM_400_SESSION_REASON,
+          ttlMs: UPSTREAM_400_SESSION_BLOCK_MS,
+          now,
+        }) || null
+      outcome = { blocked: Boolean(ban), permanent: Boolean(ban && !ban.expires_at), strikes: 1, threshold: 1, ban }
+    } else {
+      outcome = { blocked: false, permanent: false, strikes: 0, threshold, ban: null }
+    }
+    const ban = outcome?.ban || null
+    if (!outcome?.blocked) {
+      const action = outcome?.strikes > 0 ? `strike_${outcome.strikes}_of_${outcome.threshold || threshold}` : 'skipped'
+      mergeLogErrorDetails(logBag, upstreamErrorLogPatch(verdict, action))
+      return null
+    }
     if (ban && ban.expires_at) {
-      mergeLogErrorDetails(logBag, {
-        upstream_400_category: verdict.category,
-        upstream_400_action: 'session_10m',
-        punishment: 'session_10m_400',
-      })
+      const punishment = verdict.statusFamily === '500' ? 'session_10m_500' : 'session_10m_400'
+      mergeLogErrorDetails(logBag, upstreamErrorLogPatch(verdict, 'session_10m', { punishment }))
     } else if (ban && !ban.expires_at) {
-      mergeLogErrorDetails(logBag, {
-        upstream_400_category: verdict.category,
-        upstream_400_action: 'permanent_kept',
-      })
+      mergeLogErrorDetails(logBag, upstreamErrorLogPatch(verdict, 'permanent_kept'))
     } else {
       mergeLogErrorDetails(logBag, {
-        upstream_400_category: verdict.category,
+        upstream_error_category: verdict.category,
+        ...(verdict.status === 400 ? { upstream_400_category: verdict.category } : {}),
       })
     }
     return ban
   } catch {
-    console.warn('[risk-audit] failed to persist upstream 400 session block')
+    console.warn('[risk-audit] failed to persist upstream session error block')
     return null
   }
 }
+
+export const recordUpstream400SessionBlock = recordUpstreamErrorSessionBlock
 
 export function observeUpstreamRisk({
   inbound,
@@ -289,9 +322,16 @@ export function observeUpstreamRisk({
     (typeof result.body === 'string' ? result.body : '')
   const classified = classifyUpstreamError(result, policy?.risk_audit?.upstream_policy_phrases)
   const isBadRequest = classified.status === 400 && result.ok !== true
+  const isServerOrPoison =
+    result.ok !== true &&
+    (classified.status >= 500 ||
+      result.finalState === 'poison_abort' ||
+      result.terminalState === 'poison_abort' ||
+      result?.body?.error?.code === 'poison_abort')
   const reason = classified.bucket === 'policy' ? classified.reason : ''
   if (
     !isBadRequest &&
+    !isServerOrPoison &&
     classified.bucket !== 'policy' &&
     classified.bucket !== 'third_party' &&
     classified.bucket !== 'auth_suspect'
@@ -303,21 +343,24 @@ export function observeUpstreamRisk({
   if (isBadRequest) {
     logBag.audit_upstream_400 = true
     logBag.audit_upstream_400_message ||= message
-    if (blockSessionOn400) {
-      recordUpstream400SessionBlock({
-        inbound,
-        body,
-        headers,
-        identity: effectiveIdentity,
-        result,
-        logBag,
-        requestId,
-        policy,
-        devices,
-        classifier,
-        now,
-      })
-    }
+  }
+  if ((isBadRequest || isServerOrPoison) && blockSessionOn400) {
+    recordUpstreamErrorSessionBlock({
+      inbound,
+      body,
+      headers,
+      identity: effectiveIdentity,
+      result,
+      logBag,
+      requestId,
+      policy,
+      devices,
+      classifier,
+      now,
+    })
+  }
+  if (isServerOrPoison && !isBadRequest && !reason) {
+    return ''
   }
   if (classified.bucket === 'protocol') {
     mergeLogErrorDetails(logBag, { risk_bucket: 'protocol' })
@@ -382,7 +425,11 @@ export function observeUpstreamRisk({
       { devices, policy, requestId, now },
     )
     if (isBadRequest && blockSessionOn400 && escalated && logBag?.error_details) {
-      const nextDetails = { ...logBag.error_details, upstream_400_action: 'permanent_kept' }
+      const nextDetails = {
+        ...logBag.error_details,
+        upstream_400_action: 'permanent_kept',
+        upstream_error_action: 'permanent_kept',
+      }
       delete nextDetails.punishment
       logBag.error_details = nextDetails
     }
