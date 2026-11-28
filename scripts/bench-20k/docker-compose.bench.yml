@@ -1,0 +1,89 @@
+# Isolated PostgreSQL 18 + Redis 8 topology for vm2api 20K RPM replay benchmark.
+# Project name is fixed to `vm2api-bench` and ports bind strictly to 127.0.0.1:55432 / 127.0.0.1:56379
+# so existing host containers (e.g. afo-postgres on 5432) are never touched.
+#
+# Usage:
+#   docker compose -p vm2api-bench -f scripts/bench-20k/docker-compose.bench.yml up -d --wait
+#   docker compose -p vm2api-bench -f scripts/bench-20k/docker-compose.bench.yml down -v
+name: vm2api-bench
+
+services:
+  postgres:
+    image: ${BENCH_PG_IMAGE:-postgres:18-alpine}
+    container_name: ${BENCH_PG_CONTAINER_NAME:-vm2api-bench-postgres}
+    restart: "no"
+    shm_size: ${BENCH_PG_SHM_SIZE:-512mb}
+    ports:
+      - "127.0.0.1:${BENCH_PG_PORT:-55432}:5432"
+    environment:
+      POSTGRES_USER: ${BENCH_POSTGRES_USER:-vm2api}
+      POSTGRES_PASSWORD: ${BENCH_POSTGRES_PASSWORD:-vm2api_bench_pass}
+      POSTGRES_DB: ${BENCH_POSTGRES_DB:-vm2api_bench}
+      # Pin PGDATA explicitly on PostgreSQL 18 to avoid anonymous volume drift
+      PGDATA: /var/lib/postgresql/data
+      TZ: ${TZ:-UTC}
+    command:
+      - postgres
+      - -c
+      - max_connections=${BENCH_PG_MAX_CONNECTIONS:-200}
+      - -c
+      - shared_buffers=${BENCH_PG_SHARED_BUFFERS:-256MB}
+      - -c
+      - effective_cache_size=${BENCH_PG_EFFECTIVE_CACHE_SIZE:-768MB}
+      - -c
+      - work_mem=${BENCH_PG_WORK_MEM:-16MB}
+      - -c
+      - maintenance_work_mem=${BENCH_PG_MAINTENANCE_WORK_MEM:-128MB}
+      - -c
+      - wal_buffers=${BENCH_PG_WAL_BUFFERS:-16MB}
+      - -c
+      - checkpoint_completion_target=${BENCH_PG_CHECKPOINT_COMPLETION_TARGET:-0.9}
+      - -c
+      - max_wal_size=${BENCH_PG_MAX_WAL_SIZE:-1GB}
+      - -c
+      - synchronous_commit=${BENCH_PG_SYNCHRONOUS_COMMIT:-on}
+      - -c
+      - idle_in_transaction_session_timeout=${BENCH_PG_IDLE_IN_TX_TIMEOUT_MS:-60000}
+      - -c
+      - random_page_cost=${BENCH_PG_RANDOM_PAGE_COST:-1.1}
+      - -c
+      - track_io_timing=on
+    volumes:
+      - bench_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${BENCH_POSTGRES_USER:-vm2api} -d ${BENCH_POSTGRES_DB:-vm2api_bench}"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+
+  redis:
+    image: ${BENCH_REDIS_IMAGE:-redis:8-alpine}
+    container_name: ${BENCH_REDIS_CONTAINER_NAME:-vm2api-bench-redis}
+    restart: "no"
+    ports:
+      - "127.0.0.1:${BENCH_REDIS_PORT:-56379}:6379"
+    command:
+      - redis-server
+      - --appendonly
+      - "${BENCH_REDIS_APPENDONLY:-yes}"
+      - --appendfsync
+      - "${BENCH_REDIS_APPENDFSYNC:-everysec}"
+      - --maxmemory
+      - "${BENCH_REDIS_MAXMEMORY:-256mb}"
+      - --maxmemory-policy
+      - "${BENCH_REDIS_MAXMEMORY_POLICY:-allkeys-lru}"
+      - --requirepass
+      - "${BENCH_REDIS_PASSWORD:-vm2api_bench_redis}"
+    volumes:
+      - bench_redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"${BENCH_REDIS_PASSWORD:-vm2api_bench_redis}\" ping | grep -q PONG"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+      start_period: 3s
+
+volumes:
+  bench_pg_data:
+  bench_redis_data:
