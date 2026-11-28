@@ -2,129 +2,148 @@
  * True async non-blocking PostgreSQL micro-batch log writer and retention cleaner.
  *
  * Replaces main-thread synchronous `Atomics.wait` per-row RPC writes on PG with:
- * - Bounded in-memory buffers (defaults: batchSize=128, flushIntervalMs=200, maxPending=5000)
- * - Single-SQL parameterized multi-row INSERTs for `usage_logs`, `request_attempts`,
- *   and `request_log_debug` (with automatic PG 65535-param chunking)
+ * - Bounded in-memory buffers (defaults: batchSize=256, flushIntervalMs=200, maxPending=20000)
+ * - Fixed-parameter `UNNEST($1::type[], ...)` batch INSERTs for `usage_logs` (76 params),
+ *   `request_attempts` (28 params), and `request_log_debug` (3 params) — reusable PG prepared
+ *   plans and completely free from PG's 65,535 bind-parameter ceiling
+ * - Multi-channel concurrent writer pool (defaults: concurrency=2, configurable 1-4)
+ * - Scoped `SET LOCAL synchronous_commit = off` inside dedicated batch transactions
+ *   (controlled by `VM2API_LOG_SYNC_COMMIT=on|off`, default `off`, auto-compatible with
+ *   mock `pool.query`-only test pools)
  * - Automatic per-row fallback on batch SQL failure (poison-row isolation)
- * - Non-dropping overflow backpressure (urgent flush + direct single-row write)
- * - Graceful shutdown drain barrier (`flush()` / `close()`)
+ * - Non-dropping overflow backpressure (urgent flush + direct async write)
+ * - Graceful shutdown drain barrier (`flush()` / `close()`) awaiting all channels & direct writes
  * - Async `ctid`-batched retention cleanup (`runRetentionCleanupAsync`) preserving
  *   exact `account_lifetime_usage_archive` and `usage_logs_pruned_through` semantics.
  */
 
 import crypto from 'node:crypto'
 
-export const USAGE_LOG_COLUMNS = Object.freeze([
-  'id',
-  'request_id',
-  'created_at',
-  'log_mode',
-  'method',
-  'path',
-  'protocol',
-  'model',
-  'stream',
-  'status',
-  'duration_ms',
-  'api_key_kind',
-  'api_key_id',
-  'vm_id',
-  'account_id',
-  'workspace',
-  'input_tokens',
-  'output_tokens',
-  'error_code',
-  'error_message',
-  'user_agent',
-  'ip_address',
-  'api_key_presented',
-  'has_tools',
-  'via',
-  'cache_read_tokens',
-  'cache_creation_tokens',
-  'cache_creation_5m_tokens',
-  'cache_creation_1h_tokens',
-  'requested_model',
-  'upstream_model',
-  'model_mismatch',
-  'first_token_ms',
-  'first_byte_ms',
-  'generation_ms',
-  'stop_reason',
-  'attempt_count',
-  'final_state',
-  'final_account_id',
-  'usage_account_id',
-  'input_cost',
-  'output_cost',
-  'cache_read_cost',
-  'cache_creation_cost',
-  'web_search_requests',
-  'web_search_cost',
-  'total_cost',
-  'pricing_model',
-  'price_source',
-  'price_version',
-  'user_id',
-  'group_id',
-  'actual_cost',
-  'rate_multiplier',
-  'service_tier',
-  'upstream_service_tier',
-  'speed',
-  'long_context',
-  'session_id',
-  'outbound_session_id',
-  'reasoning_effort',
-  'inbound_device_id',
-  'upstream_status',
-  'upstream_400_message',
-  'intercept',
-  'jev_state',
-  'vm_owner_user_id',
-  'image_model',
-  'image_usage',
-  'image_input_tokens',
-  'image_output_tokens',
-  'image_cost',
-  'advisor_usage',
-  'advisor_cost',
-  'upstream_type',
-  'error_details',
+// SSOT column specs matching PostgreSQL DDL (`001_init.sql` + `006` + `007`).
+const USAGE_LOG_COLUMN_SPECS = Object.freeze([
+  ['id', 'text'],
+  ['request_id', 'text'],
+  ['created_at', 'text'],
+  ['log_mode', 'text'],
+  ['method', 'text'],
+  ['path', 'text'],
+  ['protocol', 'text'],
+  ['model', 'text'],
+  ['stream', 'integer'],
+  ['status', 'integer'],
+  ['duration_ms', 'bigint'],
+  ['api_key_kind', 'text'],
+  ['api_key_id', 'text'],
+  ['vm_id', 'text'],
+  ['account_id', 'text'],
+  ['workspace', 'text'],
+  ['input_tokens', 'bigint'],
+  ['output_tokens', 'bigint'],
+  ['error_code', 'text'],
+  ['error_message', 'text'],
+  ['user_agent', 'text'],
+  ['ip_address', 'text'],
+  ['api_key_presented', 'text'],
+  ['has_tools', 'integer'],
+  ['via', 'text'],
+  ['cache_read_tokens', 'bigint'],
+  ['cache_creation_tokens', 'bigint'],
+  ['cache_creation_5m_tokens', 'bigint'],
+  ['cache_creation_1h_tokens', 'bigint'],
+  ['requested_model', 'text'],
+  ['upstream_model', 'text'],
+  ['model_mismatch', 'integer'],
+  ['first_token_ms', 'bigint'],
+  ['first_byte_ms', 'bigint'],
+  ['generation_ms', 'bigint'],
+  ['stop_reason', 'text'],
+  ['attempt_count', 'integer'],
+  ['final_state', 'text'],
+  ['final_account_id', 'text'],
+  ['usage_account_id', 'text'],
+  ['input_cost', 'double precision'],
+  ['output_cost', 'double precision'],
+  ['cache_read_cost', 'double precision'],
+  ['cache_creation_cost', 'double precision'],
+  ['web_search_requests', 'integer'],
+  ['web_search_cost', 'double precision'],
+  ['total_cost', 'double precision'],
+  ['pricing_model', 'text'],
+  ['price_source', 'text'],
+  ['price_version', 'text'],
+  ['user_id', 'text'],
+  ['group_id', 'bigint'],
+  ['actual_cost', 'double precision'],
+  ['rate_multiplier', 'double precision'],
+  ['service_tier', 'text'],
+  ['upstream_service_tier', 'text'],
+  ['speed', 'text'],
+  ['long_context', 'integer'],
+  ['session_id', 'text'],
+  ['outbound_session_id', 'text'],
+  ['reasoning_effort', 'text'],
+  ['inbound_device_id', 'text'],
+  ['upstream_status', 'integer'],
+  ['upstream_400_message', 'text'],
+  ['intercept', 'text'],
+  ['jev_state', 'text'],
+  ['vm_owner_user_id', 'text'],
+  ['image_model', 'text'],
+  ['image_usage', 'text'],
+  ['image_input_tokens', 'bigint'],
+  ['image_output_tokens', 'bigint'],
+  ['image_cost', 'double precision'],
+  ['advisor_usage', 'text'],
+  ['advisor_cost', 'double precision'],
+  ['upstream_type', 'text'],
+  ['error_details', 'text'],
 ])
 
-export const REQUEST_ATTEMPT_COLUMNS = Object.freeze([
-  'request_id',
-  'attempt_no',
-  'vm_id',
-  'account_id',
-  'model',
-  'selection_reason',
-  'started_at',
-  'completed_at',
-  'upstream_status',
-  'error_scope',
-  'action',
-  'cooldown_until',
-  'downstream_committed',
-  'terminal_state',
-  'usage_json',
-  'wait_ms',
-  'ttft_ms',
-  'latency_ms',
-  'queue_wait_ms',
-  'scheduling_ms',
-  'error_code',
-  'upstream_type',
-  'error_details_json',
-  'hop_request_id',
-  'provider_run_id',
-  'provider_turn_id',
-  'provider_attempt_id',
-  'provider_request_id',
+const REQUEST_ATTEMPT_COLUMN_SPECS = Object.freeze([
+  ['request_id', 'text'],
+  ['attempt_no', 'integer'],
+  ['vm_id', 'text'],
+  ['account_id', 'text'],
+  ['model', 'text'],
+  ['selection_reason', 'text'],
+  ['started_at', 'text'],
+  ['completed_at', 'text'],
+  ['upstream_status', 'integer'],
+  ['error_scope', 'text'],
+  ['action', 'text'],
+  ['cooldown_until', 'bigint'],
+  ['downstream_committed', 'integer'],
+  ['terminal_state', 'text'],
+  ['usage_json', 'text'],
+  ['wait_ms', 'bigint'],
+  ['ttft_ms', 'bigint'],
+  ['latency_ms', 'bigint'],
+  ['queue_wait_ms', 'bigint'],
+  ['scheduling_ms', 'bigint'],
+  ['error_code', 'text'],
+  ['upstream_type', 'text'],
+  ['error_details_json', 'text'],
+  ['hop_request_id', 'text'],
+  ['provider_run_id', 'text'],
+  ['provider_turn_id', 'text'],
+  ['provider_attempt_id', 'bigint'],
+  ['provider_request_id', 'text'],
 ])
 
-export const REQUEST_DEBUG_COLUMNS = Object.freeze(['request_id', 'ts', 'record_json'])
+const REQUEST_DEBUG_COLUMN_SPECS = Object.freeze([
+  ['request_id', 'text'],
+  ['ts', 'text'],
+  ['record_json', 'text'],
+])
+
+export const USAGE_LOG_COLUMNS = Object.freeze(USAGE_LOG_COLUMN_SPECS.map(([c]) => c))
+export const USAGE_LOG_COLUMN_TYPES = Object.freeze(USAGE_LOG_COLUMN_SPECS.map(([, t]) => t))
+
+export const REQUEST_ATTEMPT_COLUMNS = Object.freeze(REQUEST_ATTEMPT_COLUMN_SPECS.map(([c]) => c))
+export const REQUEST_ATTEMPT_COLUMN_TYPES = Object.freeze(REQUEST_ATTEMPT_COLUMN_SPECS.map(([, t]) => t))
+
+export const REQUEST_DEBUG_COLUMNS = Object.freeze(REQUEST_DEBUG_COLUMN_SPECS.map(([c]) => c))
+export const REQUEST_DEBUG_COLUMN_TYPES = Object.freeze(REQUEST_DEBUG_COLUMN_SPECS.map(([, t]) => t))
 
 const ZERO_DEFAULT_USAGE_COLUMNS = new Set([
   'input_tokens',
@@ -139,9 +158,11 @@ const ZERO_DEFAULT_USAGE_COLUMNS = new Set([
 
 const JSON_TEXT_USAGE_COLUMNS = new Set(['error_details', 'advisor_usage', 'image_usage'])
 
-const DEFAULT_BATCH_SIZE = 128
+const DEFAULT_BATCH_SIZE = 256
 const DEFAULT_FLUSH_INTERVAL_MS = 200
-const DEFAULT_MAX_PENDING = 5000
+const DEFAULT_MAX_PENDING = 20_000
+const DEFAULT_CONCURRENCY = 2
+const MAX_CONCURRENCY = 4
 const DEFAULT_MAX_DEBUG_BYTES = 512 * 1024
 const DEFAULT_MAX_PARAMS_PER_QUERY = 60_000
 const DEFAULT_CLEANUP_BATCH_SIZE = 5000
@@ -269,6 +290,39 @@ function truncateUtf8ByBytes(str, maxBytes) {
     if (last >= 0xd800 && last <= 0xdbff) out = out.slice(0, -1)
   }
   return out
+}
+
+function coerceUnnestValue(value, pgType) {
+  if (value == null) return null
+  if (pgType === 'integer' || pgType === 'bigint') {
+    if (value === '') return null
+    if (typeof value === 'boolean') return value ? 1 : 0
+    if (typeof value === 'bigint') {
+      const n = Number(value)
+      return Number.isSafeInteger(n) ? n : String(value)
+    }
+    const n = Number(value)
+    return Number.isFinite(n) ? Math.trunc(n) : null
+  }
+  if (pgType === 'double precision') {
+    if (value === '') return null
+    const n = Number(value)
+    return Number.isFinite(n) ? n : null
+  }
+  if (pgType === 'boolean') {
+    if (value === '') return null
+    return Boolean(value)
+  }
+  // text and other string-like types
+  return typeof value === 'string' ? stripNul(value) : stripNul(String(value))
+}
+
+function resolveSynchronousCommit(optValue, envValue = process.env.VM2API_LOG_SYNC_COMMIT) {
+  if (typeof optValue === 'boolean') return optValue
+  const raw = optValue != null && optValue !== '' ? String(optValue) : String(envValue ?? '')
+  const norm = raw.trim().toLowerCase()
+  if (norm === 'on' || norm === 'true' || norm === '1') return true
+  return false
 }
 
 /**
@@ -484,7 +538,8 @@ export function normalizeDebugRecord(requestIdOrObj, ts, record, maxDebugBytes =
 }
 
 /**
- * Build a single parameterized multi-row PostgreSQL `INSERT` statement.
+ * Build a single parameterized multi-row PostgreSQL `VALUES` `INSERT` statement.
+ * Kept exported for backwards compatibility and unit tests.
  * @returns {{ sql: string, params: any[] }}
  */
 export function buildMultiRowInsert(table, columns, rows, conflictClause = '') {
@@ -509,6 +564,44 @@ export function buildMultiRowInsert(table, columns, rows, conflictClause = '') {
   return { sql, params }
 }
 
+const _unnestSqlCache = new Map()
+
+/**
+ * Build a fixed-parameter PostgreSQL `UNNEST($1::type[], ...)` batch `INSERT` statement.
+ * Parameter count is fixed at `columns.length` regardless of row count, enabling PG
+ * prepared-plan reuse and eliminating the 65,535 parameter ceiling.
+ * @returns {{ sql: string, params: any[][] }}
+ */
+export function buildUnnestInsert(table, columns, columnTypes, rows, conflictClause = '') {
+  if (!Array.isArray(columnTypes) || columnTypes.length !== columns.length) {
+    throw new TypeError(`buildUnnestInsert(${table}) requires columnTypes matching columns length`)
+  }
+  const colCount = columns.length
+  const rowCount = rows.length
+  const cacheKey = `${table}\0${columns.join(',')}\0${columnTypes.join(',')}\0${conflictClause}`
+  let sql = _unnestSqlCache.get(cacheKey)
+  if (!sql) {
+    const unnestArgs = new Array(colCount)
+    for (let c = 0; c < colCount; c += 1) {
+      unnestArgs[c] = `$${c + 1}::${columnTypes[c]}[]`
+    }
+    const suffix = conflictClause ? ` ${conflictClause}` : ''
+    sql = `INSERT INTO ${table} (${columns.join(', ')}) SELECT * FROM UNNEST(${unnestArgs.join(', ')})${suffix}`
+    _unnestSqlCache.set(cacheKey, sql)
+  }
+
+  const params = new Array(colCount)
+  for (let c = 0; c < colCount; c += 1) {
+    const pgType = columnTypes[c]
+    const colArr = new Array(rowCount)
+    for (let r = 0; r < rowCount; r += 1) {
+      colArr[r] = coerceUnnestValue(rows[r][c], pgType)
+    }
+    params[c] = colArr
+  }
+  return { sql, params }
+}
+
 function clampPositiveInt(value, fallback, min = 1, max = Number.MAX_SAFE_INTEGER) {
   const n = Number(value)
   if (!Number.isFinite(n)) return fallback
@@ -524,6 +617,9 @@ export class PgLogWriter {
     this.batchSize = clampPositiveInt(opts.batchSize, DEFAULT_BATCH_SIZE, 1, 10_000)
     this.flushIntervalMs = clampPositiveInt(opts.flushIntervalMs, DEFAULT_FLUSH_INTERVAL_MS, 5, 60_000)
     this.maxPending = clampPositiveInt(opts.maxPending, DEFAULT_MAX_PENDING, 1, 500_000)
+    this.concurrency = clampPositiveInt(opts.concurrency, DEFAULT_CONCURRENCY, 1, MAX_CONCURRENCY)
+    this.synchronousCommit = resolveSynchronousCommit(opts.synchronousCommit)
+    this.useUnnest = opts.useUnnest !== false
     this.maxDebugBytes = clampPositiveInt(
       opts.maxDebugBytes ?? opts.maxDebugRecordBytes,
       DEFAULT_MAX_DEBUG_BYTES,
@@ -531,6 +627,7 @@ export class PgLogWriter {
       50 * 1024 * 1024,
     )
     this.maxParamsPerQuery = clampPositiveInt(opts.maxParamsPerQuery, DEFAULT_MAX_PARAMS_PER_QUERY, 256, 65_535)
+    this.maxRowsPerQuery = clampPositiveInt(opts.maxRowsPerQuery, Math.max(this.batchSize, 10_000), 1, 50_000)
     this.onFlushed = typeof opts.onFlushed === 'function' ? opts.onFlushed : null
     this.onError =
       typeof opts.onError === 'function'
@@ -545,7 +642,7 @@ export class PgLogWriter {
 
     this._timer = null
     this._urgentScheduled = false
-    this._flushPromise = null
+    this._activeChannels = new Set()
     this._directInFlight = new Set()
     this._closing = false
     this._closed = false
@@ -579,6 +676,9 @@ export class PgLogWriter {
       errors: this._stats.errors,
       lastFlushMs: this._stats.lastFlushMs,
       lastFlushAt: this._stats.lastFlushAt,
+      concurrency: this.concurrency,
+      activeChannels: this._activeChannels.size,
+      synchronousCommit: this.synchronousCommit,
       queues: {
         usageLogs: this._usageQueue.length,
         attempts: this._attemptQueue.length,
@@ -661,7 +761,7 @@ export class PgLogWriter {
     if (this._timer || this._closing || this._closed || this.pending() === 0) return
     this._timer = setTimeout(() => {
       this._timer = null
-      void this._runOneFlushCycle()
+      this._dispatchFlushChannels()
     }, this.flushIntervalMs)
     this._timer.unref?.()
   }
@@ -680,41 +780,75 @@ export class PgLogWriter {
     queueMicrotask(() => {
       this._urgentScheduled = false
       if (this._closed || this.pending() === 0) return
-      void this._runOneFlushCycle()
+      this._dispatchFlushChannels()
     })
+  }
+
+  _buildInsert(table, columns, columnTypes, rows, conflictClause) {
+    if (this.useUnnest) {
+      return buildUnnestInsert(table, columns, columnTypes, rows, conflictClause)
+    }
+    return buildMultiRowInsert(table, columns, rows, conflictClause)
+  }
+
+  async _queryWithSyncCommit(sql, params) {
+    // Use `SET LOCAL synchronous_commit = off` inside a dedicated client transaction when
+    // disabled and `pool.connect()` is available. Falls back cleanly to `pool.query()` for
+    // mock test pools without `connect()` or when `synchronousCommit === true`.
+    if (!this.synchronousCommit && typeof this.pool.connect === 'function') {
+      const client = await this.pool.connect()
+      try {
+        await client.query('BEGIN')
+        await client.query('SET LOCAL synchronous_commit = off')
+        const res = await client.query(sql, params)
+        await client.query('COMMIT')
+        return res
+      } catch (err) {
+        try {
+          await client.query('ROLLBACK')
+        } catch {}
+        throw err
+      } finally {
+        if (typeof client.release === 'function') client.release()
+      }
+    }
+    return this.pool.query(sql, params)
   }
 
   _dispatchDirectWrite(table, item) {
     const p = (async () => {
       try {
         if (table === 'usage_logs') {
-          const { sql, params } = buildMultiRowInsert(
+          const { sql, params } = this._buildInsert(
             'usage_logs',
             USAGE_LOG_COLUMNS,
+            USAGE_LOG_COLUMN_TYPES,
             [usageLogToRow(item)],
             USAGE_LOG_CONFLICT_SQL,
           )
-          await this.pool.query(sql, params)
+          await this._queryWithSyncCommit(sql, params)
           this._stats.flushed += 1
           this._notifyFlushed({ usageLogs: 1, attempts: 0, debugRecords: 0 })
         } else if (table === 'request_attempts') {
-          const { sql, params } = buildMultiRowInsert(
+          const { sql, params } = this._buildInsert(
             'request_attempts',
             REQUEST_ATTEMPT_COLUMNS,
+            REQUEST_ATTEMPT_COLUMN_TYPES,
             [attemptToRow(item)],
             REQUEST_ATTEMPT_CONFLICT_SQL,
           )
-          await this.pool.query(sql, params)
+          await this._queryWithSyncCommit(sql, params)
           this._stats.flushed += 1
           this._notifyFlushed({ usageLogs: 0, attempts: 1, debugRecords: 0 })
         } else {
-          const { sql, params } = buildMultiRowInsert(
+          const { sql, params } = this._buildInsert(
             'request_log_debug',
             REQUEST_DEBUG_COLUMNS,
+            REQUEST_DEBUG_COLUMN_TYPES,
             [[item.request_id, item.ts, item.record_json]],
             REQUEST_DEBUG_CONFLICT_SQL,
           )
-          await this.pool.query(sql, params)
+          await this._queryWithSyncCommit(sql, params)
           this._stats.flushed += 1
           this._notifyFlushed({ usageLogs: 0, attempts: 0, debugRecords: 1 })
         }
@@ -745,56 +879,58 @@ export class PgLogWriter {
     } catch {}
   }
 
-  async _runOneFlushCycle() {
-    if (this._flushPromise) return this._flushPromise
-    if (this.pending() === 0) return this.stats()
-
+  /**
+   * Launch up to `this.concurrency` parallel writer channels while queued items remain.
+   */
+  _dispatchFlushChannels() {
+    if (this._closed || this.pending() === 0) return
     this._clearTimer()
-    const run = (async () => {
-      const started = performance.now()
+    while (!this._closed && this._activeChannels.size < this.concurrency && this.pending() > 0) {
       const usageItems = this._usageQueue.splice(0, this.batchSize)
       const attemptItems = this._attemptQueue.splice(0, this.batchSize)
       const debugItems = this._debugQueue.splice(0, this.batchSize)
+      if (usageItems.length === 0 && attemptItems.length === 0 && debugItems.length === 0) break
 
-      let usageFlushed = 0
-      let attemptsFlushed = 0
-      let debugFlushed = 0
-
-      if (usageItems.length > 0) {
-        usageFlushed = await this._flushUsageBatch(usageItems)
-      }
-      if (attemptItems.length > 0) {
-        attemptsFlushed = await this._flushAttemptBatch(attemptItems)
-      }
-      // Debug records execute independently so any failure never affects main logs.
-      if (debugItems.length > 0) {
-        debugFlushed = await this._flushDebugBatch(debugItems)
-      }
-
-      this._stats.batches += 1
-      this._stats.lastFlushMs = Math.round(Math.max(0, performance.now() - started) * 1000) / 1000
-      this._stats.lastFlushAt = new Date().toISOString()
-
-      if (usageFlushed + attemptsFlushed + debugFlushed > 0) {
-        this._notifyFlushed({
-          usageLogs: usageFlushed,
-          attempts: attemptsFlushed,
-          debugRecords: debugFlushed,
-        })
-      }
-    })()
-
-    this._flushPromise = run
-    try {
-      await run
-    } finally {
-      this._flushPromise = null
-      if (!this._closing && !this._closed && this.pending() > 0) {
-        if (this.pending() >= this.batchSize) this._triggerUrgentFlush()
-        else this._armTimer()
-      }
+      const channelPromise = this._executeFlushChannel(usageItems, attemptItems, debugItems)
+      this._activeChannels.add(channelPromise)
+      channelPromise.finally(() => {
+        this._activeChannels.delete(channelPromise)
+        if (!this._closing && !this._closed && this.pending() > 0) {
+          if (this.pending() >= this.batchSize) this._triggerUrgentFlush()
+          else this._armTimer()
+        }
+      })
     }
-    return this.stats()
+  }
+
+  async _executeFlushChannel(usageItems, attemptItems, debugItems) {
+    const started = performance.now()
+    let usageFlushed = 0
+    let attemptsFlushed = 0
+    let debugFlushed = 0
+
+    if (usageItems.length > 0) {
+      usageFlushed = await this._flushUsageBatch(usageItems)
+    }
+    if (attemptItems.length > 0) {
+      attemptsFlushed = await this._flushAttemptBatch(attemptItems)
+    }
+    // Debug records execute independently so any failure never affects main logs.
+    if (debugItems.length > 0) {
+      debugFlushed = await this._flushDebugBatch(debugItems)
+    }
+
+    this._stats.batches += 1
+    this._stats.lastFlushMs = Math.round(Math.max(0, performance.now() - started) * 1000) / 1000
+    this._stats.lastFlushAt = new Date().toISOString()
+
+    if (usageFlushed + attemptsFlushed + debugFlushed > 0) {
+      this._notifyFlushed({
+        usageLogs: usageFlushed,
+        attempts: attemptsFlushed,
+        debugRecords: debugFlushed,
+      })
+    }
   }
 
   async _flushUsageBatch(items) {
@@ -812,7 +948,13 @@ export class PgLogWriter {
       deduped.push(entry)
     }
 
-    return this._executeChunkedBatch('usage_logs', USAGE_LOG_COLUMNS, deduped, USAGE_LOG_CONFLICT_SQL)
+    return this._executeChunkedBatch(
+      'usage_logs',
+      USAGE_LOG_COLUMNS,
+      USAGE_LOG_COLUMN_TYPES,
+      deduped,
+      USAGE_LOG_CONFLICT_SQL,
+    )
   }
 
   async _flushAttemptBatch(items) {
@@ -834,12 +976,26 @@ export class PgLogWriter {
       merged.push(entry)
     }
 
+    // Deterministic key order prevents ON CONFLICT DO UPDATE deadlocks across concurrent channels.
+    merged.sort((a, b) => {
+      const ra = String(a.norm.request_id ?? '')
+      const rb = String(b.norm.request_id ?? '')
+      if (ra !== rb) return ra < rb ? -1 : 1
+      return (Number(a.norm.attempt_no) || 0) - (Number(b.norm.attempt_no) || 0)
+    })
+
     const entries = merged.map((e) => ({
       row: attemptToRow(e.norm),
       count: e.count,
       requestId: e.requestId,
     }))
-    return this._executeChunkedBatch('request_attempts', REQUEST_ATTEMPT_COLUMNS, entries, REQUEST_ATTEMPT_CONFLICT_SQL)
+    return this._executeChunkedBatch(
+      'request_attempts',
+      REQUEST_ATTEMPT_COLUMNS,
+      REQUEST_ATTEMPT_COLUMN_TYPES,
+      entries,
+      REQUEST_ATTEMPT_CONFLICT_SQL,
+    )
   }
 
   async _flushDebugBatch(items) {
@@ -854,25 +1010,35 @@ export class PgLogWriter {
         byReqId.set(item.request_id, { item, count: 1, requestId: item.request_id })
       }
     }
-    const entries = [...byReqId.values()].map((e) => ({
-      row: [e.item.request_id, e.item.ts, e.item.record_json],
-      count: e.count,
-      requestId: e.requestId,
-    }))
-    return this._executeChunkedBatch('request_log_debug', REQUEST_DEBUG_COLUMNS, entries, REQUEST_DEBUG_CONFLICT_SQL)
+    const entries = [...byReqId.values()]
+      .sort((a, b) => (a.requestId < b.requestId ? -1 : a.requestId > b.requestId ? 1 : 0))
+      .map((e) => ({
+        row: [e.item.request_id, e.item.ts, e.item.record_json],
+        count: e.count,
+        requestId: e.requestId,
+      }))
+    return this._executeChunkedBatch(
+      'request_log_debug',
+      REQUEST_DEBUG_COLUMNS,
+      REQUEST_DEBUG_COLUMN_TYPES,
+      entries,
+      REQUEST_DEBUG_CONFLICT_SQL,
+    )
   }
 
-  async _executeChunkedBatch(table, columns, entries, conflictClause) {
-    const maxRows = Math.max(1, Math.floor(this.maxParamsPerQuery / columns.length))
+  async _executeChunkedBatch(table, columns, columnTypes, entries, conflictClause) {
+    const maxRows = this.useUnnest
+      ? this.maxRowsPerQuery
+      : Math.max(1, Math.floor(this.maxParamsPerQuery / columns.length))
     let totalFlushed = 0
 
     for (let offset = 0; offset < entries.length; offset += maxRows) {
       const chunk = entries.slice(offset, offset + maxRows)
       const rows = chunk.map((e) => e.row)
-      const { sql, params } = buildMultiRowInsert(table, columns, rows, conflictClause)
+      const { sql, params } = this._buildInsert(table, columns, columnTypes, rows, conflictClause)
 
       try {
-        await this.pool.query(sql, params)
+        await this._queryWithSyncCommit(sql, params)
         const chunkCount = chunk.reduce((sum, e) => sum + e.count, 0)
         this._stats.flushed += chunkCount
         totalFlushed += chunkCount
@@ -883,9 +1049,9 @@ export class PgLogWriter {
 
         // Isolate dirty rows by replaying the failed chunk row-by-row.
         for (const entry of chunk) {
-          const single = buildMultiRowInsert(table, columns, [entry.row], conflictClause)
+          const single = this._buildInsert(table, columns, columnTypes, [entry.row], conflictClause)
           try {
-            await this.pool.query(single.sql, single.params)
+            await this._queryWithSyncCommit(single.sql, single.params)
             this._stats.flushed += entry.count
             totalFlushed += entry.count
           } catch (rowErr) {
@@ -901,29 +1067,33 @@ export class PgLogWriter {
   }
 
   /**
-   * Drain barrier: flush all currently queued items (and wait for any in-flight
-   * batches or overflow direct writes) until queues are completely empty.
+   * Drain barrier: flush all currently queued items (and wait for all concurrent
+   * writer channels and in-flight overflow direct writes) until completely drained.
    */
   async flush() {
     this._clearTimer()
     for (;;) {
-      if (this._flushPromise) {
-        await this._flushPromise
+      if (this.pending() > 0 && !this._closed) {
+        this._dispatchFlushChannels()
       }
-      if (this.pending() === 0) {
-        if (this._directInFlight.size > 0) {
-          await Promise.allSettled([...this._directInFlight])
-          continue
-        }
+      if (this._activeChannels.size > 0) {
+        await Promise.allSettled([...this._activeChannels])
+        continue
+      }
+      if (this._directInFlight.size > 0) {
+        await Promise.allSettled([...this._directInFlight])
+        continue
+      }
+      if (this.pending() === 0 || this._closed) {
         return this.stats()
       }
-      await this._runOneFlushCycle()
     }
   }
 
   /**
    * Graceful shutdown barrier: stop scheduling new periodic flushes, drain all
-   * pending items and in-flight overflow writes, then mark the writer closed.
+   * pending items, active concurrent channels, and in-flight overflow writes,
+   * then mark the writer closed.
    */
   async close() {
     if (this._closed) return this.stats()

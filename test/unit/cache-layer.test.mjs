@@ -20,6 +20,7 @@ import {
   notifyDbTablesMutated,
   registerLocalCacheClearer,
 } from '../../src/lib/cache/index.mjs'
+import { SCHED_REV_KEY, SCHED_SNAPSHOT_KEY, SchedulerSnapshotCache } from '../../src/lib/cache/scheduler-cache.mjs'
 import { createDatabase } from '../../src/lib/db/database.mjs'
 import { RefusalGuardsRepo } from '../../src/lib/db/repos/refusal-guards-repo.mjs'
 import { isRoutineApiKeyUsageUpdate } from '../../src/lib/db/pg/pg-sync-db.mjs'
@@ -1065,4 +1066,133 @@ test('invalidateAllCaches clears all domain prefixes, L2 epochs, dashboard.snaps
     fs.rmSync(tmpDir, { recursive: true, force: true })
     await closeCacheRuntime()
   }
+})
+
+test('SchedulerSnapshotCache & SchedulerCache: L1 fresh hit, non-blocking SWR singleflight, Redis L2 rev sync, and invalidateAll', async () => {
+  const sharedRedis = createMockRedis()
+  const clientA = attachMockRedis(new MultiTierCacheClient({ redisConfig: null }), sharedRedis)
+  const clientB = attachMockRedis(new MultiTierCacheClient({ redisConfig: null }), sharedRedis)
+  const schedA = new SchedulerCache(clientA, { freshTtlMs: 2_000, staleTtlMs: 10_000 })
+  const schedB = new SchedulerCache(clientB, { freshTtlMs: 2_000, staleTtlMs: 10_000 })
+
+  let loadCount = 0
+  let generation = 1
+  const asyncLoader = async () => {
+    loadCount += 1
+    const gen = generation
+    await new Promise((r) => setTimeout(r, 15))
+    return {
+      byAccountId: new Map([
+        [
+          'acc-1',
+          {
+            account: { account_id: 'acc-1', status: 'active', gen },
+            state: { account_id: 'acc-1', vm_id: 'vm-1', status: 'ready' },
+          },
+        ],
+      ]),
+      byVmId: new Map([
+        ['vm-1', { id: 'vm-1', status: 'running', claude: { account_uuid: 'acc-1', account_tier: 'max' } }],
+      ]),
+      authoritative: true,
+    }
+  }
+
+  // 1. Cold start: 5 concurrent async callers coalesce into 1 DB load and populate Redis L2
+  const coldResults = await Promise.all(Array.from({ length: 5 }, () => schedA.getSchedulingSnapshotAsync(asyncLoader)))
+  assert.equal(loadCount, 1)
+  assert.equal(coldResults[0].byAccountId.get('acc-1').account.gen, 1)
+  assert.equal(coldResults[0].byAccountId.get('acc-1').runtime.status, 'ready')
+  assert.equal(coldResults[0].byVmId.get('vm-1').id, 'vm-1')
+  assert.ok(await sharedRedis.get(`vm2api:${SCHED_SNAPSHOT_KEY}`), 'snapshot must be persisted to Redis L2')
+
+  // 2. Fresh window (< 2s): sync & async reads hit pure memory L1 with 0 DB and 0 Redis ops
+  const opsBeforeFresh = sharedRedis.ops.length
+  const syncHit = schedA.getSchedulingSnapshotSync(() => {
+    throw new Error('syncLoader must not run during fresh L1 hit')
+  })
+  const asyncHit = await schedA.getSchedulingSnapshotAsync(() => {
+    throw new Error('asyncLoader must not run during fresh L1 hit')
+  })
+  assert.equal(syncHit.byAccountId.get('acc-1').account.gen, 1)
+  assert.equal(asyncHit.byAccountId.get('acc-1').account.gen, 1)
+  assert.equal(sharedRedis.ops.length, opsBeforeFresh, 'fresh L1 hit must incur 0 Redis RTT')
+
+  // 3. Second instance cold-starts directly from Redis L2 with 0 DB loader calls
+  let instBLoads = 0
+  const fromL2 = await schedB.getSchedulingSnapshotAsync(async () => {
+    instBLoads += 1
+    return asyncLoader()
+  })
+  assert.equal(instBLoads, 0, 'instance B must hydrate from Redis L2 without hitting DB')
+  assert.equal(fromL2.byAccountId.get('acc-1').account.gen, 1)
+  assert.equal(fromL2.byVmId.get('vm-1').id, 'vm-1')
+
+  // 4. SWR grace window (2s <= age < 10s): returns stale snapshot immediately and coalesces 1 background refresh
+  generation = 2
+  const staleNow = Date.now() + 3_000
+  const swrBatch = [
+    schedA.getSchedulingSnapshotSync(
+      () => {
+        throw new Error('syncLoader must not block during SWR grace')
+      },
+      { now: staleNow, asyncRefresher: asyncLoader },
+    ),
+    ...(await Promise.all(
+      Array.from({ length: 4 }, () => schedA.getSchedulingSnapshotAsync(asyncLoader, { now: staleNow })),
+    )),
+  ]
+  assert.ok(
+    swrBatch.every((s) => s.byAccountId.get('acc-1').account.gen === 1),
+    'all callers during SWR window must immediately receive stale gen=1 without blocking',
+  )
+  await new Promise((r) => setTimeout(r, 35))
+  assert.equal(loadCount, 2, 'concurrent SWR hits must coalesce into exactly 1 background refresh')
+  const refreshed = schedA.getSchedulingSnapshotSync()
+  assert.equal(refreshed.byAccountId.get('acc-1').account.gen, 2)
+
+  // 5. bumpRevision() increments sched:rev, deletes sched:snapshot:v1, and invalidates local + cross-instance L2
+  generation = 3
+  schedA.bumpRevision({ eventType: 'accounts_updated' })
+  await new Promise((r) => setTimeout(r, 10))
+  assert.equal(schedA.getSchedulingSnapshotSync(), null, 'bumpRevision must synchronously clear L1 snapshot')
+  assert.ok(Number(await sharedRedis.get(`vm2api:${SCHED_REV_KEY}`)) >= 1, 'sched:rev must be bumped in Redis')
+  assert.equal(await sharedRedis.get(`vm2api:${SCHED_SNAPSHOT_KEY}`), null, 'sched:snapshot:v1 must be deleted')
+
+  // Instance B clears local and reads -> sees bumped sched:rev and reloads fresh gen=3
+  schedB.invalidateSchedulingSnapshot()
+  const afterBumpB = await schedB.getSchedulingSnapshotAsync(asyncLoader)
+  assert.equal(afterBumpB.byAccountId.get('acc-1').account.gen, 3)
+
+  // 6. primeSchedulingSnapshot + invalidateAll synchronously clear all local snapshots
+  schedA.getOrBuildSync('legacy-k', () => ({ ok: true }))
+  schedA.primeSchedulingSnapshot({
+    byAccountId: new Map([
+      ['acc-p', { account: { account_id: 'acc-p' }, state: { account_id: 'acc-p', status: 'ready' } }],
+    ]),
+    byVmId: new Map(),
+  })
+  assert.equal(schedA.getSchedulingSnapshotSync().byAccountId.has('acc-p'), true)
+  schedA.invalidateAll({ broadcast: false })
+  assert.equal(schedA.snapshots.size, 0)
+  assert.equal(schedA.getSchedulingSnapshotSync(), null)
+
+  // 7. Standalone SchedulerSnapshotCache without Redis degrades cleanly to in-process L1 + invalidation
+  const localOnly = new SchedulerSnapshotCache(null, { freshTtlMs: 2_000, staleTtlMs: 10_000 })
+  let localLoads = 0
+  const s1 = localOnly.getSchedulingSnapshotSync(() => {
+    localLoads += 1
+    return { byAccountId: new Map([['a', { account: { account_id: 'a' }, state: null }]]), byVmId: new Map() }
+  })
+  const s2 = localOnly.getSchedulingSnapshotSync(() => {
+    localLoads += 1
+    return { byAccountId: new Map(), byVmId: new Map() }
+  })
+  assert.equal(localLoads, 1)
+  assert.equal(s1, s2)
+  localOnly.invalidateSchedulingSnapshot()
+  assert.equal(localOnly.getSchedulingSnapshotSync(), null)
+
+  await clientA.close()
+  await clientB.close()
 })

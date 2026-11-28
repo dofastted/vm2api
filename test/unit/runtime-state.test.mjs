@@ -9,6 +9,15 @@ import { raiseDockerSlotMemory } from '../../src/lib/vm/docker-slot-memory.mjs'
 import { powerOnSlot } from '../../src/lib/vm/slot-recovery.mjs'
 import { runtimePatch } from '../../src/lib/vm/vm-runtime.mjs'
 import { getVm, patchVmRecord } from '../../src/lib/vm/vm-registry.mjs'
+import { createDatabase } from '../../src/lib/db/database.mjs'
+import {
+  AccountRuntimeRepo,
+  listAllSnapshotsAsync,
+  listAllVmsAsync,
+} from '../../src/lib/db/repos/account-runtime-repo.mjs'
+import { VmsRepo } from '../../src/lib/db/repos/vms-repo.mjs'
+import { SchedulerSnapshotCache } from '../../src/lib/cache/scheduler-cache.mjs'
+import { VIRTUAL_POOL_IDS, createSchedulerRuntime } from '../../src/lib/scheduler/scheduler-runtime.mjs'
 
 for (const type of ['docker', 'kvm']) {
   test(`runtime observation replaces stale stopped state (${type})`, () => {
@@ -173,4 +182,425 @@ test('power-on preserves a verified memory raise made while boot readiness is pe
   assert.equal(saved.runtime.pid, 42)
   assert.equal(saved.runtime.stopped, false)
   assert.equal(saved.runtime.started_at, 'new')
+})
+
+test('AccountRuntimeRepo.schedulingSnapshot uses PK-indexed subqueries (no COALESCE/json_each) and matches async PG loaders', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'runtime-snap-idx-'))
+  const db = createDatabase({ dbPath: path.join(dir, 'app.db') })
+  t.after(() => {
+    try {
+      db.close()
+    } catch {}
+    fs.rmSync(dir, { recursive: true, force: true })
+  })
+
+  const executedSql = []
+  const origPrepare = db.prepare.bind(db)
+  db.prepare = (sql) => {
+    const stmt = origPrepare(sql)
+    return new Proxy(stmt, {
+      get(target, prop) {
+        const val = Reflect.get(target, prop, target)
+        if (['get', 'all', 'run'].includes(prop)) {
+          return (...args) => {
+            executedSql.push(String(sql))
+            return val.apply(target, args)
+          }
+        }
+        return typeof val === 'function' ? val.bind(target) : val
+      },
+    })
+  }
+
+  const repo = new AccountRuntimeRepo(db)
+  const vmsRepo = new VmsRepo(db)
+  const nowIso = '2026-11-28T00:00:00.000Z'
+
+  // Seed: acc-both (accounts + runtime), acc-only (accounts only), rt-only (runtime only)
+  origPrepare(
+    `INSERT INTO accounts (id, vm_id, email, name, platform, type, status, priority, load_factor, extra, created_at, updated_at)
+     VALUES (?, ?, ?, ?, 'claude', 'oauth', 'active', ?, ?, ?, ?, ?)`,
+  ).run(
+    'acc-both',
+    'vm-1',
+    'a1@example.com',
+    'Acc 1',
+    20,
+    5,
+    JSON.stringify({ unified: { account_tier: 'max' } }),
+    nowIso,
+    nowIso,
+  )
+  origPrepare(
+    `INSERT INTO accounts (id, vm_id, email, name, platform, type, status, priority, load_factor, extra, created_at, updated_at)
+     VALUES (?, ?, ?, ?, 'claude', 'oauth', 'active', ?, ?, ?, ?, ?)`,
+  ).run('acc-only', 'vm-2', 'a2@example.com', 'Acc 2', 10, 2, '{}', nowIso, nowIso)
+
+  repo.writeHeartbeat({
+    account_id: 'acc-both',
+    vm_id: 'vm-1',
+    status: 'ready',
+    worker_heartbeat_at: 1_700_000_000_000,
+    worker_status: { ok: true },
+    credential_generation: 4,
+    refresh_status: 'fresh',
+  })
+  repo.writeHeartbeat({
+    account_id: 'rt-only',
+    vm_id: 'vm-3',
+    status: 'ready',
+    worker_heartbeat_at: 1_700_000_000_123,
+    worker_status: { ok: true },
+    credential_generation: 2,
+    refresh_status: 'fresh',
+  })
+  vmsRepo.upsertFromVmJson({
+    id: 'vm-1',
+    name: 'VM 1',
+    status: 'running',
+    schedulable: true,
+    claude: { account_uuid: 'acc-both', account_tier: 'max', has_access: true },
+  })
+
+  executedSql.length = 0
+  const single = repo.schedulingSnapshot(['acc-both'])
+  const multi = repo.schedulingSnapshot(['acc-both', 'acc-only', 'rt-only', 'acc-both', 'missing'])
+
+  assert.equal(single.size, 1)
+  assert.equal(multi.size, 3)
+  assert.deepEqual(multi.get('acc-both'), single.get('acc-both'))
+  assert.equal(multi.get('acc-both').account.email, 'a1@example.com')
+  assert.equal(multi.get('acc-both').state.credential_generation, 4)
+  assert.equal(multi.get('acc-only').account.account_id, 'acc-only')
+  assert.equal(multi.get('acc-only').state.status, 'unknown')
+  assert.equal(multi.get('rt-only').account, null)
+  assert.equal(multi.get('rt-only').state.vm_id, 'vm-3')
+  assert.equal(multi.has('missing'), false)
+
+  // Every schedulingSnapshot query must avoid COALESCE/json_each full-table scan patterns and omit credentials
+  assert.equal(executedSql.length, 2)
+  for (const sql of executedSql) {
+    assert.equal(/COALESCE\s*\(\s*a\.id/i.test(sql), false, `must not filter on COALESCE(a.id, ...): ${sql}`)
+    assert.equal(/json_each/i.test(sql), false, `must not use json_each: ${sql}`)
+    assert.equal(/credentials|access_token|refresh_token/i.test(sql), false, `must omit credential columns: ${sql}`)
+    assert.match(sql, /FROM accounts WHERE id\b/i)
+    assert.match(sql, /FROM account_runtime WHERE account_id\b/i)
+    const qCount = (sql.match(/\?/g) || []).length
+    const plan = origPrepare(`EXPLAIN QUERY PLAN ${sql}`).all(...Array(qCount).fill('acc-both'))
+    const planText = plan.map((r) => r.detail || '').join('\n')
+    assert.equal(
+      /SCAN accounts\b|SCAN account_runtime\b/i.test(planText),
+      false,
+      `unexpected full table scan: ${planText}`,
+    )
+  }
+
+  // listAllSnapshotsAsync & listAllVmsAsync run directly via async pgPool (0 sync db.prepare calls)
+  const rawSnapRows = origPrepare(
+    `SELECT a.id, a.vm_id, a.email, a.name, a.platform, a.type,
+            a.status, a.schedulable, a.priority, a.rate_multiplier, a.concurrency,
+            a.concurrency_override, a.max_rpm, a.rpm_override, a.requests,
+            a.tokens_in, a.tokens_out, a.cache_read_tokens, a.cache_creation_tokens,
+            a.extra, a.updated_at, a.load_factor, a.last_used_at, a.created_at,
+            a.temp_unschedulable_until, a.temp_unschedulable_reason, a.rate_limited_at,
+            a.rate_limit_reset_at, a.overload_until, a.session_window_start,
+            a.session_window_end, a.session_window_status,
+            r.account_id AS rt_account_id, r.vm_id AS rt_vm_id, r.status AS rt_status,
+            r.updated_at AS rt_updated_at, r.model_states_json, r.credential_generation,
+            r.refresh_status, r.worker_heartbeat_at, r.worker_status_json
+     FROM accounts a FULL JOIN account_runtime r ON r.account_id = a.id`,
+  ).all()
+  const rawVmRows = origPrepare('SELECT * FROM vms ORDER BY id').all()
+  const pgQueries = []
+  const fakePgPool = {
+    async query(sql, params) {
+      pgQueries.push({ sql: String(sql), params })
+      if (/FROM vms\b/i.test(sql)) return { rows: rawVmRows }
+      return { rows: rawSnapRows }
+    },
+  }
+
+  executedSql.length = 0
+  const asyncSnaps = await listAllSnapshotsAsync(fakePgPool)
+  const asyncVms = await listAllVmsAsync(fakePgPool)
+  assert.equal(executedSql.length, 0, 'async PG loaders must never touch sync db')
+  assert.equal(pgQueries.length, 2)
+  assert.equal(asyncSnaps.size, 3)
+  assert.equal(asyncSnaps.get('acc-both').account.email, 'a1@example.com')
+  assert.equal(asyncSnaps.get('acc-both').runtime.credential_generation, 4)
+  assert.equal(asyncVms.size, 1)
+  assert.equal(asyncVms.get('vm-1').claude.account_tier, 'max')
+  assert.equal(/access_token|refresh_token|session_key/i.test(pgQueries[1].sql), false)
+})
+
+test('SchedulerRuntime 200-VM hot path: 0 Atomics.wait / 0 N+1 DB calls, shared telemetry snapshot, and async PG UNNEST drain', async () => {
+  const vmCount = 200
+  const futureCooldown = Date.now() + 3_600_000
+  const vms = []
+  const pgAccountRows = []
+  const pgVmRows = []
+
+  for (let i = 0; i < vmCount; i += 1) {
+    const id = `vm-${String(i).padStart(3, '0')}`
+    const accountId = `acct-${id}`
+    const isMax = i === 0 || i === 1
+    const vm = {
+      id,
+      name: id,
+      kind: 'claude',
+      status: 'running',
+      schedulable: true,
+      proxy_cli_enabled: true,
+      proxy: { host: '10.0.0.1', port: 1080 },
+      claude: {
+        account_uuid: accountId,
+        account_tier: isMax ? 'max' : 'pro',
+        account_tier_source: 'profile',
+        has_access: true,
+        has_refresh: true,
+        expires_at: futureCooldown,
+      },
+      policy: { priority: isMax ? 10 : 5, weight: 10, max_concurrency: 4, session_slots: 4 },
+    }
+    vms.push(vm)
+    pgVmRows.push({
+      id,
+      name: id,
+      status: 'running',
+      schedulable: 1,
+      account_uuid: accountId,
+      vm_json: JSON.stringify(vm),
+      encrypted: 0,
+      origin: 'platform',
+    })
+    pgAccountRows.push({
+      id: accountId,
+      vm_id: id,
+      email: `${id}@example.com`,
+      name: id,
+      platform: 'claude',
+      type: 'oauth',
+      status: i === 2 ? 'disabled' : 'active',
+      schedulable: 1,
+      priority: isMax ? 10 : 5,
+      rate_multiplier: 1,
+      concurrency: 4,
+      concurrency_override: 0,
+      max_rpm: 0,
+      rpm_override: 0,
+      requests: 0,
+      tokens_in: 0,
+      tokens_out: 0,
+      cache_read_tokens: 0,
+      cache_creation_tokens: 0,
+      extra: JSON.stringify({
+        unified: {
+          account_tier: isMax ? 'max' : 'pro',
+          account_tier_source: 'profile',
+          headers: { '5h': { utilization: i === 3 ? 0.98 : 0.2, reset: futureCooldown, status: 'allowed' } },
+        },
+      }),
+      updated_at: '2026-11-28T00:00:00.000Z',
+      load_factor: 10,
+      last_used_at: null,
+      created_at: '2026-11-28T00:00:00.000Z',
+      temp_unschedulable_until: null,
+      temp_unschedulable_reason: null,
+      rate_limited_at: null,
+      rate_limit_reset_at: null,
+      overload_until: null,
+      session_window_start: null,
+      session_window_end: null,
+      session_window_status: null,
+      rt_account_id: accountId,
+      rt_vm_id: id,
+      rt_status: 'ready',
+      rt_updated_at: '2026-11-28T00:00:00.000Z',
+      // Put vm-000 (Max #1) in Fable cooldown so only vm-001 (Max #2) is eligible for Fable!
+      model_states_json:
+        i === 0
+          ? JSON.stringify({ fable: { cooldown_until: futureCooldown, reason: 'fable_credits_required' } })
+          : '{}',
+      credential_generation: 1,
+      refresh_status: 'fresh',
+      worker_heartbeat_at: Date.now(),
+      worker_status_json: JSON.stringify({ ok: true }),
+    })
+  }
+
+  const pgQueries = []
+  const fakePgPool = {
+    async query(sql, params) {
+      const text = String(sql)
+      pgQueries.push({ sql: text, params })
+      if (/FROM vms\b/i.test(text)) return { rows: pgVmRows }
+      if (/FROM accounts a FULL JOIN account_runtime/i.test(text)) return { rows: pgAccountRows }
+      return { rows: [], rowCount: 1 }
+    },
+    async connect() {
+      return {
+        query: (sql, params) => fakePgPool.query(sql, params),
+        release() {},
+      }
+    },
+  }
+
+  let syncDbCalls = 0
+  const forbidSyncPgDb = {
+    engine: 'postgres',
+    prepare(sql) {
+      syncDbCalls += 1
+      throw new Error(`Hot path must NOT invoke sync PgSyncDb.prepare: ${sql}`)
+    },
+    exec(sql) {
+      syncDbCalls += 1
+      throw new Error(`Hot path must NOT invoke sync PgSyncDb.exec: ${sql}`)
+    },
+  }
+
+  const acquiredReqs = []
+  const pushedTelemetries = []
+  const mockClient = {
+    stopped: false,
+    isStandby: false,
+    role: 'leader',
+    controllerEpoch: 'epoch-1',
+    async acquire(req) {
+      acquiredReqs.push(req)
+      return { ok: true, lease_id: `lease-${acquiredReqs.length}`, selected_node: { node_key: 'claude_vm:vm-001' } }
+    },
+    async pushTelemetry(batch) {
+      pushedTelemetries.push(batch)
+      return { ok: true, updated: batch.length }
+    },
+    async drainAll({ onDrain }) {
+      await onDrain({
+        sticky_upserts: [
+          {
+            scope_kind: 'session',
+            pool_id: VIRTUAL_POOL_IDS.claude,
+            model_family: 'claude',
+            identity_id: 'sess-1',
+            node_type: 'claude_vm',
+            node_id: 'vm-000',
+            bound_at_ms: 1000,
+            last_seen_ms: 1000,
+            expires_at_ms: 9000,
+            hits: 1,
+            generation: 1,
+          },
+          // Duplicate PK in same batch tests deduplication before PG UNNEST ON CONFLICT
+          {
+            scope_kind: 'session',
+            pool_id: VIRTUAL_POOL_IDS.claude,
+            model_family: 'claude',
+            identity_id: 'sess-1',
+            node_type: 'claude_vm',
+            node_id: 'vm-001',
+            bound_at_ms: 1000,
+            last_seen_ms: 2000,
+            expires_at_ms: 9999,
+            hits: 2,
+            generation: 2,
+          },
+        ],
+        sticky_deletes: [
+          { scope_kind: 'session', pool_id: VIRTUAL_POOL_IDS.claude, model_family: 'claude', identity_id: 'sess-old' },
+        ],
+        penalty_upserts: [
+          {
+            node_type: 'claude_vm',
+            node_id: 'vm-002',
+            model_scope: '*',
+            reason: 'rate_limit',
+            cooldown_until_ms: 5000,
+            ladder_step: 1,
+          },
+        ],
+        penalty_deletes: [{ node_key: 'claude_vm:vm-003', model_scope: '*' }],
+      })
+      return { batches: 1, remaining: 0 }
+    },
+  }
+
+  const snapCache = new SchedulerSnapshotCache(null, { freshTtlMs: 2_000, staleTtlMs: 10_000 })
+  const runtime = createSchedulerRuntime({
+    cfg: { paths: { project: '/nonexistent-test-root' } },
+    client: mockClient,
+    getDb: () => forbidSyncPgDb,
+    pgPool: fakePgPool,
+    schedulerCache: snapCache,
+    getVms: () => vms,
+    getRoutingConfig: () => ({
+      pool: { fable_requires_max: true },
+      quota: { exhaustion_guard: true, exhaustion_guard_new_session: 0.85, exhaustion_guard_stop: 0.95 },
+    }),
+    accountQuota: {
+      runtimeRepo: {
+        db: forbidSyncPgDb,
+        schedulingSnapshot() {
+          throw new Error('Must NOT call sync runtimeRepo.schedulingSnapshot in 200-VM loop')
+        },
+      },
+      repo: {
+        get() {
+          throw new Error('Must NOT call sync accountQuota.repo.get in 200-VM loop')
+        },
+      },
+    },
+    telemetryIntervalMs: 0,
+  })
+
+  // Build config snapshot (no DB pools query needed; swallow safe fallback if getDb throws)
+  runtime.buildConfigSnapshot({ configVersion: 1 })
+  syncDbCalls = 0
+  pgQueries.length = 0
+
+  // 1. Run 10 acquireNode calls across 200 VMs -> only 1 cold async PG snapshot load (2 queries), then 0 DB queries!
+  for (let i = 0; i < 10; i += 1) {
+    await runtime.acquireNode({
+      originPoolId: VIRTUAL_POOL_IDS.claude,
+      apiKeyKind: 'master',
+      model: i % 2 === 0 ? 'claude-fable-5' : 'claude-sonnet-4-6',
+      protocol: 'anthropic',
+      nodeTypes: ['claude_vm'],
+      sessionId: `sess-${i}`,
+    })
+  }
+  assert.equal(syncDbCalls, 0, 'steady-state acquireNode must execute 0 sync PgSyncDb Atomics.wait calls')
+  assert.equal(
+    pgQueries.length,
+    2,
+    '10 requests across 200 VMs must trigger only 1 cold async snapshot load (accounts+vms)',
+  )
+  // Fable requests must exclude all 198 Pro VMs AND vm-000 (fable cooldown), leaving ONLY vm-001!
+  assert.deepEqual(acquiredReqs[0].api_key_scope.allowed_node_keys, ['claude_vm:vm-001'])
+  // Sonnet requests allow all 200 VMs (compact [] representation)
+  assert.deepEqual(acquiredReqs[1].api_key_scope.allowed_node_keys, [])
+
+  // 2. pushTelemetryNow reuses warm L1 snapshot with 0 sync DB calls and evaluates account_disabled & quota_guard_stop!
+  await runtime.pushTelemetryNow()
+  assert.equal(syncDbCalls, 0, 'pushTelemetryNow must execute 0 sync PgSyncDb calls')
+  assert.equal(pgQueries.length, 2, 'pushTelemetryNow reuses fresh L1 snapshot with 0 extra PG queries')
+  const teleByKey = new Map(pushedTelemetries[0].map((u) => [u.node_key, u]))
+  assert.equal(teleByKey.get('claude_vm:vm-002').schedulable, false)
+  assert.equal(teleByKey.get('claude_vm:vm-002').unschedulable_reason, 'account_disabled')
+  assert.equal(teleByKey.get('claude_vm:vm-003').schedulable, false)
+  assert.equal(teleByKey.get('claude_vm:vm-003').unschedulable_reason, 'quota_guard_stop')
+
+  // 3. drainPersistenceNow executes batched UNNEST queries asynchronously on pgPool with 0 sync DB calls
+  pgQueries.length = 0
+  await runtime.drainPersistenceNow()
+  assert.equal(syncDbCalls, 0, 'PG drain must execute 0 sync PgSyncDb calls')
+  const drainSqls = pgQueries.map((q) => q.sql)
+  assert.equal(drainSqls[0], 'BEGIN')
+  assert.equal(drainSqls.at(-1), 'COMMIT')
+  const stickyUpsertCall = pgQueries.find((q) => /INSERT INTO scheduler_sticky_bindings[\s\S]*UNNEST/i.test(q.sql))
+  assert.ok(stickyUpsertCall, 'sticky_upserts must use PG UNNEST batch')
+  // Duplicate PK (sess-1) deduplicated to 1 row keeping the last write (vm-001, generation 2)
+  assert.deepEqual(stickyUpsertCall.params[5], ['vm-001'])
+  assert.deepEqual(stickyUpsertCall.params[12], [2])
+  assert.ok(pgQueries.some((q) => /DELETE FROM scheduler_sticky_bindings[\s\S]*UNNEST/i.test(q.sql)))
+  assert.ok(pgQueries.some((q) => /INSERT INTO scheduler_node_penalties[\s\S]*UNNEST/i.test(q.sql)))
+  assert.ok(pgQueries.some((q) => /DELETE FROM scheduler_node_penalties[\s\S]*UNNEST/i.test(q.sql)))
 })

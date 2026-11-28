@@ -10,8 +10,45 @@
  * conversion happens here.
  */
 
-import { getDb } from '../database.mjs'
+import { getDb, getPgPool } from '../database.mjs'
+import { maybeDecrypt } from '../secure.mjs'
 import { rowToAccount } from './accounts-repo.mjs'
+
+const ACCOUNT_SNAPSHOT_COLS = `id, vm_id, email, name, platform, type,
+  status, schedulable, priority, rate_multiplier, concurrency,
+  concurrency_override, max_rpm, rpm_override, requests,
+  tokens_in, tokens_out, cache_read_tokens, cache_creation_tokens,
+  extra, updated_at, load_factor, last_used_at, created_at,
+  temp_unschedulable_until, temp_unschedulable_reason, rate_limited_at,
+  rate_limit_reset_at, overload_until, session_window_start,
+  session_window_end, session_window_status`
+
+const RUNTIME_SNAPSHOT_COLS = `account_id, vm_id, status, updated_at,
+  model_states_json, credential_generation, refresh_status,
+  worker_heartbeat_at, worker_status_json`
+
+const SNAPSHOT_SELECT_CLAUSE = `SELECT a.id, a.vm_id, a.email, a.name, a.platform, a.type,
+  a.status, a.schedulable, a.priority, a.rate_multiplier, a.concurrency,
+  a.concurrency_override, a.max_rpm, a.rpm_override, a.requests,
+  a.tokens_in, a.tokens_out, a.cache_read_tokens, a.cache_creation_tokens,
+  a.extra, a.updated_at, a.load_factor, a.last_used_at, a.created_at,
+  a.temp_unschedulable_until, a.temp_unschedulable_reason, a.rate_limited_at,
+  a.rate_limit_reset_at, a.overload_until, a.session_window_start,
+  a.session_window_end, a.session_window_status,
+  r.account_id AS rt_account_id, r.vm_id AS rt_vm_id, r.status AS rt_status,
+  r.updated_at AS rt_updated_at, r.model_states_json, r.credential_generation,
+  r.refresh_status, r.worker_heartbeat_at, r.worker_status_json`
+
+const ALL_SNAPSHOTS_SQL = `${SNAPSHOT_SELECT_CLAUSE}
+  FROM accounts a FULL JOIN account_runtime r ON r.account_id = a.id`
+
+const ALL_VMS_SQL = `SELECT id, name, status, schedulable, email, account_uuid, org_uuid,
+  oauth_expires_at, oauth_source, proxy_id, claude_code_version,
+  timezone, locale, vm_json, encrypted, file_mtime_ms, synced_at,
+  created_at, updated_at, owner_user_id, origin
+  FROM vms ORDER BY id`
+
+const SNAPSHOT_BATCH_CHUNK = 500
 
 function parse(value, fallback = null) {
   if (value == null) return fallback
@@ -61,23 +98,133 @@ function mergeState(rt, acc) {
   }
 }
 
+function normalizeAccountIds(accountIds) {
+  const unique = []
+  const seen = new Set()
+  for (const raw of accountIds || []) {
+    if (raw == null || raw === '') continue
+    const id = String(raw)
+    if (!seen.has(id)) {
+      seen.add(id)
+      unique.push(id)
+    }
+  }
+  return unique
+}
+
+function decodeSnapshotRow(row) {
+  const account = row.id == null ? null : row
+  const runtime =
+    row.rt_account_id == null
+      ? null
+      : {
+          ...row,
+          account_id: row.rt_account_id,
+          vm_id: row.rt_vm_id,
+          status: row.rt_status,
+          updated_at: row.rt_updated_at,
+        }
+  return { account: rowToAccount(account), state: mergeState(runtime, account) }
+}
+
+function decodeVmRow(row) {
+  if (!row?.id) return null
+  let parsed = null
+  if (row.vm_json) {
+    try {
+      const json = row.encrypted ? maybeDecrypt(row.vm_json) : row.vm_json
+      parsed = JSON.parse(json)
+    } catch {
+      parsed = null
+    }
+  }
+  if (parsed && typeof parsed === 'object') {
+    return {
+      ...parsed,
+      id: parsed.id || row.id,
+      ...(parsed.status == null && row.status != null ? { status: row.status } : {}),
+      ...(parsed.schedulable === undefined && row.schedulable != null ? { schedulable: Boolean(row.schedulable) } : {}),
+      ...(parsed.owner_user_id === undefined && row.owner_user_id != null ? { owner_user_id: row.owner_user_id } : {}),
+      ...(parsed.origin === undefined && row.origin != null ? { origin: row.origin } : {}),
+    }
+  }
+  return {
+    id: row.id,
+    name: row.name ?? null,
+    status: row.status ?? 'unknown',
+    schedulable: row.schedulable == null ? true : Boolean(row.schedulable),
+    email: row.email ?? null,
+    account_uuid: row.account_uuid ?? null,
+    org_uuid: row.org_uuid ?? null,
+    proxy_id: row.proxy_id ?? null,
+    timezone: row.timezone ?? null,
+    locale: row.locale ?? null,
+    owner_user_id: row.owner_user_id ?? null,
+    origin: row.origin ?? 'platform',
+    claude: {
+      email: row.email ?? null,
+      account_uuid: row.account_uuid ?? null,
+      org_uuid: row.org_uuid ?? null,
+      expires_at: row.oauth_expires_at ?? null,
+      source: row.oauth_source ?? null,
+    },
+  }
+}
+
+function buildFilteredSnapshotSql(placeholderExpr) {
+  return `${SNAPSHOT_SELECT_CLAUSE}
+    FROM (SELECT ${ACCOUNT_SNAPSHOT_COLS} FROM accounts WHERE id ${placeholderExpr}) a
+    FULL JOIN (SELECT ${RUNTIME_SNAPSHOT_COLS} FROM account_runtime WHERE account_id ${placeholderExpr}) r
+      ON r.account_id = a.id`
+}
+
+/**
+ * Async PostgreSQL full scheduling snapshot loader (`accounts FULL JOIN account_runtime`).
+ * Runs directly on `pgPool` off the main thread — 0 `Atomics.wait`.
+ * @param {import('pg').Pool|null} pgPool
+ * @returns {Promise<Map<string, { account: object|null, state: object|null, runtime: object|null }>>}
+ */
+export async function listAllSnapshotsAsync(pgPool) {
+  const result = new Map()
+  if (!pgPool || typeof pgPool.query !== 'function') return result
+  const res = await pgPool.query(ALL_SNAPSHOTS_SQL)
+  for (const row of res?.rows || []) {
+    const key = row.id ?? row.rt_account_id
+    if (key == null) continue
+    const decoded = decodeSnapshotRow(row)
+    result.set(String(key), { ...decoded, runtime: decoded.state })
+  }
+  return result
+}
+
+/**
+ * Async PostgreSQL credential-free VM metadata snapshot loader (`vms` table).
+ * Runs directly on `pgPool` off the main thread — 0 `Atomics.wait`.
+ * @param {import('pg').Pool|null} pgPool
+ * @returns {Promise<Map<string, object>>}
+ */
+export async function listAllVmsAsync(pgPool) {
+  const result = new Map()
+  if (!pgPool || typeof pgPool.query !== 'function') return result
+  const res = await pgPool.query(ALL_VMS_SQL)
+  for (const row of res?.rows || []) {
+    const vm = decodeVmRow(row)
+    if (vm?.id) result.set(String(vm.id), vm)
+  }
+  return result
+}
+
 export class AccountRuntimeRepo {
   constructor(db = getDb()) {
     this.db = db
-    const snapshot = `SELECT a.id, a.vm_id, a.email, a.name, a.platform, a.type,
-      a.status, a.schedulable, a.priority, a.rate_multiplier, a.concurrency,
-      a.concurrency_override, a.max_rpm, a.rpm_override, a.requests,
-      a.tokens_in, a.tokens_out, a.cache_read_tokens, a.cache_creation_tokens,
-      a.extra, a.updated_at, a.load_factor, a.last_used_at, a.created_at,
-      a.temp_unschedulable_until, a.temp_unschedulable_reason, a.rate_limited_at,
-      a.rate_limit_reset_at, a.overload_until, a.session_window_start,
-      a.session_window_end, a.session_window_status,
-      r.account_id AS rt_account_id, r.vm_id AS rt_vm_id, r.status AS rt_status,
-      r.updated_at AS rt_updated_at, r.model_states_json, r.credential_generation,
-      r.refresh_status, r.worker_heartbeat_at, r.worker_status_json
-      FROM accounts a FULL JOIN account_runtime r ON r.account_id = a.id`
-    this._snapshots = db.prepare(snapshot + ' WHERE COALESCE(a.id, r.account_id) IN (SELECT value FROM json_each(?))')
-    this._allSnapshots = db.prepare(snapshot)
+    // Index-friendly PK subqueries on both `accounts` and `account_runtime` (0 seq_scan in PG 18).
+    this._snapshotOne = db.prepare(buildFilteredSnapshotSql('= ?'))
+    this._allSnapshots = db.prepare(ALL_SNAPSHOTS_SQL)
+    try {
+      this._allVms = db.prepare(ALL_VMS_SQL)
+    } catch {
+      this._allVms = null
+    }
     this._heartbeat = db.prepare(`INSERT INTO account_runtime
       (account_id, vm_id, status, worker_heartbeat_at, worker_status_json,
        credential_generation, refresh_status, updated_at)
@@ -124,27 +271,98 @@ export class AccountRuntimeRepo {
   }
 
   schedulingSnapshot(accountIds) {
-    if (!accountIds.length) return new Map()
-    return new Map(
-      this._snapshots
-        .all(JSON.stringify(accountIds))
-        .map((row) => [row.id ?? row.rt_account_id, this.snapshotRow(row)]),
-    )
+    const unique = normalizeAccountIds(accountIds)
+    const result = new Map()
+    if (!unique.length) return result
+    if (unique.length === 1) {
+      const id = unique[0]
+      for (const row of this._snapshotOne.all(id, id)) {
+        const key = row.id ?? row.rt_account_id
+        if (key != null) result.set(String(key), this.snapshotRow(row))
+      }
+      return result
+    }
+    for (let i = 0; i < unique.length; i += SNAPSHOT_BATCH_CHUNK) {
+      const chunk = unique.slice(i, i + SNAPSHOT_BATCH_CHUNK)
+      const placeholders = chunk.map(() => '?').join(', ')
+      const rows = this.db.prepare(buildFilteredSnapshotSql(`IN (${placeholders})`)).all(...chunk, ...chunk)
+      for (const row of rows) {
+        const key = row.id ?? row.rt_account_id
+        if (key != null) result.set(String(key), this.snapshotRow(row))
+      }
+    }
+    return result
+  }
+
+  /**
+   * Async PK-indexed batch scheduling snapshot for specific account IDs.
+   * Uses `= ANY($1::text[])` on `pgPool` (0 `Atomics.wait`, 0 `seq_scan`),
+   * falling back to `schedulingSnapshot()` on SQLite.
+   */
+  async schedulingSnapshotAsync(accountIds, pgPool = null) {
+    const unique = normalizeAccountIds(accountIds)
+    if (!unique.length) return new Map()
+    const pool = pgPool || (this.db?.engine === 'postgres' ? getPgPool() : null)
+    if (!pool || typeof pool.query !== 'function') {
+      return this.schedulingSnapshot(unique)
+    }
+    const result = new Map()
+    const sql = buildFilteredSnapshotSql('= ANY($1::text[])')
+    for (let i = 0; i < unique.length; i += SNAPSHOT_BATCH_CHUNK) {
+      const chunk = unique.slice(i, i + SNAPSHOT_BATCH_CHUNK)
+      const res = await pool.query(sql, [chunk])
+      for (const row of res?.rows || []) {
+        const key = row.id ?? row.rt_account_id
+        if (key != null) result.set(String(key), this.snapshotRow(row))
+      }
+    }
+    return result
+  }
+
+  /** Synchronous full scheduling snapshot (`accounts FULL JOIN account_runtime`). */
+  listAllSnapshots() {
+    const result = new Map()
+    for (const row of this._allSnapshots.all()) {
+      const key = row.id ?? row.rt_account_id
+      if (key == null) continue
+      const decoded = this.snapshotRow(row)
+      result.set(String(key), { ...decoded, runtime: decoded.state })
+    }
+    return result
+  }
+
+  /**
+   * Async full scheduling snapshot: runs directly on `pgPool` in PostgreSQL mode
+   * (0 `Atomics.wait`), or falls back to SQLite `listAllSnapshots()`.
+   */
+  async listAllSnapshotsAsync(pgPool = null) {
+    const pool = pgPool || (this.db?.engine === 'postgres' ? getPgPool() : null)
+    if (pool && typeof pool.query === 'function') {
+      return listAllSnapshotsAsync(pool)
+    }
+    return this.listAllSnapshots()
+  }
+
+  /**
+   * Async credential-free VM metadata snapshot: runs directly on `pgPool` in
+   * PostgreSQL mode (0 `Atomics.wait`), or decodes from SQLite `vms` table.
+   */
+  async listAllVmsAsync(pgPool = null) {
+    const pool = pgPool || (this.db?.engine === 'postgres' ? getPgPool() : null)
+    if (pool && typeof pool.query === 'function') {
+      return listAllVmsAsync(pool)
+    }
+    const result = new Map()
+    if (!this._allVms) return result
+    for (const row of this._allVms.all()) {
+      const vm = decodeVmRow(row)
+      if (vm?.id) result.set(String(vm.id), vm)
+    }
+    return result
   }
 
   snapshotRow(row) {
-    const account = row.id == null ? null : row
-    const runtime =
-      row.rt_account_id == null
-        ? null
-        : {
-            ...row,
-            account_id: row.rt_account_id,
-            vm_id: row.rt_vm_id,
-            status: row.rt_status,
-            updated_at: row.rt_updated_at,
-          }
-    return { account: rowToAccount(account), state: mergeState(runtime, account) }
+    return decodeSnapshotRow(row)
   }
 
   get(accountId) {

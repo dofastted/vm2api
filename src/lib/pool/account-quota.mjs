@@ -9,10 +9,10 @@
  * Transient state (inflight counters, RPM buckets) stays in memory.
  */
 
-import { getDb, isDbOpen, resolveStoreDb } from '../db/database.mjs'
+import { getDb, getPgPool, isDbOpen, resolveStoreDb, withTransaction } from '../db/database.mjs'
 import { enqueueWrite, writeBehindArmed } from '../db/write-behind.mjs'
-import { getCacheRuntime } from '../cache/index.mjs'
-import { AccountsRepo } from '../db/repos/accounts-repo.mjs'
+import { getCacheRuntime, notifyDbTablesMutated } from '../cache/index.mjs'
+import { AccountsRepo, rowToAccount } from '../db/repos/accounts-repo.mjs'
 import { computeWeeklySplit, weeklySplitConfig } from './weekly-split.mjs'
 import {
   applyEffectiveWindows,
@@ -78,6 +78,51 @@ const RESET_WINDOW_MAP = {
 const MAX_APPLIED_RESET_OPS = 32
 const RESET_GEN_CACHE_TTL_MS = 8_000
 const SESSION_WINDOW_WRITE_DEDUPE_MS = 60_000
+const DEFAULT_QUOTA_FLUSH_INTERVAL_MS = 1_000
+const DEFAULT_SNAPSHOT_CACHE_TTL_MS = 200
+const DEFAULT_ACCOUNT_L1_TTL_MS = 200
+const RECENT_ALLOC_RING_LIMIT = 5
+const MAX_RECENT_ALLOC_ACCOUNTS = 4_096
+const MAX_PENDING_ALLOCS = 10_000
+const MAX_ALLOCATIONS_PER_ACCOUNT = 50
+const REDIS_QUOTA_HASH_PREFIX = 'quota:acct:'
+const REDIS_QUOTA_TTL_SEC = 3_600
+const QUOTA_FLUSH_ERROR_LOG_THROTTLE_MS = 30_000
+const ALLOC_TRIM_EVERY = 10
+
+function cloneAccount(acc) {
+  if (!acc || typeof acc !== 'object') return acc
+  return structuredClone(acc)
+}
+
+function buildAccountExtraJson(acc) {
+  return JSON.stringify({
+    unified: acc.unified ?? null,
+    last_blocked: acc.last_blocked ?? null,
+    last_cli_rate_limit: acc.last_cli_rate_limit ?? null,
+    window_history: acc.window_history ?? null,
+  })
+}
+
+function toIsoMs(ms) {
+  const n = Number(ms)
+  if (!Number.isFinite(n) || n <= 0) return null
+  return new Date(Math.min(n, 8.64e15)).toISOString()
+}
+
+function normalizeAllocRow(row) {
+  return {
+    at: row.at,
+    source: row.source ?? null,
+    util_5h: row.util_5h ?? null,
+    util_7d: row.util_7d ?? null,
+    status_5h: row.status_5h ?? null,
+    status_7d: row.status_7d ?? null,
+    claim: row.claim ?? null,
+    tokens_in: row.tokens_in ?? null,
+    tokens_out: row.tokens_out ?? null,
+  }
+}
 
 function fableModelKey(model) {
   return resolvePolicyModelId(model) || String(model || '').trim()
@@ -106,9 +151,22 @@ export { extraHeadersFromLimitError }
 export { estimateRequestRisk }
 
 export class AccountQuota {
-  constructor({ dataDir, db, config, accounts }) {
+  constructor({
+    dataDir,
+    db,
+    config,
+    accounts,
+    pgPool = null,
+    writeBehindQuota = null,
+    quotaFlushIntervalMs = DEFAULT_QUOTA_FLUSH_INTERVAL_MS,
+    snapshotCacheTtlMs = DEFAULT_SNAPSHOT_CACHE_TTL_MS,
+  } = {}) {
     this.db = resolveStoreDb({ db, dataDir })
     this.repo = new AccountsRepo(this.db)
+    this._explicitPgPool = pgPool || null
+    this._explicitWriteBehindQuota = typeof writeBehindQuota === 'boolean' ? writeBehindQuota : null
+    this.quotaFlushIntervalMs = Math.max(100, Number(quotaFlushIntervalMs) || DEFAULT_QUOTA_FLUSH_INTERVAL_MS)
+    this.snapshotCacheTtlMs = Math.max(0, Number(snapshotCacheTtlMs ?? DEFAULT_SNAPSHOT_CACHE_TTL_MS) || 0)
     this.config = config?.quota || {
       safety_ratio: 0.85,
       weekly_safety_ratio: 0.8,
@@ -128,35 +186,636 @@ export class AccountQuota {
     this.vmQuota = new Map()
     this._resetGenCache = new Map() // accountId -> { gens, at }
     this._lastWrittenWindow = new Map() // accountId -> { vmId, end, start, status, at }
+    // Bounded in-process recent allocations ring: accountId -> Array<AllocRow> (newest first, max 5)
+    this._recentAllocs = new Map()
+    this._recentAllocsHydrated = new Set()
+    this._allocInsertCounts = new Map() // accountId -> inserts since last PG trim
+    // In-process L1 account state cache (200ms short TTL on PG hot path + dirty overlay)
+    this._accountL1 = new Map() // accountId -> { acc, at }
+    this._lastUsedCache = new Map() // accountId -> ms
+    this._snapshotRawCache = null // { rows, runtimeLastUsed, allocsByAccount, at }
+    this._pgSnapshotFlight = null
+    this._pgAccountFlights = new Map()
+    // Dirty-set batch queues (PG async mode, modeled on sub2api & ApiKeyStore)
+    this._dirtyAccounts = new Map() // accountId -> latest account snapshot
+    this._pendingAllocs = [] // Array<{ accountId, alloc }>
+    this._pendingWindows = new Map() // accountId -> { accountId, vmId, sessionWindowEnd, sessionWindowStart, sessionWindowStatus, updatedAt }
+    this._quotaFlushTimer = null
+    this._quotaFlushChain = Promise.resolve()
+    this._quotaFlushFailures = 0
+    this._lastQuotaFlushError = null
+    this._lastQuotaFlushWarnAt = 0
     this._batchLastUsedStmt = null
-    this._batchAllocsStmt = null
+    this._allocByAccountStmt = null
     this._prepareBatchStatements()
+    this._attachRepoHooks()
     // seed accounts
     for (const a of accounts || []) this.ensure(a)
   }
 
+  _isPrimaryDb() {
+    return isDbOpen() && this.db === getDb()
+  }
+
+  _resolvePgPool() {
+    if (this._explicitPgPool !== null) return this._explicitPgPool
+    if (this.db?.engine === 'postgres' && this._isPrimaryDb()) return getPgPool()
+    return null
+  }
+
+  _useAsyncQuotaWriteBehind() {
+    if (this._explicitWriteBehindQuota !== null) return this._explicitWriteBehindQuota
+    return Boolean(this._resolvePgPool())
+  }
+
   _prepareBatchStatements() {
     try {
-      this._batchAllocsStmt = this.db.prepare(`
-        SELECT account_id, at, source, util_5h, util_7d, status_5h, status_7d, claim, tokens_in, tokens_out
-        FROM (
-          SELECT account_id, at, source, util_5h, util_7d, status_5h, status_7d, claim, tokens_in, tokens_out,
-                 ROW_NUMBER() OVER (PARTITION BY account_id ORDER BY id DESC) AS rn
-          FROM account_allocations
-        ) ranked
-        WHERE rn <= 5
-        ORDER BY account_id, rn ASC
+      this._allocByAccountStmt = this.db.prepare(`
+        SELECT at, source, util_5h, util_7d, status_5h, status_7d, claim, tokens_in, tokens_out
+        FROM account_allocations
+        WHERE account_id = ?
+        ORDER BY id DESC
+        LIMIT ?
       `)
     } catch {
-      this._batchAllocsStmt = null
+      this._allocByAccountStmt = null
     }
     this._batchLastUsedStmt = null
+  }
+
+  _attachRepoHooks() {
+    const repo = this.repo
+    if (!repo || repo._quotaHooked) return
+    repo._quotaHooked = true
+    const origSave = repo.save.bind(repo)
+    const origInsert = repo.insert.bind(repo)
+    const origRemove = repo.remove.bind(repo)
+    const origAddAllocation = repo.addAllocation.bind(repo)
+    repo.save = (acc) => {
+      const saved = origSave(acc)
+      if (saved?.account_id) {
+        this._putAccountL1(saved)
+        this._invalidateSnapshotCache()
+      }
+      return saved
+    }
+    repo.insert = (acc) => {
+      const inserted = origInsert(acc)
+      if (inserted?.account_id) {
+        this._putAccountL1(inserted)
+        if (!this._recentAllocs.has(inserted.account_id)) {
+          this._recentAllocs.set(inserted.account_id, [])
+          this._recentAllocsHydrated.add(inserted.account_id)
+        }
+        this._invalidateSnapshotCache()
+      }
+      return inserted
+    }
+    repo.remove = (id) => {
+      const ok = origRemove(id)
+      this._accountL1.delete(id)
+      this._dirtyAccounts.delete(id)
+      this._pendingWindows.delete(id)
+      this._recentAllocs.delete(id)
+      this._recentAllocsHydrated.delete(id)
+      this._lastUsedCache.delete(id)
+      this._invalidateSnapshotCache()
+      return ok
+    }
+    repo.addAllocation = (accountId, alloc, opts) => {
+      const res = origAddAllocation(accountId, alloc, opts)
+      if (accountId && alloc) {
+        this._pushRecentAllocation(accountId, alloc)
+        this._invalidateSnapshotCache()
+      }
+      return res
+    }
+  }
+
+  _invalidateSnapshotCache() {
+    this._snapshotRawCache = null
+  }
+
+  _putAccountL1(acc, now = Date.now()) {
+    if (!acc?.account_id) return
+    const id = acc.account_id
+    if (!this._accountL1.has(id) && this._accountL1.size >= MAX_RECENT_ALLOC_ACCOUNTS) {
+      const oldest = this._accountL1.keys().next().value
+      if (oldest !== undefined) this._accountL1.delete(oldest)
+    }
+    this._accountL1.set(id, { acc: cloneAccount(acc), at: now })
+  }
+
+  _pushRecentAllocation(accountId, row) {
+    if (!accountId || !row) return
+    const normalized = normalizeAllocRow(row)
+    const prev = this._recentAllocs.get(accountId) || []
+    // Deduplicate identical consecutive push (e.g. direct repo.addAllocation hook)
+    if (
+      prev.length > 0 &&
+      prev[0].at === normalized.at &&
+      prev[0].source === normalized.source &&
+      prev[0].util_5h === normalized.util_5h &&
+      prev[0].util_7d === normalized.util_7d
+    ) {
+      return
+    }
+    const next = [normalized, ...prev].slice(0, RECENT_ALLOC_RING_LIMIT)
+    if (!this._recentAllocs.has(accountId) && this._recentAllocs.size >= MAX_RECENT_ALLOC_ACCOUNTS) {
+      const oldest = this._recentAllocs.keys().next().value
+      if (oldest !== undefined) {
+        this._recentAllocs.delete(oldest)
+        this._recentAllocsHydrated.delete(oldest)
+      }
+    }
+    this._recentAllocs.set(accountId, next)
+    const parsedAt = parseTimestampMs(normalized.at)
+    if (parsedAt != null && parsedAt > 0) {
+      const prevTs = this._lastUsedCache.get(accountId) || 0
+      if (parsedAt > prevTs) this._lastUsedCache.set(accountId, parsedAt)
+    }
+  }
+
+  /**
+   * Read an account record from hot-path L1 / dirty-set / scheduler snapshot without
+   * triggering a synchronous PgSyncDb `Atomics.wait` in PG mode.
+   * Falls back directly to `this.repo.get()` in SQLite / non-PG mode.
+   */
+  getAccountCached(accountId, { maxAgeMs = DEFAULT_ACCOUNT_L1_TTL_MS } = {}) {
+    if (!accountId) return null
+    const dirty = this._dirtyAccounts.get(accountId)
+    if (dirty) return cloneAccount(dirty)
+    if (!this._useAsyncQuotaWriteBehind()) {
+      return this.repo.get(accountId)
+    }
+    const now = Date.now()
+    const cached = this._accountL1.get(accountId)
+    if (cached && now - cached.at < maxAgeMs) {
+      return cloneAccount(cached.acc)
+    }
+    try {
+      const schedSnap = getCacheRuntime()?.scheduler?.getSchedulingSnapshotSync?.()
+      const fromSched = schedSnap?.byAccountId?.get?.(accountId)?.account
+      if (fromSched) {
+        this._putAccountL1(fromSched, now)
+        return cloneAccount(fromSched)
+      }
+    } catch {}
+    if (cached) {
+      const pgPool = this._resolvePgPool()
+      if (pgPool) void this._refreshAccountFromPgAsync(pgPool, accountId).catch(() => {})
+      return cloneAccount(cached.acc)
+    }
+    const fromDb = this.repo.get(accountId)
+    if (fromDb) this._putAccountL1(fromDb, now)
+    return fromDb
+  }
+
+  _ensureForHotPath(account) {
+    if (!this._useAsyncQuotaWriteBehind()) return this.ensure(account)
+    const id = account?.account_id || account?.account_uuid || account?.id
+    if (!id) return null
+    const existing = this.getAccountCached(id)
+    if (existing) {
+      if ((account.vm_id && existing.vm_id !== account.vm_id) || (account.type && existing.type !== account.type)) {
+        if (account.vm_id) existing.vm_id = account.vm_id
+        if (account.type) existing.type = account.type
+        this._putAccountL1(existing)
+        this._dirtyAccounts.set(id, cloneAccount(existing))
+      }
+      return existing
+    }
+    const created = this.ensure(account)
+    if (created) this._putAccountL1(created)
+    return created
+  }
+
+  async _refreshAccountFromPgAsync(pgPool, accountId) {
+    if (!pgPool || !accountId) return null
+    const existing = this._pgAccountFlights.get(accountId)
+    if (existing) return existing
+    const flight = (async () => {
+      try {
+        const res = await pgPool.query('SELECT * FROM accounts WHERE id = $1', [accountId])
+        const row = res?.rows?.[0] || null
+        const acc = row ? rowToAccount(row) : null
+        if (acc && !this._dirtyAccounts.has(accountId)) {
+          this._putAccountL1(acc)
+        }
+        if (row?.last_used_at) {
+          const ms = parseTimestampMs(row.last_used_at)
+          if (ms != null && ms > (this._lastUsedCache.get(accountId) || 0)) {
+            this._lastUsedCache.set(accountId, ms)
+          }
+        }
+        return acc
+      } catch {
+        return null
+      } finally {
+        if (this._pgAccountFlights.get(accountId) === flight) {
+          this._pgAccountFlights.delete(accountId)
+        }
+      }
+    })()
+    this._pgAccountFlights.set(accountId, flight)
+    return flight
+  }
+
+  _writeQuotaRedisHash(accountId, acc, nowMs = Date.now()) {
+    const cache = getCacheRuntime()
+    if (!cache?.client?.hasRedis || !accountId || !acc) return
+    try {
+      const h5 = headerWindowOrEmpty(acc.unified, '5h', { now: nowMs })
+      const h7 = headerWindowOrEmpty(acc.unified, '7d', { now: nowMs })
+      const rKey = cache.client.redisKey(`${REDIS_QUOTA_HASH_PREFIX}${accountId}`)
+      const fields = {
+        account_id: String(accountId),
+        vm_id: acc.vm_id ? String(acc.vm_id) : '',
+        util_5h: h5.utilization != null ? String(h5.utilization) : '',
+        status_5h: h5.status ? String(h5.status) : '',
+        reset_5h: h5.reset ? String(h5.reset) : '',
+        util_7d: h7.utilization != null ? String(h7.utilization) : '',
+        status_7d: h7.status ? String(h7.status) : '',
+        reset_7d: h7.reset ? String(h7.reset) : '',
+        requests: String(Number(acc.requests) || 0),
+        tokens_in: String(Number(acc.tokens_in) || 0),
+        tokens_out: String(Number(acc.tokens_out) || 0),
+        exhausted_at: acc.unified?.headers?.exhausted_at ? String(acc.unified.headers.exhausted_at) : '',
+        updated_at: acc.unified?.updated_at ? String(acc.unified.updated_at) : new Date(nowMs).toISOString(),
+      }
+      const redis = cache.client.redis
+      if (typeof redis?.pipeline === 'function') {
+        const pipe = redis.pipeline()
+        if (typeof pipe?.hset === 'function') {
+          pipe.hset(rKey, fields)
+          if (typeof pipe.expire === 'function') pipe.expire(rKey, REDIS_QUOTA_TTL_SEC)
+          pipe.exec().catch(() => {})
+          return
+        }
+      }
+      if (typeof redis?.hset === 'function') {
+        Promise.resolve(redis.hset(rKey, fields))
+          .then(() => (typeof redis.expire === 'function' ? redis.expire(rKey, REDIS_QUOTA_TTL_SEC) : null))
+          .catch(() => {})
+      }
+    } catch {}
+  }
+
+  /** Start background dirty-set quota flusher (default every 1000ms). Idempotent. */
+  startQuotaFlusher(intervalMs = this.quotaFlushIntervalMs) {
+    if (this._quotaFlushTimer) return
+    const ms = Math.max(100, Number(intervalMs) || this.quotaFlushIntervalMs)
+    const pgPool = this._resolvePgPool()
+    if (pgPool && !this._snapshotRawCache) {
+      void this._loadSnapshotRawFromPgAsync(pgPool).catch(() => {})
+    }
+    this._quotaFlushTimer = setInterval(() => {
+      void this.flushQuota().catch(() => {})
+    }, ms)
+    this._quotaFlushTimer.unref()
+  }
+
+  /** Stop the background dirty-set quota flusher timer. */
+  stopQuotaFlusher() {
+    if (this._quotaFlushTimer) {
+      clearInterval(this._quotaFlushTimer)
+      this._quotaFlushTimer = null
+    }
+  }
+
+  quotaFlushStats() {
+    return {
+      pendingAccounts: this._dirtyAccounts.size,
+      pendingAllocs: this._pendingAllocs.length,
+      pendingWindows: this._pendingWindows.size,
+      failures: this._quotaFlushFailures,
+      lastError: this._lastQuotaFlushError,
+    }
+  }
+
+  async _applyQuotaBatchToPg(pgPool, accountsBatch, windowsBatch, allocsBatch) {
+    const nowIso = new Date().toISOString()
+    if (accountsBatch.length > 0) {
+      const ids = []
+      const vmIds = []
+      const emails = []
+      const names = []
+      const platforms = []
+      const types = []
+      const statuses = []
+      const concurrencies = []
+      const concOverrides = []
+      const maxRpms = []
+      const rpmOverrides = []
+      const requests = []
+      const tokensIn = []
+      const tokensOut = []
+      const cacheRead = []
+      const cacheCreation = []
+      const extras = []
+      const createdAts = []
+      const updatedAts = []
+      for (const acc of accountsBatch) {
+        ids.push(String(acc.account_id))
+        vmIds.push(acc.vm_id ?? null)
+        emails.push(acc.email ?? null)
+        names.push(String(acc.name ?? acc.email ?? acc.account_id))
+        platforms.push(String(acc.platform ?? 'claude'))
+        types.push(String(acc.type ?? 'oauth'))
+        statuses.push(String(acc.status ?? 'active'))
+        concurrencies.push(Math.trunc(Number(acc.max_concurrency ?? 2) || 0))
+        concOverrides.push(acc.concurrency_override ? 1 : 0)
+        maxRpms.push(Math.trunc(Number(acc.max_rpm ?? 0) || 0))
+        rpmOverrides.push(acc.rpm_override ? 1 : 0)
+        requests.push(Math.trunc(Number(acc.requests ?? 0) || 0))
+        tokensIn.push(Math.trunc(Number(acc.tokens_in ?? 0) || 0))
+        tokensOut.push(Math.trunc(Number(acc.tokens_out ?? 0) || 0))
+        cacheRead.push(Math.trunc(Number(acc.cache_read_tokens ?? 0) || 0))
+        cacheCreation.push(Math.trunc(Number(acc.cache_creation_tokens ?? 0) || 0))
+        extras.push(buildAccountExtraJson(acc))
+        createdAts.push(acc.created_at ?? nowIso)
+        updatedAts.push(acc.updated_at ?? nowIso)
+      }
+      await pgPool.query(
+        `INSERT INTO accounts (
+          id, vm_id, email, name, platform, type, status,
+          concurrency, concurrency_override, max_rpm, rpm_override,
+          requests, tokens_in, tokens_out, cache_read_tokens, cache_creation_tokens,
+          extra, created_at, updated_at
+        )
+        SELECT * FROM UNNEST(
+          $1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::text[],
+          $8::integer[], $9::integer[], $10::integer[], $11::integer[],
+          $12::bigint[], $13::bigint[], $14::bigint[], $15::bigint[], $16::bigint[],
+          $17::text[], $18::text[], $19::text[]
+        )
+        ON CONFLICT (id) DO UPDATE SET
+          vm_id = COALESCE(EXCLUDED.vm_id, accounts.vm_id),
+          email = COALESCE(EXCLUDED.email, accounts.email),
+          name = CASE WHEN EXCLUDED.name <> '' THEN EXCLUDED.name ELSE accounts.name END,
+          type = EXCLUDED.type,
+          concurrency = EXCLUDED.concurrency,
+          concurrency_override = EXCLUDED.concurrency_override,
+          max_rpm = EXCLUDED.max_rpm,
+          rpm_override = EXCLUDED.rpm_override,
+          requests = GREATEST(COALESCE(accounts.requests, 0), EXCLUDED.requests),
+          tokens_in = GREATEST(COALESCE(accounts.tokens_in, 0), EXCLUDED.tokens_in),
+          tokens_out = GREATEST(COALESCE(accounts.tokens_out, 0), EXCLUDED.tokens_out),
+          cache_read_tokens = GREATEST(COALESCE(accounts.cache_read_tokens, 0), EXCLUDED.cache_read_tokens),
+          cache_creation_tokens = GREATEST(COALESCE(accounts.cache_creation_tokens, 0), EXCLUDED.cache_creation_tokens),
+          extra = EXCLUDED.extra,
+          updated_at = EXCLUDED.updated_at`,
+        [
+          ids,
+          vmIds,
+          emails,
+          names,
+          platforms,
+          types,
+          statuses,
+          concurrencies,
+          concOverrides,
+          maxRpms,
+          rpmOverrides,
+          requests,
+          tokensIn,
+          tokensOut,
+          cacheRead,
+          cacheCreation,
+          extras,
+          createdAts,
+          updatedAts,
+        ],
+      )
+    }
+
+    if (windowsBatch.length > 0) {
+      const wIds = []
+      const wVmIds = []
+      const wStarts = []
+      const wEnds = []
+      const wStatuses = []
+      const wUpdated = []
+      const rtIds = []
+      const rtVmIds = []
+      const rtUpdated = []
+      for (const w of windowsBatch) {
+        wIds.push(String(w.accountId))
+        wVmIds.push(w.vmId ?? null)
+        wStarts.push(toIsoMs(w.sessionWindowStart))
+        wEnds.push(toIsoMs(w.sessionWindowEnd))
+        wStatuses.push(w.sessionWindowStatus ?? null)
+        wUpdated.push(w.updatedAt || nowIso)
+        if (w.vmId) {
+          rtIds.push(String(w.accountId))
+          rtVmIds.push(String(w.vmId))
+          rtUpdated.push(w.updatedAt || nowIso)
+        }
+      }
+      await pgPool.query(
+        `UPDATE accounts AS a
+        SET
+          vm_id = COALESCE(v.vm_id, a.vm_id),
+          session_window_start = v.session_window_start,
+          session_window_end = v.session_window_end,
+          session_window_status = v.session_window_status,
+          updated_at = v.updated_at
+        FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[])
+          AS v(id, vm_id, session_window_start, session_window_end, session_window_status, updated_at)
+        WHERE a.id = v.id`,
+        [wIds, wVmIds, wStarts, wEnds, wStatuses, wUpdated],
+      )
+      if (rtIds.length > 0) {
+        await pgPool.query(
+          `INSERT INTO account_runtime (account_id, vm_id, status, model_states_json, credential_generation, updated_at)
+          SELECT v.account_id, v.vm_id, 'unknown', '{}', 0, v.updated_at
+          FROM UNNEST($1::text[], $2::text[], $3::text[]) AS v(account_id, vm_id, updated_at)
+          ON CONFLICT (account_id) DO UPDATE SET
+            vm_id = COALESCE(EXCLUDED.vm_id, account_runtime.vm_id),
+            updated_at = EXCLUDED.updated_at`,
+          [rtIds, rtVmIds, rtUpdated],
+        )
+      }
+    }
+
+    if (allocsBatch.length > 0) {
+      const aIds = []
+      const ats = []
+      const sources = []
+      const u5s = []
+      const u7s = []
+      const s5s = []
+      const s7s = []
+      const claims = []
+      const tIns = []
+      const tOuts = []
+      const trimCandidates = new Set()
+      for (const item of allocsBatch) {
+        const { accountId, alloc } = item
+        aIds.push(String(accountId))
+        ats.push(alloc.at || nowIso)
+        sources.push(alloc.source ?? null)
+        u5s.push(alloc.util_5h ?? null)
+        u7s.push(alloc.util_7d ?? null)
+        s5s.push(alloc.status_5h ?? null)
+        s7s.push(alloc.status_7d ?? null)
+        claims.push(alloc.claim ?? null)
+        tIns.push(alloc.tokens_in != null ? Math.trunc(Number(alloc.tokens_in) || 0) : null)
+        tOuts.push(alloc.tokens_out != null ? Math.trunc(Number(alloc.tokens_out) || 0) : null)
+        const nextCount = (this._allocInsertCounts.get(accountId) || 0) + 1
+        if (nextCount >= ALLOC_TRIM_EVERY) {
+          this._allocInsertCounts.set(accountId, 0)
+          trimCandidates.add(String(accountId))
+        } else {
+          this._allocInsertCounts.set(accountId, nextCount)
+        }
+      }
+      await pgPool.query(
+        `INSERT INTO account_allocations (
+          account_id, at, source, util_5h, util_7d, status_5h, status_7d, claim, tokens_in, tokens_out
+        )
+        SELECT * FROM UNNEST(
+          $1::text[], $2::text[], $3::text[], $4::double precision[], $5::double precision[],
+          $6::text[], $7::text[], $8::text[], $9::bigint[], $10::bigint[]
+        )`,
+        [aIds, ats, sources, u5s, u7s, s5s, s7s, claims, tIns, tOuts],
+      )
+      if (trimCandidates.size > 0) {
+        await pgPool.query(
+          `DELETE FROM account_allocations
+          WHERE id IN (
+            SELECT old.id
+            FROM unnest($1::text[]) AS a(account_id)
+            CROSS JOIN LATERAL (
+              SELECT id
+              FROM account_allocations
+              WHERE account_id = a.account_id
+              ORDER BY id DESC
+              OFFSET $2::integer
+            ) old
+          )`,
+          [[...trimCandidates], MAX_ALLOCATIONS_PER_ACCOUNT],
+        )
+      }
+    }
+  }
+
+  _applyQuotaBatchToSqlite(accountsBatch, windowsBatch, allocsBatch) {
+    withTransaction(this.db, () => {
+      for (const acc of accountsBatch) {
+        this.repo.save(acc)
+      }
+      for (const item of allocsBatch) {
+        this.repo.addAllocation(item.accountId, item.alloc)
+      }
+      if (this.runtimeRepo?.updateWindow) {
+        for (const w of windowsBatch) {
+          try {
+            this.runtimeRepo.updateWindow(w.accountId, {
+              vmId: w.vmId,
+              sessionWindowEnd: w.sessionWindowEnd,
+              sessionWindowStart: w.sessionWindowStart,
+              sessionWindowStatus: w.sessionWindowStatus,
+            })
+          } catch {}
+        }
+      }
+    })
+  }
+
+  /**
+   * Drain all dirty quota accounts, session windows, and allocations asynchronously.
+   * Serialized through `_quotaFlushChain`; re-queues entries on transient failure.
+   */
+  flushQuota() {
+    const run = async () => {
+      let totalAccounts = 0
+      let totalWindows = 0
+      let totalAllocs = 0
+      const pgPool = this._resolvePgPool()
+      for (let round = 0; round < 16; round += 1) {
+        if (this._dirtyAccounts.size === 0 && this._pendingWindows.size === 0 && this._pendingAllocs.length === 0) {
+          break
+        }
+        const accountsEntries = [...this._dirtyAccounts.entries()]
+        this._dirtyAccounts.clear()
+        const windowsEntries = [...this._pendingWindows.entries()]
+        this._pendingWindows.clear()
+        const allocsBatch = this._pendingAllocs.splice(0, 500)
+        const accountsBatch = accountsEntries.map(([, acc]) => acc)
+        const windowsBatch = windowsEntries.map(([, w]) => w)
+        try {
+          if (pgPool && typeof pgPool.query === 'function') {
+            await this._applyQuotaBatchToPg(pgPool, accountsBatch, windowsBatch, allocsBatch)
+          } else {
+            this._applyQuotaBatchToSqlite(accountsBatch, windowsBatch, allocsBatch)
+          }
+          totalAccounts += accountsBatch.length
+          totalWindows += windowsBatch.length
+          totalAllocs += allocsBatch.length
+          // Routine periodic quota flushes skip structural `accounts`/`account_runtime`
+          // invalidation broadcasts to avoid cross-instance SchedulerSnapshotCache /
+          // DashboardCache thrashing; high-risk 429/exhausted/blocked states already
+          // trigger explicit `scheduler.bumpRevision()`.
+        } catch (err) {
+          // Restore un-overwritten entries so zero quota state is lost
+          for (const [id, acc] of accountsEntries) {
+            if (!this._dirtyAccounts.has(id)) this._dirtyAccounts.set(id, acc)
+          }
+          for (const [id, w] of windowsEntries) {
+            if (!this._pendingWindows.has(id)) this._pendingWindows.set(id, w)
+          }
+          if (allocsBatch.length > 0) {
+            const room = Math.max(0, MAX_PENDING_ALLOCS - this._pendingAllocs.length)
+            if (room > 0) this._pendingAllocs.unshift(...allocsBatch.slice(-room))
+          }
+          const errMsg = err?.message ? String(err.message) : String(err || 'unknown error')
+          const failedAt = Date.now()
+          this._quotaFlushFailures += 1
+          this._lastQuotaFlushError = errMsg
+          if (failedAt - this._lastQuotaFlushWarnAt >= QUOTA_FLUSH_ERROR_LOG_THROTTLE_MS) {
+            this._lastQuotaFlushWarnAt = failedAt
+            console.error(
+              `[account-quota] dirty-set flush failed (accounts=${accountsBatch.length}, allocs=${allocsBatch.length}, failures=${this._quotaFlushFailures}):`,
+              errMsg,
+            )
+          }
+          return {
+            flushedAccounts: totalAccounts,
+            flushedWindows: totalWindows,
+            flushedAllocs: totalAllocs,
+            failed: accountsBatch.length + allocsBatch.length,
+            error: errMsg,
+          }
+        }
+      }
+      return {
+        flushedAccounts: totalAccounts,
+        flushedWindows: totalWindows,
+        flushedAllocs: totalAllocs,
+        failed: 0,
+      }
+    }
+    const next = this._quotaFlushChain.then(run, run)
+    this._quotaFlushChain = next.catch(() => {})
+    return next
+  }
+
+  /** Stop background flusher and drain all remaining dirty quota state before shutdown. */
+  async close() {
+    this.stopQuotaFlusher()
+    return await this.flushQuota()
   }
 
   /** Kept for API compat + post-restore hook. */
   reload() {
     this._resetGenCache.clear()
     this._lastWrittenWindow.clear()
+    this._accountL1.clear()
+    this._recentAllocs.clear()
+    this._recentAllocsHydrated.clear()
+    this._lastUsedCache.clear()
+    this._snapshotRawCache = null
   }
 
   /** Re-bind to a fresh DB connection (after backup restore). */
@@ -165,7 +824,16 @@ export class AccountQuota {
     this.repo = new AccountsRepo(db)
     this._resetGenCache.clear()
     this._lastWrittenWindow.clear()
+    this._accountL1.clear()
+    this._recentAllocs.clear()
+    this._recentAllocsHydrated.clear()
+    this._lastUsedCache.clear()
+    this._dirtyAccounts.clear()
+    this._pendingWindows.clear()
+    this._pendingAllocs.length = 0
+    this._snapshotRawCache = null
     this._prepareBatchStatements()
+    this._attachRepoHooks()
   }
 
   /**
@@ -191,8 +859,10 @@ export class AccountQuota {
     })
   }
 
-  _writeSessionWindow(acc) {
-    if (!this.runtimeRepo?.updateWindow || !acc) return
+  _writeSessionWindow(acc, { defer = false } = {}) {
+    const asyncMode = defer && this._useAsyncQuotaWriteBehind()
+    if (!asyncMode && (!this.runtimeRepo?.updateWindow || !acc)) return
+    if (!acc) return
     const extra = headerWindow(acc.unified, '5h')
     const w5 = extra.utilization != null || extra.status || extra.reset ? extra : officialWindow(acc.unified, '5h')
     const endIso = w5.reset || null
@@ -208,7 +878,8 @@ export class AccountQuota {
     // Deduplicate identical session-window writes for real DB-backed runtimeRepo
     // (mock runtimeRepos without `.db` always pass through so unit tests observe every call).
     const now = Date.now()
-    if (this.runtimeRepo.db) {
+    const shouldDedupe = Boolean(this.runtimeRepo?.db || asyncMode)
+    if (shouldDedupe) {
       const prev = this._lastWrittenWindow.get(acc.account_id)
       if (
         prev &&
@@ -228,6 +899,18 @@ export class AccountQuota {
         at: now,
       })
     }
+    if (asyncMode && (!this.runtimeRepo || this.runtimeRepo.db || this._explicitPgPool)) {
+      this._pendingWindows.set(acc.account_id, {
+        accountId: acc.account_id,
+        vmId,
+        sessionWindowEnd,
+        sessionWindowStart,
+        sessionWindowStatus,
+        updatedAt: new Date(now).toISOString(),
+      })
+      return
+    }
+    if (!this.runtimeRepo?.updateWindow) return
     try {
       this.runtimeRepo.updateWindow(acc.account_id, {
         vmId,
@@ -310,7 +993,7 @@ export class AccountQuota {
     if (cached && now - cached.at < RESET_GEN_CACHE_TTL_MS) {
       return { ...cached.gens }
     }
-    const acc = this.repo.get(accountId)
+    const acc = this._useAsyncQuotaWriteBehind() ? this.getAccountCached(accountId) : this.repo.get(accountId)
     const boundaries = acc?.unified?.reset_boundaries || {}
     const gens = {
       '5h': Number(boundaries['5h']?.generation) || 0,
@@ -326,7 +1009,7 @@ export class AccountQuota {
     if (!accountId || !key) return false
     const gens = this.resetGenerations(accountId)
     if ((Number(gens[key]) || 0) === 0) return false
-    const acc = this.repo.get(accountId)
+    const acc = this._useAsyncQuotaWriteBehind() ? this.getAccountCached(accountId) : this.repo.get(accountId)
     if (!acc?.unified?.reset_boundaries?.[key]) return false
     const check = checkResetWindowWrite(acc, key, {
       resetGenerations,
@@ -407,7 +1090,8 @@ export class AccountQuota {
    * headers: Headers | plain object (lower-cased keys preferred)
    */
   ingestHeaders(accountId, headers, usageBody = null, extra = {}) {
-    const acc = this.ensure({ account_id: accountId })
+    const asyncMode = this._useAsyncQuotaWriteBehind()
+    const acc = asyncMode ? this._ensureForHotPath({ account_id: accountId }) : this.ensure({ account_id: accountId })
     const h = normalizeHeaders(headers)
     acc.unified.headers = acc.unified.headers || {}
     acc.unified.header_stall = 0
@@ -578,7 +1262,13 @@ export class AccountQuota {
         tokens_in: usageBody?.input_tokens ?? null,
         tokens_out: usageBody?.output_tokens ?? null,
       }
-      if (writeBehindArmed() && isDbOpen() && this.db === getDb()) {
+      this._pushRecentAllocation(accountId, allocRow)
+      if (asyncMode) {
+        if (this._pendingAllocs.length >= MAX_PENDING_ALLOCS) {
+          this._pendingAllocs.shift()
+        }
+        this._pendingAllocs.push({ accountId, alloc: allocRow })
+      } else if (writeBehindArmed() && isDbOpen() && this.db === getDb()) {
         enqueueWrite(() => this.repo.addAllocation(accountId, allocRow))
       } else {
         this.repo.addAllocation(accountId, allocRow)
@@ -587,9 +1277,42 @@ export class AccountQuota {
 
     settleElapsedHeaderWindows(acc, sampledAt, nowMs)
     this._rollWindowHistory(acc, nowMs)
-    const saved = !countRequest && !sampled && !exhausted && !reconciledAny ? acc : this.repo.save(acc)
-    if (reconciledAny) this._cacheResetGenerationsFromAccount(accountId, saved)
-    this._writeSessionWindow(saved)
+    const dirty = Boolean(countRequest || sampled || exhausted || reconciledAny)
+    let saved
+    if (asyncMode) {
+      acc.updated_at = sampledAt
+      saved = cloneAccount(acc)
+      this._putAccountL1(saved, nowMs)
+      this._invalidateSnapshotCache()
+      if (dirty) {
+        this._dirtyAccounts.set(accountId, cloneAccount(saved))
+      }
+      this._writeQuotaRedisHash(accountId, saved, nowMs)
+      if (reconciledAny) this._cacheResetGenerationsFromAccount(accountId, saved, nowMs)
+      this._writeSessionWindow(saved, { defer: true })
+      const statusNum = Number(extra.status) || 0
+      const h5Status = String(saved.unified?.headers?.['5h']?.status || '').toLowerCase()
+      const h7Status = String(saved.unified?.headers?.['7d']?.status || '').toLowerCase()
+      const isHighRisk =
+        exhausted ||
+        statusNum === 429 ||
+        reconciledAny ||
+        h5Status === 'rejected' ||
+        h5Status === 'rate_limited' ||
+        h7Status === 'rejected' ||
+        h7Status === 'rate_limited' ||
+        !this.headerUnderSafety(saved, nowMs)
+      if (isHighRisk) {
+        try {
+          getCacheRuntime()?.scheduler?.bumpRevision?.({ eventType: 'quota_high_risk', accountId })
+        } catch {}
+        void this.flushQuota().catch(() => {})
+      }
+    } else {
+      saved = !dirty ? acc : this.repo.save(acc)
+      if (reconciledAny) this._cacheResetGenerationsFromAccount(accountId, saved)
+      this._writeSessionWindow(saved)
+    }
     if (reconciledAny && this.headerUnderSafety(saved, nowMs)) {
       this.clearQuotaExhaustedCooldown(accountId, {
         now: nowMs,
@@ -1061,11 +1784,27 @@ export class AccountQuota {
     for (const vm of vms || []) this.setVmQuotaOverride(vm?.id, vm?.quota_override || null)
   }
 
+  _persistBlockedState(acc) {
+    if (!acc?.account_id) return
+    if (this._useAsyncQuotaWriteBehind()) {
+      acc.updated_at = new Date().toISOString()
+      this._putAccountL1(acc)
+      this._dirtyAccounts.set(acc.account_id, cloneAccount(acc))
+      this._invalidateSnapshotCache()
+      try {
+        getCacheRuntime()?.scheduler?.bumpRevision?.({ eventType: 'quota_blocked', accountId: acc.account_id })
+      } catch {}
+      void this.flushQuota().catch(() => {})
+      return
+    }
+    this.repo.save(acc)
+  }
+
   canAccept(
     accountId,
     { tier = null, requestRisk = null, quotaRequest = null, account = undefined, now = Date.now() } = {},
   ) {
-    const acc = account === undefined ? this.ensure({ account_id: accountId }) : account
+    const acc = account === undefined ? this._ensureForHotPath({ account_id: accountId }) : account
     if (!acc) return { ok: false, reason: 'account_missing' }
     const policy = this.policyFor(acc, { tier })
     const ratio = Number(policy.limit_5h ?? policy.safety_ratio ?? this.config.safety_ratio ?? 0.85)
@@ -1090,7 +1829,7 @@ export class AccountQuota {
     if (quotaConfig.block_on_5h && headerHardBlocked(acc.unified, '5h', now)) {
       const h5 = headerWindow(acc.unified, '5h')
       acc.last_blocked = { at: new Date().toISOString(), window: '5h', status: h5.status, source: 'headers' }
-      if (account === undefined) this.repo.save(acc)
+      if (account === undefined) this._persistBlockedState(acc)
       return {
         ok: false,
         reason: 'quota_5h_cli',
@@ -1104,7 +1843,7 @@ export class AccountQuota {
     if (quotaConfig.block_on_7d && headerHardBlocked(acc.unified, '7d', now)) {
       const h7 = headerWindow(acc.unified, '7d')
       acc.last_blocked = { at: new Date().toISOString(), window: '7d', status: h7.status, source: 'headers' }
-      if (account === undefined) this.repo.save(acc)
+      if (account === undefined) this._persistBlockedState(acc)
       return {
         ok: false,
         reason: 'quota_7d_cli',
@@ -1125,7 +1864,7 @@ export class AccountQuota {
 
     if (z5 === GATE_GATED) {
       acc.last_blocked = { at: new Date().toISOString(), window: '5h', utilization: u5, status: w5.status }
-      if (account === undefined) this.repo.save(acc)
+      if (account === undefined) this._persistBlockedState(acc)
       return {
         ok: false,
         reason: 'quota_5h_safety',
@@ -1143,7 +1882,7 @@ export class AccountQuota {
 
     if (z7 === GATE_GATED) {
       acc.last_blocked = { at: new Date().toISOString(), window: '7d', utilization: u7, status: w7.status }
-      if (account === undefined) this.repo.save(acc)
+      if (account === undefined) this._persistBlockedState(acc)
       return {
         ok: false,
         reason: 'quota_7d_safety',
@@ -1225,12 +1964,12 @@ export class AccountQuota {
     return { ok: true, warn_5h: u5 >= warnRatio, warn_7d: u7 >= Math.min(warnRatio, weeklyRatio) }
   }
   tryAcquire(accountId, opts = {}) {
-    const acc = opts.account === undefined ? this.ensure({ account_id: accountId }) : opts.account
+    const acc = opts.account === undefined ? this._ensureForHotPath({ account_id: accountId }) : opts.account
     if (!acc) return { ok: false, reason: 'account_missing' }
     if (!opts.skipGate) {
       const gate = this.canAccept(accountId, { ...opts, account: acc })
       if (!gate.ok) {
-        if (acc.last_blocked) this.repo.save(acc)
+        if (acc.last_blocked) this._persistBlockedState(acc)
         return gate
       }
     }
@@ -1251,7 +1990,7 @@ export class AccountQuota {
 
   /** The `7d_oi` window limits Fable only; it does not block account scheduling. */
   fableWindowLimited(accountId, now = Date.now(), account = undefined) {
-    const oi = (account === undefined ? this.repo.get(accountId) : account)?.unified?.['7d_oi']
+    const oi = (account === undefined ? this.getAccountCached(accountId) : account)?.unified?.['7d_oi']
     if (!oi) return false
     const status = String(oi.status || '').toLowerCase()
     if (status !== 'rejected' && status !== 'rate_limited') return false
@@ -1261,7 +2000,7 @@ export class AccountQuota {
   }
 
   fableWindowResetAt(accountId, account = undefined) {
-    const reset = (account === undefined ? this.repo.get(accountId) : account)?.unified?.['7d_oi']?.reset
+    const reset = (account === undefined ? this.getAccountCached(accountId) : account)?.unified?.['7d_oi']?.reset
     if (!reset) return null
     const ms = parseResetMs(reset)
     return Number.isFinite(ms) ? ms : null
@@ -1269,7 +2008,7 @@ export class AccountQuota {
 
   /** Experimental 50/50 weekly split. Off unless quota.weekly_split.enabled (or the VM override). */
   weeklySplitOf(accountId, account = undefined) {
-    const acc = account === undefined ? this.repo.get(accountId) : account
+    const acc = account === undefined ? this.getAccountCached(accountId) : account
     const cfg = weeklySplitConfig(this.quotaConfigFor(acc))
     const u = acc?.unified || {}
     return computeWeeklySplit({
@@ -1283,7 +2022,7 @@ export class AccountQuota {
   }
 
   weeklySplitResetAt(accountId, kind = 'regular', account = undefined) {
-    const acc = account === undefined ? this.repo.get(accountId) : account
+    const acc = account === undefined ? this.getAccountCached(accountId) : account
     const key = kind === 'fable' ? '7d_oi' : '7d'
     const reset = acc?.unified?.[key]?.reset
     if (!reset) return null
@@ -1331,7 +2070,7 @@ export class AccountQuota {
    * the block switches applied. Used by the seat planner to place new devices.
    */
   gateZoneOf(accountId, { tier = null, account = undefined } = {}) {
-    const acc = account === undefined ? this.ensure({ account_id: accountId }) : account
+    const acc = account === undefined ? this._ensureForHotPath({ account_id: accountId }) : account
     const policy = this.policyFor(acc, { tier })
     const quotaConfig = this.quotaConfigFor(acc)
     const gate = quotaGateOf(quotaConfig)
@@ -1463,11 +2202,25 @@ export class AccountQuota {
     { now = Date.now(), resetReconciledAtMs = null, activeCalibratedBeforeMs = null } = {},
   ) {
     if (!accountId || !this.runtimeRepo) return false
+    const pgPool = this._resolvePgPool()
+    const usePgAsync = Boolean(
+      this._useAsyncQuotaWriteBehind() && pgPool && typeof pgPool.query === 'function' && this.runtimeRepo?.db,
+    )
     let state = null
-    try {
-      state = this.runtimeRepo.get?.(accountId)
-    } catch {
-      return false
+    if (usePgAsync) {
+      try {
+        state =
+          getCacheRuntime()?.scheduler?.getSchedulingSnapshotSync?.()?.byAccountId?.get?.(accountId)?.state || null
+      } catch {
+        state = null
+      }
+      if (!state) return false
+    } else {
+      try {
+        state = this.runtimeRepo.get?.(accountId)
+      } catch {
+        return false
+      }
     }
     if (!state) return false
     const nowMs = parseTimestampMs(now) ?? Date.now()
@@ -1492,18 +2245,46 @@ export class AccountQuota {
     const quotaCool = !reason || /quota|account_quota_exhausted|rate_limited/i.test(reason)
     if (!quotaCool) return false
     if (!state.cooldown_until && !reason && !canLiftRateLimit) return false
-    try {
-      this.runtimeRepo.upsert?.({
-        ...state,
-        status: 'ready',
-        cooldown_until: null,
-        cooldown_reason: null,
-        rate_limit_reset_at: null,
-        ...(canLiftRateLimit && state.session_window_status === 'rejected' ? { session_window_status: 'allowed' } : {}),
-      })
+    if (usePgAsync) {
+      const nowIso = new Date(nowMs).toISOString()
+      const liftWindowStatus = canLiftRateLimit && state.session_window_status === 'rejected'
       this._lastWrittenWindow.delete(accountId)
-    } catch {
-      return false
+      void Promise.resolve()
+        .then(async () => {
+          await pgPool.query(
+            `UPDATE accounts
+            SET
+              temp_unschedulable_until = NULL,
+              temp_unschedulable_reason = NULL,
+              rate_limit_reset_at = NULL,
+              session_window_status = CASE WHEN $2::boolean THEN 'allowed' ELSE session_window_status END,
+              updated_at = $3
+            WHERE id = $1`,
+            [accountId, liftWindowStatus, nowIso],
+          )
+          await pgPool.query(`UPDATE account_runtime SET status = 'ready', updated_at = $2 WHERE account_id = $1`, [
+            accountId,
+            nowIso,
+          ])
+          notifyDbTablesMutated(['accounts', 'account_runtime'])
+        })
+        .catch(() => {})
+    } else {
+      try {
+        this.runtimeRepo.upsert?.({
+          ...state,
+          status: 'ready',
+          cooldown_until: null,
+          cooldown_reason: null,
+          rate_limit_reset_at: null,
+          ...(canLiftRateLimit && state.session_window_status === 'rejected'
+            ? { session_window_status: 'allowed' }
+            : {}),
+        })
+        this._lastWrittenWindow.delete(accountId)
+      } catch {
+        return false
+      }
     }
     try {
       this.onQuotaCooldownCleared?.(accountId)
@@ -1513,19 +2294,48 @@ export class AccountQuota {
 
   _latestActivityAtMs(accountId) {
     let latest = null
+    const cached = this._lastUsedCache.get(accountId)
+    if (Number.isFinite(cached) && cached > 0) latest = maxTimestamp(latest, cached)
+    const ringHead = this._recentAllocs.get(accountId)?.[0]?.at
+    if (ringHead) {
+      const parsedRing = parseTimestampMs(ringHead)
+      if (parsedRing != null && parsedRing > 0) latest = maxTimestamp(latest, parsedRing)
+    }
     try {
-      const ms = Number(this.runtimeRepo?.get?.(accountId)?.last_used_at)
-      if (Number.isFinite(ms) && ms > 0) latest = maxTimestamp(latest, ms)
+      const schedMs = Number(
+        getCacheRuntime()?.scheduler?.getSchedulingSnapshotSync?.()?.byAccountId?.get?.(accountId)?.state?.last_used_at,
+      )
+      if (Number.isFinite(schedMs) && schedMs > 0) latest = maxTimestamp(latest, schedMs)
     } catch {}
-    try {
-      const row = this.repo.recentAllocations?.(accountId, 1)?.[0]
-      const parsed = parseTimestampMs(row?.at)
-      if (parsed != null && parsed > 0) latest = maxTimestamp(latest, parsed)
-    } catch {}
+    if (!this._useAsyncQuotaWriteBehind()) {
+      try {
+        const ms = Number(this.runtimeRepo?.get?.(accountId)?.last_used_at)
+        if (Number.isFinite(ms) && ms > 0) latest = maxTimestamp(latest, ms)
+      } catch {}
+      try {
+        const row = this.repo.recentAllocations?.(accountId, 1)?.[0]
+        const parsed = parseTimestampMs(row?.at)
+        if (parsed != null && parsed > 0) latest = maxTimestamp(latest, parsed)
+      } catch {}
+    }
     return latest
   }
 
   _lastUsedAt(accountId) {
+    const cached = this._lastUsedCache.get(accountId)
+    if (Number.isFinite(cached) && cached > 0) return cached
+    try {
+      const schedMs = Number(
+        getCacheRuntime()?.scheduler?.getSchedulingSnapshotSync?.()?.byAccountId?.get?.(accountId)?.state?.last_used_at,
+      )
+      if (Number.isFinite(schedMs) && schedMs > 0) return schedMs
+    } catch {}
+    const ringHead = this._recentAllocs.get(accountId)?.[0]?.at
+    if (ringHead) {
+      const parsedRing = Date.parse(ringHead)
+      if (Number.isFinite(parsedRing) && parsedRing > 0) return parsedRing
+    }
+    if (this._useAsyncQuotaWriteBehind()) return null
     try {
       const ms = Number(this.runtimeRepo?.get(accountId)?.last_used_at)
       if (Number.isFinite(ms) && ms > 0) return ms
@@ -1542,6 +2352,9 @@ export class AccountQuota {
 
   _batchLastUsedMap(accountIds) {
     const out = new Map()
+    for (const [id, ms] of this._lastUsedCache) {
+      if (Number.isFinite(ms) && ms > 0) out.set(id, ms)
+    }
     if (!this.runtimeRepo) return out
     if (this.runtimeRepo.db) {
       try {
@@ -1552,7 +2365,10 @@ export class AccountQuota {
         }
         for (const row of this._batchLastUsedStmt.all()) {
           const ms = typeof row.last_used_at === 'number' ? row.last_used_at : Date.parse(row.last_used_at)
-          if (Number.isFinite(ms) && ms > 0) out.set(row.account_id, ms)
+          if (Number.isFinite(ms) && ms > 0) {
+            const prev = out.get(row.account_id) || 0
+            if (ms > prev) out.set(row.account_id, ms)
+          }
         }
         return out
       } catch {}
@@ -1560,60 +2376,156 @@ export class AccountQuota {
     for (const id of accountIds) {
       try {
         const ms = Number(this.runtimeRepo.get?.(id)?.last_used_at)
-        if (Number.isFinite(ms) && ms > 0) out.set(id, ms)
+        if (Number.isFinite(ms) && ms > 0) {
+          const prev = out.get(id) || 0
+          if (ms > prev) out.set(id, ms)
+        }
       } catch {}
     }
     return out
   }
 
+  /**
+   * Read per-account top-5 recent allocations from the bounded in-process ring.
+   * Cold accounts in SQLite mode hydrate once via indexed `WHERE account_id = ? ORDER BY id DESC LIMIT 5`
+   * (zero `ROW_NUMBER()` full-table scan); PG mode hydrates asynchronously via `pgPool` LATERAL index scan.
+   */
   _batchRecentAllocationsMap(accountIds) {
     const out = new Map()
-    if (this._batchAllocsStmt) {
-      try {
-        for (const row of this._batchAllocsStmt.all()) {
-          let list = out.get(row.account_id)
-          if (!list) {
-            list = []
-            out.set(row.account_id, list)
-          }
-          list.push({
-            at: row.at,
-            source: row.source,
-            util_5h: row.util_5h,
-            util_7d: row.util_7d,
-            status_5h: row.status_5h,
-            status_7d: row.status_7d,
-            claim: row.claim,
-            tokens_in: row.tokens_in,
-            tokens_out: row.tokens_out,
-          })
-        }
-        return out
-      } catch {}
-    }
+    const isPgAsync = this._useAsyncQuotaWriteBehind()
     for (const id of accountIds) {
-      try {
-        out.set(id, this.repo.recentAllocations(id, 5))
-      } catch {
-        out.set(id, [])
+      if (!this._recentAllocsHydrated.has(id) && !isPgAsync && this._allocByAccountStmt) {
+        try {
+          const rows = this._allocByAccountStmt.all(id, RECENT_ALLOC_RING_LIMIT).map(normalizeAllocRow)
+          const existing = this._recentAllocs.get(id) || []
+          const merged = existing.length ? [...existing] : rows
+          if (existing.length && rows.length) {
+            const seen = new Set(existing.map((r) => `${r.at}|${r.source}|${r.util_5h}`))
+            for (const r of rows) {
+              const key = `${r.at}|${r.source}|${r.util_5h}`
+              if (!seen.has(key) && merged.length < RECENT_ALLOC_RING_LIMIT) {
+                merged.push(r)
+                seen.add(key)
+              }
+            }
+          }
+          this._recentAllocs.set(id, merged.slice(0, RECENT_ALLOC_RING_LIMIT))
+          this._recentAllocsHydrated.add(id)
+        } catch {}
       }
+      const list = this._recentAllocs.get(id)
+      out.set(id, list ? list.slice() : [])
     }
     return out
   }
 
-  snapshot({ now = Date.now() } = {}) {
+  async _loadSnapshotRawFromPgAsync(pgPool) {
+    if (this._pgSnapshotFlight) return this._pgSnapshotFlight
+    const flight = (async () => {
+      try {
+        const accRes = await pgPool.query('SELECT * FROM accounts ORDER BY id')
+        const rawRows = Array.isArray(accRes?.rows) ? accRes.rows : []
+        const rows = []
+        const runtimeLastUsed = new Map()
+        const ids = []
+        const now = Date.now()
+        for (const row of rawRows) {
+          const acc = rowToAccount(row)
+          if (!acc) continue
+          rows.push(acc)
+          ids.push(acc.account_id)
+          if (!this._dirtyAccounts.has(acc.account_id)) {
+            this._putAccountL1(acc, now)
+          }
+          if (row.last_used_at != null) {
+            const ms = typeof row.last_used_at === 'number' ? row.last_used_at : Date.parse(row.last_used_at)
+            if (Number.isFinite(ms) && ms > 0) {
+              runtimeLastUsed.set(acc.account_id, ms)
+              const prev = this._lastUsedCache.get(acc.account_id) || 0
+              if (ms > prev) this._lastUsedCache.set(acc.account_id, ms)
+            }
+          }
+        }
+        const allocsByAccount = new Map()
+        if (ids.length > 0) {
+          try {
+            // Indexed LATERAL top-5 per account (uses idx_alloc_account_at, 0 seq_scan)
+            const allocRes = await pgPool.query(
+              `SELECT a.account_id, x.at, x.source, x.util_5h, x.util_7d, x.status_5h, x.status_7d, x.claim, x.tokens_in, x.tokens_out
+              FROM unnest($1::text[]) AS a(account_id)
+              CROSS JOIN LATERAL (
+                SELECT at, source, util_5h, util_7d, status_5h, status_7d, claim, tokens_in, tokens_out
+                FROM account_allocations
+                WHERE account_id = a.account_id
+                ORDER BY at DESC, id DESC
+                LIMIT $2::integer
+              ) x`,
+              [ids, RECENT_ALLOC_RING_LIMIT],
+            )
+            const dbAllocs = new Map()
+            for (const r of allocRes?.rows || []) {
+              let list = dbAllocs.get(r.account_id)
+              if (!list) {
+                list = []
+                dbAllocs.set(r.account_id, list)
+              }
+              list.push(normalizeAllocRow(r))
+            }
+            for (const id of ids) {
+              const fromDb = dbAllocs.get(id) || []
+              const inMem = this._recentAllocs.get(id) || []
+              const merged = [...inMem]
+              const seen = new Set(inMem.map((r) => `${r.at}|${r.source}|${r.util_5h}`))
+              for (const r of fromDb) {
+                const key = `${r.at}|${r.source}|${r.util_5h}`
+                if (!seen.has(key) && merged.length < RECENT_ALLOC_RING_LIMIT) {
+                  merged.push(r)
+                  seen.add(key)
+                }
+              }
+              const capped = merged.slice(0, RECENT_ALLOC_RING_LIMIT)
+              this._recentAllocs.set(id, capped)
+              this._recentAllocsHydrated.add(id)
+              allocsByAccount.set(id, capped)
+            }
+          } catch {
+            for (const id of ids) allocsByAccount.set(id, this._recentAllocs.get(id) || [])
+          }
+        }
+        const raw = { rows, runtimeLastUsed, allocsByAccount, at: Date.now() }
+        this._snapshotRawCache = raw
+        return raw
+      } finally {
+        if (this._pgSnapshotFlight === flight) this._pgSnapshotFlight = null
+      }
+    })()
+    this._pgSnapshotFlight = flight
+    return flight
+  }
+
+  _formatSnapshot(raw, now = Date.now()) {
     const def = this.tiers?.default || {}
-    const rows = this.repo.list()
-    const ids = rows.map((a) => a.account_id)
-    const runtimeLastUsed = this._batchLastUsedMap(ids)
-    const allocsByAccount = this._batchRecentAllocationsMap(ids)
+    const byId = new Map()
+    for (const row of raw?.rows || []) {
+      byId.set(row.account_id, row)
+    }
+    // Overlay dirty in-memory accounts so callers observe immediate writes even before flush
+    for (const [id, dirtyAcc] of this._dirtyAccounts) {
+      byId.set(id, dirtyAcc)
+    }
+    const rows = [...byId.values()]
     return {
       safety_ratio: def.limit_5h ?? def.safety_ratio ?? this.config.safety_ratio,
       weekly_safety_ratio: def.limit_7d ?? def.weekly_safety_ratio ?? this.config.weekly_safety_ratio,
       tiers: this.tiers,
       accounts: rows.map((a) => {
-        const recentAllocs = allocsByAccount.get(a.account_id) || []
-        let lastUsedAt = runtimeLastUsed.get(a.account_id) ?? null
+        const recentAllocs =
+          this._recentAllocs.get(a.account_id)?.slice() || raw?.allocsByAccount?.get(a.account_id) || []
+        let lastUsedAt =
+          Math.max(
+            Number(raw?.runtimeLastUsed?.get(a.account_id)) || 0,
+            Number(this._lastUsedCache.get(a.account_id)) || 0,
+          ) || null
         if (lastUsedAt == null && recentAllocs[0]?.at) {
           const parsed = Date.parse(recentAllocs[0].at)
           lastUsedAt = Number.isFinite(parsed) ? parsed : null
@@ -1649,10 +2561,76 @@ export class AccountQuota {
     }
   }
 
+  snapshot({ now = Date.now(), fresh = false } = {}) {
+    const cacheNow = Date.now()
+    if (
+      !fresh &&
+      this._snapshotRawCache &&
+      this.snapshotCacheTtlMs > 0 &&
+      cacheNow - this._snapshotRawCache.at < this.snapshotCacheTtlMs
+    ) {
+      return this._formatSnapshot(this._snapshotRawCache, now)
+    }
+
+    const pgPool = this._resolvePgPool()
+    if (this._useAsyncQuotaWriteBehind() && pgPool) {
+      // Stale-while-revalidate / L1 fast path in PG mode: never block main thread with Atomics.wait
+      void this._loadSnapshotRawFromPgAsync(pgPool).catch(() => {})
+      if (this._snapshotRawCache) {
+        return this._formatSnapshot(this._snapshotRawCache, now)
+      }
+      if (this._accountL1.size > 0 || this._dirtyAccounts.size > 0) {
+        const memRows = []
+        const seen = new Set()
+        for (const [id, entry] of this._accountL1) {
+          memRows.push(entry.acc)
+          seen.add(id)
+        }
+        for (const [id, acc] of this._dirtyAccounts) {
+          if (!seen.has(id)) memRows.push(acc)
+        }
+        return this._formatSnapshot(
+          { rows: memRows, runtimeLastUsed: this._lastUsedCache, allocsByAccount: this._recentAllocs, at: cacheNow },
+          now,
+        )
+      }
+    }
+
+    const rows = this.repo.list()
+    const ids = rows.map((a) => a.account_id)
+    const runtimeLastUsed = this._batchLastUsedMap(ids)
+    const allocsByAccount = this._batchRecentAllocationsMap(ids)
+    const raw = { rows, runtimeLastUsed, allocsByAccount, at: cacheNow }
+    if (this.snapshotCacheTtlMs > 0) {
+      this._snapshotRawCache = raw
+    }
+    return this._formatSnapshot(raw, now)
+  }
+
+  /** Async PG-pool backed snapshot with 200ms short TTL cache (0 Atomics.wait). */
+  async snapshotAsync({ now = Date.now(), fresh = false } = {}) {
+    const cacheNow = Date.now()
+    if (
+      !fresh &&
+      this._snapshotRawCache &&
+      this.snapshotCacheTtlMs > 0 &&
+      cacheNow - this._snapshotRawCache.at < this.snapshotCacheTtlMs
+    ) {
+      return this._formatSnapshot(this._snapshotRawCache, now)
+    }
+    const pgPool = this._resolvePgPool()
+    if (pgPool && typeof pgPool.query === 'function') {
+      const raw = await this._loadSnapshotRawFromPgAsync(pgPool)
+      return this._formatSnapshot(raw, now)
+    }
+    return this.snapshot({ now, fresh })
+  }
+
   reloadConfig(config) {
     if (config?.quota) this.config = config.quota
     if (config?.concurrency) this.concurrency = config.concurrency
     this.tiers = normalizeTiers(config?.tiers, this.config, this.concurrency)
+    this._invalidateSnapshotCache()
   }
 
   defaultMax() {

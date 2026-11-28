@@ -46,7 +46,7 @@ async function fetchPgLogWriterAggregate(
   const headers = adminCookie ? { cookie: adminCookie } : {}
   const instances = await Promise.all(
     urls.map(async (raw) => {
-      const endpoint = new URL('/api/panel/request-logs/stats', raw).toString()
+      const endpoint = new URL('/api/panel/request-logs/stats?refresh=1', raw).toString()
       const controller = new AbortController()
       const timer = setTimeout(() => controller.abort(), timeoutMs)
       try {

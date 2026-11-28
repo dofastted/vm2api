@@ -1396,3 +1396,243 @@ test('a 限额查询 Fable hop that needs usage credits sets the same mark, and 
   assert.equal(cleared.fable_credits_required, undefined)
   assert.equal(cleared.model_denied_until[key], undefined)
 })
+
+test('AccountQuota drops ROW_NUMBER full-table scan, maintains bounded 5-entry ring, and caches snapshot() for 200ms', () => {
+  const dir = tmpDir()
+  const q = new AccountQuota({ dataDir: dir, config: {} })
+  assert.equal(q._batchAllocsStmt, undefined, 'ROW_NUMBER() full-table scan statement must be removed')
+
+  for (let i = 1; i <= 8; i += 1) {
+    q.ingestHeaders(
+      'ring-acc',
+      {
+        'anthropic-ratelimit-unified-5h-utilization': String(i / 10),
+        'anthropic-ratelimit-unified-5h-status': 'allowed',
+      },
+      { input_tokens: i * 10, output_tokens: i },
+    )
+  }
+  let listCalls = 0
+  const origList = q.repo.list.bind(q.repo)
+  q.repo.list = (...a) => {
+    listCalls += 1
+    return origList(...a)
+  }
+
+  const s1 = q.snapshot()
+  const s2 = q.snapshot()
+  assert.equal(listCalls, 1, 'second snapshot() within 200ms must hit short TTL cache')
+  const a1 = s1.accounts.find((a) => a.account_id === 'ring-acc')
+  assert.equal(a1.recent_allocations.length, 5, 'bounded recent allocation ring keeps top 5 entries')
+  assert.equal(a1.recent_allocations[0].util_5h, 0.8, 'newest allocation must be first in ring')
+  assert.equal(a1.recent_allocations[4].util_5h, 0.4)
+  assert.equal(s2.accounts.find((a) => a.account_id === 'ring-acc').recent_allocations.length, 5)
+
+  // Reopen cold instance -> hydrates once via indexed per-account statement, then serves from ring/cache
+  const q2 = new AccountQuota({ dataDir: dir, config: {} })
+  const reopened = q2.snapshot().accounts.find((a) => a.account_id === 'ring-acc')
+  assert.equal(reopened.recent_allocations.length, 5)
+  assert.equal(reopened.recent_allocations[0].util_5h, 0.8)
+})
+
+test('AccountQuota PG Dirty-Set async flusher eliminates sync writes, updates L1+Redis Hash, flushes UNNEST batches, and escalates 429 immediately', async (t) => {
+  const { closeCacheRuntime, initCacheRuntime } = await import('../../src/lib/cache/index.mjs')
+  const dir = tmpDir()
+  t.after(async () => {
+    await closeCacheRuntime()
+    fs.rmSync(dir, { recursive: true, force: true })
+  })
+
+  await closeCacheRuntime()
+  const rt = await initCacheRuntime({ redisConfig: null })
+  const redisHashes = new Map()
+  const fakeRedis = {
+    hset: async (key, fields) => {
+      redisHashes.set(key, { ...(redisHashes.get(key) || {}), ...fields })
+      return 1
+    },
+    expire: async () => 1,
+    pipeline: () => {
+      const ops = []
+      const p = {
+        hset: (key, fields) => (ops.push(['hset', key, fields]), p),
+        expire: (key, ttl) => (ops.push(['expire', key, ttl]), p),
+        exec: async () => {
+          for (const [cmd, key, val] of ops) {
+            if (cmd === 'hset') redisHashes.set(key, { ...(redisHashes.get(key) || {}), ...val })
+          }
+          return ops.map(() => [null, 'OK'])
+        },
+      }
+      return p
+    },
+    publish: async () => 0,
+    del: async () => 1,
+    incr: async () => 1,
+    quit: async () => 'OK',
+  }
+  rt.client.redis = fakeRedis
+  rt.client.redisReady = true
+
+  let failNextQuery = false
+  const pgQueries = []
+  const mockPgPool = {
+    query: async (sql, params) => {
+      pgQueries.push({ sql, params })
+      if (failNextQuery) {
+        failNextQuery = false
+        throw new Error('synthetic pg quota flush error')
+      }
+      if (/SELECT \* FROM accounts ORDER BY id/i.test(sql)) {
+        return {
+          rows: [
+            {
+              id: 'pg-a1',
+              vm_id: 'vm-1',
+              email: 'a1@test',
+              name: 'pg-a1',
+              platform: 'claude',
+              type: 'oauth',
+              status: 'active',
+              concurrency: 2,
+              concurrency_override: 0,
+              max_rpm: 0,
+              rpm_override: 0,
+              requests: 1,
+              tokens_in: 100,
+              tokens_out: 20,
+              cache_read_tokens: 0,
+              cache_creation_tokens: 0,
+              extra: JSON.stringify({ unified: { '5h': { utilization: 0.2, status: 'allowed', reset: null } } }),
+              updated_at: new Date().toISOString(),
+            },
+          ],
+        }
+      }
+      if (/CROSS JOIN LATERAL/i.test(sql)) {
+        return {
+          rows: [
+            {
+              account_id: 'pg-a1',
+              at: new Date().toISOString(),
+              source: 'headers',
+              util_5h: 0.2,
+              util_7d: 0.1,
+              status_5h: 'allowed',
+              status_7d: 'allowed',
+              claim: null,
+              tokens_in: 100,
+              tokens_out: 20,
+            },
+          ],
+        }
+      }
+      return { rows: [] }
+    },
+  }
+
+  const q = new AccountQuota({
+    dataDir: dir,
+    config: { quota: { safety_ratio: 0.85, block_on_5h: true, block_on_7d: true } },
+    accounts: [{ account_id: 'pg-a1', vm_id: 'vm-1', email: 'a1@test' }],
+    pgPool: mockPgPool,
+    quotaFlushIntervalMs: 60_000,
+  })
+  // Spy on sync repo writes to prove 0 main-thread sync DB writes during steady-state ingestHeaders
+  let syncSaves = 0
+  let syncAllocs = 0
+  let syncWinWrites = 0
+  const origSave = q.repo.save
+  const origAddAlloc = q.repo.addAllocation
+  q.repo.save = (...a) => {
+    syncSaves += 1
+    return origSave(...a)
+  }
+  q.repo.addAllocation = (...a) => {
+    syncAllocs += 1
+    return origAddAlloc(...a)
+  }
+  q.attachRuntimeRepo({
+    db: { engine: 'postgres' },
+    updateWindow: () => {
+      syncWinWrites += 1
+    },
+  })
+
+  const resetIso = futureReset(3 * 3600_000)
+  q.ingestHeaders(
+    'pg-a1',
+    {
+      'anthropic-ratelimit-unified-5h-utilization': '0.35',
+      'anthropic-ratelimit-unified-5h-status': 'allowed',
+      'anthropic-ratelimit-unified-5h-reset': resetIso,
+    },
+    { input_tokens: 250, output_tokens: 50 },
+  )
+  assert.equal(syncSaves, 0, 'steady-state PG ingestHeaders must not run sync repo.save')
+  assert.equal(syncAllocs, 0, 'steady-state PG ingestHeaders must not run sync repo.addAllocation')
+  assert.equal(syncWinWrites, 0, 'steady-state PG ingestHeaders must defer session window write')
+  assert.equal(q.quotaFlushStats().pendingAccounts, 1)
+  assert.equal(q.quotaFlushStats().pendingAllocs, 1)
+  assert.equal(q.quotaFlushStats().pendingWindows, 1)
+  assert.equal(q.getAccountCached('pg-a1').requests, 1)
+  assert.equal(q.snapshot().accounts.find((a) => a.account_id === 'pg-a1').unified['5h'].utilization, 0.35)
+  await Promise.resolve()
+  assert.equal(redisHashes.get('vm2api:quota:acct:pg-a1')?.util_5h, '0.35', 'Redis Hash must update in-place')
+
+  // Failure re-queues dirty entries (0 data loss)
+  failNextQuery = true
+  const failed = await q.flushQuota()
+  assert.ok(failed.failed > 0)
+  assert.equal(q.quotaFlushStats().pendingAccounts, 1, 'failed flush must restore dirty accounts')
+  assert.equal(q.quotaFlushStats().pendingAllocs, 1, 'failed flush must restore pending allocs')
+
+  // Successful flush drains accounts + window + account_runtime + account_allocations via async UNNEST
+  // without thrashing cross-instance SchedulerSnapshotCache / DashboardCache revisions
+  const revBeforeRoutineFlush = rt.scheduler.revision
+  pgQueries.length = 0
+  const ok = await q.flushQuota()
+  assert.equal(ok.failed, 0)
+  assert.equal(ok.flushedAccounts, 1)
+  assert.equal(ok.flushedWindows, 1)
+  assert.equal(ok.flushedAllocs, 1)
+  assert.equal(
+    rt.scheduler.revision,
+    revBeforeRoutineFlush,
+    'routine periodic flushQuota() must not broadcast structural accounts invalidation',
+  )
+  assert.ok(pgQueries.some((qObj) => /INSERT INTO accounts[\s\S]*UNNEST/i.test(qObj.sql)))
+  assert.ok(pgQueries.some((qObj) => /INSERT INTO account_runtime[\s\S]*UNNEST/i.test(qObj.sql)))
+  assert.ok(pgQueries.some((qObj) => /INSERT INTO account_allocations[\s\S]*UNNEST/i.test(qObj.sql)))
+
+  // snapshotAsync uses async pgPool + indexed CROSS JOIN LATERAL (zero ROW_NUMBER())
+  pgQueries.length = 0
+  const snapAsync = await q.snapshotAsync({ fresh: true })
+  assert.equal(snapAsync.accounts.length, 1)
+  assert.ok(pgQueries.some((qObj) => /CROSS JOIN LATERAL/i.test(qObj.sql)))
+  assert.equal(
+    pgQueries.some((qObj) => /ROW_NUMBER/i.test(qObj.sql)),
+    false,
+    'PG snapshot must never run ROW_NUMBER() full-table scan',
+  )
+
+  // High-risk 429 / exhausted immediately bumps scheduler revision & triggers async flush
+  const revBefore = rt.scheduler.revision
+  pgQueries.length = 0
+  q.ingestHeaders(
+    'pg-a1',
+    {
+      'anthropic-ratelimit-unified-5h-utilization': '1',
+      'anthropic-ratelimit-unified-5h-status': 'rejected',
+    },
+    null,
+    { exhausted: true, status: 429, countRequest: false },
+  )
+  assert.ok(
+    rt.scheduler.revision > revBefore,
+    '429/exhausted must immediately trigger cross-instance scheduler invalidation',
+  )
+  await q.close()
+  assert.equal(q.quotaFlushStats().pendingAccounts, 0)
+  assert.ok(pgQueries.some((qObj) => /INSERT INTO accounts[\s\S]*UNNEST/i.test(qObj.sql)))
+})
