@@ -164,6 +164,16 @@ export function createIssuedToolReplay() {
             content: msg.content.map((block) => {
               if (!isCall(block)) return block
               const issued = batch[n++]
+              // A fresh fork forwards the client's Bash command without a replay record.
+              // Use that same command on a parent hit so their shared history stays identical.
+              if (
+                issued.id === block.id &&
+                issued.name === 'Bash' &&
+                block.name === 'Bash' &&
+                typeof block.input?.command === 'string'
+              ) {
+                issued.input.command = block.input.command
+              }
               if (issued.id !== block.id) aliases.set(block.id, issued.id)
               // The snapshot owns the call, not this request's cache breakpoint.
               if (Object.hasOwn(block, 'cache_control')) issued.cache_control = block.cache_control
