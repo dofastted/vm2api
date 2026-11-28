@@ -103,7 +103,7 @@ const PLATFORM_METAS: readonly PlatformMeta[] = [
       '开启后自动覆盖 Google 模型矩阵中已启用且当前在线槽位支持的全部 Gemini 模型（自动跳过无账号支持的模型）。',
     emptyModelsHint:
       '未勾选具体模型时，将自动选取在线槽位中的轻量 Gemini 模型进行探测。',
-    customPlaceholder: '如 gemini-3-flash',
+    customPlaceholder: '如 gemini-3.8-flash-medium',
   },
 ] as const
 

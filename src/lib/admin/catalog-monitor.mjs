@@ -15,7 +15,11 @@ import { vmHasProxyPath } from '../oauth/credential-refresh-monitor.mjs'
 import { seedModelCatalog } from '../protocol/models.mjs'
 import { syncWorkerModelsIntoPolicy } from '../protocol/model-policy.mjs'
 import { isSyncableGeminiCatalogId, syncGeminiIdsIntoPolicy } from '../protocol/gemini-model-policy.mjs'
-import { classifyAntigravityModel, indexAccountModelCatalog } from '../gemini/model-catalog.mjs'
+import {
+  classifyAntigravityModel,
+  indexAccountModelCatalog,
+  isBlockedUpstreamGeminiModel,
+} from '../gemini/model-catalog.mjs'
 import { fetchUpstreamModels } from './api-endpoints.mjs'
 import { listModelsDevModels, modelsDevMeta, syncModelsDev } from './price-catalog.mjs'
 import { syncCodexCatalog } from './vm-test-chat.mjs'
@@ -104,10 +108,11 @@ function collectGeminiSlotModels(env, out) {
   const catalogIndex = indexAccountModelCatalog(env.account)
   for (const rawId of Array.isArray(env.models) ? env.models : []) {
     if (typeof rawId !== 'string' || !rawId.trim()) continue
+    if (isBlockedUpstreamGeminiModel(rawId)) continue
     const hint = catalogIndex.get(rawId) || null
     const classified = classifyAntigravityModel(rawId, hint?.provider, hint?.quota_group)
     if (classified.provider !== 'google') continue
-    if (!isSyncableGeminiCatalogId(classified.public_id)) continue
+    if (isBlockedUpstreamGeminiModel(classified.public_id) || !isSyncableGeminiCatalogId(classified.public_id)) continue
     out.set(classified.public_id.toLowerCase(), {
       id: classified.public_id,
       display_name: modelsDevMeta('google', classified.public_id)?.name || '',
@@ -210,7 +215,7 @@ export async function syncGeminiCatalog({
           })
           for (const row of res?.models || []) {
             const id = String(typeof row === 'string' ? row : row?.id || row?.name || '').trim()
-            if (!isSyncableGeminiCatalogId(id)) continue
+            if (isBlockedUpstreamGeminiModel(id) || !isSyncableGeminiCatalogId(id)) continue
             const key = id.toLowerCase()
             if (!discovered.has(key)) {
               discovered.set(key, {
@@ -241,7 +246,7 @@ export async function syncGeminiCatalog({
   }
   if (mdGoogle.length) {
     for (const row of mdGoogle) {
-      if (!isSyncableGeminiCatalogId(row.id)) continue
+      if (isBlockedUpstreamGeminiModel(row.id) || !isSyncableGeminiCatalogId(row.id)) continue
       const key = row.id.toLowerCase()
       const existing = discovered.get(key)
       discovered.set(key, {

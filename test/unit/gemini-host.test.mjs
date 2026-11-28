@@ -32,7 +32,7 @@ const bound = { id: record.proxy_id, enabled: true, status: 'ok', owner_user_id:
 const environmentPath = `${root}/environments/${record.id}`
 const proxyUrl = 'socks5h://fixture:private@192.0.2.11:1080'
 const runId = '0123456789abcdef0123456789abcdef'
-const model = 'gemini-3-pro'
+const model = 'gemini-4-neon'
 
 test('Gemini, Anthropic and OpenAI text inputs produce the same native turn envelope', () => {
   const model = 'gemini-3.1-pro'
@@ -935,7 +935,7 @@ test('Gemini public routes schedule one plain-text turn and reject other keys', 
     assert.match(anthropic.body.id, /^msg_[0-9a-f]{24}$/)
     assert.equal(anthropic.body.type, 'message')
     assert.equal(anthropic.body.role, 'assistant')
-    assert.equal(anthropic.body.model, 'gemini-3-pro')
+    assert.equal(anthropic.body.model, model)
     assert.deepEqual(anthropic.body.content, [{ type: 'text', text: 'ok' }])
     assert.equal(anthropic.body.stop_reason, 'end_turn')
     assert.deepEqual(anthropic.body.usage, { input_tokens: 1, output_tokens: 1 })
@@ -989,7 +989,7 @@ test('the public scheduler completes one turn through the host socket', async ()
     auth_state: 'authorized',
     proxy_id: 'px-fixture',
     models_discovered: true,
-    models: ['gemini-3-pro'],
+    models: ['gemini-4-neon'],
   }
   const server = http.createServer((request, response) => {
     const chunks = []
@@ -1289,7 +1289,7 @@ test('Google API route uses shared pool reservation and returns Google response 
   const response = await handle(
     {
       method: 'POST',
-      url: '/v1beta/models/gemini-3-pro:generateContent',
+      url: `/v1beta/models/${model}:generateContent`,
       apiKeyKind: 'managed',
       apiKeyRecord: { group_type: 'gemini' },
       once() {},
@@ -1406,7 +1406,7 @@ test('Gemini-compatible routes convert requests and results across supported pro
       response,
     )
 
-  const google = await request('/v1beta/models/gemini-3-pro:generateContent', {
+  const google = await request(`/v1beta/models/${model}:generateContent`, {
     contents: [{ role: 'user', parts: [{ text: 'hi' }] }],
   })
   assert.equal(google.status, 200)
@@ -1421,7 +1421,7 @@ test('Gemini-compatible routes convert requests and results across supported pro
   assert.equal(responses.body.object, 'response')
   assert.equal(responses.body.output[0].content[0].text, 'hello from CRAGGemini')
 
-  const sse = await request('/v1beta/models/gemini-3-pro:streamGenerateContent?alt=sse', {
+  const sse = await request(`/v1beta/models/${model}:streamGenerateContent?alt=sse`, {
     contents: [{ parts: [{ text: 'hi' }] }],
   })
   assert.equal(sse, undefined)
@@ -2162,7 +2162,7 @@ test('Gemini multi-tenant proxy egress isolation, owner-aware warm/terminal, cat
     schedulerRuntime: createMockSchedulerRuntime(),
   })
   const externalCatalog = {
-    models: [{ id: 'gemini-2.5-flash', object: 'model', owned_by: 'google' }],
+    models: [{ id: 'gemini-3.8-flash', object: 'model', owned_by: 'google' }],
     accounts: [
       {
         id: 'env-1',
@@ -2171,7 +2171,7 @@ test('Gemini multi-tenant proxy egress isolation, owner-aware warm/terminal, cat
         schedule_level: 1,
         max_concurrency: 4,
         capabilities: new Set(['full_gemini_api', 'multi_turn']),
-        models: ['gemini-2.5-flash'],
+        models: ['gemini-3.8-flash'],
         catalogIndex: new Map(),
       },
       {
@@ -2181,14 +2181,14 @@ test('Gemini multi-tenant proxy egress isolation, owner-aware warm/terminal, cat
         schedule_level: 5,
         max_concurrency: 4,
         capabilities: new Set(['full_gemini_api', 'multi_turn']),
-        models: ['gemini-2.5-flash'],
+        models: ['gemini-3.8-flash'],
         catalogIndex: new Map(),
       },
     ],
     unlicensedAccounts: [],
   }
   const done = await sched.complete({
-    model: 'gemini-2.5-flash',
+    model: 'gemini-3.8-flash',
     text: 'hi',
     ownerScope: { type: 'user', userId: 'user-a' },
     allowedEnvIds: ['env-2'],

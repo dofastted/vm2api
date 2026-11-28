@@ -2305,3 +2305,38 @@ test('sanitizeGeminiSchema strips non-RE2 pattern lookarounds/backrefs while kee
   assert.equal(outParams.properties.safe.pattern, '^[a-z]+$')
   assert.equal(outParams.properties.writes.items.properties.doc_id.pattern, undefined)
 })
+
+test('parseInboundToGemini accepts Anthropic compaction blocks with string, array, text, or empty content', () => {
+  const ir = parseInboundToGemini('anthropic', {
+    model: 'gemini-4-neon-high',
+    max_tokens: 1024,
+    messages: [
+      {
+        role: 'assistant',
+        content: [
+          { type: 'compaction', content: 'Summary of earlier conversation turns.' },
+          {
+            type: 'compaction',
+            content: ['Line one.', { type: 'text', text: 'Line two.' }],
+          },
+          { type: 'compaction', text: 'Fallback text field summary.' },
+          { type: 'compaction', content: null, encrypted_content: 'opaque_ciphertext' },
+        ],
+      },
+      { role: 'user', content: 'Continue from the summary.' },
+    ],
+  })
+
+  const assistantMsg = ir.messages.find((m) => m.role === 'assistant')
+  assert.ok(assistantMsg, 'assistant compaction message should be preserved')
+  assert.deepEqual(
+    assistantMsg.parts.map((p) => p.text),
+    ['Summary of earlier conversation turns.', 'Line one.\nLine two.', 'Fallback text field summary.'],
+  )
+  assert.ok(assistantMsg.parts.every((p) => p.kind === 'text'))
+
+  const req = buildGeminiRequest(ir, { target: 'antigravity' })
+  assert.ok(Array.isArray(req.contents) && req.contents.length >= 2)
+  assert.match(JSON.stringify(req.contents), /Summary of earlier conversation turns\./)
+  assert.match(JSON.stringify(req.contents), /Line one\.\\nLine two\./)
+})

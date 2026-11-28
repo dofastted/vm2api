@@ -2229,7 +2229,7 @@ test('auto_mode_classifier side-requests bypass JEV and never ban the main sessi
   }
 })
 
-test('borderline single non-NSFW JEV hits refuse only that request without banning session/device; high-confidence, NSFW, and multi-question hits still escalate', async () => {
+test('borderline single non-NSFW JEV hits refuse only that request without banning session/device; high-confidence and NSFW hits still escalate, and a borderline multi-question hit does not', async () => {
   assert.equal(JEV_BAN_CONFIDENCE_FLOOR, 0.25)
   assert.equal(
     shouldEscalateJevBan({ action: 'block', category: 'usage_policy', categories: ['usage_policy'], score: 0.35 }),
@@ -2240,11 +2240,31 @@ test('borderline single non-NSFW JEV hits refuse only that request without banni
     true,
   )
   assert.equal(shouldEscalateJevBan({ action: 'block', category: 'nsfw', categories: ['nsfw'], score: 0.45 }), true)
+  // Several borderline questions are not stronger evidence than one: only the lowest score counts.
   assert.equal(
     shouldEscalateJevBan({
       action: 'block',
       category: 'usage_policy',
       categories: ['usage_policy', 'abuse'],
+      score: 0.35,
+    }),
+    false,
+  )
+  assert.equal(
+    shouldEscalateJevBan({
+      action: 'block',
+      category: 'usage_policy',
+      categories: ['usage_policy', 'abuse'],
+      score: 0.2,
+    }),
+    true,
+  )
+  // NSFW still forces the ban even when it is one of several borderline hits.
+  assert.equal(
+    shouldEscalateJevBan({
+      action: 'block',
+      category: 'usage_policy',
+      categories: ['usage_policy', 'nsfw'],
       score: 0.35,
     }),
     true,
@@ -2317,9 +2337,9 @@ test('borderline single non-NSFW JEV hits refuse only that request without banni
     })
     assert.equal(nextTurn.action, 'pass')
 
-    // Multi-question hit (both 0.35) escalates to session + 10m device ban.
-    const multiHit = await runProtocolIntercept({
-      inbound: userBody('multi question risky prompt'),
+    // Multi-question hit at borderline scores (0.35 / 0.36) refuses only that request: no session or device ban.
+    const multiBorderline = await runProtocolIntercept({
+      inbound: userBody('multi question borderline prompt'),
       headers,
       policy,
       jev,
@@ -2331,8 +2351,34 @@ test('borderline single non-NSFW JEV hits refuse only that request without banni
           answers: { usage_policy: { noul: 0.35 }, nsfw: { noul: 0.95 }, abuse: { noul: 0.36 } },
         }),
       }),
-      requestId: 'req-multi-1',
+      requestId: 'req-multi-borderline-1',
       now: start + 10_000,
+    })
+    assert.equal(multiBorderline.action, 'block')
+    assert.equal(multiBorderline.error.status, 429)
+    assert.equal(multiBorderline.error.retryAfterSec, 60)
+    assert.equal(multiBorderline.errorDetails.ban_skipped, 'borderline_score')
+    assert.equal(multiBorderline.banSession, false)
+    assert.equal(multiBorderline.banDevice, false)
+    assert.equal(devices.findBan({ principal: '', sessionId: sid }), null)
+    assert.equal(devices.findBan({ principal: '', deviceId: 'dev-borderline-0001' }), null)
+
+    // Multi-question hit with a high-confidence score (0.20 / 0.22) still escalates to session + 10m device ban.
+    const multiHit = await runProtocolIntercept({
+      inbound: userBody('multi question risky prompt'),
+      headers,
+      policy,
+      jev,
+      devices,
+      sessions,
+      fetchImpl: async () => ({
+        ok: true,
+        json: async () => ({
+          answers: { usage_policy: { noul: 0.2 }, nsfw: { noul: 0.95 }, abuse: { noul: 0.22 } },
+        }),
+      }),
+      requestId: 'req-multi-1',
+      now: start + 12_000,
     })
     assert.equal(multiHit.action, 'block')
     assert.equal(multiHit.error.status, 429)

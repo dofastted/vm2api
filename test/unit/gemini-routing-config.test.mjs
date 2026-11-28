@@ -28,6 +28,7 @@ test('routing-config defaults, validation, merge, and protocol gating', () => {
   assert.equal(def.shm.require_shm, true)
   assert.equal(def.shm.request_mb, 16)
   assert.equal(def.shm.response_mb, 16)
+  assert.equal(def.failover.unschedulable_on_502, false)
 
   assert.throws(() => validateGeminiRoutingPatch({ gemini: { pool: { max_sessions_per_account: 0 } } }), {
     code: 'invalid_gemini_pool',
@@ -84,7 +85,7 @@ test('Gemini scheduler honors balanced, fill, round_robin, sticky TTL, and gatew
       models_discovered: true,
       max_concurrency: 4,
       capabilities: ['streaming'],
-      models: ['gemini-3-pro'],
+      models: ['gemini-4-neon-high'],
     },
     {
       id: 'gemini-b',
@@ -96,7 +97,7 @@ test('Gemini scheduler honors balanced, fill, round_robin, sticky TTL, and gatew
       models_discovered: true,
       max_concurrency: 4,
       capabilities: ['streaming'],
-      models: ['gemini-3-pro'],
+      models: ['gemini-4-neon-high'],
     },
     {
       id: 'gemini-c',
@@ -108,7 +109,7 @@ test('Gemini scheduler honors balanced, fill, round_robin, sticky TTL, and gatew
       models_discovered: true,
       max_concurrency: 4,
       capabilities: ['streaming'],
-      models: ['gemini-3-pro'],
+      models: ['gemini-4-neon-high'],
     },
   ]
 
@@ -156,10 +157,10 @@ test('Gemini scheduler honors balanced, fill, round_robin, sticky TTL, and gatew
   holdRelease = new Promise((resolve) => {
     releaseHold = resolve
   })
-  const heldPromise = scheduler.complete({ model: 'gemini-3-pro', prompt: 'hold' })
+  const heldPromise = scheduler.complete({ model: 'gemini-4-neon-high', prompt: 'hold' })
   await new Promise((r) => setTimeout(r, 15))
   const rBalanced = await scheduler.complete({
-    model: 'gemini-3-pro',
+    model: 'gemini-4-neon-high',
     prompt: 'hi',
     stickyKey: 'conv-42',
   })
@@ -172,12 +173,12 @@ test('Gemini scheduler honors balanced, fill, round_robin, sticky TTL, and gatew
   routing = {
     gemini: mergeGeminiRouting(routing.gemini, { pool: { strategy: 'fill' } }),
   }
-  const rFill = await scheduler.complete({ model: 'gemini-3-pro', prompt: 'fill-hit' })
+  const rFill = await scheduler.complete({ model: 'gemini-4-neon-high', prompt: 'fill-hit' })
   assert.equal(rFill.account_id, 'gemini-a')
 
   // Sticky still keeps conv-42 on its pinned account even under fill.
   const rSticky = await scheduler.complete({
-    model: 'gemini-3-pro',
+    model: 'gemini-4-neon-high',
     prompt: 'follow-up',
     stickyKey: 'conv-42',
   })
@@ -194,7 +195,7 @@ test('Gemini scheduler honors balanced, fill, round_robin, sticky TTL, and gatew
   }
   const rrPicks = new Set()
   for (let i = 0; i < 3; i++) {
-    const res = await scheduler.complete({ model: 'gemini-3-pro', prompt: `rr-${i}` })
+    const res = await scheduler.complete({ model: 'gemini-4-neon-high', prompt: `rr-${i}` })
     rrPicks.add(res.account_id)
   }
   assert.equal(rrPicks.size, 3)

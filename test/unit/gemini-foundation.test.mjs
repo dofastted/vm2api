@@ -54,7 +54,11 @@ function makeMockGeminiRuntime({ now = () => Date.now(), quotaCooldownMs = 60_00
   const noteFailure = (rec, failure) => {
     if (!rec || !failure) return
     failures.push({ nodeKey: rec.nodeKey, model: rec.model, failure })
-    if (failure.error_class === 'rate_limit' || failure.error_class === 'quota_exhausted') {
+    if (
+      failure.error_class === 'rate_limit' ||
+      failure.error_class === 'rate_limit429' ||
+      failure.error_class === 'quota_exhausted'
+    ) {
       const waitMs =
         Number.isFinite(failure.retry_after_sec) && failure.retry_after_sec > 0
           ? failure.retry_after_sec * 1000
@@ -242,7 +246,7 @@ test('full 4-protocol streaming & non-streaming end-to-end on api_key environmen
   const sseFrames = [
     `data: ${JSON.stringify({
       responseId: 'r-stream-1',
-      modelVersion: 'gemini-2.5-pro',
+      modelVersion: 'gemini-4-neon',
       candidates: [{ content: { role: 'model', parts: [{ text: 'plan', thought: true }] } }],
     })}\n\n`,
     `data: ${JSON.stringify({
@@ -284,7 +288,7 @@ test('full 4-protocol streaming & non-streaming end-to-end on api_key environmen
               auth_state: 'authorized',
               auth_method: 'api_key',
               models_discovered: true,
-              models: ['gemini-2.5-pro'],
+              models: ['gemini-4-neon'],
               capabilities: [...FULL_GEMINI_CAPABILITIES],
             },
           ],
@@ -318,7 +322,7 @@ test('full 4-protocol streaming & non-streaming end-to-end on api_key environmen
   const resGem = makeRes()
   await handler(
     makeReq({
-      url: '/v1beta/models/gemini-2.5-pro:streamGenerateContent',
+      url: '/v1beta/models/gemini-4-neon:streamGenerateContent',
       body: {
         system_instruction: { parts: [{ text: 'sys' }] },
         contents: [{ role: 'user', parts: [{ text: 'hi' }] }],
@@ -339,7 +343,7 @@ test('full 4-protocol streaming & non-streaming end-to-end on api_key environmen
     makeReq({
       url: '/v1/chat/completions',
       body: {
-        model: 'gemini-2.5-pro',
+        model: 'gemini-4-neon',
         stream: true,
         messages: [
           { role: 'system', content: 'be concise' },
@@ -360,7 +364,7 @@ test('full 4-protocol streaming & non-streaming end-to-end on api_key environmen
     makeReq({
       url: '/v1/responses',
       body: {
-        model: 'gemini-2.5-pro',
+        model: 'gemini-4-neon',
         instructions: 'solve it',
         input: 'hi',
       },
@@ -383,7 +387,7 @@ test('full 4-protocol streaming & non-streaming end-to-end on api_key environmen
     makeReq({
       url: '/v1/messages',
       body: {
-        model: 'gemini-2.5-pro',
+        model: 'gemini-4-neon',
         stream: true,
         max_tokens: 256,
         system: 'Be accurate',
@@ -418,7 +422,7 @@ test('CRAG capability-aware admission routes rich turns away from restricted slo
       auth_state: 'authorized',
       auth_method: 'oauth',
       models_discovered: true,
-      models: ['gemini-2.5-flash'],
+      models: ['gemini-3.8-flash'],
       capabilities: [...legacyRestrictedCaps],
     },
     {
@@ -427,7 +431,7 @@ test('CRAG capability-aware admission routes rich turns away from restricted slo
       auth_state: 'authorized',
       auth_method: 'api_key',
       models_discovered: true,
-      models: ['gemini-2.5-flash'],
+      models: ['gemini-3.8-flash'],
       capabilities: [...FULL_GEMINI_CAPABILITIES],
     },
   ]
@@ -458,7 +462,7 @@ test('CRAG capability-aware admission routes rich turns away from restricted slo
     makeReq({
       url: '/v1/chat/completions',
       body: {
-        model: 'gemini-2.5-flash',
+        model: 'gemini-3.8-flash',
         messages: [
           { role: 'system', content: 'be strict' },
           { role: 'user', content: 'hello' },
@@ -477,7 +481,7 @@ test('CRAG capability-aware admission routes rich turns away from restricted slo
     makeReq({
       url: '/v1/messages',
       body: {
-        model: 'gemini-2.5-flash',
+        model: 'gemini-3.8-flash',
         max_tokens: 128,
         messages: [{ role: 'user', content: 'hello' }],
       },
@@ -495,7 +499,7 @@ test('CRAG capability-aware admission routes rich turns away from restricted slo
     makeReq({
       url: '/v1/chat/completions',
       body: {
-        model: 'gemini-2.5-flash',
+        model: 'gemini-3.8-flash',
         messages: [{ role: 'user', content: 'plain hello' }],
       },
     }),
@@ -512,7 +516,7 @@ test('CRAG capability-aware admission routes rich turns away from restricted slo
       auth_state: 'authorized',
       auth_method: 'oauth',
       models_discovered: true,
-      models: ['gemini-2.5-flash'],
+      models: ['gemini-3.8-flash'],
       capabilities: [...NATIVE_TUI_CAPABILITIES],
     },
   ]
@@ -521,7 +525,7 @@ test('CRAG capability-aware admission routes rich turns away from restricted slo
     makeReq({
       url: '/v1/chat/completions',
       body: {
-        model: 'gemini-2.5-flash',
+        model: 'gemini-3.8-flash',
         messages: [
           { role: 'system', content: 'be concise' },
           { role: 'user', content: 'Remember ZEBRA-1' },
@@ -572,7 +576,7 @@ test('CRAG capability-aware admission routes rich turns away from restricted slo
     makeReq({
       url: '/v1/messages',
       body: {
-        model: 'gemini-2.5-flash',
+        model: 'gemini-3.8-flash',
         messages: [{ role: 'user', content: 'Inspect /etc/hosts and \x1b[31m/var/log/syslog\x1b[0m' }],
       },
     }),
@@ -595,7 +599,7 @@ test('CRAG capability-aware admission routes rich turns away from restricted slo
       auth_state: 'authorized',
       auth_method: 'oauth',
       models_discovered: true,
-      models: ['gemini-2.5-flash'],
+      models: ['gemini-3.8-flash'],
       capabilities: [...legacyRestrictedCaps],
     },
   ]
@@ -604,7 +608,7 @@ test('CRAG capability-aware admission routes rich turns away from restricted slo
     makeReq({
       url: '/v1/messages',
       body: {
-        model: 'gemini-2.5-flash',
+        model: 'gemini-3.8-flash',
         messages: [{ role: 'user', content: 'please run /quit' }],
       },
     }),
@@ -631,7 +635,7 @@ test('error handling: circuit breaker, pre-stream vs mid-stream errors, and disc
               auth_state: 'authorized',
               auth_method: 'api_key',
               models_discovered: true,
-              models: ['gemini-2.5-pro'],
+              models: ['gemini-4-neon'],
               capabilities: [...FULL_GEMINI_CAPABILITIES],
             },
           ],
@@ -697,7 +701,7 @@ test('error handling: circuit breaker, pre-stream vs mid-stream errors, and disc
   await handler(
     makeReq({
       url: '/v1/chat/completions',
-      body: { model: 'gemini-2.5-pro', stream: true, messages: [{ role: 'user', content: 'hi' }] },
+      body: { model: 'gemini-4-neon', stream: true, messages: [{ role: 'user', content: 'hi' }] },
     }),
     res429,
   )
@@ -713,7 +717,7 @@ test('error handling: circuit breaker, pre-stream vs mid-stream errors, and disc
   await handler(
     makeReq({
       url: '/v1/chat/completions',
-      body: { model: 'gemini-2.5-pro', stream: true, messages: [{ role: 'user', content: 'hi' }] },
+      body: { model: 'gemini-4-neon', stream: true, messages: [{ role: 'user', content: 'hi' }] },
     }),
     res502,
   )
@@ -725,7 +729,7 @@ test('error handling: circuit breaker, pre-stream vs mid-stream errors, and disc
   const resPre = makeRes()
   await handler(
     makeReq({
-      url: '/v1beta/models/gemini-2.5-pro:streamGenerateContent',
+      url: '/v1beta/models/gemini-4-neon:streamGenerateContent',
       body: { contents: [{ role: 'user', parts: [{ text: 'hi' }] }] },
     }),
     resPre,
@@ -739,7 +743,7 @@ test('error handling: circuit breaker, pre-stream vs mid-stream errors, and disc
   await handler(
     makeReq({
       url: '/v1/messages',
-      body: { model: 'gemini-2.5-pro', stream: true, messages: [{ role: 'user', content: 'hi' }] },
+      body: { model: 'gemini-4-neon', stream: true, messages: [{ role: 'user', content: 'hi' }] },
     }),
     resMid,
   )
@@ -753,7 +757,7 @@ test('error handling: circuit breaker, pre-stream vs mid-stream errors, and disc
   const cancelsBeforeAbort = cancels.length
   const reqAbort = makeReq({
     url: '/v1/chat/completions',
-    body: { model: 'gemini-2.5-pro', stream: true, messages: [{ role: 'user', content: 'hi' }] },
+    body: { model: 'gemini-4-neon', stream: true, messages: [{ role: 'user', content: 'hi' }] },
   })
   const resAbort = makeRes()
   const running = handler(reqAbort, resAbort)
@@ -769,11 +773,11 @@ test('error handling: circuit breaker, pre-stream vs mid-stream errors, and disc
 test('native-turn helpers validate gatewayPolicy and communicate with worker cancel/health endpoints', async () => {
   const env = prepareGeminiNativeTurn({
     protocol: 'gemini',
-    model: 'gemini-2.5-pro',
+    model: 'gemini-4-neon',
     requestId: 'req-policy-1',
     stream: true,
     gatewayPolicy: { queue_wait_ms: 2000, first_byte_timeout_ms: 8000, stream_idle_timeout_ms: 15000 },
-    body: { model: 'gemini-2.5-pro', stream: true, contents: [{ role: 'user', parts: [{ text: 'hello' }] }] },
+    body: { model: 'gemini-4-neon', stream: true, contents: [{ role: 'user', parts: [{ text: 'hello' }] }] },
   })
   assert.deepEqual(env.gateway_policy, {
     queue_wait_ms: 2000,
@@ -784,11 +788,11 @@ test('native-turn helpers validate gatewayPolicy and communicate with worker can
     () =>
       prepareGeminiNativeTurn({
         protocol: 'gemini',
-        model: 'gemini-2.5-pro',
+        model: 'gemini-4-neon',
         requestId: 'req-bad-policy',
         stream: true,
         gatewayPolicy: { queue_wait_ms: 50 },
-        body: { model: 'gemini-2.5-pro', stream: true, contents: [{ role: 'user', parts: [{ text: 'hello' }] }] },
+        body: { model: 'gemini-4-neon', stream: true, contents: [{ role: 'user', parts: [{ text: 'hello' }] }] },
       }),
     (err) => err.code === 'gemini_unsupported_turn',
   )
@@ -847,8 +851,8 @@ test('Codex and Claude route isolation invariants remain intact', async () => {
   ]) {
     assert.equal(isGeminiPublicPath(shared), false, `${shared} must not be Gemini-only public path`)
   }
-  assert.equal(isGeminiPublicPath('/v1beta/models/gemini-2.5-pro:generateContent'), true)
-  assert.equal(isGeminiPublicPath('/v1beta/models/gemini-2.5-pro:streamGenerateContent'), true)
+  assert.equal(isGeminiPublicPath('/v1beta/models/gemini-4-neon:generateContent'), true)
+  assert.equal(isGeminiPublicPath('/v1beta/models/gemini-4-neon:streamGenerateContent'), true)
   assert.equal(isGeminiSharedPath('/v1/chat/completions'), true)
   assert.equal(isGeminiSharedPath('/v1/responses'), true)
   assert.equal(isGeminiSharedPath('/v1/messages'), false)
@@ -878,7 +882,7 @@ test('Google Gemini native auth headers (x-goog-api-key and /v1beta ?key=) extra
   assert.equal(
     extractApiKey({
       headers: {},
-      url: '/v1beta/models/gemini-2.5-pro:generateContent?key=sk-kin-query-456&alt=sse',
+      url: '/v1beta/models/gemini-4-neon:generateContent?key=sk-kin-query-456&alt=sse',
     }),
     'sk-kin-query-456',
   )
@@ -905,7 +909,7 @@ test('Google account verification ineligibility returns 403 and counts toward ci
               auth_state: 'authorized',
               auth_method: 'oauth',
               models_discovered: true,
-              models: ['gemini-3-flash'],
+              models: ['gemini-3.8-flash'],
               capabilities: [...NATIVE_TUI_CAPABILITIES],
             },
           ],
@@ -927,7 +931,7 @@ test('Google account verification ineligibility returns 403 and counts toward ci
   await handler(
     makeReq({
       url: '/v1/chat/completions',
-      body: { model: 'gemini-3-flash', messages: [{ role: 'user', content: 'hello' }] },
+      body: { model: 'gemini-3.8-flash', messages: [{ role: 'user', content: 'hello' }] },
     }),
     res,
   )
@@ -953,7 +957,7 @@ test('Gemini upstream 400 counts toward circuit breaker without failover while l
               auth_state: 'authorized',
               auth_method: 'oauth',
               models_discovered: true,
-              models: ['gemini-3-flash'],
+              models: ['gemini-3.8-flash'],
               capabilities: [...NATIVE_TUI_CAPABILITIES],
             },
             {
@@ -962,7 +966,7 @@ test('Gemini upstream 400 counts toward circuit breaker without failover while l
               auth_state: 'authorized',
               auth_method: 'oauth',
               models_discovered: true,
-              models: ['gemini-3-flash'],
+              models: ['gemini-3.8-flash'],
               capabilities: [...NATIVE_TUI_CAPABILITIES],
             },
           ],
@@ -1000,7 +1004,7 @@ test('Gemini upstream 400 counts toward circuit breaker without failover while l
   await handler(
     makeReq({
       url: '/v1/chat/completions',
-      body: { model: 'gemini-3-flash', messages: [{ role: 'user', content: 'hello' }] },
+      body: { model: 'gemini-3.8-flash', messages: [{ role: 'user', content: 'hello' }] },
     }),
     res400,
   )
@@ -1015,7 +1019,7 @@ test('Gemini upstream 400 counts toward circuit breaker without failover while l
   await handler(
     makeReq({
       url: '/v1/chat/completions',
-      body: { model: 'gemini-3-flash', messages: [{ role: 'user', content: 'hello' }] },
+      body: { model: 'gemini-3.8-flash', messages: [{ role: 'user', content: 'hello' }] },
     }),
     resUnsupported,
   )
@@ -1029,7 +1033,7 @@ test('Gemini upstream 400 counts toward circuit breaker without failover while l
   await handler(
     makeReq({
       url: '/v1/chat/completions',
-      body: { model: 'gemini-3-flash', messages: [{ role: 'user', content: 'hello' }] },
+      body: { model: 'gemini-3.8-flash', messages: [{ role: 'user', content: 'hello' }] },
     }),
     resLicense,
   )
@@ -1227,7 +1231,7 @@ test('CRAGGemini end-to-end 4-protocol parity, early-stop cancel, and tool-conti
               auth_state: 'authorized',
               auth_method: 'oauth',
               models_discovered: true,
-              models: ['gemini-3-pro'],
+              models: ['gemini-4-neon'],
               capabilities: [...NATIVE_TUI_CAPABILITIES],
             },
             {
@@ -1236,7 +1240,7 @@ test('CRAGGemini end-to-end 4-protocol parity, early-stop cancel, and tool-conti
               auth_state: 'authorized',
               auth_method: 'oauth',
               models_discovered: true,
-              models: ['gemini-3-pro'],
+              models: ['gemini-4-neon'],
               capabilities: [...NATIVE_TUI_CAPABILITIES],
             },
           ],
@@ -1312,7 +1316,7 @@ test('CRAGGemini end-to-end 4-protocol parity, early-stop cancel, and tool-conti
   const endpoints = [
     [
       'gemini',
-      '/v1beta/models/gemini-3-pro:generateContent',
+      '/v1beta/models/gemini-4-neon:generateContent',
       {
         contents: [{ role: 'user', parts: [{ text: 'Return Tokyo temp as JSON' }] }],
         generationConfig: { temperature: 0.4, maxOutputTokens: 128, responseMimeType: 'application/json' },
@@ -1323,7 +1327,7 @@ test('CRAGGemini end-to-end 4-protocol parity, early-stop cancel, and tool-conti
       'openai-chat',
       '/v1/chat/completions',
       {
-        model: 'gemini-3-pro',
+        model: 'gemini-4-neon',
         temperature: 0.4,
         max_tokens: 128,
         response_format: { type: 'json_object' },
@@ -1335,7 +1339,7 @@ test('CRAGGemini end-to-end 4-protocol parity, early-stop cancel, and tool-conti
       'openai-responses',
       '/v1/responses',
       {
-        model: 'gemini-3-pro',
+        model: 'gemini-4-neon',
         temperature: 0.4,
         max_output_tokens: 128,
         text: { format: { type: 'json_object' } },
@@ -1347,7 +1351,7 @@ test('CRAGGemini end-to-end 4-protocol parity, early-stop cancel, and tool-conti
       'anthropic',
       '/v1/messages',
       {
-        model: 'gemini-3-pro',
+        model: 'gemini-4-neon',
         temperature: 0.4,
         max_tokens: 128,
         output_format: { type: 'json_object' },
@@ -1375,7 +1379,7 @@ test('CRAGGemini end-to-end 4-protocol parity, early-stop cancel, and tool-conti
       method: 'POST',
       url: '/v1/messages',
       body: {
-        model: 'gemini-3-pro',
+        model: 'gemini-4-neon',
         stream: true,
         max_tokens: 256,
         stop_sequences: ['###'],
@@ -1400,7 +1404,7 @@ test('CRAGGemini end-to-end 4-protocol parity, early-stop cancel, and tool-conti
       method: 'POST',
       url: '/v1/chat/completions',
       body: {
-        model: 'gemini-3-pro',
+        model: 'gemini-4-neon',
         messages: [{ role: 'user', content: 'Weather in Tokyo?' }],
         tools: [
           {
@@ -1424,7 +1428,7 @@ test('CRAGGemini end-to-end 4-protocol parity, early-stop cancel, and tool-conti
       method: 'POST',
       url: '/v1/chat/completions',
       body: {
-        model: 'gemini-3-pro',
+        model: 'gemini-4-neon',
         messages: [
           { role: 'user', content: 'Weather in Tokyo?' },
           { role: 'assistant', content: null, tool_calls: [turn1Call] },
@@ -1465,7 +1469,7 @@ test('CRAGGemini resume keeps conversation_id on same account and always remints
               auth_state: 'authorized',
               auth_method: 'oauth',
               models_discovered: true,
-              models: ['gemini-3-pro'],
+              models: ['gemini-4-neon'],
               capabilities: [...NATIVE_TUI_CAPABILITIES],
             },
             {
@@ -1474,7 +1478,7 @@ test('CRAGGemini resume keeps conversation_id on same account and always remints
               auth_state: 'authorized',
               auth_method: 'oauth',
               models_discovered: true,
-              models: ['gemini-3-pro'],
+              models: ['gemini-4-neon'],
               capabilities: [...NATIVE_TUI_CAPABILITIES],
             },
           ],
@@ -1529,7 +1533,7 @@ test('CRAGGemini resume keeps conversation_id on same account and always remints
         method: 'POST',
         url: '/v1/chat/completions',
         body: {
-          model: 'gemini-3-pro',
+          model: 'gemini-4-neon',
           conversation_id: callerConv,
           messages,
           ...extra,
@@ -1582,7 +1586,12 @@ test('CRAGGemini resume keeps conversation_id on same account and always remints
   assert.equal(t3Attempts[1].convId, c1, 'same-account 429 retry keeps conv id for agy resume')
   assert.equal(t3Attempts[2].id, 'env-b')
   const c2 = t3Attempts[2].convId
-  assert.equal(c2, `${c1}:r1`)
+  assert.equal(c2, `${c1}_r1`)
+  assert.equal(
+    c2.includes(':'),
+    false,
+    'recovery conversation_id must never contain colon (rejected by CRAGGemini 0.5.5)',
+  )
   assert.notEqual(c2, c1, 'account switch env-a -> env-b must derive a new recovery conversation_id')
   assert.equal(t3Attempts[2].body.contents.length, 5, 'failover target must receive full history for continuity')
 
@@ -1620,7 +1629,7 @@ test('CRAGGemini resume keeps conversation_id on same account and always remints
   const t5Ok = t5Attempts[t5Attempts.length - 1]
   assert.equal(t5Ok.id, 'env-a')
   const c3 = t5Ok.convId
-  assert.equal(c3, `${c1}:r2`)
+  assert.equal(c3, `${c1}_r2`)
   assert.notEqual(c3, c2, 'switch back env-b -> env-a must not reuse env-b conversation_id')
   assert.notEqual(
     c3,
@@ -1639,7 +1648,7 @@ test('CRAGGemini resume keeps conversation_id on same account and always remints
       method: 'POST',
       url: '/v1/messages',
       body: {
-        model: 'gemini-3-pro',
+        model: 'gemini-4-neon',
         max_tokens: 128,
         messages: [{ role: 'user', content: 'Unique stateless thread seed 7788' }],
       },
@@ -1654,7 +1663,7 @@ test('CRAGGemini resume keeps conversation_id on same account and always remints
       method: 'POST',
       url: '/v1/messages',
       body: {
-        model: 'gemini-3-pro',
+        model: 'gemini-4-neon',
         max_tokens: 128,
         messages: [
           { role: 'user', content: 'Unique stateless thread seed 7788' },
@@ -1678,7 +1687,7 @@ test('CRAGGemini resume keeps conversation_id on same account and always remints
       method: 'POST',
       url: '/v1/messages',
       body: {
-        model: 'gemini-3-pro',
+        model: 'gemini-4-neon',
         max_tokens: 128,
         messages: [
           { role: 'user', content: 'Unique stateless thread seed 7788' },
@@ -1715,7 +1724,7 @@ test('CRAGGemini suspended MCP tool continuation remints conversation_id and cle
               auth_state: 'authorized',
               auth_method: 'oauth',
               models_discovered: true,
-              models: ['gemini-3-pro'],
+              models: ['gemini-4-neon'],
               capabilities: [...NATIVE_TUI_CAPABILITIES],
             },
             {
@@ -1724,7 +1733,7 @@ test('CRAGGemini suspended MCP tool continuation remints conversation_id and cle
               auth_state: 'authorized',
               auth_method: 'oauth',
               models_discovered: true,
-              models: ['gemini-3-pro'],
+              models: ['gemini-4-neon'],
               capabilities: [...NATIVE_TUI_CAPABILITIES],
             },
           ],
@@ -1810,7 +1819,7 @@ test('CRAGGemini suspended MCP tool continuation remints conversation_id and cle
         method: 'POST',
         url: '/v1/chat/completions',
         headers: { 'x-session-id': 'mcp-failover-session' },
-        body: { model: 'gemini-3-pro', messages, tools: weatherTools },
+        body: { model: 'gemini-4-neon', messages, tools: weatherTools },
       }),
       res,
     )
@@ -1843,7 +1852,7 @@ test('CRAGGemini suspended MCP tool continuation remints conversation_id and cle
   assert.equal(calls[2].convId, 'conv_mcp_orig_7', '429 restart_resume retry stays on env-a with same conv id')
   assert.equal(calls[3].id, 'env-b')
   const envBConvId = calls[3].convId
-  assert.match(envBConvId, /:r\d+$/)
+  assert.match(envBConvId, /_r\d+$/)
   assert.notEqual(envBConvId, 'conv_mcp_orig_7', 'failover account must never inherit suspended account conv id')
   assert.notEqual(envBConvId, calls[0].convId)
   assert.equal(calls[3].body.contents.length, 3, 'failover account must receive full tool history')
@@ -2080,7 +2089,7 @@ test('publicError sanitizes HOST_INFRASTRUCTURE_CODES details/retryAfter while f
   for (const mode of ['complete', 'stream']) {
     let nextErr = infraErr
     const scheduler = {
-      catalog: async () => ({ models: ['gemini-2.5-pro'], environments: [] }),
+      catalog: async () => ({ models: ['gemini-4-neon'], environments: [] }),
       ...(mode === 'complete'
         ? {
             complete: async () => {
@@ -2105,7 +2114,7 @@ test('publicError sanitizes HOST_INFRASTRUCTURE_CODES details/retryAfter while f
     await handler(
       makeReq({
         url: '/v1/chat/completions',
-        body: { model: 'gemini-2.5-pro', messages: [{ role: 'user', content: 'hi' }] },
+        body: { model: 'gemini-4-neon', messages: [{ role: 'user', content: 'hi' }] },
       }),
       resInfra,
     )
@@ -2122,7 +2131,7 @@ test('publicError sanitizes HOST_INFRASTRUCTURE_CODES details/retryAfter while f
     await handler(
       makeReq({
         url: '/v1/chat/completions',
-        body: { model: 'gemini-2.5-pro', messages: [{ role: 'user', content: 'hi' }] },
+        body: { model: 'gemini-4-neon', messages: [{ role: 'user', content: 'hi' }] },
       }),
       resLimit,
     )
@@ -2677,7 +2686,7 @@ test('429 classification & perf: catalogSnapshot avoids double list, content_rej
       auth_state: 'authorized',
       auth_method: 'oauth',
       models_discovered: true,
-      models: ['gemini-3-pro', 'gemini-3-flash'],
+      models: ['gemini-4-neon', 'gemini-3.8-flash'],
       capabilities: ['streaming', 'multi_turn'],
       account: { state: 'ok', quotas: [], quota_groups: [] },
     },
@@ -2688,7 +2697,7 @@ test('429 classification & perf: catalogSnapshot avoids double list, content_rej
       auth_state: 'authorized',
       auth_method: 'oauth',
       models_discovered: true,
-      models: ['gemini-3-pro', 'gemini-3-flash'],
+      models: ['gemini-4-neon', 'gemini-3.8-flash'],
       capabilities: ['streaming', 'multi_turn'],
       account: { state: 'ok', quotas: [], quota_groups: [] },
     },
@@ -2762,7 +2771,7 @@ test('429 classification & perf: catalogSnapshot avoids double list, content_rej
   await assert.rejects(
     () =>
       scheduler.stream({
-        model: 'gemini-3-pro',
+        model: 'gemini-4-neon',
         geminiBody: { contents: [{ role: 'user', parts: [{ text: 'trigger' }] }] },
         apiKeyRecord: { id: 'k1', group_type: 'gemini' },
         catalogSnapshot: preloaded,
@@ -2775,20 +2784,20 @@ test('429 classification & perf: catalogSnapshot avoids double list, content_rej
   // 2. Explicit QUOTA_EXHAUSTED with Google quotaResetDelay reports retry_after_sec=150 to Rust and fails over.
   scenario = 'quota_exhausted_group'
   const res2 = await scheduler.stream({
-    model: 'gemini-3-pro',
+    model: 'gemini-4-neon',
     geminiBody: { contents: [{ role: 'user', parts: [{ text: 'quota test' }] }] },
     apiKeyRecord: { id: 'k1', group_type: 'gemini' },
     catalogSnapshot: preloaded,
   })
   assert.equal(res2.account_id, 'env-2')
-  assert.equal(scheduler._mockRuntime.modelCooldowns.get('gemini_env:env-1:gemini-3-pro'), clock + 150_000)
+  assert.equal(scheduler._mockRuntime.modelCooldowns.get('gemini_env:env-1:gemini-4-neon'), clock + 150_000)
 
   // 3. Short non-quota RPM 429 (<= 5s) retries the same account once before switching.
   clock += 200_000
   scenario = 'short_rpm_backoff'
   inferCalls.length = 0
   const res3 = await scheduler.stream({
-    model: 'gemini-3-pro',
+    model: 'gemini-4-neon',
     geminiBody: { contents: [{ role: 'user', parts: [{ text: 'short wait' }] }] },
     apiKeyRecord: { id: 'k1', group_type: 'gemini' },
     catalogSnapshot: preloaded,
@@ -2801,13 +2810,13 @@ test('429 classification & perf: catalogSnapshot avoids double list, content_rej
 test('Phase 2 perf: catalog TTL cache, single-flight dedup, zero hot-path get, and copy-on-write geminiCamelCase', async () => {
   const { geminiCamelCase } = await import('../../src/lib/protocol/gemini-convert.mjs')
   const alreadyCamel = {
-    model: 'gemini-3-pro',
+    model: 'gemini-4-neon',
     contents: [{ role: 'user', parts: [{ text: 'hello' }] }],
     generationConfig: { maxOutputTokens: 256 },
   }
   assert.equal(geminiCamelCase(alreadyCamel), alreadyCamel, 'already camelCase tree must avoid cloning')
   const mixedSnake = {
-    model: 'gemini-3-pro',
+    model: 'gemini-4-neon',
     generation_config: { max_output_tokens: 128 },
     contents: [{ role: 'user', parts: [{ text: 'hi' }] }],
   }
@@ -2824,7 +2833,7 @@ test('Phase 2 perf: catalog TTL cache, single-flight dedup, zero hot-path get, a
     auth_state: 'authorized',
     auth_method: 'oauth',
     models_discovered: true,
-    models: ['gemini-3-pro'],
+    models: ['gemini-4-neon'],
     capabilities: [...NATIVE_TUI_CAPABILITIES],
     account: { state: 'ok', quotas: [] },
   }
@@ -2865,7 +2874,7 @@ test('Phase 2 perf: catalog TTL cache, single-flight dedup, zero hot-path get, a
 
   // Streaming within TTL hits cached catalog AND skips redundant host 'get'.
   const res = await scheduler.stream({
-    model: 'gemini-3-pro',
+    model: 'gemini-4-neon',
     geminiBody: { contents: [{ role: 'user', parts: [{ text: 'ping' }] }] },
     apiKeyRecord: { id: 'k1', group_type: 'gemini' },
   })
@@ -2952,7 +2961,7 @@ test('P2-B direct Unix socket data plane streams 1-hop from Node to CRAGGemini a
     auth_state: 'authorized',
     auth_method: 'oauth',
     models_discovered: true,
-    models: ['gemini-3-pro'],
+    models: ['gemini-4-neon'],
     capabilities: [...NATIVE_TUI_CAPABILITIES],
     account: { state: 'ok', quotas: [] },
   }
@@ -3009,7 +3018,7 @@ test('P2-B direct Unix socket data plane streams 1-hop from Node to CRAGGemini a
     // Turn 1 & Turn 2 both stream 1-hop directly over kernel.sock with 0 Python /infer calls,
     // and Turn 2 reuses the cached target with 0 extra /infer-target calls.
     const r1 = await scheduler.stream({
-      model: 'gemini-3-pro',
+      model: 'gemini-4-neon',
       geminiBody: {
         contents: [
           {
@@ -3028,7 +3037,7 @@ test('P2-B direct Unix socket data plane streams 1-hop from Node to CRAGGemini a
     assert.equal(receivedPaths[0].body.body.contents[0].parts[0].text, 'hello direct')
 
     const r2 = await scheduler.stream({
-      model: 'gemini-3-pro',
+      model: 'gemini-4-neon',
       geminiBody: { contents: [{ role: 'user', parts: [{ text: 'second warm turn' }] }] },
       apiKeyRecord: { id: 'k1', group_type: 'gemini' },
     })
@@ -3041,7 +3050,7 @@ test('P2-B direct Unix socket data plane streams 1-hop from Node to CRAGGemini a
     await assert.rejects(
       () =>
         scheduler.stream({
-          model: 'gemini-3-pro',
+          model: 'gemini-4-neon',
           geminiBody: { contents: [{ role: 'user', parts: [{ text: 'blocked prompt' }] }] },
           apiKeyRecord: { id: 'k1', group_type: 'gemini' },
         }),
@@ -3056,7 +3065,7 @@ test('P2-B direct Unix socket data plane streams 1-hop from Node to CRAGGemini a
       fs.unlinkSync(sockPath)
     } catch {}
     const rFallback = await scheduler.stream({
-      model: 'gemini-3-pro',
+      model: 'gemini-4-neon',
       geminiBody: { contents: [{ role: 'user', parts: [{ text: 'after socket gone' }] }] },
       apiKeyRecord: { id: 'k1', group_type: 'gemini' },
     })
@@ -3067,7 +3076,7 @@ test('P2-B direct Unix socket data plane streams 1-hop from Node to CRAGGemini a
     target404 = true
     scheduler.invalidateCatalogCache()
     const r404 = await scheduler.stream({
-      model: 'gemini-3-pro',
+      model: 'gemini-4-neon',
       geminiBody: { contents: [{ role: 'user', parts: [{ text: 'older host' }] }] },
       apiKeyRecord: { id: 'k1', group_type: 'gemini' },
     })
@@ -3096,7 +3105,7 @@ test('open unitCircuit surfaces gemini_native_worker_unavailable while genuine s
     auth_method: 'oauth',
     max_concurrency: 1,
     models_discovered: true,
-    models: ['gemini-3-pro'],
+    models: ['gemini-4-neon'],
     capabilities: [...FULL_GEMINI_CAPABILITIES],
   }
   const accountId = `gemini:${env.id}`
@@ -3128,7 +3137,7 @@ test('open unitCircuit surfaces gemini_native_worker_unavailable while genuine s
   const circuitRes = await handle(
     {
       method: 'POST',
-      url: '/v1beta/models/gemini-3-pro:generateContent',
+      url: '/v1beta/models/gemini-4-neon:generateContent',
       body: { contents: [{ role: 'user', parts: [{ text: 'health probe' }] }] },
       apiKeyKind: 'managed',
       apiKeyRecord: { group_type: 'gemini' },
@@ -3155,7 +3164,7 @@ test('open unitCircuit surfaces gemini_native_worker_unavailable while genuine s
       {
         method: 'POST',
         url: '/v1/chat/completions',
-        body: { model: 'gemini-3-pro', messages: [{ role: 'user', content: 'busy check' }] },
+        body: { model: 'gemini-4-neon', messages: [{ role: 'user', content: 'busy check' }] },
         apiKeyKind: 'managed',
         apiKeyRecord: { group_type: 'gemini' },
         once() {},
@@ -3181,7 +3190,7 @@ function ccMakeEnv(id, extra = {}) {
     auth_state: 'authorized',
     auth_method: 'oauth',
     models_discovered: true,
-    models: ['gemini-4-hydrogen-high', 'gemini-4-neon-high', 'gemini-3-pro'],
+    models: ['gemini-4-hydrogen-high', 'gemini-4-neon-high', 'gemini-4-neon'],
     capabilities: [...NATIVE_TUI_CAPABILITIES],
     ...extra,
   }
@@ -3378,7 +3387,7 @@ test('directClient openDirectStream emits frozen X-Craggemini-* headers over Uni
       wireProtocol: 'anthropic',
       providerResult: true,
       sessionReset: true,
-      conversationId: '11111111-2222-4333-8444-555555555555:r1',
+      conversationId: '11111111-2222-4333-8444-555555555555_r1',
     })
     assert.equal(opened.ok, true)
     assert.equal(opened.res.statusCode, 200)
@@ -3389,7 +3398,7 @@ test('directClient openDirectStream emits frozen X-Craggemini-* headers over Uni
     assert.equal(captured[0].headers['x-craggemini-wire-protocol'], 'anthropic')
     assert.equal(captured[0].headers['x-craggemini-provider-result'], '1')
     assert.equal(captured[0].headers['x-craggemini-session-reset'], '1')
-    assert.equal(captured[0].body.conversation_id, '11111111-2222-4333-8444-555555555555:r1')
+    assert.equal(captured[0].body.conversation_id, '11111111-2222-4333-8444-555555555555_r1')
     assert.equal(captured[0].body.body.model, 'gemini-4-hydrogen-high')
     assert.deepEqual(captured[0].body.body.messages, [{ role: 'user', content: 'Inspect /mnt/x/vm2api' }])
   } finally {
@@ -3770,7 +3779,7 @@ test('(A) createGeminiRestoreTransform does not early-stop long thinking via cha
   assert.ok(emitted.some((e) => e.kind === 'text' && e.text === 'actual final answer'))
 })
 
-test('(A) 409 session conflict codes map to 409 gemini_session_conflict and retry with :r1 + X-Craggemini-Session-Reset', async () => {
+test('(A) 409 session conflict codes map to 409 gemini_session_conflict and retry with _r1 + X-Craggemini-Session-Reset', async () => {
   for (const code of ['session_conflict', 'tool_continuation_already_settled', 'duplicate_request', 'session_busy']) {
     const mapped = mapCragWorkerError(409, { code, error: code })
     assert.equal(mapped.status, 409, `expected 409 for ${code}`)
@@ -3844,7 +3853,8 @@ test('(A) 409 session conflict codes map to 409 gemini_session_conflict and retr
   assert.equal(directAttempts.length, 2)
   assert.match(directAttempts[0].conversationId, /^cs_[a-f0-9]{24}$/)
   assert.equal(directAttempts[0].sessionReset, false)
-  assert.equal(directAttempts[1].conversationId, `${directAttempts[0].conversationId}:r1`)
+  assert.equal(directAttempts[1].conversationId, `${directAttempts[0].conversationId}_r1`)
+  assert.equal(directAttempts[1].conversationId.includes(':'), false)
   assert.equal(directAttempts[1].sessionReset, true)
 })
 
@@ -4590,7 +4600,7 @@ test('(V4) derived_first_turn hitting 409 isolates onto a random conversation_id
   assert.match(attempts[0].conversationId, /^cs_[a-f0-9]{24}$/)
   assert.match(attempts[1].conversationId, /^cs_[a-f0-9]{24}$/)
   assert.notEqual(attempts[1].conversationId, attempts[0].conversationId)
-  assert.equal(attempts[1].conversationId.includes(':r'), false, 'derived_* 409 retry must mint random isolated id')
+  assert.equal(/[:_]r\d+$/.test(attempts[1].conversationId), false, 'derived_* 409 retry must mint random isolated id')
   assert.equal(attempts[1].sessionReset, false, 'derived_* 409 retry must not reset concurrent sibling session')
 })
 

@@ -102,7 +102,7 @@ const GEMINI_DEFAULTS = {
     max_account_switches: 3,
     quota_cooldown_ms: 60_000,
     account_cooldown_ms: 300_000,
-    unschedulable_on_502: true,
+    unschedulable_on_502: false,
   },
   shm: {
     require_shm: true,
@@ -510,7 +510,7 @@ export function GeminiConfigPane({
     'account_cooldown_ms',
     GEMINI_DEFAULTS.failover.account_cooldown_ms
   )
-  const unschedulableOn502 = failover.unschedulable_on_502 !== false
+  const unschedulableOn502 = failover.unschedulable_on_502 === true
   const shmReqMb = numOf(shm, 'request_mb', GEMINI_DEFAULTS.shm.request_mb)
   const shmRespMb = numOf(shm, 'response_mb', GEMINI_DEFAULTS.shm.response_mb)
   const perfTier = resolveGeminiPerformanceTier(shmReqMb, shmRespMb)
@@ -1012,7 +1012,7 @@ export function GeminiConfigPane({
           <div className='border-t pt-4'>
             <SettingRow
               label='502 自动打入不可调度'
-              desc='请求触发上游/代理 502 错误时自动将该 Gemini 账号置为不可调度（类似 Codex 不可调度态），避免 502→503 死循环；恢复可点「恢复状态」或刷新账号。'
+              desc='默认关闭：遇到上游 502/520 等瞬态 5xx 时继承 Anthropic 调度策略直接切号重试并由调度器短冷却，不会因单次 502 停机或误报。'
             >
               <Switch
                 id='gemini-unschedulable-502'

@@ -5,7 +5,7 @@ import { GEMINI_LICENSE_MESSAGES } from './subscription.mjs'
 const TOKEN_RE = /^[!-~]{24,4096}$/
 const MODEL_RE = /^[a-z0-9][a-z0-9._-]{0,99}$/
 const REQUEST_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
-const CONV_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
+const CONV_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
 const VALID_WIRE_PROTOCOLS = new Set(['raw', 'gemini', 'anthropic'])
 const MAX_ENVELOPE_BYTES = 64 * 1024 * 1024
 const MAX_ERROR_BODY_BYTES = 64 * 1024
@@ -372,6 +372,8 @@ export function buildDirectEnvelope({
 }
 
 const UPSTREAM_403_REASON_TOKENS = ['TOS_VIOLATION', 'UNSUPPORTED_REGION', 'VALIDATION_REQUIRED', 'UNSUPPORTED_CLIENT']
+const PROXY_EDGE_403_RE = /<html|<!doctype|cloudflare|cf-ray|just a moment|\bproxy\b/i
+const EMBEDDED_UPSTREAM_5XX_RE = /\b(?:http|status)[\s:=]+(520|521|522|523|524|529|503|504)\b/i
 
 function payloadUpstreamReason(obj) {
   const raw = typeof obj.upstream_reason === 'string' ? obj.upstream_reason.trim() : ''
@@ -390,6 +392,16 @@ function payloadUpstreamReason(obj) {
 function mapEffective403(obj, message, makeErr) {
   const reason = payloadUpstreamReason(obj)
   if (reason === 'TOS_VIOLATION') return makeErr(403, 'gemini_account_ineligible', message)
+  if (reason === 'VALIDATION_REQUIRED') return makeErr(403, 'gemini_account_verification_required', message)
+  if (reason === 'UNSUPPORTED_CLIENT') return makeErr(403, 'gemini_client_unsupported', message)
+  if (reason === 'UNSUPPORTED_REGION') return makeErr(403, 'gemini_location_unsupported', message)
+  const hay = `${typeof obj.error === 'string' ? obj.error : ''} ${typeof obj.message === 'string' ? obj.message : ''} ${message || ''}`
+  if (PROXY_EDGE_403_RE.test(hay)) {
+    const err = makeErr(502, 'gemini_proxy_error', message || 'Upstream proxy or edge rejected request (HTTP 403)')
+    err.upstreamStatus = 403
+    err.proxyEdgeForbidden = true
+    return err
+  }
   return makeErr(403, 'gemini_location_unsupported', message)
 }
 
@@ -400,11 +412,15 @@ function mapEffective403(obj, message, makeErr) {
 export function mapCragWorkerError(httpStatus, payload) {
   const obj = payload && typeof payload === 'object' ? payload : {}
   const code = typeof obj.code === 'string' ? obj.code : null
-  const upstream =
+  const message = typeof obj.error === 'string' && obj.error ? obj.error : undefined
+  let upstream =
     Number.isInteger(obj.upstream_status) && obj.upstream_status >= 400 && obj.upstream_status <= 599
       ? obj.upstream_status
       : null
-  const message = typeof obj.error === 'string' && obj.error ? obj.error : undefined
+  if (upstream == null && (httpStatus === 502 || httpStatus == null) && message) {
+    const m = EMBEDDED_UPSTREAM_5XX_RE.exec(message)
+    if (m) upstream = Number(m[1])
+  }
   const makeErr = (status, errCode, errMsg) => {
     const err = new Error(errMsg || errCode)
     err.status = status
@@ -422,7 +438,12 @@ export function mapCragWorkerError(httpStatus, payload) {
   }
   const effectiveStatus = upstream ?? httpStatus
   if (code === 'unsupported_turn') return makeErr(400, 'gemini_unsupported_turn', message)
-  if (code === 'invalid_envelope' || code === 'invalid_json' || code === 'invalid_wire_protocol') {
+  if (
+    code === 'invalid_envelope' ||
+    code === 'invalid_json' ||
+    code === 'invalid_wire_protocol' ||
+    code === 'invalid_conversation'
+  ) {
     return makeErr(400, 'gemini_invalid_request', message)
   }
   if (code === 'empty_upstream_stream' || code === 'acp_executor_error' || code === 'acp_model_unspecified') {
@@ -437,7 +458,14 @@ export function mapCragWorkerError(httpStatus, payload) {
   ) {
     return makeErr(503, code === 'queue_full' ? 'gemini_operation_busy' : 'gemini_native_worker_unavailable', message)
   }
-  if (code === 'first_byte_timeout' || code === 'turn_timeout' || code === 'idle_timeout' || code === 'queue_timeout') {
+  if (
+    code === 'first_byte_timeout' ||
+    code === 'turn_timeout' ||
+    code === 'idle_timeout' ||
+    code === 'queue_timeout' ||
+    effectiveStatus === 504 ||
+    effectiveStatus === 408
+  ) {
     return makeErr(504, 'gemini_inference_timeout', message)
   }
   if (code === 'cancelled') return makeErr(499, 'gemini_inference_cancelled', message)
@@ -468,6 +496,14 @@ export function mapCragWorkerError(httpStatus, payload) {
   if (effectiveStatus === 401) return makeErr(401, 'gemini_oauth_required', message)
   if (effectiveStatus === 403) return mapEffective403(obj, message, makeErr)
   if (effectiveStatus === 404) return makeErr(404, 'gemini_model_unavailable', message)
+  if (code === 'upstream_overloaded' || code === 'overloaded' || effectiveStatus === 529) {
+    const err = makeErr(529, 'gemini_upstream_unavailable', message || 'Upstream overloaded. Please retry shortly.')
+    if (Number.isInteger(obj.retry_after_ms) && obj.retry_after_ms >= 1 && obj.retry_after_ms <= 3_600_000) {
+      err.retryAfterMs = obj.retry_after_ms
+      err.retryAfter = Math.ceil(obj.retry_after_ms / 1000)
+    }
+    return err
+  }
   if (code === 'upstream_unavailable' || effectiveStatus === 503) {
     const err = makeErr(
       503,
@@ -480,11 +516,8 @@ export function mapCragWorkerError(httpStatus, payload) {
     }
     return err
   }
-  return makeErr(
-    effectiveStatus >= 400 && effectiveStatus <= 599 ? effectiveStatus : 502,
-    'gemini_inference_failed',
-    message,
-  )
+  const finalStatus = effectiveStatus >= 400 && effectiveStatus <= 599 ? effectiveStatus : 502
+  return makeErr(finalStatus, 'gemini_inference_failed', message || `Upstream HTTP ${finalStatus}`)
 }
 
 export function targetSupportsWireProtocol(target, wireProtocol) {
