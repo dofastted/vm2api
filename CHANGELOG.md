@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.4.242 — 2026-11-28 · WU-3 物理机深度去虚拟化、每槽随机用户名与实时时区同步、钉死版 Linux `6.12.118-1` `prctl()` 写一次自定义内核轨与新版 `kin-computer` / `crag-debian13` 1.1.0 载荷钉选
+
+- **WU-3 Phase A — 物理机去虚拟化、每槽随机 Linux 用户名与实时时区/预设同步（#2015）**：
+  - **身份单一真源与老槽零破坏兼容**：新增 `src/lib/vm/slot-identity.mjs` 统一收口 `slotUser`/`slotHome`/`slotClaudeDir`/`slotGuestUidGid`（新建 KVM `custom-erofs` 槽 `1000:1000`，存量 `kincli` 老槽维持 `999:987` 与 `/home/kincli` 不变）及 `detectHostCpuVendor`；`workstation-fingerprint.mjs` 与 `slot-computer.mjs` 为新槽分配防碰撞随机用户名、生成剥离 `kincli` 的过滤只读 `runtime-etc/{passwd,group}`，并保护已有 `hostname`/`device_id` 的存量老槽绝不被 `rememberComputer` 篡改。
+  - **定制 Debian 13 只读身份覆盖与实时热切时区**：`docker/kin-os/debian-13/Dockerfile` 与 `scripts/build-custom-debian13-os.sh` 将 `/etc/{os-release,localtime,timezone}` 及 `/usr/lib/os-release` 实体化为 `0644` 常规文件并写入镜像门控标签 `org.vm2api.regular-etc-targets=1`；`kin-guest-init` 落地 8 步无 `eval` `boot.env` 启动序列、`tmpfs /home` + 过滤 RO `/etc/{passwd,group,shadow}` 与 `dmesg_restrict=1`；`kin-slot-agent` 新增鉴权 RPC `sync_preset_tz` 以 `pwrite`+尾部 `ftruncate` 保 inode 原地刷新 `TZif` 并联动 `10-slot-preset.json`；`kin-guest-exec` 降权时清除 root `MAIL` 并从 `/etc/passwd` 反查 `USER/LOGNAME/HOME`。
+  - **全链路随机用户参数化与 KVM 去虚拟化**：覆盖本地 Docker/KVM（`vm-runtime`/`slot-host`/`slot-shell`/`slot-engine`/`rust-kernel-supervisor`）、OAuth/Bootstrap/PTY（对齐 KVM `custom-erofs` Guest UID）与远端集群（按目标节点真实 UID:GID 动态渲染 `runtime-etc/{passwd,group}`）；`load-hw-plan.sh` 与 `kin-kvm-entry` 强制宿主同厂 CPUID 锁（`kvm=off,-hypervisor,-vmx/-svm` 含跨厂保护与非导出环境变量透传）、ACPI OEM 表注入、离线 `state.ext4` `boot.env`/`etc-override` 同步与 `/proc/cmdline` `kin.*` 剥离，引入 `KIN_KVM_KERNEL_TRACK=official|custom` 双轨契约（默认 `official`、远端节点锁定 `official`）。
+- **WU-3 Phase B — 钉死版 Linux `6.12.118-1` `prctl()` 写一次内核轨与零 `kin` cmdline（#2019）**：
+  - 新增 `patches/kernel-6.12/0001-uts-prctl-write-once.patch`（针对 Debian `linux-source-6.12=6.12.118-1` 的 `--fuzz=0` 4 文件补丁）：实现 `PR_KIN_SET_UTS_ONCE (0x564d3201)`（322B `struct kin_uts_override`，限定 `CAP_SYS_ADMIN` + `GLOBAL_ROOT_UID` + `init_uts_ns` + `init_pid_ns`，校验先于封锁后以 `atomic_cmpxchg` 永久封锁并清零尾字节），保持 `/proc/sys/kernel/{osrelease,version}` `0444` 且五处内核版本读取面 100% 字节一致。
+  - 新增可复现内核构建脚本 `scripts/build-custom-debian13-kernel.sh`（内置全部 KVM/EROFS/EXT4/VirtIO/VSOCK/Overlay/nftables 驱动与 EROFS 模块版本解耦、禁用 `CONFIG_FW_CFG_SYSFS`、启用 `CONFIG_SECURITY_DMESG_RESTRICT=y`、`initrd.img-custom` 通过 `conf.d/99-kin-init` 默认引导 `kin-guest-init`）；`kin-kvm-entry` 在 `custom` 轨省略 `-append` 中的 `init=` 实现 `/proc/cmdline` 零 `kin` 字样；`scripts/fetch-payload.mjs` 与 `.github/workflows/guest-images.yml` 接入可选 `custom_kernel` 资产校验拉取与镜像构建。
+- **钉选新版 `kin-computer`（38 档案）与 `crag-debian13` 1.1.0 载荷**：
+  - `deploy/payload.json` 的 `release` 升级至 `payload-2026.11.28-kin-computer-2`（仅更新 `bin/kin-computer`，其余二进制与 `CRAG 3.1.26` / `CRAGGemini 0.5.4` 载荷及密钥零变更）；`crag_debian13_release` 升级至 `payload-2026.11.28-crag-debian13-1.1.0`（含新版常规 `/etc` EROFS 与可选 `custom_kernel` `vmlinuz-custom`/`initrd.img-custom`）。
+- 部署说明：本次改动零新增数据库迁移、零前端或 Rust `kin-scheduler` 变更；`kin-kernel`/`cli-node`/`wrap-cli` 与 `CRAG 3.1.26`/`CRAGGemini 0.5.4` 字节均未变，既有 `wrap`/Codex/老 `kincli` 槽位预期 **`SLOT_SYNC=skip`**，无需重启既有槽位。如需在 `crag-debian13` 槽位启用新版 38 档案与随机用户名，需同步 `bin/kin-computer`、拉取最新 `kin-os-debian:13-baked`/`kin-kvm-debian:13` 镜像，并在 KVM 宿主机执行 `node scripts/fetch-payload.mjs --crag-debian13` 落盘 `share/os/crag-debian13/`（含 `vmlinuz-custom`/`initrd.img-custom`）；默认走 `KIN_KVM_KERNEL_TRACK=official`，按需设 `KIN_KVM_KERNEL_TRACK=custom` 启用定制 6.12 内核并支持秒级切回 `official`。
+
 ## 1.4.241 — 2026-11-28 · 修复 CRAG V4 与号池第三方客户端 Claude Code 格式转换（含 SQLite `072`/PG `009` 迁移与 `kin-scheduler` 默认策略）、Gemini OAuth/RT 导入格式（Format 1 & 2）与多客户端回退、`UMask=0077` 目录权限自愈、直连模型拉取、代理绑定透传及 CRAGGemini `0.5.4` `GRPC_PROXY` 载荷钉选
 
 - **修复 CRAG V4 与 M1b/M3 号池第三方客户端 Claude Code 格式转换（#2011）**：
