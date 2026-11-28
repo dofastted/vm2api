@@ -862,6 +862,25 @@ export function assertNoUnrepresentableCragFields(body) {
   }
 }
 
+function hasSuppliedToolName(tools, messages, name) {
+  if (typeof name !== 'string' || !name) return false
+  if (Array.isArray(tools) && tools.some((t) => t?.name === name)) return true
+  if (!Array.isArray(messages)) return false
+  for (const message of messages) {
+    if (!Array.isArray(message?.content)) continue
+    for (const block of message.content) {
+      if (
+        block?.type === 'tool_addition' &&
+        block.tool?.type === 'tool_definition' &&
+        block.tool.definition?.name === name
+      ) {
+        return true
+      }
+    }
+  }
+  return false
+}
+
 export function sanitizeCragBodyWhitelist(
   input,
   {
@@ -914,24 +933,8 @@ export function sanitizeCragBodyWhitelist(
   if (materialized.tool_choice != null) {
     if (!isPlainObject(materialized.tool_choice)) invalid('tool_choice', 'must be an object')
     out.tool_choice = pickKeys(materialized.tool_choice, TOOL_CHOICE_KEYS)
-    if (out.tool_choice.type === 'tool') {
-      const hasTopLevelTool = Array.isArray(out.tools) && out.tools.some((t) => t.name === out.tool_choice.name)
-      const hasInlineTool =
-        !hasTopLevelTool &&
-        Array.isArray(out.messages) &&
-        out.messages.some(
-          (m) =>
-            Array.isArray(m?.content) &&
-            m.content.some(
-              (b) =>
-                b?.type === 'tool_addition' &&
-                ((b.tool?.type === 'tool_definition' && b.tool.definition?.name === out.tool_choice.name) ||
-                  (b.tool?.type === 'tool_reference' && b.tool.name === out.tool_choice.name)),
-            ),
-        )
-      if (!hasTopLevelTool && !hasInlineTool) {
-        invalid('tool_choice.name', 'must identify a supplied tool')
-      }
+    if (out.tool_choice.type === 'tool' && !hasSuppliedToolName(out.tools, out.messages, out.tool_choice.name)) {
+      invalid('tool_choice.name', 'must identify a supplied tool')
     }
   }
 

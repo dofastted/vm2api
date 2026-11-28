@@ -1243,6 +1243,22 @@ export function validateBetweenToolsThinking(body = {}, { code = 'thinking_incom
     invalid('between_tools thinking does not support xhigh or max effort.')
 }
 
+function inlineToolDefinitionsOf(messages) {
+  if (!Array.isArray(messages)) return []
+  const defs = []
+  for (const message of messages) {
+    if (!Array.isArray(message?.content)) continue
+    for (const block of message.content) {
+      const def =
+        block?.type === 'tool_addition' && block.tool?.type === 'tool_definition' ? block.tool.definition : null
+      if (def && typeof def === 'object' && !Array.isArray(def) && typeof def.name === 'string' && def.name) {
+        defs.push(def)
+      }
+    }
+  }
+  return defs
+}
+
 /** Validate the caller contract before any model or persona rewrite. */
 export function validateToolChoice(body = {}) {
   const choice = body.tool_choice
@@ -1256,8 +1272,14 @@ export function validateToolChoice(body = {}) {
   if (!choice || typeof choice !== 'object' || !['auto', 'none', 'any', 'tool'].includes(choice.type))
     invalid('tool_choice.type must be auto, none, any, or tool.')
   const tools = Array.isArray(body.tools) ? body.tools : []
-  if (choice.type !== 'none' && tools.length === 0) invalid('tool_choice requires a non-empty tools list.')
-  if (choice.type === 'tool' && (!choice.name || !tools.some((tool) => tool?.name === choice.name)))
+  const inlineTools = inlineToolDefinitionsOf(body.messages)
+  if (choice.type !== 'none' && tools.length === 0 && inlineTools.length === 0)
+    invalid('tool_choice requires a non-empty tools list.')
+  if (
+    choice.type === 'tool' &&
+    (!choice.name ||
+      (!tools.some((tool) => tool?.name === choice.name) && !inlineTools.some((tool) => tool?.name === choice.name)))
+  )
     invalid('tool_choice.name must identify a supplied tool.')
   if (!hasForcedToolChoice(body)) return
   const entry = getModelEntry(body.model)

@@ -774,17 +774,11 @@ export function scrubUpstreamClientBody(
     for (const message of out.messages) {
       if (!Array.isArray(message?.content)) continue
       for (const block of message.content) {
-        if (
-          block?.type === 'tool_addition' &&
-          block.tool?.type === 'tool_definition' &&
-          block.tool.definition &&
-          typeof block.tool.definition === 'object' &&
-          typeof block.tool.definition.name === 'string'
-        ) {
-          if (!toolByName.has(block.tool.definition.name)) {
-            toolByName.set(block.tool.definition.name, block.tool.definition)
-          }
-          if (!preserveToolNames) declared.add(block.tool.definition.name)
+        const def =
+          block?.type === 'tool_addition' && block.tool?.type === 'tool_definition' ? block.tool.definition : null
+        if (def && typeof def === 'object' && !Array.isArray(def) && typeof def.name === 'string' && def.name) {
+          if (!toolByName.has(def.name)) toolByName.set(def.name, def)
+          if (!preserveToolNames) declared.add(def.name)
         }
       }
     }
@@ -852,28 +846,30 @@ function scrubToolReferenceFields(block, rename) {
     block.tool?.type === 'tool_definition' &&
     block.tool.definition &&
     typeof block.tool.definition === 'object' &&
+    !Array.isArray(block.tool.definition) &&
     !isAnthropicServerTool(block.tool.definition)
   ) {
     const def = block.tool.definition
+    let nextDef = def
     let defChanged = false
-    const nextDef = { ...def }
-    if (typeof nextDef.name === 'string') {
-      const name = rename(nextDef.name, def)
-      if (name !== nextDef.name) {
-        nextDef.name = name
+    if (typeof def.name === 'string') {
+      const name = rename(def.name, def)
+      if (name !== def.name) {
+        nextDef = { ...nextDef, name }
         defChanged = true
       }
     }
-    if (typeof nextDef.description === 'string') {
-      const desc = scrubClientProse(nextDef.description, { includeThirdPartyBrands: true })
-      if (desc !== nextDef.description) {
-        nextDef.description = desc
+    if (typeof def.description === 'string') {
+      const description = scrubClientProse(def.description, { includeThirdPartyBrands: true })
+      if (description !== def.description) {
+        nextDef = { ...nextDef, description }
         defChanged = true
       }
     }
     if (defChanged) {
       return { block: { ...block, tool: { ...block.tool, definition: nextDef } }, changed: true }
     }
+    return { block, changed: false }
   }
   if (
     (block.type === 'tool_addition' || block.type === 'tool_removal') &&
