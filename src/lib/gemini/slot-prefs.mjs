@@ -15,6 +15,21 @@ export const DEFAULT_GEMINI_SCHEDULE_LEVEL = 5
 
 const UNSCHEDULABLE_REASON_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/
 
+/**
+ * Transient upstream faults park a slot only for a bounded time. Everything else
+ * (reauth_required, verification_required, location_unsupported, ineligible, ...) is a
+ * deterministic account state that only a recheck or an operator may clear.
+ */
+export const TRANSIENT_UNSCHEDULABLE_REASONS = new Set(['upstream_502', 'proxy_502'])
+export const TRANSIENT_UNSCHEDULABLE_TTL_MS = 10 * 60 * 1000
+
+function transientMarkExpired(unsched, nowMs) {
+  if (!unsched || !TRANSIENT_UNSCHEDULABLE_REASONS.has(unsched.reason)) return false
+  const at = Date.parse(unsched.at || '')
+  if (!Number.isFinite(at)) return false
+  return nowMs - at >= TRANSIENT_UNSCHEDULABLE_TTL_MS
+}
+
 export function parseGeminiScheduleLevel(value) {
   if (value === null || value === '' || value === 'auto') return { ok: true, value: null }
   const n = typeof value === 'string' && /^\d+$/.test(value.trim()) ? Number(value.trim()) : value
@@ -82,9 +97,21 @@ export function createGeminiSlotPrefs({ settingsRepo = null, now = () => Date.no
     }
   }
 
+  /** Drop an expired transient mark from the store so it cannot come back on the next read. */
+  function pruneExpired(envId) {
+    const store = readAll()
+    const entry = sanitizeEntry(store[envId])
+    if (!transientMarkExpired(entry.unschedulable, now())) return entry
+    delete entry.unschedulable
+    if (Object.keys(entry).length > 0) store[envId] = entry
+    else delete store[envId]
+    writeAll(store)
+    return entry
+  }
+
   function get(envId) {
     if (!envId) return { schedulable: true, schedule_level: null, display_name: null, unschedulable: null }
-    const raw = sanitizeEntry(readAll()[envId])
+    const raw = pruneExpired(envId)
     return {
       schedulable: raw.schedulable !== false,
       schedule_level: raw.schedule_level ?? null,
@@ -195,7 +222,11 @@ export function createGeminiSlotPrefs({ settingsRepo = null, now = () => Date.no
   return {
     get,
     resolved,
-    all: readAll,
+    all() {
+      const store = readAll()
+      for (const envId of Object.keys(store)) pruneExpired(envId)
+      return readAll()
+    },
     patch,
     markUnschedulable,
     clearUnschedulable,
