@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.4.259 — 2026-11-28 · V4 协议纯度收口（内联 `tool_choice`、首部 `role: "system"` 控制回合）与 CRAG `3.1.31` 钉选
+
+- **内联工具与首部系统控制回合的协议不变量收口（#2085）**：
+  - `src/lib/protocol/model-policy.mjs`：`validateToolChoice` 识别 `body.messages` 中内联的 `tool_addition`（`tool.type === 'tool_definition'`）工具，`tool_choice`（`auto` / `any` / `tool`）指向内联定义的工具时不再在入口被误判为 400
+  - `src/lib/protocol/crag-whitelist.mjs`：`tool_choice.type === 'tool'` 只匹配顶层 `tools` 或内联 `tool_addition (tool_definition)`，缺少定义的裸 `tool_reference` 会被拒绝
+  - `src/lib/protocol/sanitize.mjs`：首部 `role: "system" | "developer"` 回合只上提纯文本块，`tool_addition` / `tool_removal` / `tool_reference` 等协议块原位保留；非空的首部 `clear_at` 回合保持原位且多遍处理幂等，空的 `clear_at` 回合不再绕过首部 user 守卫；`mergeConsecutiveAnthropicMessages` 新增 `preserveConsecutiveSystem` 选项
+  - `src/lib/protocol/outbound-attempt.mjs`：第三方 `role: "system"` 折叠时保留相邻系统控制回合各自的消息级 `cache_control`，不再合并成一回合
+  - `src/lib/protocol/anthropic-policy.mjs`：收紧内联 `tool_definition` 守卫（非数组、`name` 非空、未改动时不克隆、`tool_definition` 提前返回）
+- **CRAG `3.1.31` 载荷钉选（#2085，配套 `dofastted/crag#44`）**：`deploy/payload.json` 的 `crag_release` 升级至 `payload-2026.11.28-crag-3.1.31`，并在 `src/lib/admin/kernel-catalog.mjs` 注册 `3.1.31`（收口 `wire.rs` Beta SSOT、门控 diagnostics 注入、移除重复的 runtime beta 推导）；零密钥轮换，沿用现役 `issuer_public_key_id=9dbb4bc2…` / `payload_key_id=835451e2…`，CRAGGemini 载荷不变，`3.1.30` 及更早版本保留可回退
+- 部署说明：本次改动零数据库迁移、零 Rust 变更；`deploy/payload.json` 更新了 CRAG 载荷（`crag-v2` 三个资产与 `crag-v2-licensed-amd64.tar.gz`），升级后既有 CRAG 槽位按槽位同步策略更新内核，协议层改动随控制面重启生效。
+
 ## 1.4.258 — 2026-11-28 · 控制面 Gemini 熔断改按 `gemini.pool.circuit_*` 生效
 
 - **控制面 `gemini:<环境 id>` 单元熔断跟随 `gemini.pool.circuit_*`（#2084，外部贡献）**：此前 `gemini.pool.circuit_failure_threshold` / `circuit_open_ms` 只通过 `apply-policy` 下发给 CRAGGemini 内核，控制面这一层的 Gemini 环境熔断实际借用的是 Claude 的 `pool.circuit_*`——在面板里改 Gemini 的熔断阈值（包括设为 `0` 关闭）对控制面不生效，环境详情里显示的 threshold / open_ms 也是 Claude 的值。
