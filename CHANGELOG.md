@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.4.247 — 2026-11-28 · API 端点默认 `body_policy` 切为 `caller` 并修复 `/#/api` 开关即时持久化
+
+- **API 端点 `body_policy` 默认透传调用方原始正文并修复 `/#/api` 开关持久化（#2045）**：
+  - 后端 `src/lib/admin/api-endpoints.mjs`（`BODY_POLICIES` 顺位调整为 `['caller', 'persona']`）与 `src/lib/db/repos/api-endpoints-repo.mjs`（`rowEp` / `_epValues` 缺省回退）全链路将默认 `body_policy` 由 `'persona'` 切为 `'caller'`（透传调用方原始请求体，不额外注入项目 persona/system；`'persona'` 保留为显式可选）；新增 SQLite 迁移 `src/lib/db/migrations/073_api_endpoint_body_policy_default.sql` 与 PostgreSQL 迁移 `src/lib/db/pg/pg-migrations/010_api_endpoint_body_policy_default.sql`，在线幂等设置列默认值（PG `SET DEFAULT 'caller'`）并将既有 `'persona'` 行自动回填为 `'caller'`（保留 `CHECK` 约束）。
+  - 前端 `web/src/features/anthropic/{index.tsx,endpoint-save.ts}` 与 `web/src/types/panel-api-endpoints.ts` 将新建草稿与 `asBodyPolicy` 默认切为 `'caller'`；已保存端点在 `/#/api` 切换「转发调用方原始正文」开关时即时下发单字段 `PATCH /api/panel/api-endpoints/:id`（`{ body_policy }`），同步更新本地 `stored.bodyPolicy` 与 React Query 缓存（`patchCachedApiEndpoint`），失败时自动回滚并提示，且与完整保存回调保持一致；补齐 `test/unit/{anthropic-console,api-endpoints,database,scheduler-m0-migrations}.test.mjs` 与 `web/src/features/anthropic/endpoint-save.test.ts`。
+- 部署说明：本次改动新增 **SQLite 迁移 `073`** 与 **PostgreSQL 迁移 `010`**（在线幂等，启动控制面时自动执行），升级后会将数据库 `api_endpoints` 表中既有 `body_policy = 'persona'` 的端点行自动回填为 `'caller'`（如需项目协议注入，升级后可在 `/#/api` 手动切回 `'persona'`）；零 `deploy/payload.json`、`docker/`、`scripts/gemini-host.py`、`protofront` 或 Rust `kin-scheduler` 变更。
+
+## 1.4.246 — 2026-11-28 · KVM 共享 Store CRAG 原子同步与回滚自愈、账号预热爬坡引擎（opt-in / M3 / PG 18）与 CRAG `3.1.26`/`3.1.27` 热修载荷钉选
+
+- **KVM `crag-debian13` 共享 Store CRAG 版本同步与回滚自愈（#2040）**：
+  - `src/lib/vm/wrap-cli-runtime.mjs` 新增 `syncSharedStoreCrag()`、`resolveSharedStoreCragCurrentDir()` 与 `sharedStoreCragWouldChange()`：先经 `verifyCragV2Tree()` 严格验签，再写入不可变版本目录 `store/crag/versions/<version>`（同版本重构建使用 `<version>-<sha8>`，不覆写运行中 KVM 正在 `mmap` 的旧二进制）并原子切换 `current`/`previous` 相对软链，接入 `materializeCragV2()` 与 `inspectKernelChanges()`。
+  - `src/lib/vm/vm-runtime.mjs` 在 `buildKvmRunArgs()`、`cragCustomOsDockerMountArgs()` 及 `startVmRuntimeAdmitted()` `preserveCrag` 路径自动同步/补齐共享 store CRAG；`src/lib/vm/{kernel-install,crag-license}.mjs` 与 `src/lib/admin/kernel-catalog.mjs` 在 `restoreCragRollback()` 原子回切 `store/crag/current` 并为 `crag-debian13` 槽位透传 `allowUnbundledStore` / `sharedClaudeStoreRoot`；`src/lib/oauth/claude-auth-login.mjs` 解析真实版本目录避免传软链触发 `crag_v2_symlink`；新增 `test/unit/shared-store-crag-sync.test.mjs`。
+- **账号预热爬坡引擎落地与 M3 / PG 18 全链路对齐（#1970）**：
+  - 新增 `src/lib/pool/{account-warmup,warmup-monitor}.mjs` 与 `test/unit/{account-warmup,warmup-monitor}.test.mjs`，接入 `src/lib/admin/{panel-api,panel-routes,routing-runtime}.mjs`、`src/lib/oauth/import-commit.mjs`、`src/lib/pool/account-quota.mjs` 与 `src/server.mjs`：默认 `enabled: false`（opt-in），支持新导入/换绑账号自动启动预热并在稳定达标后自动毕业，保留人工覆写优先（operator-wins）生命周期。
+  - 端到端对齐 M3 Rust `kin-scheduler` 与 PostgreSQL 18：启动与毕业均触发 `schedulerRuntime.syncConfigNow()` 同步 `max_rpm`，毕业经 `inheritVmScheduling(id, { rpm: true })` 恢复分档/默认限流并清除 `rpm_override=0`；日志查询改用 ISO-8601 字符串比较（兼容 PG 18）并记录结构化告警；基于 `scheduler_pools`/`scheduler_pool_members` 并在无自定义 Claude 池时覆盖默认虚拟池；统一 `withVmLock(vmPath)` 完整路径锁并接入 `stopLeaderJobs()` 与备份恢复/配置热更新生命周期。
+- **CRAG `3.1.26` / `3.1.27` 热修载荷重新钉选（#2042，Fixes #2017）**：
+  - `deploy/payload.json` 与 `src/lib/admin/kernel-catalog.mjs`（`CRAG_PINNED_RELEASES`）同步包含 CRAG V4 `tool_use` `handoff_complete` 热修的重传签名载荷资产大小、SHA256 与版本说明：`payload-2026.11.28-crag-3.1.27`（`crag-v2` `aa9c9c6d…`、`crag-v2.payload.enc` `c9ffa0d1…`、`manifest.json` `6b8ad1e8…`、`crag-v2-licensed-amd64.tar.gz` `168930962`/`31d94d34…`）与 `payload-2026.11.28-crag-3.1.26`（`manifest.json` `e8a6cd7e…`、`crag-v2-licensed-amd64.tar.gz` `168863735`/`cad5fe5e…`；零密钥轮换，沿用生产公钥 `9dbb4bc2…` 与载荷密钥 `835451e2…`），并同步恢复 `v1.4.245` 因远端 prerelease 更新中断的 `amd64` 控制面镜像与多架构 `latest` 发布。
+- 部署说明：本次改动零新增数据库迁移，零 `docker/`、`scripts/gemini-host.py`、`protofront` 或 Rust `kin-scheduler` 变更；`v1.4.246` 完整发布 `amd64` + `arm64` 多架构控制面镜像并更新 `latest` tag，升级后自动同步热修版 CRAG `3.1.27` 载荷（面板同时支持 `3.1.26` 热修版钉选/回滚）并经 `#2040` 原子更新 `crag-debian13` KVM 共享 store `store/crag/current`；账号预热默认关闭（`routing.warmup.enabled = false`），按需开启。
+
 ## 1.4.245 — 2026-11-28 · 统一 System Prompt `PromptSpec v1` 与 CRAG `3.1.27` 载荷钉选、严格官方 CC 校验、面板凭据 SSOT、多模型健康探测及 Gemini/KVM 多项加固
 
 - **统一 System Prompt `PromptSpec v1`、载荷钉选与 CRAG 缓存/前缀修复（#2026、#2031、#2032）**：
