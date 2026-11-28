@@ -34,6 +34,7 @@ import {
   CLIENT_SYSTEM_POLICY_LABELS,
   isPromptLockedProvider,
   NODE_TYPE_LABELS,
+  normalizePoolPromptPreset,
   PROVIDER_SCOPE_LABELS,
   SYSTEM_PROMPT_MAX_BYTES,
   SYSTEM_PROMPT_PRESET_LABELS,
@@ -52,17 +53,17 @@ const MODE_CARDS: Array<{
   {
     mode: 'official',
     title: '官方提示词',
-    subtitle: 'official · 注入官方人设',
+    subtitle: 'official · 统一官方人设注入',
     detail:
-      '对本池 Anthropic 节点注入官方内置人设（CRAG append 保块级缓存；cli-node 走 official_full）。',
+      '对本池 Anthropic 节点按所选官方预设注入（official_full 完整官方提示词 / official 默认仅身份），cli-node 与 CRAG 语义统一。',
     highlight: 'official',
   },
   {
     mode: 'zero_inject',
     title: '0 注入',
-    subtitle: 'zero_inject · 剥离官方人设',
+    subtitle: 'zero_inject · 剥离官方提示词',
     detail:
-      '清空内核内置官方提示词，仅原样透传客户端自带 system（客户端未传则保持空白）。',
+      '剥离全部内置系统提示词与官方身份块，将官方 CLI 身份写入计费头 prompt_version，原样保留调用方业务 system。',
     highlight: 'zero',
   },
   {
@@ -98,8 +99,8 @@ export function PoolPromptTab({ pool }: { pool: SchedulerPool }) {
   const locked = isPromptLockedProvider(pool.provider_scope)
 
   const [mode, setMode] = useState<SystemPromptMode>(pool.system_prompt_mode)
-  const [preset, setPreset] = useState<SystemPromptPreset>(
-    pool.system_prompt_preset
+  const [preset, setPreset] = useState<SystemPromptPreset>(() =>
+    normalizePoolPromptPreset(pool.system_prompt_preset)
   )
   const [text, setText] = useState(pool.system_prompt_text || '')
   const [clientPolicy, setClientPolicy] = useState<ClientSystemPolicy>(
@@ -108,7 +109,7 @@ export function PoolPromptTab({ pool }: { pool: SchedulerPool }) {
 
   useEffect(() => {
     setMode(locked ? 'passthrough' : pool.system_prompt_mode)
-    setPreset(pool.system_prompt_preset || 'official_full')
+    setPreset(normalizePoolPromptPreset(pool.system_prompt_preset))
     setText(locked ? '' : pool.system_prompt_text || '')
     setClientPolicy(pool.client_system_policy || 'prepend_pool')
   }, [pool, locked])
@@ -279,18 +280,17 @@ export function PoolPromptTab({ pool }: { pool: SchedulerPool }) {
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              {(['official_full', 'official', 'official_303'] as const).map(
-                (p) => (
-                  <SelectItem key={p} value={p}>
-                    {SYSTEM_PROMPT_PRESET_LABELS[p]}
-                  </SelectItem>
-                )
-              )}
+              {(['official_full', 'official'] as const).map((p) => (
+                <SelectItem key={p} value={p}>
+                  {SYSTEM_PROMPT_PRESET_LABELS[p]}
+                </SelectItem>
+              ))}
             </SelectContent>
           </Select>
           <p className='text-xs text-muted-foreground'>
-            在 CRAG v2/v3 上以 append 模式保留官方前缀缓存断点，客户端自带的
-            system 将安全追加在后。
+            统一作用于本池内的 cli-node、CRAG 与 Anthropic API 节点：
+            official_full 注入完整官方提示词；official
+            默认仅含计费头与官方身份句（可按 /system 开关按需扩展）。
           </p>
         </section>
       ) : null}

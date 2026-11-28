@@ -70,18 +70,19 @@ native cli-hop 优先完整保留 Node 已组装、带 billing 的 wire system�
 
 权威开关是 `routing.json` 的 `compatibility.persona_preset`（system提示词）与 `cache_ttl`（设置 → 协议 → 提示词缓存 → 默认缓存写入 TTL，可选 `5m` / `1h`，缺省 `1h`，点击「保存」生效）。该值仅是默认值，不覆盖请求头、请求显式 TTL、已有会话锁定值或 system 模板显式 TTL；官方透传的调用方 marker 及缺失 TTL 保持原样。`vms/<id>/run/kernel.json` 不是第二套面板：面板保存、槽位「跟随全局」、外部改写 `routing.json`，或虚拟机环境保存时区之后，才把解析结果投影进去（`persona_preset`、`system_layout`、`default_cache_ttl`、`timezone`）。`system_layout` 只有 `zero` 与 `identity`（`official` / `official_full` / `custom` 都是 `identity`）。字节没变不重写。kernel 热读该文件，不必重启槽。Codex 槽不写。手改 `kernel.json` 会在下一次投影时被盖掉。
 
-### CRAG v2 print
+### 统一系统提示词（`prompt_spec` v1，跨 `cli-node` 与 CRAG）
 
-CRAG v2 槽的 worker 传输是 **print**，不是 TUI。官方二进制是 `claude-code-2.1.321`。`kernel.json` 的 `persona_preset` 和 `CLAUDE_CODE_SYSTEM_LAYOUT` 不被这个 worker 读取，也不能靠 `--bare` 做 0注入：`--bare` 会把 OAuth 槽切成只认 API key。是否走 print 只看这台 VM 实际启用的内核：运行中的 health `runtime_variant=crag-v2` 优先，其次是槽位自己写明的 `dataplane` / `crag_kernel_version`，再其次是该槽 `run/kernel.json`。全局 `routing.inference` 不能把 wrap、cc 或未写内核的槽送上 print。legacy CRAG 仍走 cli-node。
+Claude 系统提示词统一由 `compatibility.persona_preset`（以及槽位 `vm.persona_preset`、池级策略 `M1b`）作为唯一真值源，解析为抽象 IR `prompt_spec` v1 后按目标内核编译投递：
 
-system提示词页有两套。cli-node 仍用上面的模板。CRAG 一套只认 `compatibility.crag_persona_preset`：
+- **`cli-node`（免费内核）**：通过内部请求 envelope 顶层 `prompt_spec` 透传给 `kin-kernel` / `cli-node`（绝不混入发往 Anthropic 上游的 `envelope.body`），同时投影 `persona_preset` / `system_layout` 到 `kernel.json`。
+- **CRAG V4**：能力包含 `prompt_spec_v1` 时通过 `body.crag_prompt_spec` 下发完整 IR，并附带对齐的 `crag_persona_preset`（`official` / `official_full` / `zero` / `custom`）、`crag_prompt_version`、`crag_env`；对未升级旧版 CRAG 自动回退到 `crag_prompt` replace/append 协议。遗留 `compatibility.crag_persona_preset` 仅在 `persona_preset` 缺省时作为兼容回退读取。
 
-| 值 | 清洗 |
-|----|------|
-| `official_full`（缺省） | 不把官方四块 system 再贴进去。调用方剩余文本走 `crag_prompt.mode=append`（裸 `system` 在 v2 里也是 append）。≤ 64 KiB 才是 `--append-system-prompt`；更长由 helper 写进用户消息，不是 system 缓存块。没有尾巴就不发 system 旗标。 |
-| `zero` | 必须 `crag_prompt.mode=replace`。超过 64 KiB 直接 400，不假装替换成功。没有调用方文本时发不出 replace。`--system-prompt` 是否换掉 identity/harness/guidance，2.1.303 没复抓，未证实。 |
-
-槽位显式 `zero` 覆盖成 replace。`official` / `official_full` / `official_303` 在这条 print 上都收成 append 尾巴；只要 identity 没有旗标，自定义模板不贴进去。print 不传 `--tools ""` 和 `--no-chrome`，内置工具和 Chrome 保持官方默认。thinking、temperature、betas、system 上的 `cache_control` 协议层可以收到，helper 不转发。今天进官方 CLI 的是 `--model`、64 KiB append/replace 文本、preload 的 `max_tokens` / `effort` / 已有 cache marker 的 ttl，以及调用方工具变成 MCP。
+| 档位 | 默认行为 |
+|------|----------|
+| `official`（官方提示词） | 仅保留计费头与官方身份句（`You are Claude Code, Anthropic's official CLI for Claude.`）；核心提示词（`harness`）、行为指引（`guidance`）、环境注入（`env` 及子项）均默认关闭并可独立开关。 |
+| `official_full`（完整官方提示词） | 保持现有完整官方 CC 提示词逻辑（默认开启核心提示词与环境注入；行为指引及环境子项独立可控）。 |
+| `zero`（0注入） | 剔除全部官方系统提示词与官方身份句，将官方身份句写入计费头 `prompt_version`；原样保留调用方业务 `system[]` 与缓存断点，不向 `messages[0]` 迁移，不注入任何环境段。 |
+| `custom`（自定义） | 由 `vm2api` 编译用户自定义模板块并统一下发到 `cli-node` 或 CRAG。 |
 
 官方 Claude Code 的 `agent_summary` 旁路只按当前完整摘要指令识别，使用独立执行会话, stickyKey 为空. 默认独占席位. 家族模式下, 有效根登记使摘要共享根席位并计入 m, 可与父请求并行执行. 根 VM 不可用时, 已验证的摘要用独立摘要 ID 在其他 VM 申请普通席位, 包括外形与短探测相同的单轮 Haiku 摘要. CRAG 的工具续接按工具 ID 认领，换 session ID 不会隔离继承的 `tool_result`：print 入核前，仅将已识别摘要的末条 user 消息中的工具结果展开为只读标签和原始内容块，保留正文、图片、错误标记、缓存断点及尾随 system 提示。历史工具调用/结果对与正常主请求保持原样；不靠匹配工具输出里的 `tool_result replayed` 文本触发清洗，不吞真实重放错误、不重发已消费结果。
 

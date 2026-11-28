@@ -150,7 +150,6 @@ import {
   resolveCragPrintPersona,
   trackCallerSystemBlock,
 } from './crag-print-prompt.mjs'
-import { sanitizeCragEnv } from './crag-whitelist.mjs'
 import { repairAnthropicRequest } from '../pool/upstream-error-policy.mjs'
 import { profileForPreset } from '../identity/official-profiles.mjs'
 import { loadVmIdentity, OFFICIAL_CLI_VERSION } from '../identity/vm-identity.mjs'
@@ -199,7 +198,12 @@ import {
   standingUsageFromRoutingFile,
   personaModeFromRoutingFile,
 } from '../identity/crs-persona.mjs'
-import { canonicalPersonaCompat, presetFlagEnabled } from '../identity/persona-template.mjs'
+import { isPresetEnvEnabled } from '../identity/persona-template.mjs'
+import {
+  compileSpecForCliNode,
+  resolveGlobalUnifiedPreset,
+  resolveSystemPromptSpec,
+} from '../identity/system-prompt-spec.mjs'
 import {
   claudeCodeOnlyError,
   claudeCodeOnlyFromRouting,
@@ -1064,6 +1068,7 @@ export function createHandleProtocol(deps) {
     preserveCacheBreakpoints = false,
     cliHop = false,
     cragPrint = false,
+    promptSpec = null,
     preparedHop = null,
     callerCwd = null,
     repaired = false,
@@ -1098,6 +1103,7 @@ export function createHandleProtocol(deps) {
       preserveCacheBreakpoints,
       cliHop,
       cragPrint,
+      promptSpec,
       preparedHop,
       callerCwd,
       repaired,
@@ -2589,14 +2595,13 @@ export function createHandleProtocol(deps) {
     })
     const preRelocateBody = ctx.body
     const preRelocateCragSystem = cragSystem
-    const shouldRelocateForAttempt = (policy, routingSnap) =>
-      !apiNonAnthropic &&
-      inferenceBackend !== 'api' &&
-      !requestContext &&
-      !officialPassthrough &&
-      !(policy?.applies && ['zero_inject', 'override', 'passthrough'].includes(policy.mode)) &&
-      (!officialTraffic || hasForeignSystemBlock(preRelocateBody.system)) &&
-      thirdPartyRelocateEnabled(routingSnap)
+    const shouldRelocateForAttempt = (policy, routingSnap, effectivePreset = null) => {
+      if (apiNonAnthropic || inferenceBackend === 'api' || requestContext || officialPassthrough) return false
+      if (policy?.applies && ['zero_inject', 'override', 'passthrough'].includes(policy.mode)) return false
+      const resolvedPreset = effectivePreset || (!policy?.applies ? resolveGlobalUnifiedPreset(routingSnap) : null)
+      if (resolvedPreset === 'zero') return false
+      return (!officialTraffic || hasForeignSystemBlock(preRelocateBody.system)) && thirdPartyRelocateEnabled(routingSnap)
+    }
     let relocatedCache = null
     const getRelocatedForAttempt = () => {
       if (!relocatedCache) {
@@ -3302,14 +3307,15 @@ export function createHandleProtocol(deps) {
           }
           const effectiveCliPersona =
             attemptPoolPrompt.applies && attemptPoolPrompt.cliPreset ? attemptPoolPrompt.cliPreset : resolvedPersona
-          const preserveCallerEnvironment = !presetFlagEnabled(
-            routingNow?.compatibility,
-            'persona_env_presets',
-            effectiveCliPersona,
-          )
+          const preserveCallerEnvironment = !isPresetEnvEnabled(routingNow?.compatibility, effectiveCliPersona)
+          const attemptIsZero =
+            !(attemptPoolPrompt.applies && attemptPoolPrompt.mode === 'passthrough') &&
+            (effectiveCliPersona === 'zero' ||
+              (attemptPoolPrompt.applies && ['zero_inject', 'override'].includes(attemptPoolPrompt.mode)))
           const attemptPoolOwnsSystemDirectly =
-            attemptPoolPrompt.applies && ['zero_inject', 'override', 'passthrough'].includes(attemptPoolPrompt.mode)
-          const attemptNeedsRelocate = shouldRelocateForAttempt(attemptPoolPrompt, routingNow)
+            attemptIsZero ||
+            (attemptPoolPrompt.applies && ['zero_inject', 'override', 'passthrough'].includes(attemptPoolPrompt.mode))
+          const attemptNeedsRelocate = shouldRelocateForAttempt(attemptPoolPrompt, routingNow, effectiveCliPersona)
           const attemptPersonaIn = attemptPoolOwnsSystemDirectly
             ? preRelocateBody
             : attemptNeedsRelocate
@@ -3343,6 +3349,7 @@ export function createHandleProtocol(deps) {
               const strictPassthrough =
                 !requestContext &&
                 protocol === 'anthropic.messages' &&
+                (!attemptPoolPrompt.applies || ['official', 'passthrough'].includes(attemptPoolPrompt.mode)) &&
                 cragStrictPassthroughEnabled(officialPassthrough, routingNow)
               // CRAG V4 (headless_claude_bridge_v1) removed the claude CLI MCP
               // tool-wrapping layer while still advertising generation_controls_v3,
@@ -3365,7 +3372,8 @@ export function createHandleProtocol(deps) {
               const usePreRelocate =
                 !officialPassthrough &&
                 (attemptPoolOwnsSystemDirectly ||
-                  (headlessBridge && (cragPersona === 'zero' || customCragTemplateUsesCallerSystem)))
+                  cragPersona === 'zero' ||
+                  (headlessBridge && customCragTemplateUsesCallerSystem))
               const attemptRelocated =
                 !strictPassthrough && !usePreRelocate && attemptNeedsRelocate ? getRelocatedForAttempt() : null
               const cragInput = strictPassthrough
@@ -3380,6 +3388,19 @@ export function createHandleProtocol(deps) {
                       : hasCragSystem
                         ? { ...preRelocateBody, system: preRelocateCragSystem }
                         : preRelocateBody)
+              const cragPromptSpec = resolveSystemPromptSpec({
+                routing: routingNow,
+                slot: selected.vm,
+                poolPolicy: attemptPoolPrompt.applies ? attemptPoolPrompt : null,
+                identity,
+                officialPassthrough: headlessBridge
+                  ? officialPassthrough
+                  : officialPassthrough && !cacheControlRepaired,
+                strictPassthrough,
+                // vm2api already ran attemptRelocated (when applicable) before calling CRAG,
+                // so never ask CRAG V4 to relocate caller system a second time.
+                relocateCallerSystem: false,
+              })
               const reuseHistory = !officialPassthrough && !repaired && !extra.repairs?.length
               const reuseIngress =
                 reuseHistory &&
@@ -3462,7 +3483,8 @@ export function createHandleProtocol(deps) {
                 for (const policy of extra.repairs || []) source = repairAnthropicRequest(source, policy)
               }
               hopBody = prepareCragPrintBody(source, {
-                preset: cragPersona,
+                preset: cragPromptSpec.mode,
+                promptSpec: cragPromptSpec,
                 officialPassthrough: headlessBridge
                   ? officialPassthrough
                   : officialPassthrough && !cacheControlRepaired,
@@ -3482,31 +3504,6 @@ export function createHandleProtocol(deps) {
                 entrypoint: entrypointNow,
                 cacheTtl: requestedCacheTtl,
               })
-              const poolBlocksCragEnv =
-                attemptPoolPrompt.applies && ['zero_inject', 'passthrough'].includes(attemptPoolPrompt.mode)
-              if (headlessBridge && !strictPassthrough && !officialPassthrough && !poolBlocksCragEnv) {
-                const compat = canonicalPersonaCompat(routingNow?.compatibility || {})
-                const envPreset = effectiveCliPersona
-                const envEnabled = presetFlagEnabled(compat, 'persona_env_presets', envPreset)
-                const tzEnabled = envEnabled && presetFlagEnabled(compat, 'persona_timezone_presets', envPreset)
-                const localeEnabled = envEnabled && presetFlagEnabled(compat, 'persona_locale_presets', envPreset)
-                const tz = tzEnabled ? configuredTimezone(selected.vm, {}) || configuredTimezone(identity, {}) : ''
-                const loc = localeEnabled
-                  ? String(
-                      selected.vm?.locale ||
-                        selected.vm?.fingerprint?.locale ||
-                        identity?.locale ||
-                        identity?.fingerprint?.locale ||
-                        '',
-                    ).trim()
-                  : ''
-                const cragEnv = sanitizeCragEnv({
-                  ...(tz ? { timezone: tz } : {}),
-                  ...(loc ? { locale: loc } : {}),
-                  inject_if_missing: envEnabled,
-                })
-                if (cragEnv) hopBody.crag_env = cragEnv
-              }
               if (!strictPassthrough && cacheControlRepaired && needsCragProviderCompatibility(hopBody, caps)) {
                 hopBody = repairCacheBreakpoints(
                   applyCacheBreakpoints(hopBody, {
@@ -3556,7 +3553,8 @@ export function createHandleProtocol(deps) {
               logBag.crag_print = {
                 transport: preparedHop.ready.health?.transport,
                 persona: cragPersona,
-                prompt_mode: hopBody.crag_prompt?.mode || hopBody.crag_persona_preset || 'default',
+                prompt_mode:
+                  hopBody.crag_prompt?.mode || hopBody.crag_prompt_spec?.mode || hopBody.crag_persona_preset || 'default',
                 ...(attemptPoolPrompt.applies ? { pool_prompt_mode: attemptPoolPrompt.mode } : {}),
                 strict_passthrough: strictPassthrough,
                 safeguards_stripped: Boolean(personaIn.safeguards != null && hopBody.safeguards == null),
@@ -3715,6 +3713,25 @@ export function createHandleProtocol(deps) {
               requestId: logCtx.request_id,
               ctx: bodyCtx,
             })
+            const cliPoolSystemApplied =
+              attemptPoolPrompt.applies &&
+              (attemptPoolPrompt.mode === 'append' || attemptPoolPrompt.mode === 'override')
+            const cliPromptSpec = !requestContext
+              ? compileSpecForCliNode(
+                  resolveSystemPromptSpec({
+                    routing: routingNow,
+                    slot: selected.vm,
+                    poolPolicy: attemptPoolPrompt.applies ? attemptPoolPrompt : null,
+                    identity,
+                    officialPassthrough: effectiveOfficialPassthrough,
+                    strictPassthrough: false,
+                    // vm2api already handled caller system relocation before cli-node dispatch.
+                    relocateCallerSystem: false,
+                  }),
+                  hopBody,
+                  { poolSystemApplied: cliPoolSystemApplied },
+                ).promptSpec
+              : null
             logBag.outbound_session_id = sessionIdForLog(sessionIdFromOutboundBody(hopBody) || attemptSessionId)
             return {
               body: hopBody,
@@ -3723,6 +3740,7 @@ export function createHandleProtocol(deps) {
                 sessionId: attemptSessionId,
                 cliHop: true,
                 cragPrint: false,
+                promptSpec: cliPromptSpec,
                 preparedHop,
                 transportRouting,
                 requestContext,
@@ -3889,6 +3907,7 @@ export function createHandleProtocol(deps) {
               preserveCacheBreakpoints,
               cliHop: attemptMeta?.cliHop === true,
               cragPrint: attemptMeta?.cragPrint === true,
+              promptSpec: attemptMeta?.promptSpec || null,
               callerCwd: attemptMeta?.callerCwd,
               preparedHop: attemptMeta?.preparedHop,
               repaired: attemptMeta?.repaired === true,
@@ -3941,6 +3960,7 @@ export function createHandleProtocol(deps) {
               preserveCacheBreakpoints,
               cliHop: attemptMeta?.cliHop === true,
               cragPrint: attemptMeta?.cragPrint === true,
+              promptSpec: attemptMeta?.promptSpec || null,
               callerCwd: attemptMeta?.callerCwd,
               preparedHop: attemptMeta?.preparedHop,
               repaired: attemptMeta?.repaired === true,

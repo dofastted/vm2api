@@ -13,7 +13,6 @@ import { dashboardQueryOptions } from '@/features/overview/queries'
 import { routingQueryOptions } from '@/features/settings/queries'
 import { SaveBar } from '@/features/settings/save-bar'
 import { SettingsSkeleton } from '@/features/settings/settings-skeleton'
-import { CragPrintPanel } from '@/features/system/crag-print-panel'
 import {
   CragGeminiPanel,
   cragGeminiPromptProblem,
@@ -43,7 +42,7 @@ export function SystemPromptPage() {
   const [draft, setDraft] = useState<Record<string, unknown>>({})
   const [personaProblems, setPersonaProblems] = useState<string[]>([])
   const [discardKey, setDiscardKey] = useState(0)
-  const [kernelSet, setKernelSet] = useState<SystemPromptKernelSet>('cli-node')
+  const [kernelSet, setKernelSet] = useState<SystemPromptKernelSet>('claude')
 
   useEffect(() => {
     if (routing.data) setDraft(routing.data)
@@ -140,12 +139,15 @@ export function SystemPromptPage() {
           <div
             role='tablist'
             aria-label='提示词内核'
-            className='mb-4 grid gap-2 sm:grid-cols-3'
+            className='mb-4 grid gap-2 sm:grid-cols-2'
           >
             {(
               [
-                ['cli-node', 'cli-node 原生内核', '模板注入，写入 kernel.json'],
-                ['crag', 'CRAG v2 print', '不读 persona_preset，不是 TUI'],
+                [
+                  'claude',
+                  'Claude 系统提示词',
+                  '统一作用于 cli-node / CRAG / API 直连',
+                ],
                 [
                   'craggemini',
                   'CRAGGemini (Antigravity)',
@@ -176,7 +178,7 @@ export function SystemPromptPage() {
               )
             })}
           </div>
-          <div hidden={kernelSet !== 'cli-node'}>
+          <div hidden={kernelSet !== 'claude'}>
             <SystemPromptWorkspace
               key={discardKey}
               compat={
@@ -189,15 +191,6 @@ export function SystemPromptPage() {
               }
               onChange={(next) => setDraft({ ...draft, compatibility: next })}
               onProblemsChange={setPersonaProblems}
-            />
-          </div>
-          <div hidden={kernelSet !== 'crag'}>
-            <CragPrintPanel
-              compat={
-                (draft.compatibility as Record<string, unknown> | undefined) ||
-                {}
-              }
-              onChange={(next) => setDraft({ ...draft, compatibility: next })}
             />
           </div>
           <div hidden={kernelSet !== 'craggemini'}>

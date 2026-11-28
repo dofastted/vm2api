@@ -79,7 +79,14 @@ function hideFor(compat, inbound) {
 
 test('standing mask is its own switch, independent of template hide flags', () => {
   const standingTokens = estimateClaudeInputTokens(DEFAULT_AGENT_STANDING)
-  const official = hideFor({ persona_preset: 'official', agent_standing_presets: { official: true } }, helloBody)
+  const official = hideFor(
+    {
+      persona_preset: 'official',
+      persona_block_presets: { official: { harness: true } },
+      agent_standing_presets: { official: true },
+    },
+    helloBody,
+  )
   assert.equal(Number(official), standingTokens)
   assert.equal(official.overlay, standingTokens)
 
@@ -89,6 +96,7 @@ test('standing mask is its own switch, independent of template hide flags', () =
   const shown = hideFor(
     {
       persona_preset: 'official',
+      persona_block_presets: { official: { harness: true } },
       agent_standing_presets: { official: true },
       agent_standing_hide_presets: { official: false },
     },
@@ -146,7 +154,16 @@ test('official_prompt does not start usage hide, even with standing and env', ()
   const before = { model: 'claude-opus-5-5', messages: helloBody.messages }
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-official-standing-'))
   const routingFile = path.join(dir, 'routing.json')
-  fs.writeFileSync(routingFile, JSON.stringify({ compatibility: { agent_standing_presets: { official: true } } }))
+  fs.writeFileSync(
+    routingFile,
+    JSON.stringify({
+      compatibility: {
+        persona_block_presets: { official: { harness: true } },
+        persona_env_presets: { official: true },
+        agent_standing_presets: { official: true },
+      },
+    }),
+  )
   try {
     const after = applyCrsUnofficialPersona(before, { mode: 'official_prompt', routingFile })
     assert.equal(personaHideForUnofficial(before, after, { mode: 'official_prompt' }), 0)

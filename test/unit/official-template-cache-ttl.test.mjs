@@ -52,7 +52,10 @@ for (const preset of ['official', 'official_full']) {
     test(`${preset} fills template and message TTL from ${ttl} setting`, (t) => {
       const { rendered, out } = render(t, { preset, ttl })
       const markers = listCacheMarkers(out)
-      assert.ok(markers.some((m) => m.section === 'system'))
+      // Mode 1 (`official`) default emits only [billing, CLI_IDENTITY] (no harness marker);
+      // Mode 2 (`official_full`) includes the cached harness block in system[].
+      if (preset === 'official_full') assert.ok(markers.some((m) => m.section === 'system'))
+      else assert.equal(markers.some((m) => m.section === 'system'), false)
       assert.equal(markers.filter((m) => m.section === 'messages').length, 2)
       assert.ok(markers.every((m) => m.ttl === ttl))
       assert.deepEqual(out.system, rendered.system)

@@ -326,11 +326,16 @@ export function prepareCliHopBody(
       ))
   // Zero may forward a caller's boundary literal; it must keep zero's fallback
   // policy rather than trigger the official template/tool-marker policy.
+  // Mode 1 (`official`, default) omits dynamic_boundary when harness/guidance are off,
+  // so recognize its gateway-rendered [billing, CLI_IDENTITY] prefix too.
   const shaped =
     !preparedZero &&
     (personaPreset != null ||
       (Array.isArray(body.system) &&
-        body.system.some((block) => textOf(block).trim() === '__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__')))
+        (body.system.some((block) => textOf(block).trim() === '__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__') ||
+          (body.system.length === 2 &&
+            /^x-anthropic-billing-header:/i.test(textOf(body.system[0])) &&
+            textOf(body.system[1]).trim() === CRS_OFFICIAL_CLI_SYSTEM))))
   if (!preserveSystem) {
     if (!shaped && !preparedZero) {
       const leftover = stripCliOwnedSystem(body.system, { preserveCallerEnvironment })

@@ -66,7 +66,7 @@ function PresetBar({
     <div
       role='tablist'
       aria-label='system 提示词档位'
-      className='grid grid-cols-2 gap-2 md:grid-cols-3 xl:grid-cols-5'
+      className='grid grid-cols-2 gap-2 xl:grid-cols-4'
     >
       {PERSONA_PRESET_OPTIONS.map(([key, label]) => {
         const selected = key === viewing

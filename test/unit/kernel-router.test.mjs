@@ -1500,7 +1500,7 @@ test('writeKernelConfig cli-hop writes local_cli without secrets', () => {
   assert.equal(doc.claude_bin, '/home/kincli/.kin/cli-node')
   assert.equal(doc.https_proxy, undefined)
   assert.equal(doc.slots_per_worker, WRAP_SLOT_MAX)
-  assert.equal(doc.system_layout, 'identity')
+  assert.equal(doc.system_layout, 'official_full')
   assert.equal(doc.cli_version, OFFICIAL_CLI_VERSION)
   assert.equal(doc.default_cache_ttl, '5m')
   assert.equal(doc.auto_compact_window, null)
@@ -1743,12 +1743,12 @@ test('writeKernelConfig uses identity layout when persona_inject is rewrite', ()
     },
   )
   const doc = JSON.parse(fs.readFileSync(written.configPath, 'utf8'))
-  assert.equal(doc.system_layout, 'identity')
+  assert.equal(doc.system_layout, 'official_full')
   assert.equal(doc.persona_preset, 'official_full')
   fs.rmSync(root, { recursive: true, force: true })
 })
 
-test('writeKernelConfig uses identity when official_full has no persona_inject', () => {
+test('writeKernelConfig uses official_full layout when official_full has no persona_inject', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-kernel-preset-identity-'))
   const written = writeKernelConfig(
     root,
@@ -1756,7 +1756,7 @@ test('writeKernelConfig uses identity when official_full has no persona_inject',
     { token: 'tok', routing: { compatibility: { persona_preset: 'official_full' } } },
   )
   const doc = JSON.parse(fs.readFileSync(written.configPath, 'utf8'))
-  assert.equal(doc.system_layout, 'identity')
+  assert.equal(doc.system_layout, 'official_full')
   assert.equal(doc.persona_preset, 'official_full')
   const before = fs.statSync(written.configPath).mtimeMs
   const again = writeKernelConfig(
@@ -1878,7 +1878,7 @@ test('routing.json mtime projects persona_preset into Claude kernel.json only', 
     assert.equal(next.updated, 1)
     const followed = JSON.parse(fs.readFileSync(kernelPath, 'utf8'))
     assert.equal(followed.persona_preset, 'official')
-    assert.equal(followed.system_layout, 'identity')
+    assert.equal(followed.system_layout, 'official')
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }

@@ -483,17 +483,13 @@ export function PoolFormDialog({
                           <SelectValue />
                         </SelectTrigger>
                         <SelectContent>
-                          {(
-                            [
-                              'official_full',
-                              'official',
-                              'official_303',
-                            ] as const
-                          ).map((preset) => (
-                            <SelectItem key={preset} value={preset}>
-                              {SYSTEM_PROMPT_PRESET_LABELS[preset]}
-                            </SelectItem>
-                          ))}
+                          {(['official_full', 'official'] as const).map(
+                            (preset) => (
+                              <SelectItem key={preset} value={preset}>
+                                {SYSTEM_PROMPT_PRESET_LABELS[preset]}
+                              </SelectItem>
+                            )
+                          )}
                         </SelectContent>
                       </Select>
                     </div>

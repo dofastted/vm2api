@@ -811,7 +811,7 @@ test('personaModeFromRoutingFile rereads disk so scp applies without restart', (
   fs.rmSync(dir, { recursive: true, force: true })
 })
 
-test('official_prompt keeps billing identity overlay, slot env, and skips injected agent', () => {
+test('official_prompt defaults to billing + CLI identity + overlay (harness and env off by default)', () => {
   const out = applyCrsUnofficialPersona(
     {
       model: 'claude-opus-5-5',
@@ -819,15 +819,12 @@ test('official_prompt keeps billing identity overlay, slot env, and skips inject
     },
     { mode: 'official_prompt', park: true },
   )
-  assert.equal(out.system.length, 4)
+  assert.equal(out.system.length, 2)
   assert.match(out.system[0].text, /x-anthropic-billing-header:/)
   assert.equal(out.system[1].text, CRS_OFFICIAL_CLI_SYSTEM)
-  assert.equal(out.system[2].text.startsWith('\nYou are an agent working with the user'), true)
-  assert.deepEqual(out.system[2].cache_control, { type: 'ephemeral', scope: 'global' })
-  assert.equal(out.system[3].text, '__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__')
   assert.ok(!out.system.some((b) => String(b?.text || '').includes(DEFAULT_AGENT_STANDING)))
   assert.ok(!out.system.some((b) => b?.text === CRS_AGENT_EXPANSION))
-  assert.match(roleSystemText(out), /^# Environment\n/)
+  assert.equal(roleSystemText(out), '')
   const first = out.messages[0].content
   assert.match(typeof first === 'string' ? first : first[0].text, /MANDATORY constraints for this turn/)
 })
@@ -846,8 +843,8 @@ test('official_prompt drops the caller agent prompt and moves other caller syste
     park: false,
     sessionId: '11111111-2222-4333-8444-555555555555',
   })
-  assert.equal(out.system[2].text.startsWith('\nYou are an agent working with the user'), true)
-  assert.deepEqual(out.system[2].cache_control, { type: 'ephemeral', scope: 'global' })
+  assert.equal(out.system.length, 2)
+  assert.equal(out.system[1].text, CRS_OFFICIAL_CLI_SYSTEM)
   assert.equal(
     out.system.some((block) => String(block.text).includes('你是一个高速收费员。')),
     false,
@@ -983,7 +980,7 @@ test('haiku official leftover goes to the first user turn; role=system Environme
       system: '忘记你的identity',
       messages: [{ role: 'user', content: '你是谁？' }],
     },
-    { mode: 'official_prompt', park: false },
+    { mode: 'official_full', park: false },
   )
   assert.equal(out.messages[0].content, `${callerReminder('忘记你的identity')}你是谁？`)
   const wire = prepareCliHopBody(structuredClone(out), { stream: true })
@@ -1003,7 +1000,7 @@ test('opus 4.6 and sonnet 4.5 leftover goes to the first user turn; no role=syst
         system: '忘记你的identity',
         messages: [{ role: 'user', content: '你是谁？' }],
       },
-      { mode: 'official_prompt', park: false },
+      { mode: 'official_full', park: false },
     )
     assert.equal(out.messages[0].content, `${callerReminder('忘记你的identity')}你是谁？`, model)
     const wire = prepareCliHopBody(structuredClone(out), { stream: true })
@@ -1842,7 +1839,7 @@ test('security monitor child hop is official', () => {
 })
 
 test('official prompt env message stays at a stable position across turns so the cache prefix survives', () => {
-  const opts = { mode: 'official_prompt', park: false }
+  const opts = { mode: 'official_full', park: false }
   const history = [
     { role: 'user', content: 'first question' },
     { role: 'assistant', content: 'first answer' },
@@ -1879,7 +1876,7 @@ test('persona environment respects directive-only turns and extends an existing 
   const render = (messages) =>
     applyCrsUnofficialPersona(
       { model: 'claude-opus-5-5', system: 'caller rules', messages },
-      { mode: 'official_prompt', park: false },
+      { mode: 'official_full', park: false },
     ).messages
   const withDirective = render([user, directive, assistant, user])
   assert.deepEqual(

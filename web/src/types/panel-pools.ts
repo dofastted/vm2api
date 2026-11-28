@@ -17,7 +17,7 @@ export type SystemPromptMode =
   | 'passthrough'
   | 'inherit_global'
 
-export type SystemPromptPreset = 'official_full' | 'official' | 'official_303'
+export type SystemPromptPreset = 'official_full' | 'official'
 
 export type ClientSystemPolicy =
   'prepend_pool' | 'append_pool' | 'replace_client'

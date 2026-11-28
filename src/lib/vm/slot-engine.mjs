@@ -16,6 +16,7 @@ import {
   OFFICIAL_303_PRESET,
   personaPresetFromLegacyMode,
 } from '../identity/persona-template.mjs'
+import { resolveGlobalUnifiedPreset } from '../identity/system-prompt-spec.mjs'
 import { isCodexVm } from './vm-kind.mjs'
 import { isCustomOsSlot, sharedClaudeGuestPath, sharedProfilesGuestDir } from './custom-os-runtime.mjs'
 import { slotHome } from './slot-identity.mjs'
@@ -244,7 +245,7 @@ export function normalizeSlotPersonaPreset(value, { inherit = false } = {}) {
   )
     return 'official'
   if (raw === 'zero' || raw === 'zero_inject' || raw === '0inject' || raw === '0-inject') return 'zero'
-  if (raw === OFFICIAL_303_PRESET || raw === '303' || raw === 'official-303') return OFFICIAL_303_PRESET
+  if (raw === OFFICIAL_303_PRESET || raw === '303' || raw === 'official-303') return 'official_full'
   return inherit ? '' : null
 }
 
@@ -473,26 +474,21 @@ export function parseOfficialCcInferencePatch(value) {
 export function resolveSlotPersonaPreset(vm, routing = {}) {
   const fromVm = normalizeSlotPersonaPreset(vm?.persona_preset, { inherit: true })
   if (fromVm) return fromVm
-  const compat = routing?.compatibility || {}
-  if (compat.persona_preset != null && String(compat.persona_preset).trim() !== '') {
-    return normalizePersonaPreset(compat.persona_preset)
-  }
-  return personaPresetFromLegacyMode(compat.persona_inject)
+  return resolveGlobalUnifiedPreset(routing)
 }
 
 export function personaModeFromPreset(preset) {
   if (preset === 'zero') return 'zero'
   if (preset === 'official') return 'official_prompt'
   if (preset === 'official_full') return 'official_full'
-  if (preset === OFFICIAL_303_PRESET) return OFFICIAL_303_PRESET
+  if (preset === 'custom') return 'custom'
+  if (preset === OFFICIAL_303_PRESET) return 'official_full'
   return null
 }
 
-/** zero stays zero. Other presets stay identity; the CLI preserves a 303-shaped system there. */
+/** Unified CLI system_layout matches resolved persona_preset (`official | official_full | zero | custom`). */
 export function resolveCliSystemLayout(vm, routing = {}) {
-  const preset = resolveSlotPersonaPreset(vm, routing)
-  if (preset === 'zero') return 'zero'
-  return 'identity'
+  return resolveSlotPersonaPreset(vm, routing)
 }
 
 /** Explicit hop mode when the VM overrides global protocol. Null = inherit. */

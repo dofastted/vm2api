@@ -8,6 +8,7 @@
  * into CRAG or Anthropic upstream.
  */
 import { CRS_OFFICIAL_CLI_SYSTEM } from '../identity/crs-persona.mjs'
+import { isPromptSpecV1Caps, sanitizePromptSpec } from '../identity/system-prompt-spec.mjs'
 import {
   DEFAULT_CACHE_TTL,
   isCleanCacheControl,
@@ -42,6 +43,7 @@ export const CRAG_CORE_ALLOWED_TOP_KEYS = Object.freeze(
 export const CRAG_INTERNAL_ALLOWED_TOP_KEYS = Object.freeze(
   new Set([
     'crag_prompt',
+    'crag_prompt_spec',
     'crag_options',
     'crag_model',
     'crag_persona_preset',
@@ -85,6 +87,7 @@ export const CRAG_SILENT_STRIP_TOP_KEYS = Object.freeze(
     'kin_outbound_shape',
     'request_id',
     'delivery_mode',
+    'prompt_spec',
   ]),
 )
 
@@ -808,6 +811,7 @@ export function sanitizeCragBodyWhitelist(
   input,
   {
     capabilities,
+    health = null,
     preserveCanonicalHistory = false,
     rejectUnknownTopKeys = true,
     validateCacheBudget = true,
@@ -980,6 +984,15 @@ export function sanitizeCragBodyWhitelist(
     const value = materialized[key]
     if (value === undefined) continue
     if (key === 'effort' && isEmptyEffortValue(value)) continue
+    if (key === 'crag_prompt_spec') {
+      if ((caps || health) && !isPromptSpecV1Caps(caps, health)) {
+        strippedFields.push(key)
+        continue
+      }
+      const cleanSpec = sanitizePromptSpec(value)
+      if (cleanSpec) out[key] = cleanSpec
+      continue
+    }
     if (key === 'crag_persona_preset' || key === 'crag_prompt_version') {
       if (caps && !caps.includes('headless_claude_bridge_v1')) {
         strippedFields.push(key)
@@ -988,7 +1001,12 @@ export function sanitizeCragBodyWhitelist(
       if (typeof value !== 'string') continue
       const trimmed = value.trim()
       if (!trimmed || trimmed.length > 512 || /[\r\n\0]/.test(trimmed)) continue
-      if (key === 'crag_persona_preset' && trimmed !== 'zero' && trimmed !== 'official_full') continue
+      if (
+        key === 'crag_persona_preset' &&
+        !['official', 'official_full', 'zero', 'custom'].includes(trimmed)
+      ) {
+        continue
+      }
       out[key] = trimmed
       continue
     }
