@@ -43,6 +43,7 @@ export type ApiEndpoint = {
   kind?: 'claude' | 'openai' | 'gemini' | 'custom'
   protocol?: 'anthropic' | 'openai' | 'gemini'
   risk_review_enabled?: boolean
+  body_policy?: 'persona' | 'caller'
   /** 上游认证方案，后端 `endpointAuthScheme()` 计算得出，openai 协议恒为 bearer，gemini 默认 x_goog_api_key。 */
   auth_scheme?: ApiEndpointAuthScheme
   headers?: Record<string, string>

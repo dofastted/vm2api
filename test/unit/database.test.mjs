@@ -534,3 +534,50 @@ test('migration 067 upgrades pre-067 crag_shop_orders in place with NULL activat
     db.close()
   }
 })
+
+test('migration 073 / pg 010 backfill api_endpoints body_policy to caller and keep persona selectable', () => {
+  const src = path.resolve('src/lib/db/migrations')
+  const pg010 = path.resolve('src/lib/db/pg/pg-migrations/010_api_endpoint_body_policy_default.sql')
+  const oldDir = path.join(tmp, 'before073')
+  fs.mkdirSync(oldDir, { recursive: true })
+  for (const file of fs.readdirSync(src)) {
+    if (file.endsWith('.sql') && file < '073') fs.copyFileSync(path.join(src, file), path.join(oldDir, file))
+  }
+  const db = new DatabaseSync(':memory:')
+  try {
+    applyMigrations(db, { migrationsDir: oldDir })
+    db.prepare(`INSERT INTO api_endpoints (id, name, base_url, created_at, updated_at)
+      VALUES ('ep_old_default', 'Old Default', 'https://api.anthropic.com', '2026-11-27', '2026-11-27')`).run()
+    db.prepare(`INSERT INTO api_endpoints (id, name, base_url, created_at, updated_at, body_policy)
+      VALUES ('ep_old_caller', 'Old Caller', 'https://api.anthropic.com', '2026-11-27', '2026-11-27', 'caller')`).run()
+    assert.equal(
+      db.prepare('SELECT body_policy FROM api_endpoints WHERE id = ?').get('ep_old_default').body_policy,
+      'persona',
+    )
+
+    const applied = applyMigrations(db, { migrationsDir: src })
+    assert.ok(applied.includes('073_api_endpoint_body_policy_default.sql'))
+    assert.deepEqual(applyMigrations(db, { migrationsDir: src }), [])
+    assert.equal(
+      db.prepare('SELECT body_policy FROM api_endpoints WHERE id = ?').get('ep_old_default').body_policy,
+      'caller',
+    )
+    assert.equal(
+      db.prepare('SELECT body_policy FROM api_endpoints WHERE id = ?').get('ep_old_caller').body_policy,
+      'caller',
+    )
+
+    // Turning persona injection back on explicitly stays allowed by CHECK constraint
+    db.prepare(`UPDATE api_endpoints SET body_policy = 'persona' WHERE id = 'ep_old_default'`).run()
+    assert.equal(
+      db.prepare('SELECT body_policy FROM api_endpoints WHERE id = ?').get('ep_old_default').body_policy,
+      'persona',
+    )
+
+    const pg010Sql = fs.readFileSync(pg010, 'utf8')
+    assert.match(pg010Sql, /ALTER TABLE api_endpoints[\s\S]*ALTER COLUMN body_policy SET DEFAULT 'caller'/i)
+    assert.match(pg010Sql, /UPDATE api_endpoints[\s\S]*SET body_policy = 'caller'/i)
+  } finally {
+    db.close()
+  }
+})

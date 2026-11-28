@@ -75,7 +75,11 @@ test('SQLite 071 upgrades pre-071 DB cleanly, preserves existing api_keys, and e
   )
 
   const applied = applyMigrations(db)
-  assert.deepEqual(applied, ['071_scheduler_center.sql', '072_scheduler_pool_prompt_default.sql'])
+  assert.deepEqual(applied, [
+    '071_scheduler_center.sql',
+    '072_scheduler_pool_prompt_default.sql',
+    '073_api_endpoint_body_policy_default.sql',
+  ])
 
   // Re-applying is idempotent
   assert.deepEqual(applyMigrations(db), [])
@@ -732,7 +736,7 @@ test('072 SQLite / 009 PG migrations safely repair untouched legacy vm_pools bac
   ).run('pool_openai_pt', 'openai-pt', 'OpenAI Pool', now, now)
 
   const applied = applyMigrations(db)
-  assert.deepEqual(applied, ['072_scheduler_pool_prompt_default.sql'])
+  assert.deepEqual(applied, ['072_scheduler_pool_prompt_default.sql', '073_api_endpoint_body_policy_default.sql'])
 
   const modeOf = (id) =>
     db.prepare('SELECT system_prompt_mode FROM scheduler_pools WHERE id = ?').get(id).system_prompt_mode

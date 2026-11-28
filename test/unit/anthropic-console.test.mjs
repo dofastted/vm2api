@@ -815,3 +815,80 @@ test('Gemini console probes native /v1beta generateContent with x-goog-api-key a
     'https://kin.example.com/v1/models/gemini-4-neon-low:generateContent',
   ])
 })
+
+test('panel /api/panel/api-endpoints defaults body_policy to caller and persists single-field PATCH toggles across reload', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-console-body-policy-'))
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  let store = new ApiEndpointStore({ dataDir: dir })
+  let schedulerReloads = 0
+  const response = {}
+  const makeHandler = (currentStore) =>
+    createPanelHandler({
+      cfg: { paths: { project: dir } },
+      readBody,
+      apiEndpointStore: currentStore,
+      apiScheduler: {
+        reload() {
+          schedulerReloads += 1
+        },
+        pick() {
+          return { ok: false, code: 'model_not_found' }
+        },
+      },
+      requireAuth(req) {
+        req.panelUser = 'admin'
+        req.panelRole = 'admin'
+        return true
+      },
+      json(_res, status, body) {
+        response.status = status
+        response.body = body
+      },
+    })
+
+  let handlePanel = makeHandler(store)
+  const createReq = Readable.from([
+    Buffer.from(
+      JSON.stringify({
+        kind: 'claude',
+        protocol: 'anthropic',
+        name: 'https://api.anthropic.com',
+        base_url: 'https://api.anthropic.com',
+        auth_scheme: 'x_api_key',
+        api_key_entries: [{ api_key: 'sk-ant-default-caller' }],
+        models: [{ name: 'claude-sonnet-4-5', alias: 'claude-sonnet-4-5' }],
+      }),
+    ),
+  ])
+  createReq.method = 'POST'
+  await handlePanel(createReq, {}, new URL('http://localhost/api/panel/api-endpoints'))
+  assert.equal(response.status, 201)
+  assert.equal(response.body.item.body_policy, 'caller')
+  const createdId = response.body.item.id
+  const keyId = response.body.item.api_key_entries[0].id
+
+  // Immediate click-toggle PATCH sends only { body_policy: 'persona' } and persists across DB reopen
+  const toggleOffReq = Readable.from([Buffer.from(JSON.stringify({ body_policy: 'persona' }))])
+  toggleOffReq.method = 'PATCH'
+  await handlePanel(toggleOffReq, {}, new URL(`http://localhost/api/panel/api-endpoints/${createdId}`))
+  assert.equal(response.status, 200)
+  assert.equal(response.body.item.body_policy, 'persona')
+  assert.equal(response.body.item.api_key_entries[0].id, keyId)
+  assert.equal(schedulerReloads, 2)
+
+  store.db.close()
+  store = new ApiEndpointStore({ dataDir: dir })
+  assert.equal(store.getRaw(createdId).body_policy, 'persona')
+
+  handlePanel = makeHandler(store)
+  const toggleOnReq = Readable.from([Buffer.from(JSON.stringify({ body_policy: 'caller' }))])
+  toggleOnReq.method = 'PATCH'
+  await handlePanel(toggleOnReq, {}, new URL(`http://localhost/api/panel/api-endpoints/${createdId}`))
+  assert.equal(response.status, 200)
+  assert.equal(response.body.item.body_policy, 'caller')
+
+  store.db.close()
+  store = new ApiEndpointStore({ dataDir: dir })
+  assert.equal(store.getRaw(createdId).body_policy, 'caller')
+  store.db.close()
+})
