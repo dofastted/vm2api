@@ -75,26 +75,26 @@ test('endpoint risk review defaults off and preserves explicit toggles across re
   }
 })
 
-test('endpoint body policy defaults to persona and survives reloads (#1321)', () => {
+test('endpoint body policy defaults to caller and survives reloads (#1321)', () => {
   const dataDir = tmpDir()
   let store = new ApiEndpointStore({ dataDir })
   try {
     const rec = store.create({ kind: 'claude' })
-    assert.equal(rec.body_policy, 'persona')
-    assert.equal(store.listRaw()[0].body_policy, 'persona')
-    assert.equal(store.update(rec.id, { body_policy: 'caller' }).body_policy, 'caller')
-    store.db.close()
-    store = new ApiEndpointStore({ dataDir })
-    assert.equal(store.list()[0].body_policy, 'caller')
-    // An unrelated patch must not reset the policy.
-    assert.equal(store.update(rec.id, { name: 'renamed' }).body_policy, 'caller')
+    assert.equal(rec.body_policy, 'caller')
+    assert.equal(store.listRaw()[0].body_policy, 'caller')
     assert.equal(store.update(rec.id, { body_policy: 'persona' }).body_policy, 'persona')
-    const opted = store.create({ kind: 'claude', body_policy: 'caller' })
-    assert.equal(opted.body_policy, 'caller')
     store.db.close()
     store = new ApiEndpointStore({ dataDir })
-    assert.equal(store.getRaw(rec.id).body_policy, 'persona')
-    assert.equal(store.getRaw(opted.id).body_policy, 'caller')
+    assert.equal(store.list()[0].body_policy, 'persona')
+    // An unrelated patch must not reset the policy.
+    assert.equal(store.update(rec.id, { name: 'renamed' }).body_policy, 'persona')
+    assert.equal(store.update(rec.id, { body_policy: 'caller' }).body_policy, 'caller')
+    const opted = store.create({ kind: 'claude', body_policy: 'persona' })
+    assert.equal(opted.body_policy, 'persona')
+    store.db.close()
+    store = new ApiEndpointStore({ dataDir })
+    assert.equal(store.getRaw(rec.id).body_policy, 'caller')
+    assert.equal(store.getRaw(opted.id).body_policy, 'persona')
   } finally {
     store.db.close()
     fs.rmSync(dataDir, { recursive: true, force: true })

@@ -37,13 +37,13 @@ function riskReviewEnabled(value) {
   return value === true
 }
 
-const BODY_POLICIES = ['persona', 'caller']
+const BODY_POLICIES = ['caller', 'persona']
 
 /**
  * How an API endpoint treats the caller's request body.
- * `persona` (default) keeps the historical behaviour: the configured subscription
- * persona replaces the caller's identity and billing blocks. `caller` forwards the
- * caller's own body instead, for upstreams that read those blocks themselves (#1321).
+ * `caller` (default) forwards the caller's own body as-is without persona/system injection,
+ * for upstreams that read those blocks themselves. `persona` replaces the caller's
+ * identity and billing blocks with the configured subscription persona (#1321).
  */
 function bodyPolicy(value) {
   if (value === undefined) return BODY_POLICIES[0]

@@ -1,3 +1,8 @@
+import type {
+  ApiEndpoint,
+  ApiEndpointsPayload,
+} from '@/types/panel-api-endpoints'
+
 export const DEFAULT_URL = 'https://api.anthropic.com'
 export const DIRECT = '__direct__'
 export type ApiProtocol = 'anthropic' | 'openai' | 'gemini'
@@ -15,11 +20,37 @@ export const API_DEFAULTS = {
 
 export type AuthScheme = 'x_api_key' | 'authorization_bearer' | 'x_goog_api_key'
 
-/** 地址如何处理调用方正文：`persona` 套用配置的人设，`caller` 原样转发。 */
+/** 地址如何处理调用方正文：`caller` 原样转发（默认），`persona` 套用配置的人设。 */
 export type BodyPolicy = 'persona' | 'caller'
 
 export function asBodyPolicy(value: unknown): BodyPolicy {
-  return value === 'caller' ? 'caller' : 'persona'
+  return value === 'persona' ? 'persona' : 'caller'
+}
+
+export function endpointBodyPolicyRequest(
+  storedId: string,
+  bodyPolicy: BodyPolicy
+): { method: 'PATCH'; path: string; body: { body_policy: BodyPolicy } } {
+  return {
+    method: 'PATCH',
+    path: `/api/panel/api-endpoints/${encodeURIComponent(storedId)}`,
+    body: { body_policy: bodyPolicy },
+  }
+}
+
+export function patchCachedApiEndpoint(
+  payload: ApiEndpointsPayload | undefined,
+  saved: ApiEndpoint | undefined
+): ApiEndpointsPayload | undefined {
+  if (!payload || !saved?.id) return payload
+  const items = payload.items || []
+  const exists = items.some((entry) => entry.id === saved.id)
+  return {
+    ...payload,
+    items: exists
+      ? items.map((entry) => (entry.id === saved.id ? saved : entry))
+      : [...items, saved],
+  }
 }
 
 /** 载入时的服务端值；保存已存地址只发和它不同的字段。 */
