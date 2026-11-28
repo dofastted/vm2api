@@ -164,7 +164,7 @@ const INFERENCE_ERROR_LABELS: Readonly<Record<string, string>> = {
   gemini_pool_overloaded: '号池高负载（全部账号不可调度）',
   gemini_upstream_unavailable: '上游服务暂时不可用（503）',
   gemini_content_rejected: '内容触发上游过滤（429）',
-  gemini_inference_failed: '上游推理失败（502）',
+  gemini_inference_failed: '上游请求失败',
   gemini_inference_timeout: '请求超时',
   gemini_inference_bad_input: '推理输入不受支持',
   gemini_inference_invalid_output: '响应无法解析',
@@ -273,15 +273,32 @@ export function groupGeminiModels(
     }))
 }
 
+function isBlockedTestModel(id: string): boolean {
+  const lower = id.trim().toLowerCase()
+  return (
+    !lower ||
+    lower.endsWith('-disabled') ||
+    lower.startsWith('tab_') ||
+    lower.includes('-tiered') ||
+    lower.endsWith('-sonar')
+  )
+}
+
 export function defaultGeminiTestModel(models: readonly string[]): string {
   const clean = models.filter(Boolean)
   if (!clean.length) return ''
+  const usable = clean.filter((id) => !isBlockedTestModel(id))
+  const pool = usable.length ? usable : clean
   return (
-    clean.find((id) => id === 'gemini-4-neon') ??
-    clean.find((id) => id === 'gemini-4-neon-high') ??
-    clean.find((id) => id.startsWith('gemini-4-neon')) ??
-    clean.find((id) => id.startsWith('gemini-')) ??
-    clean[0]
+    pool.find((id) => id === 'gemini-4-neon') ??
+    pool.find((id) => id === 'gemini-4-neon-high') ??
+    pool.find((id) => id.startsWith('gemini-4-neon')) ??
+    pool.find((id) => id.startsWith('gemini-4-')) ??
+    pool.find((id) => id === 'gemini-3.8-flash-medium') ??
+    pool.find((id) => id.startsWith('gemini-3.8-flash')) ??
+    pool.find((id) => id === 'gemini-3.1-flash-image') ??
+    pool.find((id) => id.startsWith('gemini-')) ??
+    pool[0]
   )
 }
 
@@ -303,7 +320,7 @@ const INFERENCE_ERROR_ACTIONS: Readonly<Record<string, string>> = {
   gemini_quota_exhausted:
     '处理方式：上游配额已耗尽（429），请等待配额重置、改用其他模型或切换至其他可用账号。',
   gemini_pool_overloaded:
-    '处理方式：当前所有 Gemini 账号均不可调度或处于冷却/高负载，请检查账号错误状态、恢复 502 暂停账号或稍后重试。',
+    '处理方式：当前所有 Gemini 账号均不可调度或处于冷却/高负载，请检查账号状态或稍后重试。',
   gemini_upstream_unavailable:
     '处理方式：Google 上游返回 503 临时不可用，调度器已自动保留 agy 进程并切号，无需人工重启。',
   gemini_content_rejected:
@@ -326,7 +343,7 @@ const INFERENCE_ERROR_ACTIONS: Readonly<Record<string, string>> = {
   gemini_inference_tool_blocked:
     '处理方式：当前测试通道不允许该工具调用，请改用纯文本提示词测试。',
   gemini_inference_failed:
-    '处理方式：请先在「账号」页点击刷新确认是否触发 Google 身份验证/风控，再排查绑定代理与宿主服务日志。',
+    '处理方式：上游返回瞬态错误（如 502/520），调度器会自动切号重试；若持续失败请检查绑定代理连通性与宿主服务日志。',
   gemini_native_worker_unavailable:
     '处理方式：CRAGGemini 常驻内核正在预热或异常退出，请稍候重试，或前往「设置 → Gemini 维护」检查载荷与宿主服务。',
   gemini_native_config_invalid:

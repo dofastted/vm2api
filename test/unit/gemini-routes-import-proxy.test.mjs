@@ -228,14 +228,14 @@ test('POST /environments/:id/models returns call_models/models and preserves str
       if (operation === 'get') return baseEnv
       return {
         ...baseEnv,
-        call_models: ['gemini-2.5-pro', 'gemini-3-flash'],
+        call_models: ['gemini-4-neon', 'gemini-3.8-flash', 'gemini-2.5-pro', 'tab_flash_lite_preview'],
       }
     },
   })
   const okModels = await runModels('POST', `${root}/environments/${baseEnv.id}/models`)
   assert.equal(okModels.status, 200)
-  assert.deepEqual(okModels.body.data.models, ['gemini-2.5-pro', 'gemini-3-flash'])
-  assert.deepEqual(okModels.body.data.call_models, ['gemini-2.5-pro', 'gemini-3-flash'])
+  assert.deepEqual(okModels.body.data.models, ['gemini-4-neon', 'gemini-3.8-flash'])
+  assert.deepEqual(okModels.body.data.call_models, ['gemini-4-neon', 'gemini-3.8-flash'])
   assert.equal(okModels.body.data.models_discovered, true)
 
   // 2. Real UDS socket test (on Linux x64) verifying hostRequest status/code propagation

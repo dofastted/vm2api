@@ -253,7 +253,7 @@ describe('Gemini account presentation', () => {
       '宿主运行环境故障'
     )
     expect(geminiInferenceErrorLabel('gemini_inference_failed')).toBe(
-      '上游推理失败（502）'
+      '上游请求失败'
     )
     expect(geminiInferenceErrorLabel('gemini_upstream_unavailable')).toBe(
       '上游服务暂时不可用（503）'
@@ -335,6 +335,20 @@ describe('Gemini account presentation', () => {
     expect(
       defaultGeminiTestModel(['gemini-3-flash', 'gemini-4-neon-medium'])
     ).toBe('gemini-4-neon-medium')
+    expect(
+      defaultGeminiTestModel([
+        'gemini-4-neon-disabled',
+        'tab_flash_lite_preview',
+        'gemini-3.8-flash-medium',
+      ])
+    ).toBe('gemini-3.8-flash-medium')
+    expect(
+      defaultGeminiTestModel([
+        'gemini-4-neon-disabled',
+        'gemini-4-hydrogen-tiered-high',
+        'gemini-4-hydrogen-high',
+      ])
+    ).toBe('gemini-4-hydrogen-high')
     expect(defaultGeminiTestModel(['gemini-3-flash', 'gemini-2.5-pro'])).toBe(
       'gemini-3-flash'
     )
@@ -365,7 +379,13 @@ describe('Gemini account presentation', () => {
     )
     expect(geminiInferenceErrorAction('gemini_proxy_error')).toContain('SOCKS5')
     expect(geminiInferenceErrorAction('gemini_inference_failed')).toContain(
-      '刷新'
+      '切号重试'
+    )
+    expect(geminiInferenceErrorAction('gemini_inference_failed')).not.toContain(
+      '身份验证'
+    )
+    expect(geminiInferenceErrorAction('gemini_inference_failed')).not.toContain(
+      '风控'
     )
     expect(
       geminiInferenceErrorAction('gemini_native_worker_unavailable')

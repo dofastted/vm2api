@@ -2861,6 +2861,24 @@ function parseAnthropicInbound(body, { headers }) {
             pendingThinkingSig = block.data.trim()
             turnThinkingSig = pendingThinkingSig
           }
+        } else if (block.type === 'compaction') {
+          let compactionText = ''
+          if (typeof block.content === 'string') {
+            compactionText = block.content
+          } else if (Array.isArray(block.content)) {
+            const chunks = []
+            for (const sub of block.content) {
+              if (typeof sub === 'string') chunks.push(sub)
+              else if (isPlainObject(sub) && typeof sub.text === 'string') chunks.push(sub.text)
+            }
+            compactionText = chunks.join('\n')
+          } else if (typeof block.text === 'string') {
+            compactionText = block.text
+          }
+          if (compactionText && !isPlaceholderText(compactionText)) {
+            parts.push({ kind: 'text', text: compactionText, signature: pendingThinkingSig })
+            pendingThinkingSig = ''
+          }
         } else if (block.type === 'server_tool_use' || block.type === 'web_search_tool_result') {
           // Do not send foreign server tool replay blocks back to Gemini.
         } else if (
@@ -4964,22 +4982,26 @@ export function formatGeminiProtocolError(protocol, status, code, message, detai
           ? 'not_found_error'
           : code === 'api_key_quota_exhausted'
             ? 'quota_error'
-            : code === 'api_key_rate_limit' ||
-                code === 'api_key_concurrency_limit' ||
-                code === 'user_concurrency_limit' ||
-                status === 429
-              ? 'rate_limit_error'
-              : status >= 500
-                ? 'api_error'
-                : 'invalid_request_error'
+            : status === 529 || code === 'pool_overloaded' || code === 'upstream_overloaded'
+              ? 'overloaded_error'
+              : status === 504 || status === 408 || code === 'upstream_timeout' || code === 'gemini_inference_timeout'
+                ? 'timeout_error'
+                : code === 'api_key_rate_limit' ||
+                    code === 'api_key_concurrency_limit' ||
+                    code === 'user_concurrency_limit' ||
+                    status === 429
+                  ? 'rate_limit_error'
+                  : status >= 500
+                    ? 'api_error'
+                    : 'invalid_request_error'
   if (protocol === 'anthropic') {
     return { type: 'error', error: hasDetails ? { type, message, code, details } : { type, message, code } }
   }
   return { error: hasDetails ? { type, code, message, details } : { type, code, message } }
 }
 
-export function formatGeminiProtocolStreamError(protocol, status, code, message) {
-  const payload = formatGeminiProtocolError(protocol, status, code, message)
+export function formatGeminiProtocolStreamError(protocol, status, code, message, details = null) {
+  const payload = formatGeminiProtocolError(protocol, status, code, message, details)
   if (protocol === 'anthropic') {
     return buildAnthropicSseError(payload.error)
   }

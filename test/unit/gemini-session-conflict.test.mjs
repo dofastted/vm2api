@@ -12,7 +12,7 @@ const OAUTH_ENV = {
   auth_state: 'authorized',
   auth_method: 'oauth',
   models_discovered: true,
-  models: ['gemini-3-pro'],
+  models: ['gemini-4-neon'],
   capabilities: [...NATIVE_TUI_CAPABILITIES],
 }
 
@@ -201,7 +201,7 @@ test('gemini_session_conflict does not increment unit circuit failures', async (
   })
 
   const turn = await scheduler.stream({
-    model: 'gemini-3-pro',
+    model: 'gemini-4-neon',
     geminiBody: { contents: [{ role: 'user', parts: [{ text: 'continue after tool' }] }] },
     stickyKey: 'key:test:session-409',
     apiKeyRecord: { id: 'key-test', group_type: 'gemini' },
@@ -233,7 +233,7 @@ test('gemini_session_conflict retries on same account with fresh conversation_id
 
   const sticky = 'key:test:paired-1837'
   const turn = await scheduler.stream({
-    model: 'gemini-3-pro',
+    model: 'gemini-4-neon',
     geminiBody: { contents: [{ role: 'user', parts: [{ text: 'print marker' }] }] },
     stickyKey: sticky,
     apiKeyRecord: { id: 'key-test', group_type: 'gemini' },
@@ -269,14 +269,14 @@ test('gemini_session_conflict on tool continuation retries with new conv (mas=3)
   const userBody = { contents: [{ role: 'user', parts: [{ text: 'after tool' }] }] }
 
   await scheduler.stream({
-    model: 'gemini-3-pro',
+    model: 'gemini-4-neon',
     geminiBody: { contents: [{ role: 'user', parts: [{ text: 'emit tool' }] }] },
     stickyKey: 'key:test:tool-cont-mas3',
     apiKeyRecord: apiKey,
   })
 
   const turn = await scheduler.stream({
-    model: 'gemini-3-pro',
+    model: 'gemini-4-neon',
     geminiBody: userBody,
     stickyKey: 'key:test:tool-cont-mas3',
     continuationCallIds: [TOOL_CONT_CALL],
@@ -316,7 +316,7 @@ test('gemini_session_conflict on tool continuation clears binding when mas=0', a
   const userBody = { contents: [{ role: 'user', parts: [{ text: 'after tool' }] }] }
 
   await scheduler.stream({
-    model: 'gemini-3-pro',
+    model: 'gemini-4-neon',
     geminiBody: { contents: [{ role: 'user', parts: [{ text: 'emit tool' }] }] },
     stickyKey: 'key:test:tool-cont-mas0',
     apiKeyRecord: apiKey,
@@ -324,7 +324,7 @@ test('gemini_session_conflict on tool continuation clears binding when mas=0', a
 
   try {
     await scheduler.stream({
-      model: 'gemini-3-pro',
+      model: 'gemini-4-neon',
       geminiBody: userBody,
       stickyKey: 'key:test:tool-cont-mas0',
       continuationCallIds: [TOOL_CONT_CALL],
@@ -338,7 +338,7 @@ test('gemini_session_conflict on tool continuation clears binding when mas=0', a
   assert.equal(inferCalls[1].convId, TOOL_CONT_CONV)
 
   const third = await scheduler.stream({
-    model: 'gemini-3-pro',
+    model: 'gemini-4-neon',
     geminiBody: userBody,
     stickyKey: 'key:test:tool-cont-mas0',
     continuationCallIds: [TOOL_CONT_CALL],
@@ -376,7 +376,7 @@ test('gemini_session_conflict clears sticky when max_account_switches is 0 (no r
   const body = { contents: [{ role: 'user', parts: [{ text: 'x' }] }] }
 
   const first = await scheduler.stream({
-    model: 'gemini-3-pro',
+    model: 'gemini-4-neon',
     geminiBody: body,
     stickyKey: sticky,
     apiKeyRecord: apiKey,
@@ -387,7 +387,7 @@ test('gemini_session_conflict clears sticky when max_account_switches is 0 (no r
 
   try {
     await scheduler.stream({
-      model: 'gemini-3-pro',
+      model: 'gemini-4-neon',
       geminiBody: body,
       stickyKey: sticky,
       apiKeyRecord: apiKey,
@@ -400,7 +400,7 @@ test('gemini_session_conflict clears sticky when max_account_switches is 0 (no r
   assert.equal(inferCalls[1].convId, boundConv)
 
   const third = await scheduler.stream({
-    model: 'gemini-3-pro',
+    model: 'gemini-4-neon',
     geminiBody: body,
     stickyKey: sticky,
     apiKeyRecord: apiKey,
@@ -421,7 +421,7 @@ test('gemini_session_conflict is only retried once (no infinite retry)', async (
 
   try {
     await scheduler.stream({
-      model: 'gemini-3-pro',
+      model: 'gemini-4-neon',
       geminiBody: { contents: [{ role: 'user', parts: [{ text: 'fail twice' }] }] },
       stickyKey: 'key:test:no-infinite',
       apiKeyRecord: { id: 'key-test', group_type: 'gemini' },

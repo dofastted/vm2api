@@ -41,7 +41,7 @@ export const DEFAULT_GEMINI_ROUTING = Object.freeze({
     max_account_switches: 3,
     quota_cooldown_ms: 60_000,
     account_cooldown_ms: 300_000,
-    unschedulable_on_502: true,
+    unschedulable_on_502: false,
   }),
   shm: Object.freeze({
     require_shm: true,

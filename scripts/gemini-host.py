@@ -410,7 +410,17 @@ NATIVE_HEALTH_FAIL_THRESHOLD = 3
 NATIVE_HEALTH_POLL_INTERVAL = 15.0
 NATIVE_WARM_BACKOFF_MIN = 2.0
 NATIVE_WARM_BACKOFF_MAX = 60.0
-NATIVE_DEFAULT_MODEL = "gemini-3-flash"
+NATIVE_DEFAULT_MODEL = "gemini-3.8-flash-medium"
+_BLOCKED_UPSTREAM_MODEL_RE = re.compile(r"(?:^tab_|(?:-disabled)\Z)", re.I)
+_PREFERRED_SESSION_MODEL_PATTERNS = (
+    re.compile(r"^gemini-3\.8-flash-medium\Z", re.I),
+    re.compile(r"^gemini-3\.8-flash(?:-(?:low|medium|high))?\Z", re.I),
+    re.compile(
+        r"^gemini-4-(?:neon|hydrogen|argon|carbon)(?:-(?:low|medium|high|xhigh))?\Z",
+        re.I,
+    ),
+    re.compile(r"^gemini-3\.1-flash-image\Z", re.I),
+)
 DEFAULT_RUNTIME_POLICY = {
     "strategy": "balanced",
     "accounts_per_daemon": DEFAULT_ACCOUNTS_PER_DAEMON,
@@ -5708,11 +5718,28 @@ class Host:
 
     @staticmethod
     def _initial_session_model(env, requested_model=None):
-        if isinstance(requested_model, str) and MODEL.fullmatch(requested_model):
+        if (
+            isinstance(requested_model, str)
+            and MODEL.fullmatch(requested_model)
+            and not _BLOCKED_UPSTREAM_MODEL_RE.search(requested_model)
+        ):
             return requested_model
-        for candidate in env.get("call_models") or ():
-            if isinstance(candidate, str) and MODEL.fullmatch(candidate):
+        candidates = [
+            candidate
+            for candidate in (env.get("call_models") or ())
+            if isinstance(candidate, str)
+            and MODEL.fullmatch(candidate)
+            and not _BLOCKED_UPSTREAM_MODEL_RE.search(candidate)
+        ]
+        for pattern in _PREFERRED_SESSION_MODEL_PATTERNS:
+            for candidate in candidates:
+                if pattern.fullmatch(candidate):
+                    return candidate
+        for candidate in candidates:
+            if candidate.lower().startswith("gemini-"):
                 return candidate
+        if candidates:
+            return candidates[0]
         return NATIVE_DEFAULT_MODEL
 
     def _schedule_warm_locked(self, identifier, model=None, force=False):

@@ -598,7 +598,7 @@ test('end-to-end Gemini CRAG subscription: redeem, bind OAuth seat, skip api_key
         auth_state: 'authorized',
         auth_method: 'oauth',
         models_discovered: true,
-        models: ['gemini-3-flash'],
+        models: ['gemini-3.8-flash-medium'],
         capabilities: ['streaming', 'native_tui'],
       },
     ],
@@ -611,7 +611,7 @@ test('end-to-end Gemini CRAG subscription: redeem, bind OAuth seat, skip api_key
         auth_state: 'authorized',
         auth_method: 'oauth',
         models_discovered: true,
-        models: ['gemini-3-flash'],
+        models: ['gemini-3.8-flash-medium'],
         capabilities: ['streaming', 'native_tui'],
       },
     ],
@@ -624,7 +624,7 @@ test('end-to-end Gemini CRAG subscription: redeem, bind OAuth seat, skip api_key
         auth_state: 'authorized',
         auth_method: 'api_key',
         models_discovered: true,
-        models: ['gemini-2.5-pro'],
+        models: ['gemini-4-neon'],
         capabilities: ['streaming', 'full_gemini_api'],
       },
     ],
@@ -725,7 +725,7 @@ test('end-to-end Gemini CRAG subscription: redeem, bind OAuth seat, skip api_key
   await assert.rejects(
     () =>
       scheduler.stream({
-        model: 'gemini-3-flash',
+        model: 'gemini-3.8-flash-medium',
         geminiBody: { contents: [{ role: 'user', parts: [{ text: 'hi' }] }] },
       }),
     (err) => err.status === 403 && err.code === 'license_required',

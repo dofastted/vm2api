@@ -25,7 +25,7 @@ TURN_TIMEOUT = 305
 TOKEN = re.compile(r"[!-~]{24,4096}\Z")
 MODEL = re.compile(r"[a-z0-9][a-z0-9._-]{0,99}\Z")
 REQUEST_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
-CONV_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
+CONV_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 ACCOUNT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 VALID_WIRE_PROTOCOLS = frozenset({"raw", "gemini", "anthropic"})
 MAX_WORKER_STDERR = 4096
@@ -560,10 +560,28 @@ def _payload_upstream_reason(payload):
     return None
 
 
+_PROXY_EDGE_403_RE = re.compile(r"<html|<!doctype|cloudflare|cf-ray|just a moment|\bproxy\b", re.IGNORECASE)
+_EMBEDDED_UPSTREAM_5XX_RE = re.compile(r"\b(?:http|status)[\s:=]+(520|521|522|523|524|529|503|504)\b", re.IGNORECASE)
+
+
 def _map_effective_403(payload, message):
     reason = _payload_upstream_reason(payload)
     if reason == "TOS_VIOLATION":
         return NativeFailure("gemini_account_ineligible", 403, message)
+    if reason == "VALIDATION_REQUIRED":
+        return NativeFailure("gemini_account_verification_required", 403, message)
+    if reason == "UNSUPPORTED_CLIENT":
+        return NativeFailure("gemini_client_unsupported", 403, message)
+    if reason == "UNSUPPORTED_REGION":
+        return NativeFailure("gemini_location_unsupported", 403, message)
+    parts = [message or ""]
+    if isinstance(payload, dict):
+        for key in ("error", "message"):
+            val = payload.get(key)
+            if isinstance(val, str):
+                parts.append(val)
+    if _PROXY_EDGE_403_RE.search(" ".join(parts)):
+        return NativeFailure("gemini_proxy_error", 502, message or "Upstream proxy or edge rejected request (HTTP 403)")
     return NativeFailure("gemini_location_unsupported", 403, message)
 
 
@@ -573,10 +591,14 @@ def _map_worker_error(http_status, payload):
     message = payload.get("error") if isinstance(payload, dict) and isinstance(payload.get("error"), str) else None
     if isinstance(code, str) and code in LICENSE_ERROR_CODES:
         return NativeFailure(code, 503 if code == "gemini_subscription_sync_pending" else 403, message)
+    if not (isinstance(upstream, int) and 400 <= upstream <= 599) and http_status == 502 and message:
+        embedded = _EMBEDDED_UPSTREAM_5XX_RE.search(message)
+        if embedded:
+            upstream = int(embedded.group(1))
     effective_status = upstream if isinstance(upstream, int) and 400 <= upstream <= 599 else http_status
     if code == "unsupported_turn":
         return NativeFailure("gemini_unsupported_turn", 400, message)
-    if code in ("invalid_envelope", "invalid_json", "invalid_wire_protocol"):
+    if code in ("invalid_envelope", "invalid_json", "invalid_wire_protocol", "invalid_conversation"):
         return NativeFailure("gemini_invalid_request", 400, message)
     if code in ("empty_upstream_stream", "acp_executor_error", "acp_model_unspecified"):
         return NativeFailure("gemini_inference_invalid_output", 502, message)
@@ -588,7 +610,7 @@ def _map_worker_error(http_status, payload):
             503,
             message,
         )
-    if code in ("first_byte_timeout", "turn_timeout", "idle_timeout", "queue_timeout"):
+    if code in ("first_byte_timeout", "turn_timeout", "idle_timeout", "queue_timeout") or effective_status in (504, 408):
         return NativeFailure("gemini_inference_timeout", 504, message)
     if code == "cancelled":
         return NativeFailure("gemini_inference_cancelled", 499, message)
@@ -628,6 +650,19 @@ def _map_worker_error(http_status, payload):
         return _map_effective_403(payload, message)
     if effective_status == 404:
         return NativeFailure("gemini_model_unavailable", 404, message)
+    if code in ("upstream_overloaded", "overloaded") or effective_status == 529:
+        raw_retry = payload.get("retry_after_ms") if isinstance(payload, dict) else None
+        retry_after_ms = (
+            raw_retry
+            if type(raw_retry) is int and 1 <= raw_retry <= 3_600_000
+            else None
+        )
+        return NativeFailure(
+            "gemini_upstream_unavailable",
+            529,
+            message or "Upstream overloaded. Please retry shortly.",
+            retry_after_ms=retry_after_ms,
+        )
     if code == "upstream_unavailable" or effective_status == 503:
         raw_retry = payload.get("retry_after_ms") if isinstance(payload, dict) else None
         retry_after_ms = (
@@ -641,7 +676,8 @@ def _map_worker_error(http_status, payload):
             message or "Gemini upstream service temporarily unavailable",
             retry_after_ms=retry_after_ms,
         )
-    return NativeFailure("gemini_inference_failed", effective_status if 400 <= effective_status <= 599 else 502, message)
+    final_status = effective_status if 400 <= effective_status <= 599 else 502
+    return NativeFailure("gemini_inference_failed", final_status, message or f"Upstream HTTP {final_status}")
 
 
 def _worker_ready(status):

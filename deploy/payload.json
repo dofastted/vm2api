@@ -40,19 +40,19 @@
     "payload_key_id": "835451e266145220a2e75b1f39ff22a0d7b17be48395553a24666b1946e0333a"
   },
   "geminiDefaultLinuxAmd64": {
-    "tag": "payload-2026.11.28-gemini-0.5.5",
+    "tag": "payload-2026.11.29-gemini-0.5.6",
     "assets": {
       "craggemini": {
-        "size": 1479808,
-        "sha256": "8b1e1e6650074be7fa6923b82a6253b29ea86b715218673b502dfc2448ec9dc7"
+        "size": 1479936,
+        "sha256": "06339d5c8f8b006e1bc35d6048efee3fc82bc10dc5f19551020caaf52bad6dc8"
       },
       "craggemini.payload.enc": {
-        "size": 9163092,
-        "sha256": "618f93bc3655539ef2798526627e254b93c0ae1c96b4d8f1a9bffe31ddc155f3"
+        "size": 9194116,
+        "sha256": "3f3228a31e1ac87d53f5533706185ab9fc6e23f713694f74e89e9f7ffdfc7204"
       },
       "libagy_bridge.so": {
-        "size": 1057216,
-        "sha256": "8f2a661202f7a3ffa68743fb8576952ee3cacacda35eeb2b0f1c09a1d2882e35"
+        "size": 1057400,
+        "sha256": "01e81f407882abb66d579dbcfaf881e06bd9ea0194014f91be4d9be086a10e12"
       },
       "crag-license-public.pem": {
         "size": 113,
@@ -60,7 +60,7 @@
       },
       "manifest.json": {
         "size": 2281,
-        "sha256": "f84fd2f09a1dea85dc13e3c83a02bc94db0b0f44ce316e2ea271937f1b194962"
+        "sha256": "de3933b44c3110e2568576207bfa830bc3c6825ccb2a5a8813828b6fad6634c0"
       }
     }
   },

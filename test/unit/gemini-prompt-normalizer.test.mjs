@@ -358,7 +358,7 @@ test('end-to-end 4-protocol Codex/Claude/OpenCode requests normalize cleanly thr
               auth_state: 'authorized',
               auth_method: 'oauth',
               models_discovered: true,
-              models: ['gemini-3-pro'],
+              models: ['gemini-4-neon'],
               capabilities: [...NATIVE_TUI_CAPABILITIES],
             },
           ],
@@ -413,7 +413,7 @@ test('end-to-end 4-protocol Codex/Claude/OpenCode requests normalize cleanly thr
       apiKeyKind: 'managed',
       apiKeyRecord: { id: 'key-norm-1', group_type: 'gemini' },
       body: {
-        model: 'gemini-3-pro',
+        model: 'gemini-4-neon',
         stream: false,
         instructions: 'You are Codex, based on GPT-5. Follow repo rules.',
         input: [

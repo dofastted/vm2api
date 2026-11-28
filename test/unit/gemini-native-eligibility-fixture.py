@@ -96,7 +96,7 @@ account = {
     "auth_state": "authorized",
     "auth_method": "oauth",
     "models_discovered": True,
-    "models": ["gemini-test"],
+    "models": ["gemini-3.8-flash"],
 }
 run_id = "b" * 32
 runs = []
