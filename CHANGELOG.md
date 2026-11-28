@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.4.254 — 2026-11-28 · 热修：`role: "system"` `tool_addition`/`tool_removal` 400、内联工具改写与 CRAG `3.1.30` beta 兼容性修复
+
+- **修复中转/第三方流量触发 `400 messages.*.content: 'tool_addition'/'tool_removal' blocks are only permitted within role: "system" messages` 及重构兼容性回归**：
+  - **收口第三方 `role: "system"|"developer"` 折叠路径（`src/lib/protocol/{third-party-system,outbound-attempt}.mjs`）**：`foldThirdPartyRoleSystemMessages` 统一复用 `extractThirdPartySystemMessages`（SSOT），仅搬迁纯文本块到 `messages[firstUser]`，完整保留 `tool_addition` / `tool_removal` / `tool_reference` 非文本块与 `output_config` / `clear_at` / `cache_control` 回合控制原位留在 `role: "system"`。
+  - **首条 `role: "system"` 工具控制回合保留（`src/lib/protocol/sanitize.mjs`）**：`normalizeAnthropicMessages` 对首条 `user` 之前的 `role: "system"` 消息保留 `tool_addition` / `tool_removal` 块在 `role: "system"`（混合文本仍上提至顶层 `system`），且不再误插 `{ role: 'user', content: '.' }`。
+  - **内联工具名与描述统一改写与白名单放行（`src/lib/protocol/{anthropic-policy,crag-whitelist}.mjs`）**：`scrubToolReferenceFields` 同步改写 `tool_addition.tool.definition.{name,description}` 并将内联声明纳入 `toolByName`/`declared` 索引后再对齐 `tool_choice.name`；`sanitizeCragBodyWhitelist` 在校验 `tool_choice: { type: 'tool', name }` 时识别消息中 `tool_addition` 声明的内联工具。
+  - **官方 `count_tokens_v1` 请求头透传（`src/lib/protocol/user-count-tokens.mjs`）**：经严格校验的官方 Claude Code 流量调用 `count_tokens_v1` 时透传 `extractCragCallerHeaders` 与 `anthropic-beta`，第三方流量仍保持 `{}`。
+- **钉选 CRAG V4 `3.1.30` 延续载荷（`dofastted/crag#43`、`payload-2026.11.28-crag-3.1.30`，零密钥轮换）**：
+  - 修复 `wire.rs::scan_body_features` 遗漏顶层 `body.cache_control`（`1h` / `evict_on_complete` / `scope`）、`synthesize_betas` 误将 `claude-haiku-5-5` 判为旧 Haiku 及 `/v1/messages/count_tokens` 缺少按需 beta，并修复 `runtime.rs::collect_body_feature_betas` 对 `fast-mode-2026-02-01` 与 `compact_20260904` 的门控。
+  - `deploy/payload.json` 与 `src/lib/admin/kernel-catalog.mjs` 升级至 `payload-2026.11.28-crag-3.1.30`（沿用生产公钥 `9dbb4bc2…` / 载荷密钥 `835451e2…`，保留 `3.1.29` 可一键回退）。
+- 部署说明：本次热修零数据库迁移、零前端与 `bin/` 变更；更新控制面至 `v1.4.254` 并刷新宿主 `share/crag/kernels/v2/amd64/` 与共享仓 `store/crag/current -> versions/3.1.30` 后滚动重载 CRAG 槽即可生效。
+
 ## 1.4.253 — 2026-11-28 · 清理 M3 切换后无人读取的号池/故障转移配置键与面板滑块
 
 - **删除 M3 切换（v1.4.243）后没有任何读取方的 routing 键（#2063）**：

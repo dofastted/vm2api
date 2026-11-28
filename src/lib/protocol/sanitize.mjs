@@ -414,6 +414,19 @@ export function normalizeAnthropicMessages(
         if (effort) trailingEmptyEffort = effort
         continue
       }
+      if (!seenUser && keepMidConversationSystem && isSystemToolControlMessage(message)) {
+        const controlBlocks = message.content.filter(isSystemToolControlBlock)
+        const otherBlocks = message.content.filter((block) => !isSystemToolControlBlock(block))
+        if (otherBlocks.length) {
+          appendLiftedSystemMessage(systemParts, mapped, { ...message, content: otherBlocks })
+        }
+        if (effort) {
+          liftedContentEffort = null
+          trailingEmptyEffort = null
+        }
+        mapped.push(keptAnthropicMessage({ ...message, content: controlBlocks }, 'system'))
+        continue
+      }
       if (!seenUser || !keepMidConversationSystem) {
         appendLiftedSystemMessage(systemParts, mapped, message)
         if (effort) liftedContentEffort = effort
@@ -434,7 +447,12 @@ export function normalizeAnthropicMessages(
   }
 
   const merged = mergeConsecutiveAnthropicMessages(mapped, { preserveConsecutiveUser })
-  if (merged.length && merged[0].role !== 'user' && !isEmptyEffortControl(merged[0])) {
+  if (
+    merged.length &&
+    merged[0].role !== 'user' &&
+    !isEmptyEffortControl(merged[0]) &&
+    !isSystemToolControlMessage(merged[0])
+  ) {
     merged.unshift({ role: 'user', content: '.' })
   }
 
@@ -503,6 +521,21 @@ function keptAnthropicMessage(message, role) {
 function messageOutputConfigEffort(message) {
   const effort = message?.output_config?.effort
   return typeof effort === 'string' && effort.trim() ? effort : null
+}
+
+function isSystemToolControlBlock(block) {
+  return block != null && typeof block === 'object' && (block.type === 'tool_addition' || block.type === 'tool_removal')
+}
+
+function isSystemToolControlMessage(message) {
+  const role = String(message?.role || '')
+    .trim()
+    .toLowerCase()
+  return (
+    (role === 'system' || role === 'developer') &&
+    Array.isArray(message?.content) &&
+    message.content.some(isSystemToolControlBlock)
+  )
 }
 
 function isEmptyEffortControl(message) {
