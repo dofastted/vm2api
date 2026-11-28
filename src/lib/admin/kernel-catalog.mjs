@@ -45,6 +45,13 @@ const archFor = (projectRoot, kernel, runtimeOptions) =>
   kernel === 'crag' ? cragTargetArch(projectRoot, runtimeOptions) : 'amd64'
 const CRAG_PINNED_RELEASES = [
   {
+    tag: 'payload-2026.11.28-crag-3.1.31',
+    label: '3.1.31 收口 wire.rs Beta SSOT、门控 diagnostics 注入并移除重复 runtime beta 推导',
+    size: 168956657,
+    manifestSha256: '270fcd28e6e61e597d5425f861c4c7dcda532b7991c31fabcf35ffb552c81cd0',
+    sha256: '58ef8c34d2a8d13451ad221113b7eb17288dfa3600f6fd740e41601c843c51a9',
+  },
+  {
     tag: 'payload-2026.11.28-crag-3.1.30',
     label: '3.1.30 修复顶层 cache_control、Haiku 5.5、count_tokens 与 fast-mode/compact beta 合成',
     size: 168939626,

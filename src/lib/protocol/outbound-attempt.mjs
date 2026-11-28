@@ -285,7 +285,7 @@ export function foldThirdPartyRoleSystemMessages(body) {
   if (!body || typeof body !== 'object' || !Array.isArray(body.messages) || !body.messages.length) return body
   const { moved: extracted, messages: kept, changed } = extractThirdPartySystemMessages(body.messages)
   if (!changed) return body
-  const merged = mergeConsecutiveAnthropicMessages(kept)
+  const merged = mergeConsecutiveAnthropicMessages(kept, { preserveConsecutiveSystem: true })
   if (extracted.length) {
     const firstUser = merged.findIndex((m) => m?.role === 'user')
     if (firstUser >= 0) {
