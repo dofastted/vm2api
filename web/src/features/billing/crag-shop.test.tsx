@@ -1034,6 +1034,38 @@ describe('CRAG buyer presentation and activation wire', () => {
     expect(render()).toContain('此码与当前宿主机或订阅不匹配')
   })
 
+  it('falls back to CRAGGemini redemption when Claude rejects with auth_forbidden', async () => {
+    const code = `CRAGR1.${'q'.repeat(43)}`
+    vi.mocked(api)
+      .mockRejectedValueOnce(
+        new ApiError('claude forbidden', 403, 'auth_forbidden')
+      )
+      .mockResolvedValueOnce({
+        active: true,
+        slot_limit: 10,
+        used_slots: 0,
+        available_slots: 10,
+      })
+
+    render()
+    fillHostCode(code)
+    submitHostCode()
+    await settle()
+
+    expect(api).toHaveBeenNthCalledWith(
+      2,
+      '/api/panel/gemini/crag-subscription/redeem',
+      {
+        method: 'POST',
+        body: JSON.stringify({ redemption_code: code }),
+      }
+    )
+    expect(render()).toContain('已自动识别为 CRAGGemini 兑换码')
+    expect(state.invalidateQueries).toHaveBeenCalledExactlyOnceWith({
+      queryKey: ['panel', 'gemini-environments'],
+    })
+  })
+
   it('lets only admins recover a pending host sync without resubmitting a code', async () => {
     const pending = { state: 'sync_pending', ready: false } as const
     state.hostStatus = pending
@@ -1739,5 +1771,56 @@ describe('CRAG 画布本地缓存、哈希跳过与防超时加载', () => {
       '新版发布画布'
     )
     if (typeof cleanup === 'function') cleanup()
+  })
+
+  it('切换到 CRAGGemini 标签页后走独立 /api/panel/gemini/crag-shop/plans 接口并展示 Gemini 宿主管理区', async () => {
+    const storage = makeStorage()
+    vi.stubGlobal('localStorage', storage)
+    stubBrowserEnv()
+    vi.mocked(api).mockResolvedValueOnce({
+      plans: [
+        {
+          sku: 'gemini-monthly',
+          name: 'CRAGGemini 月卡',
+          term: '1m',
+          amount_minor: 9900,
+          slot_limit: 10,
+          product: 'craggemini',
+          stackable: true,
+        },
+      ],
+      payment_methods: ['alipay'],
+    })
+
+    const initialHtml = render()
+    expect(initialHtml).toContain('Claude CRAG')
+    expect(initialHtml).toContain('CRAGGemini')
+
+    click('CRAGGemini')
+    try {
+      state.values = []
+      state.refs = []
+      state.queries = []
+      vi.mocked(useEffect).mockClear()
+
+      const geminiHtml = render()
+      expect(geminiHtml).toContain('CRAGGemini 订阅')
+      expect(geminiHtml).toContain('本机 CRAGGemini 订阅')
+      expect(geminiHtml).toContain('按订单号取回订阅')
+      expect(geminiHtml).toContain('CRAGGemini 宿主机身份与云端历史订单')
+      expect(geminiHtml).not.toContain('免登录购买到本机')
+      expect(state.queries[0]?.enabled).toBe(false)
+
+      const catalogEffect = vi.mocked(useEffect).mock.calls[1]?.[0]
+      const cleanup = catalogEffect?.()
+      await settle()
+      expect(api).toHaveBeenCalledWith(
+        '/api/panel/gemini/crag-shop/plans',
+        expect.objectContaining({ signal: expect.any(AbortSignal) })
+      )
+      if (typeof cleanup === 'function') cleanup()
+    } finally {
+      click('Claude CRAG')
+    }
   })
 })

@@ -17,9 +17,13 @@ import {
 } from './crag-shop-supplier.mjs'
 
 const ROOT = '/api/panel/crag-shop'
+const GEMINI_ROOT = '/api/panel/gemini/crag-shop'
 const DEVICE_ROOT = `${ROOT}/device`
 const ORDER_PATH =
   /^\/api\/panel\/crag-shop(?:\/device)?\/orders\/([^/]+)(\/(?:claim|resume|cancel|apply|apply-renewal|retry-activation|recover))?$/
+const GEMINI_ORDER_PATH = /^\/api\/panel\/gemini\/crag-shop\/orders\/([^/]+)(\/(?:claim|resume|cancel|apply-renewal))?$/
+export const GEMINI_SHOP_OWNER_PREFIX = 'craggemini:'
+export const GEMINI_CATALOG_CACHE_KEY = 'crag_gemini_shop_catalog_cache_v1'
 const DEVICE_COOKIE = 'kin_crag_device_checkout'
 const MAX_BODY = 4096
 const PAGE_SIZE = 100
@@ -68,7 +72,21 @@ function isCachedCatalogPayload(value) {
 }
 
 export const isCragShopPath = (pathname) => pathname === ROOT || pathname.startsWith(`${ROOT}/`)
+export const isGeminiCragShopPath = (pathname) => pathname === GEMINI_ROOT || pathname.startsWith(`${GEMINI_ROOT}/`)
 export const isCragDeviceShopPath = (pathname) => pathname.startsWith(`${DEVICE_ROOT}/`)
+
+export function geminiCragShopRoute(method, pathname) {
+  if (method === 'GET' && pathname === `${GEMINI_ROOT}/plans`) return 'plans'
+  if (method === 'POST' && pathname === `${GEMINI_ROOT}/quote`) return 'quote'
+  if (pathname === `${GEMINI_ROOT}/orders`) return method === 'GET' ? 'list' : method === 'POST' ? 'create' : null
+  const match = GEMINI_ORDER_PATH.exec(pathname)
+  if (!match) return null
+  if (match[2]) {
+    if (method !== 'POST') return null
+    return match[2].slice(1)
+  }
+  return method === 'GET' ? 'status' : null
+}
 
 export function cragShopRoute(method, pathname) {
   const device = isCragDeviceShopPath(pathname)
@@ -608,6 +626,10 @@ export function createCragShopHandler({
   supplier = createShopSupplier(),
   catalogCacheTtlMs = CATALOG_FRESH_MS,
   nowMs = () => Date.now(),
+  ownerPrefix = '',
+  catalogCacheKey = CATALOG_CACHE_KEY,
+  orderPathPattern = ORDER_PATH,
+  deviceEnabled = true,
 }) {
   const project = (row) => view(row, activationEnabled)
   const catalogCache = new Map()
@@ -624,7 +646,7 @@ export function createCragShopHandler({
     if (!db || hydratedDb === db) return
     hydratedDb = db
     try {
-      const row = db.prepare('SELECT value FROM settings WHERE key = ?').get(CATALOG_CACHE_KEY)
+      const row = db.prepare('SELECT value FROM settings WHERE key = ?').get(catalogCacheKey)
       if (!row?.value) return
       const parsed = JSON.parse(row.value)
       if (!object(parsed)) return
@@ -668,7 +690,7 @@ export function createCragShopHandler({
       db.prepare(`
         INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)
         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
-      `).run(CATALOG_CACHE_KEY, JSON.stringify(snapshot), new Date(nowMs()).toISOString())
+      `).run(catalogCacheKey, JSON.stringify(snapshot), new Date(nowMs()).toISOString())
     } catch {
       // Cache persistence is best-effort and must never fail plan delivery.
     }
@@ -806,7 +828,7 @@ export function createCragShopHandler({
     if (order?.direct_credit !== true || order?.status !== 'fulfilled') return row
     if (typeof subscription?.status === 'function') {
       try {
-        await subscription.status()
+        await subscription.status({ sync: true })
       } catch {
         // Authority pull is best-effort; status polling will also converge.
       }
@@ -910,13 +932,23 @@ export function createCragShopHandler({
     expiring = true
     try {
       const db = getDb()
-      const row = db
-        .prepare(`SELECT * FROM crag_shop_orders
-        WHERE dispatch_state = 'submitted' AND status IN ('reserved', 'pending')
-          AND closed_at IS NULL
-          AND reserved_at IS NOT NULL AND reserved_at <= ?
-        ORDER BY reserved_at, order_id LIMIT 1`)
-        .get(nowSeconds() - PAYMENT_WINDOW)
+      const row = ownerPrefix
+        ? db
+            .prepare(`SELECT * FROM crag_shop_orders
+            WHERE dispatch_state = 'submitted' AND status IN ('reserved', 'pending')
+              AND closed_at IS NULL
+              AND owner LIKE ?
+              AND reserved_at IS NOT NULL AND reserved_at <= ?
+            ORDER BY reserved_at, order_id LIMIT 1`)
+            .get(`${ownerPrefix}%`, nowSeconds() - PAYMENT_WINDOW)
+        : db
+            .prepare(`SELECT * FROM crag_shop_orders
+            WHERE dispatch_state = 'submitted' AND status IN ('reserved', 'pending')
+              AND closed_at IS NULL
+              AND owner NOT LIKE ?
+              AND reserved_at IS NOT NULL AND reserved_at <= ?
+            ORDER BY reserved_at, order_id LIMIT 1`)
+            .get(`${GEMINI_SHOP_OWNER_PREFIX}%`, nowSeconds() - PAYMENT_WINDOW)
       if (!row) return
       // A reserved order never returned a checkout form, so no payment link ever
       // reached the buyer. Anything else has one, so ask the supplier before closing:
@@ -954,13 +986,23 @@ export function createCragShopHandler({
       const db = getDb()
       const now = nowSeconds()
       // At most one in-flight order per process; a crashed lease expires on restart.
-      const row = db
-        .prepare(`SELECT * FROM crag_shop_orders
-        WHERE dispatch_state = 'submitted' AND activation_vm_id IS NOT NULL
-          AND closed_at IS NULL
-          AND activation_next_at IS NOT NULL AND activation_next_at <= ?
-        ORDER BY activation_next_at, order_id LIMIT 1`)
-        .get(now)
+      const row = ownerPrefix
+        ? db
+            .prepare(`SELECT * FROM crag_shop_orders
+            WHERE dispatch_state = 'submitted' AND activation_vm_id IS NOT NULL
+              AND closed_at IS NULL
+              AND owner LIKE ?
+              AND activation_next_at IS NOT NULL AND activation_next_at <= ?
+            ORDER BY activation_next_at, order_id LIMIT 1`)
+            .get(`${ownerPrefix}%`, now)
+        : db
+            .prepare(`SELECT * FROM crag_shop_orders
+            WHERE dispatch_state = 'submitted' AND activation_vm_id IS NOT NULL
+              AND closed_at IS NULL
+              AND owner NOT LIKE ?
+              AND activation_next_at IS NOT NULL AND activation_next_at <= ?
+            ORDER BY activation_next_at, order_id LIMIT 1`)
+            .get(`${GEMINI_SHOP_OWNER_PREFIX}%`, now)
       if (!row) return
 
       const lease = now + ACTIVATION_LEASE
@@ -1070,11 +1112,12 @@ export function createCragShopHandler({
   async function handleCragShop(req, res, url, route) {
     try {
       res.setHeader?.('Cache-Control', 'no-store')
-      const device = isCragDeviceShopPath(url.pathname)
-      let owner = buyerOwner(req)
+      const device = deviceEnabled && isCragDeviceShopPath(url.pathname)
+      const rawOwner = buyerOwner(req)
+      let owner = rawOwner ? `${ownerPrefix}${rawOwner}` : null
       const ok = (data) => json(res, 200, { ok: true, data })
-      if (!device && route === 'plans') return await servePlans(req, res, url, { allowPilot: !!owner })
-      if (!device && !owner) {
+      if (!device && route === 'plans') return await servePlans(req, res, url, { allowPilot: !!rawOwner })
+      if (!device && !rawOwner) {
         // A valid panel session with no buyer binding is not the same as not being signed
         // in, and "sign in" is advice such a user cannot act on — they already are. The
         // binding is written at sign-in, so signing in again is what actually fixes it.
@@ -1123,11 +1166,11 @@ export function createCragShopHandler({
       }
       if (route === 'activation-targets') {
         const targets =
-          activationEnabled && isActivationAdmin(owner) && subscription?.listOrderTargets
+          activationEnabled && isActivationAdmin(rawOwner) && subscription?.listOrderTargets
             ? await subscription.listOrderTargets()
             : []
         return ok({
-          targets: (isActivationAdmin(owner) ? targets : []).filter(isCragOrderVmId).map((vm_id) => ({ vm_id })),
+          targets: (isActivationAdmin(rawOwner) ? targets : []).filter(isCragOrderVmId).map((vm_id) => ({ vm_id })),
         })
       }
       if (route === 'quote') {
@@ -1158,9 +1201,10 @@ export function createCragShopHandler({
       }
       if (route === 'create') {
         const input = createInput(await readInput(req, readRawBody, false))
+        if (ownerPrefix && input.vm_id) throw badBody()
         if (device && (input.sku === 'renewal' || input.vm_id)) throw deviceOptionDenied()
         if (input.sku === 'renewal') requireAdmin(req)
-        if (input.vm_id) requireActivationAdmin(owner)
+        if (input.vm_id) requireActivationAdmin(rawOwner)
         const key = receiptKey(db)
         const { coupon, ...selection } = input.purchase
         const purchase_json = JSON.stringify({
@@ -1173,7 +1217,7 @@ export function createCragShopHandler({
           db,
           owner,
           { ...input, purchase_json },
-          (id) => pinTarget(owner, id),
+          (id) => pinTarget(rawOwner, id),
           device ? hostId : null,
         )
         if (isClosed(row)) return ok(project(row))
@@ -1210,7 +1254,7 @@ export function createCragShopHandler({
           if (quote.amount_minor !== row.expected_amount_minor)
             throw failure(409, 'shop_price_changed', 'Price changed; request a new quote and use a new request ID')
         }
-        if (row.activation_vm_id && (await pinTarget(owner, row.activation_vm_id)) !== row.activation_fingerprint)
+        if (row.activation_vm_id && (await pinTarget(rawOwner, row.activation_vm_id)) !== row.activation_fingerprint)
           throw unavailableTarget()
         const dispatch = durable(db, () =>
           db
@@ -1222,7 +1266,7 @@ export function createCragShopHandler({
         const reply = await supplier.create(row, receipt, proof, supplierPurchase, supplierOptions)
         return await result(reply)
       }
-      const orderId = ORDER_PATH.exec(url.pathname)?.[1]
+      const orderId = orderPathPattern.exec(url.pathname)?.[1]
       if (!orderId || !isOrderId(orderId)) throw missingOrder()
       if (route === 'recover') {
         const body = await readInput(req, readRawBody, true)
@@ -1339,7 +1383,7 @@ export function createCragShopHandler({
         return ok(project(findOrder(db, owner, row.order_id)))
       }
       if (route === 'retry-activation') {
-        requireActivationAdmin(owner)
+        requireActivationAdmin(rawOwner)
         if (!row.activation_vm_id) throw failure(409, 'shop_activation_not_pinned', 'This order uses manual activation')
         if (!activationEnabled) throw failure(503, 'shop_activation_disabled', 'Automatic CRAG activation is disabled')
         const now = nowSeconds()
@@ -1446,4 +1490,16 @@ export function createCragShopHandler({
   }
 
   return Object.assign(handleCragShop, { pollActivation, pollOrderExpiry, warmPlans })
+}
+
+export function createGeminiCragShopHandler(options) {
+  return createCragShopHandler({
+    ...options,
+    activationEnabled: false,
+    deviceEnabled: false,
+    ownerPrefix: GEMINI_SHOP_OWNER_PREFIX,
+    catalogCacheKey: GEMINI_CATALOG_CACHE_KEY,
+    orderPathPattern: GEMINI_ORDER_PATH,
+    supplier: options.supplier ?? createShopSupplier(globalThis.fetch, { pathPrefix: '/gemini' }),
+  })
 }
