@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.4.248 — 2026-11-28 · 面板「席位」统一更名为「执行位」
+
+- **面板文案：`session_slots`「席位」统一更名为「执行位」（#2043，拆自 #1970）**：
+  - `web/src/features/vm/{list-page,vm-detail-card,vm-list-table,vm-rack,vm-rack-blade,vm-scheduling}.tsx` 与 `web/src/features/settings/pool-pane.tsx` 中面板可见的「席位 / 席位上限 / 席位占用 / 席位与流量」改为「执行位」口径，并澄清「物理执行位」与「根会话（主会话）数」的说明；仅文案变更，不改任何接口字段与调度行为
+- 测试对齐（#2050）：`web/src/features/vm/vm-list-table.test.tsx` 的 403 文案断言对齐 `gemini-account-status` 现行「Google 403：地区或账号受限」，修复任何改动 `web/` 的 PR 在 `ci / web tests and build` 被基线断言卡住的问题；纯测试改动，无用户可见变化
+- 部署说明：本次改动零数据库迁移、零后端运行时变更，仅前端静态资源与文案；升级无需额外操作。
+
 ## 1.4.247 — 2026-11-28 · API 端点默认 `body_policy` 切为 `caller` 并修复 `/#/api` 开关即时持久化
 
 - **API 端点 `body_policy` 默认透传调用方原始正文并修复 `/#/api` 开关持久化（#2045）**：
