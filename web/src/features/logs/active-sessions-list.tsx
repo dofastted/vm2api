@@ -22,6 +22,21 @@ function formatSpan(ms: number): string {
   return `${Math.floor(ms / 60_000)}m ${Math.floor((ms % 60_000) / 1000)}s`
 }
 
+/** 解析会话当前进行中状态与并发数（兼容蛇形与驼峰字段）。 */
+export function sessionInflightState(session: ActiveSession): {
+  inProgress: boolean
+  inflightCount: number
+} {
+  const rawCount = session.inflight_count ?? session.inflightCount
+  const inflightCount =
+    typeof rawCount === 'number' && Number.isFinite(rawCount) && rawCount > 0
+      ? Math.trunc(rawCount)
+      : 0
+  const flag = session.in_progress ?? session.inProgress
+  const inProgress = flag === true || (flag !== false && inflightCount > 0)
+  return { inProgress, inflightCount }
+}
+
 function SessionListItem({
   session,
   onSelect,
@@ -29,8 +44,9 @@ function SessionListItem({
   session: ActiveSession
   onSelect: (sessionId: string) => void
 }) {
-  const failed = session.lastStatus != null && session.lastStatus >= 400
-  const StatusIcon = failed ? XCircle : CheckCircle
+  const { inProgress, inflightCount } = sessionInflightState(session)
+  const failed = !inProgress && session.lastStatus != null && session.lastStatus >= 400
+  const StatusIcon = inProgress ? Loader2 : failed ? XCircle : CheckCircle
   const provider = session.vmName || session.providerName
   return (
     <button
@@ -43,7 +59,11 @@ function SessionListItem({
         <StatusIcon
           className={cn(
             'h-3.5 w-3.5 flex-shrink-0',
-            failed ? 'text-red-500' : 'text-green-500'
+            inProgress
+              ? 'animate-spin text-sky-500'
+              : failed
+                ? 'text-red-500'
+                : 'text-green-500'
           )}
         />
         <div className='flex min-w-0 items-center gap-1.5'>
@@ -76,6 +96,20 @@ function SessionListItem({
             ) : null}
           </span>
         </div>
+        {inProgress ? (
+          <span
+            data-slot='session-in-progress'
+            className='inline-flex flex-shrink-0 items-center gap-1 rounded-full border border-sky-300 bg-sky-100 px-1.5 py-0.5 text-[10px] leading-none font-medium text-sky-700 dark:border-sky-700 dark:bg-sky-900/30 dark:text-sky-300'
+          >
+            <span className='relative flex h-1.5 w-1.5'>
+              <span className='absolute inline-flex h-full w-full animate-ping rounded-full bg-sky-400 opacity-75' />
+              <span className='relative inline-flex h-1.5 w-1.5 rounded-full bg-sky-500' />
+            </span>
+            <span>
+              {inflightCount > 1 ? `进行中 ×${inflightCount}` : '进行中'}
+            </span>
+          </span>
+        ) : null}
         <div className='ml-auto flex flex-shrink-0 items-center gap-1'>
           <Clock className='h-3 w-3 text-muted-foreground' />
           <span className='font-mono text-xs text-muted-foreground'>
@@ -86,14 +120,14 @@ function SessionListItem({
         </div>
         <div className='flex flex-shrink-0 items-center gap-2 font-mono text-xs'>
           <span className='text-muted-foreground'>
-            {session.requests} 次 · {formatTokenAmount(session.totalTokens)}
+            {session.requests} 次 · {formatTokenAmount(session.totalTokens ?? 0)}
           </span>
           {session.oneOff ? (
             <span className='rounded bg-muted px-1 text-[10px] text-muted-foreground'>
               一次性
             </span>
           ) : null}
-          {session.totalCost > 0 ? (
+          {(session.totalCost ?? 0) > 0 ? (
             <span className='font-medium'>
               {formatCurrency(session.totalCost, 4)}
             </span>
@@ -105,18 +139,26 @@ function SessionListItem({
 }
 
 /**
- * 近 5 分钟有请求的会话（hub `ActiveSessionsList`）。vm2api 请求完成才落库，
- * 没有「进行中」态，所以状态图标只区分末次成功 / 失败；点击改为按会话筛选日志。
+ * 近 5 分钟有请求（含进行中请求）的活跃会话列表。
+ * 轮询行为严格尊重页面自动刷新开关；点击会话条目按该会话筛选日志。
  */
 export function ActiveSessionsList({
   maxHeight = '200px',
+  autoRefreshEnabled = true,
   onSelectSession,
 }: {
   maxHeight?: string
+  autoRefreshEnabled?: boolean
   onSelectSession: (sessionId: string) => void
 }) {
-  const { data, isLoading } = useQuery(activeSessionsQueryOptions())
+  const { data, isLoading } = useQuery(
+    activeSessionsQueryOptions(autoRefreshEnabled)
+  )
   const sessions = data?.sessions ?? []
+  const inProgressCount = sessions.reduce(
+    (sum, s) => sum + (sessionInflightState(s).inProgress ? 1 : 0),
+    0
+  )
   return (
     <div className='rounded-lg border bg-card'>
       <div className='flex items-center justify-between border-b px-4 py-3'>
@@ -128,6 +170,12 @@ export function ActiveSessionsList({
             {data?.oneOffTotal ? ` + ${data.oneOffTotal} 个一次性` : ''}，
             {data?.minutes ?? 5} 分钟内
           </span>
+          {inProgressCount > 0 ? (
+            <span className='inline-flex items-center gap-1 rounded-full border border-sky-300 bg-sky-100 px-1.5 py-0.5 text-[10px] leading-none font-medium text-sky-700 dark:border-sky-700 dark:bg-sky-900/30 dark:text-sky-300'>
+              <span className='h-1.5 w-1.5 rounded-full bg-sky-500' />
+              {inProgressCount} 进行中
+            </span>
+          ) : null}
         </div>
       </div>
       <div style={{ maxHeight }} className='overflow-y-auto'>

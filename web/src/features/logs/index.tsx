@@ -239,6 +239,7 @@ export function LogsPage() {
       <div className='space-y-3'>
         <ActiveSessionsList
           maxHeight='200px'
+          autoRefreshEnabled={!isFullscreen && isAutoRefresh}
           onSelectSession={(sessionId) => {
             applyFilters({ ...filters, sessionId })
             setIsFilterOpen(true)

@@ -10,6 +10,7 @@ import {
   DollarSign,
   Globe,
   InfoIcon,
+  Loader2,
   Monitor,
   Settings2,
   ShieldAlert,
@@ -35,7 +36,10 @@ import {
   cacheWriteSplit,
   effectiveMultiplier,
   hasFastMode,
+  isInFlightLog,
   isSuccessStatus,
+  livePhaseLabel,
+  resolveLiveMeta,
   resolveModelAuditDisplay,
 } from '../log-display'
 
@@ -290,6 +294,8 @@ export function SummaryTab({
   scrollToRedirect: boolean
 }) {
   const audit = resolveModelAuditDisplay(row)
+  const inFlight = isInFlightLog(row)
+  const live = inFlight ? resolveLiveMeta(row) : null
   const success = isSuccessStatus(row.statusCode)
   const rate = calculateOutputRate(row.outputTokens, row.generationMs)
   const totalTokens = row.totalTokens
@@ -326,20 +332,26 @@ export function SummaryTab({
       <div
         className={cn(
           'flex items-center gap-4 rounded-lg border p-4',
-          success
-            ? 'border-emerald-200 bg-emerald-50 dark:border-emerald-800 dark:bg-emerald-950/20'
-            : 'border-rose-200 bg-rose-50 dark:border-rose-800 dark:bg-rose-950/20'
+          inFlight
+            ? 'border-sky-200 bg-sky-50 dark:border-sky-800 dark:bg-sky-950/20'
+            : success
+              ? 'border-emerald-200 bg-emerald-50 dark:border-emerald-800 dark:bg-emerald-950/20'
+              : 'border-rose-200 bg-rose-50 dark:border-rose-800 dark:bg-rose-950/20'
         )}
       >
         <div
           className={cn(
             'flex h-12 w-12 items-center justify-center rounded-full',
-            success
-              ? 'bg-emerald-100 dark:bg-emerald-900/30'
-              : 'bg-rose-100 dark:bg-rose-900/30'
+            inFlight
+              ? 'bg-sky-100 dark:bg-sky-900/30'
+              : success
+                ? 'bg-emerald-100 dark:bg-emerald-900/30'
+                : 'bg-rose-100 dark:bg-rose-900/30'
           )}
         >
-          {success ? (
+          {inFlight ? (
+            <Loader2 className='h-6 w-6 animate-spin text-sky-600' />
+          ) : success ? (
             <CheckCircle className='h-6 w-6 text-emerald-600' />
           ) : (
             <AlertCircle className='h-6 w-6 text-rose-600' />
@@ -348,9 +360,13 @@ export function SummaryTab({
         <div>
           <div className='flex items-center gap-2'>
             <span className='text-lg font-semibold'>
-              {row.statusCode ?? '未知'}
+              {inFlight ? livePhaseLabel(live?.phase) : (row.statusCode ?? '未知')}
             </span>
-            {row.statusCode != null ? (
+            {inFlight ? (
+              <Badge variant='outline' className='text-xs'>
+                进行中
+              </Badge>
+            ) : row.statusCode != null ? (
               <Badge
                 variant={success ? 'default' : 'destructive'}
                 className='text-xs'
@@ -365,9 +381,11 @@ export function SummaryTab({
             ) : null}
           </div>
           <p className='text-sm text-muted-foreground'>
-            {success
-              ? '请求成功完成'
-              : '请求失败，以下是详细的错误信息和虚拟机决策链'}
+            {inFlight
+              ? '请求仍在处理中，完成后将自动更新最终状态与用量'
+              : success
+                ? '请求成功完成'
+                : '请求失败，以下是详细的错误信息和虚拟机决策链'}
           </p>
         </div>
       </div>
@@ -676,13 +694,13 @@ export function SummaryTab({
         </div>
       ) : null}
 
-      {row.specialSettings.length ? (
+      {(row.specialSettings ?? []).length ? (
         <div className='space-y-2'>
           <SectionTitle icon={Settings2} color='text-purple-600'>
             特殊设置
           </SectionTitle>
           <div className='flex flex-wrap gap-2 rounded-lg border bg-card p-4'>
-            {row.specialSettings.map((setting) => (
+            {(row.specialSettings ?? []).map((setting) => (
               <Badge
                 key={setting.key}
                 variant='outline'
