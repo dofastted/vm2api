@@ -1172,6 +1172,15 @@ test('Stage 2B dashboard: no sync clearExpired, scheduler L1 / PG async runtime 
     assert.equal(res1.data.ops.ttft.p95_ms, 55)
     assert.equal(res1.data.ops.sticky.hits, 4)
 
+    // Raw pgPool queries must never emit SQLite-only IFNULL() (PG throws "function ifnull(...) does not exist")
+    for (const q of pgQueries) {
+      assert.doesNotMatch(q, /\bIFNULL\s*\(/i, `raw pgPool SQL must not contain IFNULL(): ${q}`)
+    }
+    assert.ok(
+      pgQueries.some((q) => /COALESCE\(error_code/i.test(q)),
+      'windowStatsAsync ingress_hits query must convert IFNULL to PostgreSQL COALESCE()',
+    )
+
     // Second call within SWR window reuses cached totalsAsync & windowStatsAsync with 0 new PG queries
     const beforeQueries = pgQueries.length
     const t2 = await reqLog.totalsAsync()
