@@ -45,9 +45,9 @@ Linux amd64 的 vm2api 一键安装和升级默认准备 Gemini（Antigravity CL
 
 管理员创建的 Gemini 专用密钥可以通过 `GET /v1/models` 查询模型，并使用已授权且已拉取该模型的 Google OAuth 环境。协议入口包括 OpenAI Chat Completions、OpenAI Responses、Anthropic Messages、Google `generateContent` / `streamGenerateContent`，以及兼容旧客户端的 `/v1/gemini/sessions/:id`。
 
-公开网关的原生适配支持多轮对话历史、`systemInstruction`（系统指令）、函数工具声明与工具结果（`tools` / `toolConfig`）、常用生成参数（`generationConfig`）以及内联多模态输入（请求体上限 12 MiB）；超出 `NATIVE_CAPABILITIES` 范围的字段仍会明确拒绝，不静默丢弃。CRAGGemini 原生 worker 内部使用 SSE：面向 JSON 请求的公开协议收齐完整回合后再组装对应 JSON，流式端点按上游 SSE 帧转发。Google API 错误和 OpenAI/Anthropic 错误按各自协议形状映射。
+公开网关的原生适配支持多轮对话历史、`systemInstruction`（系统指令）、函数工具声明与工具结果（`tools` / `toolConfig`）、常用生成参数（`generationConfig`）以及内联多模态输入（请求体上限 64 MiB，SHM 请求缓冲默认 `16 MiB`）；超出 `NATIVE_CAPABILITIES` 范围的字段仍会明确拒绝，不静默丢弃。Anthropic `/v1/messages` 与 `/v1/messages/count_tokens` 同步支持带任意 `<provider>/` 前缀的 Gemini 模型（如 `gemini-vm/gemini-4-hydrogen-high`），放行 `master` 密钥及绑定含 Gemini 成员分组池的受管密钥。CRAGGemini 原生 worker 内部使用 SSE：面向 JSON 请求的公开协议收齐完整回合后再组装对应 JSON，流式端点在预提交缓冲确认可见输出后再提交下游响应头与 SSE 帧（提交后发送保活心跳）。Google API 错误和 OpenAI/Anthropic 错误按各自协议形状映射。
 
-OAuth 环境仍由 Gemini host 管理 token、HOME 和代理绑定；请求进入复用的 `PoolScheduler` 账号平衡、in-flight 并发预留和 unit-circuit 状态。每个环境支持配置 `max_concurrency`（`1–64`，默认跟随 `routing.gemini.pool.max_concurrency_per_account`，缺省为 `20`），达到本环境并发上限时在其他符合模型和代理条件的环境中选择。尚未向客户端产出输出前遇到配额限流或上游 `502`/`503`/`504` 等可重试故障时，调度器按 `max_account_switches`（默认 `3` 次）自动切换其他可用环境；一旦回合已产出输出，后续中断或失败不再自动重放到另一账号，客户端应按错误码决定是否重试。每个环境使用自身已绑定 SOCKS5 与独立网络命名空间；模型白名单及 Gemini API key 限额照常执行。
+OAuth 环境仍由 Gemini host 管理 token、HOME 和代理绑定；请求进入复用的 `PoolScheduler` 账号平衡、in-flight 并发预留和 unit-circuit 状态。每个环境支持配置 `max_concurrency`（`1–64`，默认跟随 `routing.gemini.pool.max_concurrency_per_account`，缺省为 `20`），默认单回合超时 `timeout_ms=300000`、流式空闲超时 `idle_timeout_ms=180000`。达到本环境并发上限时在其他符合模型和代理条件的环境中选择。尚未向客户端产出输出前遇到配额限流、空/异常终态输出或上游 `502`/`503`/`504` 等可重试故障时，调度器按 `max_account_switches`（默认 `3` 次）自动切换其他可用环境；遇到 `409` 会话冲突时按规则派生恢复会话并附带 `X-Craggemini-Session-Reset: 1` 重试（并发派生的无头会话隔离到独立随机会话，避免误取消兄弟请求）；一旦回合已产出输出，后续中断或失败不再自动重放到另一账号，客户端应按错误码决定是否重试。每个环境使用自身已绑定 SOCKS5 与独立网络命名空间；模型白名单及 Gemini API key 限额照常执行。
 
 ### 管理员诊断接口
 
@@ -72,7 +72,7 @@ OAuth 环境仍由 Gemini host 管理 token、HOME 和代理绑定；请求进�
 | 入口与额度 | Gemini 会话使用独立入口，不与 Claude、Codex 或 API 直连混合调度。额度按共享组展示 5 小时和每周窗口，逐模型读数单列。 |
 | 协议适配   | 请求先归一化再派发到官方 `agy` 的原生桥，只接受桥明确支持的字段与能力。                                              |
 
-公开网关经协议转换层 [`gemini-convert.mjs`](../src/lib/protocol/gemini-convert.mjs) 将 Gemini `generateContent` / `streamGenerateContent` 请求体、Anthropic Messages、OpenAI Chat Completions 和 Responses 统一转换为 Gemini 请求结构（含 `model`、`contents` 及可选 `systemInstruction`、`tools`、`toolConfig`、`generationConfig`），再由宿主 [`gemini-host.py`](../scripts/gemini-host.py) 校验并组装 `{ request_id, stream: true, body }` 发往目标环境常驻 CRAGGemini 池的 `kernel.sock`（`/internal/v1/messages`），由对应槽位的 `agy` 实例经 `LD_PRELOAD` 原生桥执行（早期单轮纯文本辅助模块 [`native-turn.mjs`](../src/lib/gemini/native-turn.mjs) 仍保留最小信封回归契约）。不支持的字段明确拒绝，不静默丢弃；宿主保留原生 Gemini SSE，不把首个 HTTP 200 当作回合成功，也不自动重试。
+公开网关通过 `/infer-target` 协商内核 `/internal/health` 公布的 `capabilities` 与 `protocol_capabilities`：当目标 CRAGGemini 内核声明支持 `anthropic` / `gemini` 内部线协议与 `provider_result_v2` 时，网关直接通过 `X-Craggemini-Wire-Protocol` 零转换透传原生 Anthropic `/v1/messages` 请求或无损透传 `/v1beta` 请求（附带 `X-Craggemini-Provider-Result: 1`，消费并在向客户端输出前严格剥离 `event: kin_provider_result` / `x-kin-provider-result` 终态元数据），并使用按租户、分组池与 API 密钥作用域隔离的确定性会话 ID（`cs_<sha256>`，故障切号/409 恢复派生 `:r<epoch>` 与 `X-Craggemini-Session-Reset: 1`）；对未声明新能力的旧内核，自动经协议转换层 [`gemini-convert.mjs`](../src/lib/protocol/gemini-convert.mjs) 兼容回退（含旧内核斜杠转义保护），再由宿主 [`gemini-host.py`](../scripts/gemini-host.py) 校验并组装 `{ request_id, stream: true, body }` 发往常驻 CRAGGemini 池的 `kernel.sock`（`/internal/v1/messages`），由对应槽位的 `agy` 实例经 `LD_PRELOAD` 原生桥执行（早期单轮纯文本辅助模块 [`native-turn.mjs`](../src/lib/gemini/native-turn.mjs) 仍保留最小信封回归契约）。不支持的字段明确拒绝，不静默丢弃；宿主与调度器不把首个 HTTP 200 或空/纯思考回合当作成功。
 
 宿主解析 Gemini SSE 时同时接受顶层 `candidates`／`usageMetadata` 和 Code Assist 的 `response` 包装；无有效结束帧仍按失败处理。Unix socket 回归覆盖包装帧的文本、结束原因与用量。CRAGGemini 独立 worker 的真实 OAuth 验证不等于 vm2api 验收：还需将含 Code Assist 捕获修复的签名载荷接入 vm2api，再从网关端发起真实 OAuth 回合。
 

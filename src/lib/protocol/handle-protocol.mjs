@@ -1478,9 +1478,15 @@ export function createHandleProtocol(deps) {
 
     const rawInboundBackend = resolveInferenceBackend(req)
     const inboundKeyPolicy = req.apiKeyKind === 'managed' ? keyTierPolicyFromRecord(req.apiKeyRecord) : null
-    if (
+    const inboundGroupType = keyScopeFromRequest(req).group_type
+    const hasExplicitGeminiPoolIntent =
       req.apiKeyKind === 'managed' &&
-      keyScopeFromRequest(req).group_type === 'all' &&
+      hasExplicitPoolIntent(req, { requestedPoolId: requestedPoolIdFromHeaders(req?.headers || {}) })
+    const canRouteAntigravityKey =
+      req.apiKeyKind === 'master' ||
+      (req.apiKeyKind === 'managed' && (inboundGroupType === 'all' || hasExplicitGeminiPoolIntent))
+    if (
+      canRouteAntigravityKey &&
       rawInboundBackend !== 'api' &&
       isAntigravityRoutedModel(inbound?.model) &&
       (protocol === 'openai.chat' || protocol === 'openai.responses' || protocol === 'anthropic.messages') &&
@@ -1529,7 +1535,7 @@ export function createHandleProtocol(deps) {
         }
       }
       if (!preferGeminiApiChannel) {
-        // Bypass #4 closed: `all` key + Antigravity model must pass pool
+        // Bypass #4 closed: `all` / `master` / pool-bound key + Antigravity model must pass pool
         // Fail-Closed authorization AND unified pre-dispatch JEV BEFORE delegating.
         const bypassOwnerScope = ownerScopeFromRequest(req, apiKeyStore?.users)
         if (
@@ -1547,39 +1553,45 @@ export function createHandleProtocol(deps) {
           ownerScope: bypassOwnerScope,
           geminiEnvs: Array.isArray(preloadedGeminiCatalog?.accounts) ? preloadedGeminiCatalog.accounts : null,
         })
-        if (!bypassPoolAccess.ok) {
-          return rejectPoolAccess(res, bypassPoolAccess, logBag, protocol)
-        }
-        req._poolAccess = bypassPoolAccess
-        if (bypassPoolAccess.effectivePool?.id) {
-          logBag.resolved_pool_id = bypassPoolAccess.effectivePool.id
-        }
-        if (bypassPoolAccess.effectivePool?.jev_profile) {
-          req.poolJevProfile = bypassPoolAccess.effectivePool.jev_profile
-        }
-        if (
-          await applyProtocolIntercept({
-            ...gateArgs,
-            body: inbound,
-            poolJevProfile: bypassPoolAccess.effectivePool?.jev_profile || req.poolJevProfile || null,
-            zeroInject: isPoolZeroInjectMode(bypassPoolAccess.effectivePool, getRouting() || {}, {
-              nodeProvider: 'google',
-            }),
-            channel: 'gemini',
-            enforceHardAndJev: true,
-            backend: 'oauth',
-            apiPlatform: false,
+        const poolGrantsGemini =
+          req.apiKeyKind === 'master' ||
+          inboundGroupType === 'all' ||
+          (bypassPoolAccess.ok && !bypassPoolAccess.legacy && (bypassPoolAccess.allowedGeminiEnvIds?.length || 0) > 0)
+        if (poolGrantsGemini) {
+          if (!bypassPoolAccess.ok) {
+            return rejectPoolAccess(res, bypassPoolAccess, logBag, protocol)
+          }
+          req._poolAccess = bypassPoolAccess
+          if (bypassPoolAccess.effectivePool?.id) {
+            logBag.resolved_pool_id = bypassPoolAccess.effectivePool.id
+          }
+          if (bypassPoolAccess.effectivePool?.jev_profile) {
+            req.poolJevProfile = bypassPoolAccess.effectivePool.jev_profile
+          }
+          if (
+            await applyProtocolIntercept({
+              ...gateArgs,
+              body: inbound,
+              poolJevProfile: bypassPoolAccess.effectivePool?.jev_profile || req.poolJevProfile || null,
+              zeroInject: isPoolZeroInjectMode(bypassPoolAccess.effectivePool, getRouting() || {}, {
+                nodeProvider: 'google',
+              }),
+              channel: 'gemini',
+              enforceHardAndJev: true,
+              backend: 'oauth',
+              apiPlatform: false,
+            })
+          ) {
+            return
+          }
+          req.body = inbound
+          return (deps.handleGeminiPublic || deps.handleGeminiMessages)(req, res, {
+            logBag,
+            logCtx,
+            preDispatchDecision: req._preDispatchDecision || null,
+            ...(preloadedGeminiCatalog ? { catalogSnapshot: preloadedGeminiCatalog } : {}),
           })
-        ) {
-          return
         }
-        req.body = inbound
-        return (deps.handleGeminiPublic || deps.handleGeminiMessages)(req, res, {
-          logBag,
-          logCtx,
-          preDispatchDecision: req._preDispatchDecision || null,
-          ...(preloadedGeminiCatalog ? { catalogSnapshot: preloadedGeminiCatalog } : {}),
-        })
       }
     }
 
@@ -1836,7 +1848,13 @@ export function createHandleProtocol(deps) {
         let hasOwnedVm = false
         const vmDeniedByResourcePin =
           keyScope.permission_tier === 'resource' && !keyScope.vm_pool_id && (keyScope.allowed_vms?.length || 0) === 0
-        if (!vmDeniedByResourcePin && keyScope.group_type !== 'gemini' && cfg.paths?.project) {
+        if (
+          !vmDeniedByResourcePin &&
+          keyScope.group_type !== 'gemini' &&
+          targetPlatform &&
+          !isAntigravityRoutedModel(ctx.body?.model) &&
+          cfg.paths?.project
+        ) {
           try {
             hasOwnedVm = listVms(cfg.paths.project).some(
               (vm) =>
@@ -1844,7 +1862,7 @@ export function createHandleProtocol(deps) {
                 vm.schedulable !== false &&
                 vmMatchesOwnerScope(vm, reqOwnerScope) &&
                 keyAllowsVm(keyScope, vm) &&
-                (!targetPlatform || vmGroupType(vm) === targetPlatform),
+                vmGroupType(vm) === targetPlatform,
             )
           } catch {
             hasOwnedVm = false
