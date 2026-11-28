@@ -804,6 +804,7 @@ export class RequestLogStore {
       stream = null,
       has_tools = null,
       phase = 'routing',
+      res = null,
     } = {},
   ) {
     const requestId = newRequestId(req)
@@ -833,52 +834,135 @@ export class RequestLogStore {
       // readable by the owning tenant; only the operator's configured mode may
       // enable them, never the caller's x-kin-debug / x-kin-log header.
       capture_outbound: this.mode === 'debug',
+      _liveSettled: false,
+      _detachLifecycle: null,
     }
 
     if (mode !== 'off') {
-      try {
-        const liveLogs = this._getCache()?.liveLogs
-        if (liveLogs && typeof liveLogs.startRequest === 'function') {
-          const resolvedUserId = user_id ?? req?.apiKeyRecord?.user_id ?? null
-          const resolvedVmOwnerId = vm_id ? this._resolveVmOwner(vm_id) : null
-          const resolvedOwnerId = owner_user_id ?? resolvedUserId ?? resolvedVmOwnerId ?? null
-          const resolvedKeyId = api_key_id ?? req?.apiKeyRecord?.id ?? null
-          const resolvedSessionKey = session_key || session_id || outbound_session_id || null
-          Promise.resolve(
-            liveLogs.startRequest(requestId, {
-              request_id: requestId,
-              started_at: t0,
-              created_at: new Date(t0).toISOString(),
-              log_mode: mode,
-              method,
-              path: cleanPath,
-              endpoint: cleanPath,
-              protocol,
-              model: model || null,
-              requested_model: model || null,
-              stream: stream == null ? null : !!stream,
-              has_tools: has_tools == null ? null : !!has_tools,
-              user_id: resolvedUserId ?? null,
-              owner_user_id: resolvedOwnerId ?? null,
-              vm_owner_user_id: resolvedVmOwnerId ?? null,
-              api_key_id: resolvedKeyId ?? null,
-              session_key: resolvedSessionKey,
-              session_id: session_id ?? resolvedSessionKey ?? null,
-              outbound_session_id: outbound_session_id ?? null,
-              client_ip: ip || null,
-              ip_address: ip || null,
-              user_agent: userAgent || null,
-              vm_id: vm_id || null,
-              account_id: account_id || null,
-              phase,
-              attempt_count: 0,
-            }),
-          ).catch(() => {})
-        }
-      } catch {}
+      const alreadyClosed =
+        Boolean(req?.aborted) ||
+        (req?.destroyed === true && req?.complete === false) ||
+        Boolean(res && (res.destroyed || res.closed) && !res.writableFinished)
+      if (alreadyClosed) {
+        ctx._liveSettled = true
+      } else {
+        try {
+          const liveLogs = this._getCache()?.liveLogs
+          if (liveLogs && typeof liveLogs.startRequest === 'function') {
+            const resolvedUserId = user_id ?? req?.apiKeyRecord?.user_id ?? null
+            const resolvedVmOwnerId = vm_id ? this._resolveVmOwner(vm_id) : null
+            const resolvedOwnerId = owner_user_id ?? resolvedUserId ?? resolvedVmOwnerId ?? null
+            const resolvedKeyId = api_key_id ?? req?.apiKeyRecord?.id ?? null
+            const resolvedSessionKey = session_key || session_id || outbound_session_id || null
+            Promise.resolve(
+              liveLogs.startRequest(requestId, {
+                request_id: requestId,
+                started_at: t0,
+                created_at: new Date(t0).toISOString(),
+                log_mode: mode,
+                method,
+                path: cleanPath,
+                endpoint: cleanPath,
+                protocol,
+                model: model || null,
+                requested_model: model || null,
+                stream: stream == null ? null : !!stream,
+                has_tools: has_tools == null ? null : !!has_tools,
+                user_id: resolvedUserId ?? null,
+                owner_user_id: resolvedOwnerId ?? null,
+                vm_owner_user_id: resolvedVmOwnerId ?? null,
+                api_key_id: resolvedKeyId ?? null,
+                session_key: resolvedSessionKey,
+                session_id: session_id ?? resolvedSessionKey ?? null,
+                outbound_session_id: outbound_session_id ?? null,
+                client_ip: ip || null,
+                ip_address: ip || null,
+                user_agent: userAgent || null,
+                vm_id: vm_id || null,
+                account_id: account_id || null,
+                phase,
+                attempt_count: 0,
+              }),
+            ).catch(() => {})
+          }
+        } catch {}
+        this.bindLifecycle(ctx, req, res)
+      }
     }
 
     return ctx
+  }
+
+  _detachLifecycle(ctx) {
+    if (!ctx || typeof ctx._detachLifecycle !== 'function') return
+    const detach = ctx._detachLifecycle
+    ctx._detachLifecycle = null
+    try {
+      detach()
+    } catch {}
+  }
+
+  /**
+   * Bind idempotent abort/close listeners on `req` and `res` so client disconnects,
+   * timeouts, or premature socket closes that never emit `res` `finish` still
+   * clean up `live:inflight` and `live:sess:conc:*` via `liveLogs.finishRequest(id, null)`.
+   */
+  bindLifecycle(ctx, req = null, res = null) {
+    if (!ctx || ctx.mode === 'off' || ctx._liveSettled) return () => {}
+    this._detachLifecycle(ctx)
+    if (
+      req?.aborted ||
+      (req?.destroyed === true && req?.complete === false) ||
+      (res && (res.destroyed || res.closed) && !res.writableFinished)
+    ) {
+      this.abort(ctx)
+      return () => {}
+    }
+    const cleanups = []
+    const onAbort = () => {
+      this.abort(ctx)
+    }
+    const onReqClose = () => {
+      if (req?.aborted || req?.complete === false) {
+        this.abort(ctx)
+      }
+    }
+    const onResClose = () => {
+      if (!res?.writableFinished) {
+        this.abort(ctx)
+      }
+    }
+    const bind = (emitter, event, fn) => {
+      if (!emitter || typeof emitter.once !== 'function') return
+      emitter.once(event, fn)
+      cleanups.push(() => {
+        try {
+          if (typeof emitter.off === 'function') emitter.off(event, fn)
+          else if (typeof emitter.removeListener === 'function') emitter.removeListener(event, fn)
+        } catch {}
+      })
+    }
+    bind(req, 'aborted', onAbort)
+    bind(req, 'close', onReqClose)
+    bind(res, 'close', onResClose)
+    const detach = () => {
+      if (ctx._detachLifecycle === detach) ctx._detachLifecycle = null
+      for (const fn of cleanups.splice(0)) fn()
+    }
+    ctx._detachLifecycle = detach
+    return detach
+  }
+
+  /**
+   * Idempotently settle an in-flight request that aborted, disconnected, or exited
+   * early without reaching `finish()`, cleaning up `live:inflight` and `live:sess:conc:*`.
+   */
+  abort(ctx) {
+    if (!ctx || ctx.mode === 'off' || ctx._liveSettled) return false
+    ctx._liveSettled = true
+    this._detachLifecycle(ctx)
+    this._finishLive(ctx.request_id, null)
+    return true
   }
 
   /**
@@ -977,6 +1061,8 @@ export class RequestLogStore {
    */
   finish(ctx, extra = {}) {
     if (!ctx || ctx.mode === 'off') return null
+    ctx._liveSettled = true
+    this._detachLifecycle(ctx)
     const duration_ms = Math.max(0, Date.now() - (ctx.t0 || Date.now()))
     if (extra.merge_into_request_id) {
       this._finishLive(ctx.request_id, null)

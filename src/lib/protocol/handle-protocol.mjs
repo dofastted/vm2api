@@ -1232,8 +1232,39 @@ export function createHandleProtocol(deps) {
     return acceptAssistantHop(workerResult)
   }
 
+  function settleProtocolLogOnExit(res, logCtx, threw = false) {
+    if (!logCtx || logCtx._liveSettled) return
+    if (threw || !res?.writableEnded || res?.destroyed || res?.closed) {
+      requestLog.abort?.(logCtx)
+    }
+  }
+
+  function onResponseFinishOnce(res, fn) {
+    let fired = false
+    const wrapped = () => {
+      if (fired) return
+      fired = true
+      fn()
+    }
+    if (typeof res?.on === 'function') res.on('finish', wrapped)
+    else if (typeof res?.once === 'function') res.once('finish', wrapped)
+  }
+
   async function handleProtocol(req, res, protocol, pathName, routeMeta = null) {
     const logCtx = requestLog.start(req, { protocol, pathName })
+    requestLog.bindLifecycle?.(logCtx, req, res)
+    let threw = false
+    try {
+      return await runHandleProtocol(req, res, protocol, pathName, routeMeta, logCtx)
+    } catch (err) {
+      threw = true
+      throw err
+    } finally {
+      settleProtocolLogOnExit(res, logCtx, threw)
+    }
+  }
+
+  async function runHandleProtocol(req, res, protocol, pathName, routeMeta, logCtx) {
     res._kinRequestId = logCtx.request_id
     // Registers its own 'finish' listener first so status/headers are final when finish() runs.
     requestLog.tapResponse?.(logCtx, res)
@@ -1280,17 +1311,19 @@ export function createHandleProtocol(deps) {
     }
     res.once('close', discardToolPrune)
     req.once('aborted', discardToolPrune)
-    res.on('finish', () => {
-      const usage = logBag.usage || {}
-      toolPruneAttempt?.commit({
-        verified: res.statusCode === 200 && logBag.final_state === 'verified',
-        attemptCount: logBag.attempt_count,
-        inputTokens:
-          Number(usage.input_tokens || 0) +
-          Number(usage.cache_read_tokens ?? usage.cache_read_input_tokens ?? 0) +
-          Number(usage.cache_creation_tokens ?? usage.cache_creation_input_tokens ?? 0),
-        outputTokens: Number(usage.output_tokens || 0),
-      })
+    onResponseFinishOnce(res, () => {
+      try {
+        const usage = logBag.usage || {}
+        toolPruneAttempt?.commit({
+          verified: res.statusCode === 200 && logBag.final_state === 'verified',
+          attemptCount: logBag.attempt_count,
+          inputTokens:
+            Number(usage.input_tokens || 0) +
+            Number(usage.cache_read_tokens ?? usage.cache_read_input_tokens ?? 0) +
+            Number(usage.cache_creation_tokens ?? usage.cache_creation_input_tokens ?? 0),
+          outputTokens: Number(usage.output_tokens || 0),
+        })
+      } catch {}
       try {
         const groupId = req.apiKeyRecord?.group_id ?? 1
         requestLog.finish(logCtx, {
@@ -1302,7 +1335,9 @@ export function createHandleProtocol(deps) {
           rate_multiplier: resolveGroupRate(req),
           ...logBag,
         })
-      } catch {}
+      } catch {
+        requestLog.abort?.(logCtx)
+      }
     })
     if (!(await authenticateRequest(req, res))) {
       logBag.error_code = req.authError?.code || ErrorCode.INVALID_API_KEY
@@ -4626,6 +4661,19 @@ export function createHandleProtocol(deps) {
   async function handleSearch(req, res, pathName) {
     const protocol = 'openai.search'
     const logCtx = requestLog.start(req, { protocol, pathName })
+    requestLog.bindLifecycle?.(logCtx, req, res)
+    let threw = false
+    try {
+      return await runHandleSearch(req, res, pathName, protocol, logCtx)
+    } catch (err) {
+      threw = true
+      throw err
+    } finally {
+      settleProtocolLogOnExit(res, logCtx, threw)
+    }
+  }
+
+  async function runHandleSearch(req, res, pathName, protocol, logCtx) {
     res._kinRequestId = logCtx.request_id
     requestLog.tapResponse?.(logCtx, res)
     const logBag = {
@@ -4645,7 +4693,7 @@ export function createHandleProtocol(deps) {
       attempt_count: null,
       final_state: null,
     }
-    res.on('finish', () => {
+    onResponseFinishOnce(res, () => {
       try {
         const groupId = req.apiKeyRecord?.group_id ?? 1
         requestLog.finish(logCtx, {
@@ -4657,7 +4705,9 @@ export function createHandleProtocol(deps) {
           rate_multiplier: resolveGroupRate(req),
           ...logBag,
         })
-      } catch {}
+      } catch {
+        requestLog.abort?.(logCtx)
+      }
     })
     if (!(await authenticateRequest(req, res))) {
       logBag.error_code = req.authError?.code || ErrorCode.INVALID_API_KEY
@@ -4892,6 +4942,19 @@ export function createHandleProtocol(deps) {
   async function handleImages(req, res, pathName, kind) {
     const protocol = 'openai.images'
     const logCtx = requestLog.start(req, { protocol, pathName })
+    requestLog.bindLifecycle?.(logCtx, req, res)
+    let threw = false
+    try {
+      return await runHandleImages(req, res, pathName, kind, protocol, logCtx)
+    } catch (err) {
+      threw = true
+      throw err
+    } finally {
+      settleProtocolLogOnExit(res, logCtx, threw)
+    }
+  }
+
+  async function runHandleImages(req, res, pathName, kind, protocol, logCtx) {
     res._kinRequestId = logCtx.request_id
     requestLog.tapResponse?.(logCtx, res)
     const logBag = {
@@ -4911,7 +4974,7 @@ export function createHandleProtocol(deps) {
       attempt_count: null,
       final_state: null,
     }
-    res.on('finish', () => {
+    onResponseFinishOnce(res, () => {
       try {
         const groupId = req.apiKeyRecord?.group_id ?? 1
         requestLog.finish(logCtx, {
@@ -4923,7 +4986,9 @@ export function createHandleProtocol(deps) {
           rate_multiplier: resolveGroupRate(req),
           ...logBag,
         })
-      } catch {}
+      } catch {
+        requestLog.abort?.(logCtx)
+      }
     })
     if (!(await authenticateRequest(req, res))) {
       logBag.error_code = req.authError?.code || ErrorCode.INVALID_API_KEY

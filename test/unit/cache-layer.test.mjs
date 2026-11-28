@@ -1,6 +1,10 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import {
+  ALL_CACHE_PREFIXES,
   ApiKeyCache,
   BillingCache,
   ConcurrencyCache,
@@ -12,8 +16,12 @@ import {
   getCacheRuntime,
   initCacheRuntime,
   closeCacheRuntime,
+  invalidateAllCaches,
   notifyDbTablesMutated,
+  registerLocalCacheClearer,
 } from '../../src/lib/cache/index.mjs'
+import { createDatabase } from '../../src/lib/db/database.mjs'
+import { RefusalGuardsRepo } from '../../src/lib/db/repos/refusal-guards-repo.mjs'
 import { isRoutineApiKeyUsageUpdate } from '../../src/lib/db/pg/pg-sync-db.mjs'
 
 /**
@@ -980,6 +988,81 @@ test('isRoutineApiKeyUsageUpdate and onDbTablesMutated prevent L1 invalidation s
     notifyDbTablesMutated(['refusal_device_blocks'])
     assert.equal((await rt.client.get('risk:bans:device:d1')).hit, false)
   } finally {
+    await closeCacheRuntime()
+  }
+})
+
+test('invalidateAllCaches clears all domain prefixes, L2 epochs, dashboard.snapshotCache, liveLogs, and RefusalGuardsRepo snapshots', async () => {
+  await closeCacheRuntime()
+  const sharedRedis = createMockRedis()
+  const rt = await initCacheRuntime({ redisConfig: null })
+  attachMockRedis(rt.client, sharedRedis)
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-inv-all-'))
+  const db = createDatabase({ dataDir: tmpDir })
+  let customClearCalls = 0
+  const unregister = registerLocalCacheClearer(() => {
+    customClearCalls += 1
+  })
+
+  try {
+    // Seed every single domain prefix in L1 + mock Redis L2
+    const samples = [
+      ['apikey:auth:h1', { id: 'k1' }],
+      ['billing:bal:u1', 42],
+      ['sched:snap:pool1', { rev: 1 }],
+      ['dash:panel:vms', { count: 3 }],
+      ['entity:user:id:usr_dirty_only', { v: { id: 'usr_dirty_only', username: 'DirtyGhost' } }],
+      ['risk:bans:session:s1', { blocked: true }],
+      ['live:req:r1', { request_id: 'r1' }],
+    ]
+    for (const [k, v] of samples) {
+      await rt.client.set(k, v, { ttlMs: 60_000 })
+    }
+    rt.apiKeys.putSync('missing_hash', null)
+    rt.scheduler.getOrBuildSync('sched-local', () => ({ ok: true }))
+    rt.dashboard.snapshotCache.set('panel:snap:1', { rows: [1, 2] }, 60_000)
+    await rt.liveLogs.startRequest('req-live-clear', { started_at: Date.now(), session_id: 'sess-clear' })
+
+    // Seed RefusalGuardsRepo in-process snapshot and then mutate DB directly underneath it
+    const guards = new RefusalGuardsRepo(db)
+    guards.remember({ fingerprint: 'fp_dirty_guard', model: 'claude-sonnet-4-6', preview: 'blocked' })
+    assert.ok(guards.get('fp_dirty_guard'), 'guard snapshot must be warm before restore')
+    db.prepare('DELETE FROM refusal_guards WHERE fingerprint = ?').run('fp_dirty_guard')
+    assert.ok(guards.get('fp_dirty_guard'), 'without invalidation, stale in-process snapshot still returns old row')
+
+    assert.equal(rt.dashboard.snapshotCache.get('panel:snap:1').hit, true)
+    assert.equal(rt.liveLogs._localInflight.size, 1)
+    assert.equal(rt.apiKeys.getSync('missing_hash').hit, true)
+    assert.equal(rt.scheduler.snapshots.size, 1)
+
+    await invalidateAllCaches()
+
+    // Every single prefix must be evicted from both L1 and L2 (epochs bumped)
+    for (const prefix of ALL_CACHE_PREFIXES) {
+      const epochRaw = await sharedRedis.get(`vm2api:epoch:${prefix}`)
+      assert.ok(Number(epochRaw) >= 1, `expected Redis epoch bumped for ${prefix}`)
+    }
+    for (const [k] of samples) {
+      assert.equal(rt.client.getL1(k).hit, false, `L1 entry ${k} must be evicted`)
+      assert.equal((await rt.client.get(k)).hit, false, `L2 entry ${k} must be invalidated via epoch bump`)
+    }
+    assert.equal(rt.dashboard.snapshotCache.get('panel:snap:1').hit, false)
+    assert.equal(rt.liveLogs._localInflight.size, 0)
+    assert.equal(rt.apiKeys.getSync('missing_hash').hit, false)
+    assert.equal(rt.scheduler.snapshots.size, 0)
+    assert.ok(customClearCalls >= 1, 'registered local cache clearer must run')
+    assert.equal(
+      guards.get('fp_dirty_guard'),
+      null,
+      'RefusalGuardsRepo snapshot must reload cleanly after invalidateAllCaches',
+    )
+  } finally {
+    unregister()
+    try {
+      db.close()
+    } catch {}
+    fs.rmSync(tmpDir, { recursive: true, force: true })
     await closeCacheRuntime()
   }
 })
