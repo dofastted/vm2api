@@ -883,6 +883,11 @@ export class PoolScheduler extends EventEmitter {
     return true
   }
 
+  /** Rust `node_cooldown` of Claude slots by vm id (see SchedulerRuntime#activeNodePenalties). */
+  nodePenalties(nowMs = Date.now()) {
+    return this.schedulerRuntime?.activeNodePenalties?.(nowMs) || new Map()
+  }
+
   releaseSticky(bound, stickyKey, stickyKeys) {
     const keys = Array.isArray(stickyKeys) && stickyKeys.length ? stickyKeys : stickyKey ? [stickyKey] : []
     for (const key of keys) this.stickyRouter?.unbind?.(key)
