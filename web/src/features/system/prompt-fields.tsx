@@ -195,7 +195,13 @@ export function PromptFields({
               checked={on}
               disabled={environment && !envOn}
               onCheckedChange={(checked) => {
-                const next = setTemplateBlock(compat, preset, id, checked, server)
+                const next = setTemplateBlock(
+                  compat,
+                  preset,
+                  id,
+                  checked,
+                  server
+                )
                 onCompatChange(
                   flag
                     ? setPresetFlag(next, flag, preset, checked, server)

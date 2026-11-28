@@ -832,10 +832,7 @@ export function migrateLegacyOfficialTemplate(
   ) {
     return blocks as RawBlock[]
   }
-  return [
-    ...blocks,
-    defaults.find((block) => block.id === 'caller_system')!,
-  ]
+  return [...blocks, defaults.find((block) => block.id === 'caller_system')!]
 }
 
 /**
@@ -1232,24 +1229,25 @@ export function previewSystemBlocks(
     if (!block || typeof block !== 'object') continue
     const id = String(block.id ?? '')
     const used = extractTemplateVars(block.text)
-    if (
-      id === 'dynamic_boundary' ||
-      used.includes('dynamic_boundary')
-    ) {
+    if (id === 'dynamic_boundary' || used.includes('dynamic_boundary')) {
       continue
     }
     const usesBilling = used.some((name) => BILLING_VARS.includes(name))
     if (
       usesBilling &&
       !includeBilling &&
-      !used.some((name) => BILLING_VARS.includes(name) && Boolean(vars[name]?.trim()))
+      !used.some(
+        (name) => BILLING_VARS.includes(name) && Boolean(vars[name]?.trim())
+      )
     ) {
       continue
     }
     if (
       block.drop_if_empty &&
       used.length > 0 &&
-      used.every((name) => name === 'caller_system' || name === 'caller_agent') &&
+      used.every(
+        (name) => name === 'caller_system' || name === 'caller_agent'
+      ) &&
       used.every((name) => !String(vars[name] ?? '').trim())
     ) {
       continue

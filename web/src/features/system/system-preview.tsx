@@ -140,7 +140,8 @@ export function SystemPreview({
             : '',
           timezone,
           env_timezone_only: env,
-          env_timezone: vars.data.vars.env_timezone || ` - Timezone: ${timezone}`,
+          env_timezone:
+            vars.data.vars.env_timezone || ` - Timezone: ${timezone}`,
           env_locale: vars.data.vars.env_locale || ' - Language: en-US',
           env_official: timezoneOnly ? env : vars.data.vars.env_official,
           env,

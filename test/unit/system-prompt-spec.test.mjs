@@ -152,10 +152,22 @@ test('Mode 1 (official) defaults to billing + CLI_IDENTITY only, with independen
   assert.equal(rendered.system.length, 2)
   assert.match(rendered.system[0].text, /^x-anthropic-billing-header:/i)
   assert.equal(rendered.system[1].text, CLI_IDENTITY)
-  assert.equal(rendered.system.some((b) => b.text.includes(OFFICIAL_303_AGENT_IDENTITY)), false)
-  assert.equal(rendered.system.some((b) => b.text.includes(OFFICIAL_303_HARNESS.slice(0, 40))), false)
-  assert.equal(rendered.system.some((b) => b.text.includes(CRS_OFFICIAL_AGENT_PROMPT.slice(0, 40))), false)
-  assert.equal(rendered.system.some((b) => b.text.includes('__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__')), false)
+  assert.equal(
+    rendered.system.some((b) => b.text.includes(OFFICIAL_303_AGENT_IDENTITY)),
+    false,
+  )
+  assert.equal(
+    rendered.system.some((b) => b.text.includes(OFFICIAL_303_HARNESS.slice(0, 40))),
+    false,
+  )
+  assert.equal(
+    rendered.system.some((b) => b.text.includes(CRS_OFFICIAL_AGENT_PROMPT.slice(0, 40))),
+    false,
+  )
+  assert.equal(
+    rendered.system.some((b) => b.text.includes('__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__')),
+    false,
+  )
   assert.equal(
     rendered.messages.some((m) => m.role === 'system'),
     false,
@@ -256,7 +268,10 @@ test('Mode 2 (official_full) keeps full official CC prompt and never swaps CLI_I
     sessionId: 'mode2-sdk',
   })
   assert.equal(rendered.system[1].text, CLI_IDENTITY)
-  assert.equal(rendered.system.some((b) => b.text.includes(OFFICIAL_303_HARNESS.slice(0, 40))), true)
+  assert.equal(
+    rendered.system.some((b) => b.text.includes(OFFICIAL_303_HARNESS.slice(0, 40))),
+    true,
+  )
   assert.equal(
     rendered.messages.some((m) => m.role === 'system' && String(m.content).includes('# Environment')),
     true,
@@ -265,18 +280,27 @@ test('Mode 2 (official_full) keeps full official CC prompt and never swaps CLI_I
   // guidance enabled solely via persona_block_presets.official_full.guidance = true renders real guidance
   const gBlockOnly = applyCrsUnofficialPersona(sampleBody(), {
     forceConfigured: true,
-    routing: { compatibility: { persona_preset: 'official_full', persona_block_presets: { official_full: { guidance: true } } } },
+    routing: {
+      compatibility: { persona_preset: 'official_full', persona_block_presets: { official_full: { guidance: true } } },
+    },
     sessionId: 'mode2-guidance-block',
   })
   assert.equal(
     gBlockOnly.system.some((b) => b.text.includes('When you use a pronoun for someone')),
     true,
   )
-  assert.equal(gBlockOnly.system.some((b) => b.text === '\u200b'), false)
+  assert.equal(
+    gBlockOnly.system.some((b) => b.text === '\u200b'),
+    false,
+  )
 })
 
 test('Mode 3 (zero) strips all 3 official identities, preserves caller business blocks verbatim, and places CLI_IDENTITY in billing prompt_version', () => {
-  const businessA = { type: 'text', text: 'You are my custom SQL tutor.', cache_control: { type: 'ephemeral', ttl: '1h' } }
+  const businessA = {
+    type: 'text',
+    text: 'You are my custom SQL tutor.',
+    cache_control: { type: 'ephemeral', ttl: '1h' },
+  }
   const businessB = { type: 'text', text: 'Always answer in JSON.' }
   const input = sampleBody({
     system: [
@@ -457,9 +481,13 @@ test('Cross-repo parity fixes (items 1-8): pool append/override, cli-node env de
     blocks: [{ type: 'text', text: 'POOL_APPEND_ONCE', cache_control: null }],
   })
   // cli-node: when vm2api already applied pool append to hopBody.system, compileSpecForCliNode clears custom_blocks
-  const cliAppendCompiled = compileSpecForCliNode(appendSpec, sampleBody({ system: [{ type: 'text', text: 'POOL_APPEND_ONCE' }] }), {
-    poolSystemApplied: true,
-  })
+  const cliAppendCompiled = compileSpecForCliNode(
+    appendSpec,
+    sampleBody({ system: [{ type: 'text', text: 'POOL_APPEND_ONCE' }] }),
+    {
+      poolSystemApplied: true,
+    },
+  )
   assert.equal(cliAppendCompiled.promptSpec.custom_blocks, null)
 
   // CRAG V4 prompt_spec_v1 Mode 1 & Mode 2: out.system omits pool text, crag_prompt_spec.custom_blocks carries it ONCE
@@ -479,16 +507,13 @@ test('Cross-repo parity fixes (items 1-8): pool append/override, cli-node env de
       poolPolicy: modeAppendPool,
       relocateCallerSystem: false,
     })
-    const cragV4Append = prepareCragPrintBody(
-      sampleBody({ system: [{ type: 'text', text: CLI_IDENTITY }] }),
-      {
-        preset: mode,
-        promptSpec: modeAppendSpec,
-        capabilities: ['headless_claude_bridge_v1', 'prompt_spec_v1'],
-        promptPolicy: modeAppendPool,
-        routing: { compatibility: { persona_preset: mode } },
-      },
-    )
+    const cragV4Append = prepareCragPrintBody(sampleBody({ system: [{ type: 'text', text: CLI_IDENTITY }] }), {
+      preset: mode,
+      promptSpec: modeAppendSpec,
+      capabilities: ['headless_claude_bridge_v1', 'prompt_spec_v1'],
+      promptPolicy: modeAppendPool,
+      routing: { compatibility: { persona_preset: mode } },
+    })
     assert.equal(cragV4Append.system, undefined)
     assert.equal(cragV4Append.crag_persona_preset, mode)
     assert.equal(cragV4Append.crag_prompt_spec.caller_system.policy, 'preserve')
@@ -499,22 +524,16 @@ test('Cross-repo parity fixes (items 1-8): pool append/override, cli-node env de
   }
 
   // CRAG legacy (!prompt_spec_v1) Mode 1 append: pool text is NOT relocated into messages[0] and appears ONCE in crag_prompt.blocks
-  const legacyMode1Append = prepareCragPrintBody(
-    sampleBody({ system: [{ type: 'text', text: 'CALLER_RULE' }] }),
-    {
-      preset: 'official',
-      promptSpec: appendSpec,
-      capabilities: ['headless_claude_bridge_v1'],
-      promptPolicy: appendPool,
-      routing: { compatibility: { persona_preset: 'official' } },
-    },
-  )
+  const legacyMode1Append = prepareCragPrintBody(sampleBody({ system: [{ type: 'text', text: 'CALLER_RULE' }] }), {
+    preset: 'official',
+    promptSpec: appendSpec,
+    capabilities: ['headless_claude_bridge_v1'],
+    promptPolicy: appendPool,
+    routing: { compatibility: { persona_preset: 'official' } },
+  })
   assert.equal('crag_prompt_spec' in legacyMode1Append, false)
   assert.equal(JSON.stringify(legacyMode1Append.messages).includes('POOL_APPEND_ONCE'), false)
-  assert.equal(
-    legacyMode1Append.crag_prompt.blocks.filter((b) => b.text === 'POOL_APPEND_ONCE').length,
-    1,
-  )
+  assert.equal(legacyMode1Append.crag_prompt.blocks.filter((b) => b.text === 'POOL_APPEND_ONCE').length, 1)
   assert.equal(legacyMode1Append.crag_prompt.blocks[0].text, CLI_IDENTITY)
 
   // Item 2: Pool override preserves merged caller system on cli-node and strips billing + all 3 official identities on CRAG V4

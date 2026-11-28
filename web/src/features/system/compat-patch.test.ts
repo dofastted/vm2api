@@ -56,7 +56,10 @@ describe('system prompt save body', () => {
   })
 
   it('removes CRAG v2 print tab and legacy split from SystemPromptPage and VmPersonaEditor', () => {
-    const systemPage = readFileSync(new URL('./index.tsx', import.meta.url), 'utf8')
+    const systemPage = readFileSync(
+      new URL('./index.tsx', import.meta.url),
+      'utf8'
+    )
     const vmEditor = readFileSync(
       new URL('../vm/persona-editor.tsx', import.meta.url),
       'utf8'

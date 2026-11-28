@@ -1001,10 +1001,7 @@ export function sanitizeCragBodyWhitelist(
       if (typeof value !== 'string') continue
       const trimmed = value.trim()
       if (!trimmed || trimmed.length > 512 || /[\r\n\0]/.test(trimmed)) continue
-      if (
-        key === 'crag_persona_preset' &&
-        !['official', 'official_full', 'zero', 'custom'].includes(trimmed)
-      ) {
+      if (key === 'crag_persona_preset' && !['official', 'official_full', 'zero', 'custom'].includes(trimmed)) {
         continue
       }
       out[key] = trimmed

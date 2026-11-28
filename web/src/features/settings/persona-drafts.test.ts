@@ -25,7 +25,9 @@ describe('persona drafts payload', () => {
   })
 
   it('canonicalizes legacy official_303 templates into official_full on read', () => {
-    const legacyBlocks = [{ id: 'custom_303', type: 'text', text: 'legacy-303' }]
+    const legacyBlocks = [
+      { id: 'custom_303', type: 'text', text: 'legacy-303' },
+    ]
     const drafts = seedPersonaDrafts({
       persona_preset: 'official_303',
       persona_templates: { official_303: legacyBlocks },

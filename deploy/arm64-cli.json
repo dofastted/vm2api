@@ -1,7 +1,7 @@
 {
   "schema": 1,
-  "cli_sha256": "f6c3744dda01f756049360113607d2bd9a25911de0fdaf30fe9bb1a1918a6788",
-  "source_sha256": "34951c0743f79668bbda184ba743dd08a2049c31b89ed7349106587053e37d76",
+  "cli_sha256": "ea2a8c119330caa3832e57319d833a035fb12f51ae1884b2e3346435a007a1fb",
+  "source_sha256": "2146cbc8f8076655a746ad2997334b3de44da8ecb54f6704f86a3f6f1ace1760",
   "bun_version": "1.3.14",
   "bun": {
     "url": "https://github.com/oven-sh/bun/releases/download/bun-v1.3.14/bun-linux-aarch64.zip",

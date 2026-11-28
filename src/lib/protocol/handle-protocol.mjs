@@ -2600,7 +2600,9 @@ export function createHandleProtocol(deps) {
       if (policy?.applies && ['zero_inject', 'override', 'passthrough'].includes(policy.mode)) return false
       const resolvedPreset = effectivePreset || (!policy?.applies ? resolveGlobalUnifiedPreset(routingSnap) : null)
       if (resolvedPreset === 'zero') return false
-      return (!officialTraffic || hasForeignSystemBlock(preRelocateBody.system)) && thirdPartyRelocateEnabled(routingSnap)
+      return (
+        (!officialTraffic || hasForeignSystemBlock(preRelocateBody.system)) && thirdPartyRelocateEnabled(routingSnap)
+      )
     }
     let relocatedCache = null
     const getRelocatedForAttempt = () => {
@@ -3554,7 +3556,10 @@ export function createHandleProtocol(deps) {
                 transport: preparedHop.ready.health?.transport,
                 persona: cragPersona,
                 prompt_mode:
-                  hopBody.crag_prompt?.mode || hopBody.crag_prompt_spec?.mode || hopBody.crag_persona_preset || 'default',
+                  hopBody.crag_prompt?.mode ||
+                  hopBody.crag_prompt_spec?.mode ||
+                  hopBody.crag_persona_preset ||
+                  'default',
                 ...(attemptPoolPrompt.applies ? { pool_prompt_mode: attemptPoolPrompt.mode } : {}),
                 strict_passthrough: strictPassthrough,
                 safeguards_stripped: Boolean(personaIn.safeguards != null && hopBody.safeguards == null),

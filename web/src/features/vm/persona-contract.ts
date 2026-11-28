@@ -1,4 +1,5 @@
-export type SlotPersonaPreset = 'inherit' | 'official' | 'official_full' | 'zero'
+export type SlotPersonaPreset =
+  'inherit' | 'official' | 'official_full' | 'zero'
 
 const SLOT_LABELS: Record<SlotPersonaPreset, string> = {
   inherit: '跟随全局',

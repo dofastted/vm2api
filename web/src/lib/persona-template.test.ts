@@ -178,10 +178,28 @@ describe('Mode 1/2/3 defaults, toggles, and system preview', () => {
     let compat: Record<string, unknown> = {}
     compat = setTemplateBlock(compat, 'official', 'harness', true, {})
     compat = setTemplateBlock(compat, 'official', 'guidance', true, {})
-    compat = setPresetFlag(compat, 'persona_guidance_presets', 'official', true, {})
+    compat = setPresetFlag(
+      compat,
+      'persona_guidance_presets',
+      'official',
+      true,
+      {}
+    )
     compat = setPresetFlag(compat, 'persona_env_presets', 'official', true, {})
-    compat = setPresetFlag(compat, 'persona_timezone_presets', 'official', true, {})
-    compat = setPresetFlag(compat, 'persona_locale_presets', 'official', true, {})
+    compat = setPresetFlag(
+      compat,
+      'persona_timezone_presets',
+      'official',
+      true,
+      {}
+    )
+    compat = setPresetFlag(
+      compat,
+      'persona_locale_presets',
+      'official',
+      true,
+      {}
+    )
     compat = setPresetFlag(
       compat,
       'persona_env_instructions_presets',

@@ -330,7 +330,12 @@ export function resolveSystemPromptSpec({
   const localeValue = envLocale ? resolveLocaleValue(slot, identity) : null
 
   let resolvedCustomBlocks = normalizeCustomBlocksPayload(customBlocks)
-  if (!resolvedCustomBlocks && chosen.poolMode === 'append' && typeof poolPolicy?.text === 'string' && poolPolicy.text) {
+  if (
+    !resolvedCustomBlocks &&
+    chosen.poolMode === 'append' &&
+    typeof poolPolicy?.text === 'string' &&
+    poolPolicy.text
+  ) {
     resolvedCustomBlocks = {
       action: 'append',
       blocks: [{ type: 'text', text: poolPolicy.text, cache_control: null }],
@@ -454,7 +459,9 @@ export function sanitizePromptSpec(raw) {
     caller_system: {
       policy,
       strip_official_identity:
-        rawCaller.strip_official_identity === undefined ? mode !== 'custom' : rawCaller.strip_official_identity !== false,
+        rawCaller.strip_official_identity === undefined
+          ? mode !== 'custom'
+          : rawCaller.strip_official_identity !== false,
     },
     custom_blocks: customBlocks,
     passthrough: raw.passthrough === true,

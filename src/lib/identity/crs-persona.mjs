@@ -932,9 +932,7 @@ export function personaTemplateVars({
         : OFFICIAL_303_HARNESS,
     harness_303: OFFICIAL_303_HARNESS,
     guidance_303: () =>
-      isPresetGuidanceEnabled(compat, preset)
-        ? renderOfficial303Guidance({ cwd: env?.cwd, entrypoint })
-        : '',
+      isPresetGuidanceEnabled(compat, preset) ? renderOfficial303Guidance({ cwd: env?.cwd, entrypoint }) : '',
     env_303: () => (withEnv ? buildOfficial303Environment(env, { model: model || env?.modelId }) : ''),
     env_instructions_303: () =>
       withEnv && presetFlagEnabled(compat, 'persona_env_instructions_presets', preset)
@@ -2146,15 +2144,15 @@ function applyTemplatePersona(
     list.some(
       (block) =>
         ['harness', 'guidance'].includes(String(block?.id || '')) ||
-        extractTemplateVars(block?.text).some((name) => ['harness_303', 'guidance_303', 'agent_official'].includes(name)),
+        extractTemplateVars(block?.text).some((name) =>
+          ['harness_303', 'guidance_303', 'agent_official'].includes(name),
+        ),
     )
   const templateHasHarness = hasHarnessBlock(blocks)
   const sourceDefinesHarness = hasHarnessBlock(templateSource)
   const templateWantsCallerAgent = blocks.some((block) => extractTemplateVars(block?.text).includes('caller_agent'))
   const usesCallerAgent =
-    !harness &&
-    !templateHasHarness &&
-    ((preset === 'official' && !sourceDefinesHarness) || templateWantsCallerAgent)
+    !harness && !templateHasHarness && ((preset === 'official' && !sourceDefinesHarness) || templateWantsCallerAgent)
   const suppliedAgent = usesCallerAgent ? String(rawCallerAgent || '').trim() : ''
   const zeroAgentBlocks =
     zero && usesCallerAgent && zeroVars.has('caller_agent')
@@ -2163,7 +2161,9 @@ function applyTemplatePersona(
   const callerAgent = zero
     ? extractSystemTexts(zeroAgentBlocks).join('\n\n')
     : suppliedAgent ||
-      (preset === 'official' && !harness && !templateHasHarness && !sourceDefinesHarness ? CRS_OFFICIAL_AGENT_PROMPT : '')
+      (preset === 'official' && !harness && !templateHasHarness && !sourceDefinesHarness
+        ? CRS_OFFICIAL_AGENT_PROMPT
+        : '')
   const zeroRemaining = zero
     ? harness && zeroVars.has('agent_official')
       ? []
@@ -2335,8 +2335,7 @@ export function applyCrsUnofficialPersona(
   const templateSettings =
     chosen.preset === OFFICIAL_303_PRESET ? { ...chosen, preset: templatePresetFor(chosen.preset) } : chosen
   const preserveEnvironment =
-    personaUsesTemplate(templateSettings) &&
-    !isPresetEnvEnabled(templateSettings.switches, templateSettings.preset)
+    personaUsesTemplate(templateSettings) && !isPresetEnvEnabled(templateSettings.switches, templateSettings.preset)
   const cleaned = {
     ...body,
     system:

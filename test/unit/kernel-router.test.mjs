@@ -1967,7 +1967,7 @@ test('reconcileCliHopRuntime accepts Claude onboarding inside a cluster-node slo
   assert.deepEqual(first.actions, ['reap_zombies', 'node_claude_setup'])
   const setup = calls.find((args) => args.includes('python3'))
   assert.ok(setup, JSON.stringify(calls))
-  assert.deepEqual(setup.slice(0, 4), ['exec', '-u', '10001:987', 'kin-vm-node-onboard'])
+  assert.deepEqual(setup.slice(0, 6), ['exec', '-u', '10001:987', '-e', 'HOME=/home/kincli', 'kin-vm-node-onboard'])
   assert.match(setup.at(-1), /hasCompletedOnboarding/)
   assert.match(setup.at(-1), /\.claude\/\.claude\.json/)
   assert.match(setup.at(-1), /FileNotFoundError/)
