@@ -3,6 +3,7 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it, vi } from 'vitest'
 import {
   DEFAULT_PERSONA_TEMPLATES,
+  PERSONA_TEMPLATE_VARS,
   isPresetEnvEnabled,
   isPresetGuidanceEnabled,
   isPresetHarnessEnabled,
@@ -15,6 +16,7 @@ import {
   promptEditorBlocks,
   promptSourceBlocks,
   promptSourceText,
+  sanitizeTemplateVarNote,
 } from './prompt-presentation'
 
 function elements(
@@ -376,14 +378,32 @@ describe('prompt fields', () => {
     expect(promptSourceText('{{official_prompt}}')).toBe('{{main_prompt_303}}')
   })
 
-  it('keeps advanced editor notes versionless without changing stored preset metadata', () => {
+  it('keeps advanced editor notes versionless and free of internal kernel jargon without changing stored preset metadata', () => {
     for (const blocks of Object.values(DEFAULT_PERSONA_TEMPLATES)) {
       const shown = promptEditorBlocks(blocks)
-      expect(JSON.stringify(shown)).not.toContain('303')
+      const serialized = JSON.stringify(shown)
+      expect(serialized).not.toContain('303')
+      expect(serialized).not.toMatch(
+        /crag|antigravity|cli-node|cli-hop|\bagy\b/i
+      )
       expect(JSON.stringify(promptSourceBlocks(shown, blocks))).toBe(
         JSON.stringify(blocks)
       )
     }
+    for (const [, description] of PERSONA_TEMPLATE_VARS) {
+      const sanitized = sanitizeTemplateVarNote(description)
+      expect(sanitized).not.toContain('303')
+      expect(sanitized).not.toMatch(
+        /crag|antigravity|cli-node|cli-hop|\bagy\b/i
+      )
+    }
+  })
+
+  it('uses consistent h4 heading levels for both system and environment subsections', () => {
+    const html = render('official_full')
+    expect(html).toContain('<h4')
+    expect(html).not.toContain('<h3')
+    expect(html).toMatch(/<h4[^>]*>环境注入<\/h4>/)
   })
 
   it('enables saved disabled optional fields without changing unrelated compatibility settings', () => {
