@@ -4,6 +4,10 @@ import { cn } from '@/lib/utils'
 import { RelativeTime } from '@/features/logs/relative-time'
 import { EmptyNotice } from './blocks'
 import { type FeedKind, evidenceOf, feedKindOf } from './model'
+import {
+  UPSTREAM_400_ACTION_LABELS,
+  upstream400CategoryLabel,
+} from './upstream-400'
 
 const KIND_NAME: Record<FeedKind, string> = {
   distill: '蒸馏',
@@ -71,6 +75,14 @@ export function RiskFeed({
           [400, 401, 403, 422].includes(row.upstreamStatus)
         const disguised429 =
           row.statusCode === 429 && (kind === 'jev' || kind === 'refusal')
+        const u400Category =
+          typeof row.errorDetails?.upstream_400_category === 'string'
+            ? row.errorDetails.upstream_400_category
+            : ''
+        const u400Action =
+          typeof row.errorDetails?.upstream_400_action === 'string'
+            ? row.errorDetails.upstream_400_action
+            : ''
         const showIdentity =
           hasUpstream4xx || !!row.inboundDeviceId || !!row.clientSessionId
         return (
@@ -101,6 +113,24 @@ export function RiskFeed({
                   {disguised429 ? (
                     <span className='w-fit rounded-md bg-[var(--status-warn-bg)] px-1.5 py-0.5 text-[11px] font-medium whitespace-nowrap text-[var(--status-warn)]'>
                       429 伪装
+                    </span>
+                  ) : null}
+                  {u400Category ? (
+                    <span
+                      className={cn(
+                        'w-fit rounded-md px-1.5 py-0.5 text-[11px] font-medium whitespace-nowrap',
+                        u400Action === 'session_10m' ||
+                          u400Action === 'permanent_kept'
+                          ? 'bg-[var(--status-bad-bg)] text-[var(--status-bad)]'
+                          : 'bg-[var(--status-none-bg)] text-[var(--status-none)]'
+                      )}
+                      title={
+                        u400Action
+                          ? UPSTREAM_400_ACTION_LABELS[u400Action] || u400Action
+                          : undefined
+                      }
+                    >
+                      {upstream400CategoryLabel(u400Category)}
                     </span>
                   ) : null}
                 </span>
