@@ -491,3 +491,83 @@ test('Gemini public handler records requestLog once on direct calls and populate
     { id: 'gemini-4-neon', provider: 'google', quota_group: 'gemini' },
   ])
 })
+
+test('group quota rejects all exhausted accounts before acquisition, preserves 3p and recovers on refresh', async () => {
+  const reset = new Date(Date.now() + 120_000).toISOString()
+  const env = {
+    id: 'quota-env',
+    proxy_id: 'px-1',
+    auth_state: 'authorized',
+    auth_method: 'oauth',
+    models_discovered: true,
+    models: ['gemini-4-neon', 'claude-sonnet-4-6-high'],
+    capabilities: [...NATIVE_TUI_CAPABILITIES],
+    account: {
+      state: 'ok',
+      quotas: [],
+      quota_groups: [
+        {
+          name: 'Gemini Models',
+          windows: [
+            { id: 'gemini-5h', remaining_fraction: 0, reset_at: reset },
+            { id: 'gemini-weekly', remaining_fraction: 0.5, reset_at: reset },
+          ],
+        },
+      ],
+    },
+  }
+  let acquisitions = 0
+  let calls = 0
+  const scheduler = createGeminiScheduler({
+    schedulerRuntime: createMockSchedulerRuntime({
+      onAcquire: () => {
+        acquisitions++
+      },
+    }),
+    callHost: async (op) => (op === 'list' ? { payload_state: 'installed', environments: [env] } : env),
+    callHostStream: async () => {
+      calls++
+      return sseResponse([
+        `data: ${JSON.stringify({ candidates: [{ content: { role: 'model', parts: [{ text: 'ok' }] }, finishReason: 'STOP' }] })}\n\n`,
+      ])
+    },
+    resolveProxy: () => 'socks5h://192.0.2.10:1080',
+  })
+  const params = {
+    model: 'gemini-4-neon',
+    apiKeyRecord: { id: 'key', group_type: 'all' },
+    geminiBody: { contents: [{ role: 'user', parts: [{ text: 'hello' }] }] },
+  }
+  await assert.rejects(scheduler.stream(params), (error) => {
+    assert.equal(error.code, 'gemini_quota_exhausted')
+    assert.equal(error.status, 429)
+    assert.equal(error.attemptCount, 0)
+    assert.ok(error.retryAfter > 0 && error.retryAfter <= 120)
+    return true
+  })
+  const handler = createGeminiPublicHandler({
+    json: jsonResponder,
+    readBody: async () => ({}),
+    scheduler,
+    apiKeyStore: { users: { getById: () => ({ id: 7, role: 'admin' }) } },
+  })
+  const response = makeRes()
+  const logBag = {}
+  await handler(
+    makeReq({ url: '/v1beta/models/gemini-4-neon:generateContent', groupType: 'all', body: params.geminiBody }),
+    response,
+    { logBag },
+  )
+  assert.equal(response.statusCode, 429)
+  assert.equal(response.jsonBody().error.details[0].reason, 'gemini_quota_exhausted')
+  assert.ok(Number(response.headers['retry-after']) > 0)
+  assert.equal(logBag.attempt_count, 0)
+  assert.equal(logBag.upstream_status ?? null, null)
+  assert.equal(acquisitions, 0)
+  assert.equal(calls, 0)
+  assert.equal((await scheduler.stream({ ...params, model: 'ag-claude-sonnet-4-6-high' })).account_id, env.id)
+  env.account.quota_groups[0].windows[0].remaining_fraction = 0.5
+  scheduler.invalidateCatalogCache()
+  assert.equal((await scheduler.stream(params)).account_id, env.id)
+  assert.equal(calls, 2)
+})

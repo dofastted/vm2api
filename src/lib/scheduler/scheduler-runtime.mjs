@@ -46,7 +46,9 @@ import {
   normalizeProviderScope,
 } from '../db/repos/scheduler-pools-repo.mjs'
 import { SettingsRepo } from '../db/repos/settings-repo.mjs'
-import { resolveUpstreamModel, stripAntigravityPrefix } from '../gemini/model-catalog.mjs'
+import { indexAccountModelCatalog, resolveUpstreamModel, stripAntigravityPrefix } from '../gemini/model-catalog.mjs'
+import { evaluateGeminiQuota, quotaRetryAfter } from '../gemini/quota-admission.mjs'
+import { isGeminiSeriesId, resolveGeminiDefaultEffort } from '../protocol/gemini-model-policy.mjs'
 import { OFFICIAL_303_PRESET, normalizePersonaPreset } from '../identity/persona-template.mjs'
 import { activeHoursOf, evaluateActiveHours } from '../pool/active-hours.mjs'
 import { endpointMatchesModel, stripPrefix } from '../pool/api-scheduler.mjs'
@@ -2027,6 +2029,58 @@ export class SchedulerRuntime {
     return matched
   }
 
+  #geminiQuotaState(nodeKey, model, requestedEffort, currentEnvs = null) {
+    const node = this.#nodesByKey.get(nodeKey)
+    if (!model || node?.node_type !== 'gemini_env') return { exhausted: false, resetAt: null }
+    const current =
+      currentEnvs || new Map(this.#loadGeminiEnvs().map((env) => [String(env.id ?? env.env_id ?? env.name ?? ''), env]))
+    const env = current.get(node.node_id) || this.#inventoryByKey.get(nodeKey)?.item
+    if (!env) return { exhausted: false, resetAt: null }
+    const rawModels = Array.isArray(env.models)
+      ? env.models
+          .map((entry) => (typeof entry === 'string' ? entry : String(entry?.id ?? entry?.name ?? '')))
+          .filter(Boolean)
+      : []
+    const resolved = resolveUpstreamModel(model, rawModels, {
+      allowUnprefixedNonGemini: true,
+      catalogIndex: indexAccountModelCatalog(env.account),
+      requestedEffort,
+      defaultEffort: isGeminiSeriesId(model) ? resolveGeminiDefaultEffort(model) : null,
+    }) || { publicId: model, upstreamModel: model }
+    return evaluateGeminiQuota(env.account, resolved)
+  }
+
+  // Apply quota admission even to prebuilt API scopes and switch/fallback requests.
+  #applyGeminiQuotaScope(scope, model, requestedEffort) {
+    if (!model) return scope
+    const current = new Map(this.#loadGeminiEnvs().map((env) => [String(env.id ?? env.env_id ?? env.name ?? ''), env]))
+    const existing = scope.allowed_node_keys
+    const keys = Array.isArray(existing) && existing.length ? existing : [...this.#nodesByKey.keys()]
+    const eligible = keys.filter((key) => !this.#geminiQuotaState(key, model, requestedEffort, current).exhausted)
+    if (eligible.length === keys.length) return scope
+    return { ...scope, allowed_node_keys: eligible.length ? eligible : ['__no_eligible_node__'] }
+  }
+
+  async #validateGeminiLeaseQuota(res, req, requestedEffort) {
+    const key = res.selected_node?.node_key || formatNodeKey(res.selected_node?.node_type, res.selected_node?.node_id)
+    const quota = this.#geminiQuotaState(key, req.model, requestedEffort)
+    if (!quota.exhausted) return
+    // Quota may change while Rust is waiting for capacity. Never expose the stale
+    // lease to a caller, and release without a node-wide fault/cooldown penalty.
+    await this.releaseLease(res.lease_id, 'aborted')
+    const retryAfter = quotaRetryAfter([quota])
+    const error = new SchedulerApiError({
+      status: 429,
+      code: 'gemini_quota_exhausted',
+      message: 'The selected account quota was exhausted while waiting for dispatch.',
+      retryAfterSec: retryAfter,
+      explain: { reason: 'quota_exhausted', excluded: [{ node_key: key, reason: 'quota_exhausted' }] },
+    })
+    error.retryAfter = retryAfter
+    error.upstreamReason = 'quota_exhausted'
+    throw error
+  }
+
   #buildAcquireRequest(params = {}) {
     const model = String(params.model || '').trim()
     const protocol = String(params.protocol || '').trim()
@@ -2081,6 +2135,8 @@ export class SchedulerRuntime {
         allowPoolFallbackChain: fallbackChain,
       })
     }
+
+    api_key_scope = this.#applyGeminiQuotaScope(api_key_scope, model, params.requestedEffort ?? params.requested_effort)
 
     const rawRequestId = String(params.requestId ?? params.request_id ?? '').trim() || crypto.randomUUID()
     const resolvedProtocol =
@@ -2179,6 +2235,7 @@ export class SchedulerRuntime {
     } catch (err) {
       this.#rethrowGated(err, req)
     }
+    await this.#validateGeminiLeaseQuota(res, req, params.requestedEffort ?? params.requested_effort)
     return { ...res, _request: req }
   }
 
@@ -2222,6 +2279,7 @@ export class SchedulerRuntime {
     } catch (err) {
       this.#rethrowGated(err, next_attempt)
     }
+    await this.#validateGeminiLeaseQuota(res, next_attempt, rawNext.requestedEffort ?? rawNext.requested_effort)
     return { ...res, _request: next_attempt }
   }
 
