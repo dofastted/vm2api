@@ -97,6 +97,9 @@ function writeClaudeVm(
     schedulable: true,
     official_cc_inference: 'cli-hop',
     inference_engine: 'crag',
+    // 238 parity: a Claude slot is only schedulable with a bound SOCKS exit.
+    proxy_cli_enabled: true,
+    proxy: { id: `proxy-${id}`, url: 'socks5h://127.0.0.1:10001' },
     policy: { maxConcurrency, concurrencyOverride: true, weight, ...(priority != null ? { priority } : {}) },
     ...(runtime ? { runtime } : {}),
     claude: omitTokens

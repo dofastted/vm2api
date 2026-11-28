@@ -72,8 +72,10 @@ import { effectiveSlotCount, isHeadlessBridgeSlot } from '../vm/slot-capacity.mj
 import { activeCragManifestForSlot, resolveKernelDataplane } from '../vm/slot-engine.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
 import { getVm, listVms } from '../vm/vm-registry.mjs'
+import { readWorkerEgressMode, readWorkerProxyEndpoint } from '../vm/vm-runtime.mjs'
+import { kernelFaults } from '../transport/rust-kernel-client.mjs'
 import { accountIdOf } from '../pool/pool-scheduler.mjs'
-import { claudeModelWaitGate } from './node-gates.mjs'
+import { claudeNodeGate, claudeModelWaitGate } from './node-gates.mjs'
 
 export { SchedulerApiError, SchedulerUnavailableError }
 
@@ -1423,6 +1425,7 @@ export class SchedulerRuntime {
     const externalVms = this.#externalLoadProvider?.() || {}
     const routing = this.#getRoutingConfig() || {}
     const quotaPolicy = normalizeOpenAIQuotaPolicy(routing.codex?.quota || {})
+    const gateCtx = this.#claudeNodeGateContext()
 
     for (const vm of vms) {
       if (!vm?.id) continue
@@ -1463,6 +1466,16 @@ export class SchedulerRuntime {
       } else if (schedulable && codex && isCodexSlotParked(vm, now, quotaPolicy)) {
         schedulable = false
         unschedReason = 'codex_slot_parked'
+      }
+
+      // Node gates read vm.json, worker.json and cli-home under the project
+      // root (as 238 did); without one there is nothing to read.
+      if (schedulable && !codex && gateCtx.projectRoot) {
+        const gateReason = this.#claudeNodeGateReason(vm, acct, gateCtx, now)
+        if (gateReason) {
+          schedulable = false
+          unschedReason = gateReason
+        }
       }
 
       const activeHoursRes = evaluateActiveHours(activeHoursOf(vm), now, vm.timezone)
@@ -1554,14 +1567,62 @@ export class SchedulerRuntime {
   }
 
   /** vm.json as 238 read it (`getVm`); `listVms` hands out summaries. */
-  #rawVm(vm) {
+  #rawVm(vm, { strict = false } = {}) {
     const projectRoot = this.#cfg?.paths?.project || ''
-    if (!projectRoot || !vm?.id) return vm
+    if (!projectRoot || !vm?.id) return strict ? null : vm
     try {
-      return getVm(projectRoot, vm.id) || vm
+      return getVm(projectRoot, vm.id) || (strict ? null : vm)
     } catch {
-      return vm
+      return strict ? null : vm
     }
+  }
+
+  /** Shared per-batch inputs for `claudeNodeGate` (one runtime-table read per batch). */
+  #claudeNodeGateContext() {
+    const projectRoot = this.#cfg?.paths?.project || ''
+    const poolScheduler = this.#resolvePoolScheduler()
+    const runtimeById = new Map()
+    try {
+      const repo = this.#accountQuota?.runtimeRepo || poolScheduler?.runtimeRepo
+      for (const row of repo?.list?.() || []) {
+        if (row?.account_id) runtimeById.set(String(row.account_id), row)
+        if (row?.vm_id && !runtimeById.has(`vm:${row.vm_id}`)) runtimeById.set(`vm:${row.vm_id}`, row)
+      }
+    } catch {}
+    return { projectRoot, poolScheduler, runtimeById }
+  }
+
+  #claudeNodeGateReason(vm, acct, ctx, now) {
+    const { projectRoot, poolScheduler, runtimeById } = ctx
+    // Judge vm.json only; a flattened summary lacks proxy/credential fields.
+    const raw = this.#rawVm(vm, { strict: true })
+    if (!raw) return null
+    const accountId = accountIdOf(raw, projectRoot || null)
+    const account = rawAccountForVm(this.#accountQuota, raw, accountId) || null
+    const state = runtimeById.get(String(accountId)) || runtimeById.get(`vm:${vm.id}`) || null
+    const ttl = Math.max(5_000, Number(poolScheduler?.config?.worker_health_ttl_ms) || 5_000)
+    const cached = poolScheduler?.healthCache?.get?.(vm.id)
+    const health = cached && now - Number(cached.at || 0) <= ttl * 6 ? cached.value : undefined
+    const unreachableAt = Number(poolScheduler?.workerUnreachable?.get?.(vm.id)?.at || 0)
+    const unreachable = unreachableAt > 0 && now - unreachableAt <= ttl * 6
+    let maxConcurrency = null
+    try {
+      const fallback = Number(poolScheduler?.config?.default_max_per_account)
+      maxConcurrency =
+        poolScheduler?.effectiveMaxConcurrency?.(raw, account, Number.isFinite(fallback) ? fallback : 2) ?? null
+    } catch {}
+    return claudeNodeGate({
+      vm: raw,
+      account,
+      state,
+      health,
+      unreachable,
+      kernelFaulted: kernelFaults.has(vm.id),
+      workerProxyEndpoint: projectRoot ? readWorkerProxyEndpoint(projectRoot, vm.id) : undefined,
+      egressMode: projectRoot ? readWorkerEgressMode(projectRoot, vm.id) : '',
+      maxConcurrency,
+      now,
+    })
   }
 
   #buildBootstrapPayload({ controllerEpoch, role }) {
