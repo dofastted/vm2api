@@ -8,11 +8,18 @@ import {
   createGeminiEventDecoder,
   createGeminiRestoreTransform,
   createSseFrameSplitter,
+  parseGeminiSseFrame,
 } from '../protocol/gemini-convert.mjs'
 import { createStreamTiming } from '../protocol/stream-timing.mjs'
 import { isGeminiModelEnabled, isGeminiSeriesId, resolveGeminiDefaultEffort } from '../protocol/gemini-model-policy.mjs'
 import { classifyAntigravityModel, indexAccountModelCatalog, resolveUpstreamModel } from './model-catalog.mjs'
-import { createDirectCragClient } from './direct-client.mjs'
+import {
+  createDirectCragClient,
+  prepareDirectNativeTurnBody,
+  targetSupportsCleanAcpText,
+  targetSupportsProviderResult,
+  targetSupportsWireProtocol,
+} from './direct-client.mjs'
 import { callGeminiHost, callGeminiHostStream } from './routes.mjs'
 import { DEFAULT_GEMINI_ROUTING, normalizeGeminiRouting } from './routing-config.mjs'
 import {
@@ -33,24 +40,59 @@ import {
 const ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/
 const MODEL = /^[a-z0-9][a-z0-9._-]{0,99}$/
 const RUN_ID = /^[a-f0-9]{32}$/
-const CONV_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
+const CONV_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
 const MAX_CONCURRENCY = 64
 const DEFAULT_CONCURRENCY = 20
 const POLL_MS = 250
-const TURN_MS = 120_000
+const TURN_MS = 300_000
 const STREAM_TURN_MS = 300_000
+const THINKING_COMMIT_GRACE_MS = 15_000
 const TOOL_CONTINUATION_TTL_MS = 10 * 60_000
 const TOOL_CONTINUATION_MAX = 2048
 const MAX_TRACKED_CONVERSATION_IDS = 32
 const CONV_MEMORY_TTL_MS = 24 * 60 * 60_000
 const CONV_MEMORY_MAX = 4096
 
-function mintOutboundConversationId(avoidSet = null) {
-  for (let i = 0; i < 8; i += 1) {
-    const id = `gc_${crypto.randomBytes(12).toString('hex')}`
-    if (!avoidSet || !avoidSet.has(id)) return id
+function ownerScopeKey(ownerScope) {
+  if (!ownerScope || typeof ownerScope !== 'object') return 'platform'
+  if (ownerScope.type === 'user' && ownerScope.userId != null) {
+    const uid = String(ownerScope.userId).trim()
+    if (uid) return `user:${uid}`
   }
-  return `gc_${crypto.randomBytes(16).toString('hex')}`
+  if (typeof ownerScope.type === 'string' && ownerScope.type) return ownerScope.type
+  return 'platform'
+}
+
+function scopedConversationId({ ownerScope = null, poolId = '', apiKeyId = '', sessionId = '' } = {}) {
+  const seed = typeof sessionId === 'string' && sessionId.trim() ? sessionId.trim() : crypto.randomUUID()
+  const scope = `${ownerScopeKey(ownerScope)}|${String(poolId || '')}|${String(apiKeyId || '')}|${seed}`
+  return `cs_${crypto.createHash('sha256').update(scope).digest('hex').slice(0, 24)}`
+}
+
+function randomConversationId(avoidSet = null) {
+  for (let i = 0; i < 8; i += 1) {
+    const candidate = `cs_${crypto.randomBytes(12).toString('hex')}`
+    if (!avoidSet || !avoidSet.has(candidate)) return candidate
+  }
+  return `cs_${crypto.randomBytes(12).toString('hex')}`
+}
+
+function nextRecoveryConversationId(baseScopedId, avoidSet = null, startEpoch = 1) {
+  const base =
+    typeof baseScopedId === 'string' && CONV_ID.test(baseScopedId)
+      ? baseScopedId.slice(0, 116)
+      : scopedConversationId({ sessionId: baseScopedId })
+  let epoch = Math.max(1, Number(startEpoch) || 1)
+  for (let i = 0; i < 64; i += 1) {
+    const suffix = `:r${epoch}`
+    const candidate = `${base.slice(0, Math.max(1, 128 - suffix.length))}${suffix}`
+    if (!avoidSet || !avoidSet.has(candidate)) {
+      return { conversationId: candidate, epoch }
+    }
+    epoch += 1
+  }
+  const fallback = randomConversationId(avoidSet)
+  return { conversationId: fallback, epoch }
 }
 
 function normalizeConcurrency(value, fallback = DEFAULT_CONCURRENCY) {
@@ -192,15 +234,13 @@ const ACCOUNT_WIDE_COOLDOWN_ERRORS = new Set([
   'gemini_oauth_required',
 ])
 
-const CONTENT_OUTPUT_EVENTS = new Set([
-  'text',
-  'thinking',
-  'thinking_signature',
-  'text_signature',
-  'tool_call',
-  'image',
-  'search',
-  'stop',
+const CONTENT_OUTPUT_EVENTS = new Set(['text', 'tool_call', 'image', 'search'])
+
+const ABNORMAL_FINISH_REASONS = new Set([
+  'MALFORMED_FUNCTION_CALL',
+  'UNEXPECTED_TOOL_CALL',
+  'TOO_MANY_TOOL_CALLS',
+  'OTHER',
 ])
 
 const SHORT_RATE_LIMIT_MAX_MS = 5_000
@@ -217,7 +257,14 @@ function isLocalBridgeDisconnectFailure(failure, failureCode, attemptUpstreamSta
   }
   return false
 }
-const WORKER_SESSION_CONFLICT_CODES = new Set(['tool_continuation_aborted', 'gemini_session_conflict'])
+const WORKER_SESSION_CONFLICT_CODES = new Set([
+  'tool_continuation_aborted',
+  'gemini_session_conflict',
+  'session_conflict',
+  'tool_continuation_already_settled',
+  'duplicate_request',
+  'session_busy',
+])
 
 function resolveInferFailureCode(errBody, statusCode) {
   const rawCode = typeof errBody?.code === 'string' ? errBody.code : null
@@ -230,7 +277,7 @@ function resolveInferFailureCode(errBody, statusCode) {
   if (statusCode === 503) return 'gemini_upstream_unavailable'
   if (statusCode === 400) return 'gemini_invalid_request'
   if (statusCode === 404) return 'gemini_model_unavailable'
-  if (statusCode === 409 && rawCode && WORKER_SESSION_CONFLICT_CODES.has(rawCode)) {
+  if (statusCode === 409) {
     return 'gemini_session_conflict'
   }
   return 'gemini_inference_failed'
@@ -404,6 +451,608 @@ async function readRun(callHost, id, runId, signal) {
   throw fail(504, 'gemini_inference_timeout')
 }
 
+function parseProviderResultHeader(headers) {
+  const raw = headers?.['x-kin-provider-result'] ?? headers?.['X-Kin-Provider-Result']
+  if (typeof raw !== 'string' || !raw.trim() || raw.length > 16 * 1024) return null
+  try {
+    const parsed = JSON.parse(raw)
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null
+  } catch {
+    return null
+  }
+}
+
+function usageFromProviderResult(pr) {
+  const u = pr?.usage
+  if (!u || typeof u !== 'object') return null
+  const input = Number.isFinite(Number(u.input_tokens)) ? Math.max(0, Number(u.input_tokens)) : 0
+  const output = Number.isFinite(Number(u.output_tokens)) ? Math.max(0, Number(u.output_tokens)) : 0
+  const cacheRead = Number.isFinite(Number(u.cache_read_input_tokens))
+    ? Math.max(0, Number(u.cache_read_input_tokens))
+    : 0
+  const thinking = Number.isFinite(Number(u.thinking_tokens)) ? Math.max(0, Number(u.thinking_tokens)) : 0
+  if (input === 0 && output === 0 && cacheRead === 0 && thinking === 0) return null
+  return {
+    input_tokens: input,
+    output_tokens: output,
+    total_tokens: input + cacheRead + output,
+    cache_read_tokens: cacheRead,
+    cache_read_input_tokens: cacheRead,
+    reasoning_tokens: thinking,
+  }
+}
+
+function parseRawSseFrameMeta(frame) {
+  const normalized = String(frame || '').replace(/\r\n/g, '\n')
+  let eventName = ''
+  const dataLines = []
+  for (const line of normalized.split('\n')) {
+    if (!line || line.startsWith(':')) continue
+    const colon = line.indexOf(':')
+    if (colon < 0) continue
+    const field = line.slice(0, colon)
+    const rawVal = line.slice(colon + 1)
+    const value = rawVal.startsWith(' ') ? rawVal.slice(1) : rawVal
+    if (field === 'event') eventName = value.trim()
+    else if (field === 'data') dataLines.push(value)
+  }
+  return { eventName, dataText: dataLines.join('\n').trim() }
+}
+
+async function consumePassthroughStreamResponse(
+  response,
+  {
+    wireProtocol,
+    model,
+    wantStream = true,
+    onRawSseFrame = null,
+    onCommit = null,
+    signal,
+    startedAt = null,
+    now = () => Date.now(),
+    thinkingCommitGraceMs = THINKING_COMMIT_GRACE_MS,
+  },
+) {
+  const timing = createStreamTiming(Number.isFinite(startedAt) ? startedAt : now())
+  const headerProviderResult = parseProviderResultHeader(response.headers)
+  let providerResult = headerProviderResult
+  let meta = null
+  let usage = null
+  let reportedModel = null
+  let stopReason = 'stop'
+  let finishReason = ''
+  let sawFinish = false
+  let sawChunk = false
+  let committed = false
+  let firstThinkingAt = 0
+  let streamError = null
+  let sawVisibleText = false
+  let sawImage = false
+  let collectedText = ''
+  let collectedThinking = ''
+  const toolCalls = []
+  const images = []
+  const pendingFrames = []
+  const terminalFrames = []
+  const anthropicBlocks = new Map()
+  let anthropicMessageId = `msg_${crypto.randomBytes(10).toString('hex')}`
+  const geminiParts = []
+  let geminiResponseId = `resp_${crypto.randomBytes(10).toString('hex')}`
+
+  const flushCommit = () => {
+    if (!wantStream) return
+    if (!committed) {
+      committed = true
+      for (const f of pendingFrames) onRawSseFrame?.(f)
+      pendingFrames.length = 0
+      onCommit?.()
+    }
+  }
+
+  const pushDownstreamFrame = (frameText, { isTerminal = false, substantive = false, isThinking = false } = {}) => {
+    if (!wantStream || !frameText) return
+    if (isTerminal) {
+      terminalFrames.push(frameText)
+      return
+    }
+    if (committed) {
+      onRawSseFrame?.(frameText)
+      return
+    }
+    pendingFrames.push(frameText)
+    if (substantive) {
+      flushCommit()
+      return
+    }
+    if (isThinking) {
+      const ts = now()
+      if (!firstThinkingAt) firstThinkingAt = ts
+      if (thinkingCommitGraceMs >= 0 && ts - firstThinkingAt >= thinkingCommitGraceMs) {
+        flushCommit()
+      }
+    }
+  }
+
+  const handleFrame = (rawFrame) => {
+    const trimmedFrame = String(rawFrame || '')
+    if (!trimmedFrame.trim()) return
+    const { eventName, dataText } = parseRawSseFrameMeta(trimmedFrame)
+    if (eventName === 'kin_provider_result') {
+      if (dataText) {
+        try {
+          const parsed = JSON.parse(dataText)
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+            providerResult = parsed
+            meta = {
+              conversationId:
+                typeof parsed.conversation_id === 'string' ? parsed.conversation_id : meta?.conversationId || '',
+              nativeConversationId:
+                typeof parsed.native_conversation_id === 'string'
+                  ? parsed.native_conversation_id
+                  : meta?.nativeConversationId || '',
+              awaitingToolResults: parsed.awaiting_tool_results === true || meta?.awaitingToolResults === true,
+            }
+            const prUsage = usageFromProviderResult(parsed)
+            if (prUsage) usage = prUsage
+          }
+        } catch {}
+      }
+      return
+    }
+
+    if (wireProtocol === 'anthropic') {
+      if (!dataText || dataText === '[DONE]') return
+      let payload
+      try {
+        payload = JSON.parse(dataText)
+      } catch {
+        return
+      }
+      const evType = eventName || String(payload?.type || '')
+      if (evType === 'error') {
+        if (!streamError) {
+          streamError = {
+            status: Number.isInteger(payload?.status) ? payload.status : 502,
+            code: payload?.error?.code || payload?.error?.type || 'gemini_inference_failed',
+            message: payload?.error?.message || payload?.message || 'Upstream Anthropic stream error',
+          }
+        }
+        return
+      }
+      const wireFrame = `${trimmedFrame.replace(/\r\n/g, '\n').replace(/\n*$/, '')}\n\n`
+      if (evType === 'message_start') {
+        timing.observe({ type: 'message_start' }, now())
+        if (typeof payload?.message?.id === 'string' && payload.message.id) anthropicMessageId = payload.message.id
+        if (typeof payload?.message?.model === 'string' && payload.message.model) reportedModel = payload.message.model
+        if (payload?.message?.usage && typeof payload.message.usage === 'object') {
+          const u = payload.message.usage
+          const inTok = Number(u.input_tokens || 0)
+          const outTok = Number(u.output_tokens || 0)
+          const cacheTok = Number(u.cache_read_input_tokens || 0)
+          usage = {
+            input_tokens: inTok,
+            output_tokens: outTok,
+            total_tokens: inTok + cacheTok + outTok,
+            cache_read_tokens: cacheTok,
+            cache_read_input_tokens: cacheTok,
+          }
+        }
+        pushDownstreamFrame(wireFrame)
+        return
+      }
+      if (evType === 'content_block_start') {
+        const idx = Number(payload?.index ?? 0)
+        const block = payload?.content_block || {}
+        if (block.type === 'tool_use') {
+          timing.observe({ type: 'content_block_delta', delta: { type: 'text_delta', text: 'x' } }, now())
+          const tc = {
+            kind: 'tool_call',
+            id: typeof block.id === 'string' ? block.id : '',
+            signedId: typeof block.id === 'string' ? block.id : '',
+            name: typeof block.name === 'string' ? block.name : '',
+            args: block.input && typeof block.input === 'object' ? { ...block.input } : {},
+            _partialJson: '',
+          }
+          toolCalls.push(tc)
+          anthropicBlocks.set(idx, { type: 'tool_use', tc })
+          pushDownstreamFrame(wireFrame, { substantive: true })
+          return
+        }
+        if (block.type === 'thinking') {
+          anthropicBlocks.set(idx, { type: 'thinking', thinking: String(block.thinking || ''), signature: '' })
+          pushDownstreamFrame(wireFrame, { isThinking: true })
+          return
+        }
+        if (block.type === 'text') {
+          const initialText = String(block.text || '')
+          anthropicBlocks.set(idx, { type: 'text', text: initialText })
+          if (initialText.trim()) {
+            sawVisibleText = true
+            collectedText += initialText
+            timing.observe({ type: 'content_block_delta', delta: { type: 'text_delta', text: 'x' } }, now())
+            pushDownstreamFrame(wireFrame, { substantive: true })
+          } else {
+            pushDownstreamFrame(wireFrame)
+          }
+          return
+        }
+        pushDownstreamFrame(wireFrame)
+        return
+      }
+      if (evType === 'content_block_delta') {
+        const idx = Number(payload?.index ?? 0)
+        const delta = payload?.delta || {}
+        const tracked = anthropicBlocks.get(idx)
+        if (delta.type === 'text_delta' && typeof delta.text === 'string') {
+          if (tracked && tracked.type === 'text') tracked.text += delta.text
+          collectedText += delta.text
+          const substantive = delta.text.trim().length > 0
+          if (substantive) {
+            sawVisibleText = true
+            timing.observe({ type: 'content_block_delta', delta: { type: 'text_delta', text: 'x' } }, now())
+          }
+          pushDownstreamFrame(wireFrame, { substantive })
+          return
+        }
+        if (delta.type === 'input_json_delta' && typeof delta.partial_json === 'string') {
+          if (tracked?.tc) tracked.tc._partialJson += delta.partial_json
+          pushDownstreamFrame(wireFrame, { substantive: true })
+          return
+        }
+        if (delta.type === 'thinking_delta' && typeof delta.thinking === 'string') {
+          if (tracked && tracked.type === 'thinking') tracked.thinking += delta.thinking
+          collectedThinking += delta.thinking
+          timing.observe({ type: 'content_block_delta', delta: { type: 'text_delta', text: 'x' } }, now())
+          pushDownstreamFrame(wireFrame, { isThinking: true })
+          return
+        }
+        if (delta.type === 'signature_delta' && typeof delta.signature === 'string') {
+          if (tracked && tracked.type === 'thinking') tracked.signature += delta.signature
+          pushDownstreamFrame(wireFrame, { isThinking: true })
+          return
+        }
+        pushDownstreamFrame(wireFrame)
+        return
+      }
+      if (evType === 'content_block_stop') {
+        const idx = Number(payload?.index ?? 0)
+        const tracked = anthropicBlocks.get(idx)
+        if (tracked?.tc && tracked.tc._partialJson) {
+          try {
+            const parsedArgs = JSON.parse(tracked.tc._partialJson)
+            if (parsedArgs && typeof parsedArgs === 'object') tracked.tc.args = parsedArgs
+          } catch {}
+        }
+        pushDownstreamFrame(wireFrame)
+        return
+      }
+      if (evType === 'message_delta') {
+        const sr = payload?.delta?.stop_reason
+        if (typeof sr === 'string' && sr) {
+          sawFinish = true
+          stopReason =
+            sr === 'tool_use'
+              ? 'tool'
+              : sr === 'max_tokens'
+                ? 'length'
+                : sr === 'refusal'
+                  ? 'filter'
+                  : sr === 'stop_sequence'
+                    ? 'stop_sequence'
+                    : 'stop'
+          timing.observe({ type: 'message_delta', delta: { stop_reason: sr } }, now())
+        }
+        if (payload?.usage && typeof payload.usage === 'object') {
+          const u = payload.usage
+          const prevIn = usage?.input_tokens || 0
+          const prevCache = usage?.cache_read_input_tokens || 0
+          const inTok = u.input_tokens != null ? Number(u.input_tokens || 0) : prevIn
+          const outTok = Number(u.output_tokens || 0)
+          const cacheTok = u.cache_read_input_tokens != null ? Number(u.cache_read_input_tokens || 0) : prevCache
+          usage = {
+            input_tokens: inTok,
+            output_tokens: outTok,
+            total_tokens: inTok + cacheTok + outTok,
+            cache_read_tokens: cacheTok,
+            cache_read_input_tokens: cacheTok,
+          }
+        }
+        pushDownstreamFrame(wireFrame, { isTerminal: true })
+        return
+      }
+      if (evType === 'message_stop') {
+        sawFinish = true
+        pushDownstreamFrame(wireFrame, { isTerminal: true })
+        return
+      }
+      pushDownstreamFrame(wireFrame)
+      return
+    }
+
+    // wireProtocol === 'gemini': lossless native Gemini SSE relay (strips craggeminiMeta & kin_provider_result)
+    const parsed = parseGeminiSseFrame(trimmedFrame)
+    if (parsed.kind === 'error') {
+      if (!streamError) streamError = parsed
+      return
+    }
+    if (parsed.kind === 'invalid') {
+      if (!streamError) {
+        streamError = { status: 502, code: 'gemini_inference_invalid_output', message: parsed.message }
+      }
+      return
+    }
+    if (parsed.kind !== 'chunk') return
+    const chunk = parsed.chunk
+    if (parsed.meta) {
+      meta = {
+        conversationId:
+          typeof parsed.meta.conversation_id === 'string' ? parsed.meta.conversation_id : meta?.conversationId || '',
+        nativeConversationId:
+          typeof parsed.meta.native_conversation_id === 'string'
+            ? parsed.meta.native_conversation_id
+            : meta?.nativeConversationId || '',
+        awaitingToolResults: parsed.meta.awaiting_tool_results === true || meta?.awaitingToolResults === true,
+      }
+    }
+    if (typeof chunk.responseId === 'string' && chunk.responseId) geminiResponseId = chunk.responseId
+    if (typeof chunk.modelVersion === 'string' && chunk.modelVersion.trim()) reportedModel = chunk.modelVersion.trim()
+    const rawUsage = chunk.usageMetadata ?? chunk.usage_metadata
+    if (rawUsage && typeof rawUsage === 'object') {
+      const promptTokens = Number(rawUsage.promptTokenCount ?? rawUsage.prompt_token_count ?? 0)
+      const cachedTokens = Number(rawUsage.cachedContentTokenCount ?? rawUsage.cached_content_token_count ?? 0)
+      const candTokens = Number(rawUsage.candidatesTokenCount ?? rawUsage.candidates_token_count ?? 0)
+      const thoughtTokens = Number(rawUsage.thoughtsTokenCount ?? rawUsage.thoughts_token_count ?? 0)
+      const inputTokens = Math.max(0, promptTokens - cachedTokens)
+      const outputTokens = candTokens + thoughtTokens
+      usage = {
+        input_tokens: inputTokens,
+        output_tokens: outputTokens,
+        total_tokens: inputTokens + cachedTokens + outputTokens,
+        cache_read_tokens: cachedTokens,
+        cache_read_input_tokens: cachedTokens,
+        reasoning_tokens: thoughtTokens,
+      }
+    }
+    let chunkSubstantive = false
+    let chunkThinking = false
+    let chunkHasFinish = false
+    const candidates = Array.isArray(chunk.candidates) ? chunk.candidates : []
+    for (const cand of candidates) {
+      const parts = Array.isArray(cand?.content?.parts) ? cand.content.parts : []
+      for (const part of parts) {
+        if (!part || typeof part !== 'object') continue
+        geminiParts.push(part)
+        if (part.functionCall && typeof part.functionCall === 'object') {
+          chunkSubstantive = true
+          toolCalls.push({
+            kind: 'tool_call',
+            id: typeof part.functionCall.id === 'string' ? part.functionCall.id : '',
+            signedId: typeof part.functionCall.id === 'string' ? part.functionCall.id : '',
+            name: typeof part.functionCall.name === 'string' ? part.functionCall.name : '',
+            args: part.functionCall.args && typeof part.functionCall.args === 'object' ? part.functionCall.args : {},
+            signature: typeof part.thoughtSignature === 'string' ? part.thoughtSignature : '',
+          })
+          timing.observe({ type: 'content_block_delta', delta: { type: 'text_delta', text: 'x' } }, now())
+        } else if (part.thought === true) {
+          chunkThinking = true
+          if (typeof part.text === 'string') collectedThinking += part.text
+          timing.observe({ type: 'content_block_delta', delta: { type: 'text_delta', text: 'x' } }, now())
+        } else if (part.inlineData && typeof part.inlineData.data === 'string' && part.inlineData.data) {
+          chunkSubstantive = true
+          sawImage = true
+          images.push({ mediaType: part.inlineData.mimeType || 'image/png', data: part.inlineData.data })
+          timing.observe({ type: 'content_block_delta', delta: { type: 'text_delta', text: 'x' } }, now())
+        } else if (typeof part.text === 'string' && part.text) {
+          collectedText += part.text
+          if (part.text.trim()) {
+            sawVisibleText = true
+            chunkSubstantive = true
+            timing.observe({ type: 'content_block_delta', delta: { type: 'text_delta', text: 'x' } }, now())
+          }
+        }
+      }
+      if (
+        typeof cand?.finishReason === 'string' &&
+        cand.finishReason &&
+        cand.finishReason !== 'FINISH_REASON_UNSPECIFIED'
+      ) {
+        sawFinish = true
+        chunkHasFinish = true
+        finishReason = cand.finishReason
+        const fr = cand.finishReason.toUpperCase()
+        stopReason =
+          fr === 'MAX_TOKENS'
+            ? 'length'
+            : fr === 'STOP'
+              ? toolCalls.length
+                ? 'tool'
+                : 'stop'
+              : ABNORMAL_FINISH_REASONS.has(fr)
+                ? toolCalls.length
+                  ? 'tool'
+                  : 'malformed_tool_call'
+                : 'filter'
+        timing.observe({ type: 'message_delta', delta: { stop_reason: stopReason } }, now())
+      }
+    }
+    const cleanChunk = { ...chunk }
+    delete cleanChunk.craggeminiMeta
+    const wireFrame = `data: ${JSON.stringify(cleanChunk)}\n\n`
+    pushDownstreamFrame(wireFrame, {
+      isTerminal: chunkHasFinish && !chunkSubstantive && !chunkThinking,
+      substantive: chunkSubstantive,
+      isThinking: chunkThinking,
+    })
+  }
+
+  const splitter = createSseFrameSplitter(handleFrame)
+  const onAbort = () => {
+    try {
+      response.destroy()
+    } catch {}
+  }
+  signal?.addEventListener('abort', onAbort, { once: true })
+  try {
+    for await (const chunk of response) {
+      signal?.throwIfAborted()
+      if (!sawChunk) {
+        sawChunk = true
+        timing.observe({ type: 'message_start' }, now())
+      }
+      splitter.push(chunk)
+    }
+    signal?.throwIfAborted()
+    splitter.flush()
+  } finally {
+    signal?.removeEventListener('abort', onAbort)
+  }
+
+  if (streamError) {
+    const code = Object.hasOwn(FAILURES, streamError.code)
+      ? streamError.code
+      : streamError.status === 429
+        ? 'gemini_quota_exhausted'
+        : streamError.status === 401
+          ? 'gemini_oauth_required'
+          : streamError.status === 403
+            ? 'gemini_location_unsupported'
+            : streamError.status === 404
+              ? 'gemini_model_unavailable'
+              : streamError.status === 400
+                ? 'gemini_invalid_request'
+                : 'gemini_inference_failed'
+    const err = fail(streamError.status || FAILURES[code][0], code, streamError.message)
+    if (Number.isInteger(streamError.status)) err.upstreamStatus = streamError.status
+    err.timing = timing.snapshot()
+    err.usage = usage
+    throw err
+  }
+
+  const effectiveFinish = String(providerResult?.finish_reason || finishReason || '').toUpperCase()
+  const hasVisibleOutput = sawVisibleText || toolCalls.length > 0 || sawImage || providerResult?.visible_output === true
+  const providerIncomplete = providerResult?.provider_complete === false || providerResult?.visible_output === false
+  const abnormalFinish = ABNORMAL_FINISH_REASONS.has(effectiveFinish) && toolCalls.length === 0
+  if (!hasVisibleOutput || providerIncomplete || abnormalFinish) {
+    const err = fail(
+      502,
+      'gemini_inference_invalid_output',
+      abnormalFinish
+        ? `Upstream terminated abnormally (${effectiveFinish}) without usable output.`
+        : FAILURES.gemini_inference_invalid_output[1],
+    )
+    err.timing = timing.snapshot()
+    err.usage = usage
+    throw err
+  }
+
+  if (wantStream) {
+    flushCommit()
+    for (const tf of terminalFrames) onRawSseFrame?.(tf)
+  }
+
+  let passthroughJson = null
+  if (!wantStream) {
+    if (wireProtocol === 'anthropic') {
+      const content = []
+      const sortedIndices = [...anthropicBlocks.keys()].sort((a, b) => a - b)
+      for (const idx of sortedIndices) {
+        const blk = anthropicBlocks.get(idx)
+        if (!blk) continue
+        if (blk.type === 'thinking') {
+          content.push({
+            type: 'thinking',
+            thinking: blk.thinking || '',
+            ...(blk.signature ? { signature: blk.signature } : {}),
+          })
+        } else if (blk.type === 'text') {
+          content.push({ type: 'text', text: blk.text || '' })
+        } else if (blk.type === 'tool_use' && blk.tc) {
+          content.push({
+            type: 'tool_use',
+            id: blk.tc.id,
+            name: blk.tc.name,
+            input: blk.tc.args || {},
+          })
+        }
+      }
+      const anthStop =
+        stopReason === 'tool'
+          ? 'tool_use'
+          : stopReason === 'length'
+            ? 'max_tokens'
+            : stopReason === 'filter'
+              ? 'refusal'
+              : stopReason === 'stop_sequence'
+                ? 'stop_sequence'
+                : 'end_turn'
+      passthroughJson = {
+        id: anthropicMessageId,
+        type: 'message',
+        role: 'assistant',
+        model: reportedModel || model,
+        content,
+        stop_reason: anthStop,
+        stop_sequence: null,
+        usage: {
+          input_tokens: usage?.input_tokens || 0,
+          output_tokens: usage?.output_tokens || 0,
+          ...(usage?.cache_read_input_tokens ? { cache_read_input_tokens: usage.cache_read_input_tokens } : {}),
+        },
+      }
+    } else {
+      passthroughJson = {
+        responseId: geminiResponseId,
+        modelVersion: reportedModel || model,
+        candidates: [
+          {
+            index: 0,
+            content: { role: 'model', parts: geminiParts },
+            finishReason: finishReason || 'STOP',
+          },
+        ],
+        ...(usage
+          ? {
+              usageMetadata: {
+                promptTokenCount: (usage.input_tokens || 0) + (usage.cache_read_tokens || 0),
+                candidatesTokenCount: Math.max(0, (usage.output_tokens || 0) - (usage.reasoning_tokens || 0)),
+                totalTokenCount: usage.total_tokens || 0,
+                ...(usage.cache_read_tokens ? { cachedContentTokenCount: usage.cache_read_tokens } : {}),
+                ...(usage.reasoning_tokens ? { thoughtsTokenCount: usage.reasoning_tokens } : {}),
+              },
+            }
+          : {}),
+      }
+    }
+  }
+
+  return {
+    id: wireProtocol === 'anthropic' ? anthropicMessageId : geminiResponseId,
+    model: reportedModel || model,
+    reportedModel,
+    text: collectedText,
+    thinking: collectedThinking,
+    toolCalls,
+    images,
+    searches: [],
+    stopReason: toolCalls.length && stopReason === 'stop' ? 'tool' : stopReason,
+    finishReason: finishReason || (sawFinish ? 'STOP' : ''),
+    sawFinish,
+    meta,
+    providerResult,
+    passthroughHandled: wantStream,
+    passthroughJson,
+    usage: usage || {
+      input_tokens: 0,
+      output_tokens: 0,
+      total_tokens: 0,
+      cache_read_tokens: 0,
+      cache_read_input_tokens: 0,
+      reasoning_tokens: 0,
+    },
+    timing: timing.snapshot(),
+  }
+}
+
 async function consumeStreamResponse(
   response,
   {
@@ -490,6 +1139,26 @@ async function consumeStreamResponse(
     signal?.removeEventListener('abort', onAbort)
   }
   const result = collector.result()
+  const headerProviderResult = parseProviderResultHeader(response.headers)
+  const effectiveProviderResult = result.providerResult || headerProviderResult || null
+  if (effectiveProviderResult && !result.meta) {
+    result.meta = {
+      conversationId:
+        typeof effectiveProviderResult.conversation_id === 'string' ? effectiveProviderResult.conversation_id : '',
+      nativeConversationId:
+        typeof effectiveProviderResult.native_conversation_id === 'string'
+          ? effectiveProviderResult.native_conversation_id
+          : '',
+      awaitingToolResults: effectiveProviderResult.awaiting_tool_results === true,
+    }
+  }
+  const prUsage = usageFromProviderResult(effectiveProviderResult)
+  if (
+    prUsage &&
+    (!result.usage || ((result.usage.input_tokens || 0) === 0 && (result.usage.output_tokens || 0) === 0))
+  ) {
+    result.usage = prUsage
+  }
   if (streamError) {
     const code = Object.hasOwn(FAILURES, streamError.code)
       ? streamError.code
@@ -510,16 +1179,23 @@ async function consumeStreamResponse(
     err.usage = result.usage
     throw err
   }
-  if (!result.sawFinish && !result.text && !result.toolCalls.length && !result.images.length) {
-    const err = fail(502, 'gemini_inference_invalid_output')
-    err.timing = timing.snapshot()
-    err.usage = result.usage
-    throw err
-  }
+  const hasVisibleOutput =
+    Boolean(result.text && result.text.trim()) ||
+    result.toolCalls.length > 0 ||
+    result.images.length > 0 ||
+    effectiveProviderResult?.visible_output === true
+  const providerIncomplete =
+    effectiveProviderResult?.provider_complete === false || effectiveProviderResult?.visible_output === false
+  const abnormalFinish =
+    ABNORMAL_FINISH_REASONS.has(
+      String(effectiveProviderResult?.finish_reason || result.finishReason || '').toUpperCase(),
+    ) && result.toolCalls.length === 0
   const requiredChoice = typeof restoreContext?.toolChoice === 'string' ? restoreContext.toolChoice : ''
   const requiresToolCall =
     (requiredChoice === 'required' || requiredChoice.startsWith('name:')) && (restoreContext?.toolMap?.size ?? 0) > 0
   if (
+    !abnormalFinish &&
+    !providerIncomplete &&
     requiresToolCall &&
     result.toolCalls.length === 0 &&
     (result.stopReason === 'stop' || (!result.sawFinish && result.text))
@@ -532,10 +1208,22 @@ async function consumeStreamResponse(
     err.usage = result.usage
     throw err
   }
+  if (!hasVisibleOutput || providerIncomplete || abnormalFinish) {
+    const err = fail(
+      502,
+      'gemini_inference_invalid_output',
+      abnormalFinish
+        ? `Upstream terminated abnormally (${effectiveProviderResult?.finish_reason || result.finishReason}) without usable output.`
+        : FAILURES.gemini_inference_invalid_output[1],
+    )
+    err.timing = timing.snapshot()
+    err.usage = result.usage
+    throw err
+  }
   if (!result.sawFinish) {
     timing.observe({ type: 'message_stop' }, now())
   }
-  return { ...result, timing: timing.snapshot() }
+  return { ...result, providerResult: effectiveProviderResult, timing: timing.snapshot() }
 }
 
 async function readErrorPayload(response) {
@@ -771,7 +1459,14 @@ export function createGeminiScheduler({
     return entry
   }
 
-  function rememberConversation(stickyKey, accountId, outboundConversationId, ts, extraUsedIds = null) {
+  function rememberConversation(
+    stickyKey,
+    accountId,
+    outboundConversationId,
+    ts,
+    extraUsedIds = null,
+    recoveryEpoch = 0,
+  ) {
     if (!stickyKey) return
     const prev = outboundConversationMemory.get(stickyKey)
     if (outboundConversationMemory.size >= CONV_MEMORY_MAX) {
@@ -799,10 +1494,37 @@ export function createGeminiScheduler({
         : prev?.accountId === accountId
           ? prev.outboundConversationId || null
           : null
+    const nextEpoch = Math.max(Number(prev?.recoveryEpoch) || 0, Number(recoveryEpoch) || 0)
     outboundConversationMemory.set(stickyKey, {
       accountId,
       outboundConversationId: resolvedOutboundConvId,
       usedConversationIds,
+      recoveryEpoch: nextEpoch,
+      pendingReset: false,
+      expiresAt: ts + CONV_MEMORY_TTL_MS,
+    })
+  }
+
+  function invalidateConversationBinding(stickyKey, failedConversationId, ts, { pendingReset = true } = {}) {
+    if (!stickyKey) return
+    const prev = outboundConversationMemory.get(stickyKey)
+    const usedConversationIds = new Set(prev?.usedConversationIds || [])
+    if (typeof prev?.outboundConversationId === 'string' && CONV_ID.test(prev.outboundConversationId)) {
+      usedConversationIds.add(prev.outboundConversationId)
+    }
+    if (typeof failedConversationId === 'string' && CONV_ID.test(failedConversationId)) {
+      usedConversationIds.add(failedConversationId)
+    }
+    while (usedConversationIds.size > MAX_TRACKED_CONVERSATION_IDS) {
+      const oldest = usedConversationIds.values().next().value
+      usedConversationIds.delete(oldest)
+    }
+    outboundConversationMemory.set(stickyKey, {
+      accountId: null,
+      outboundConversationId: null,
+      usedConversationIds,
+      recoveryEpoch: Number(prev?.recoveryEpoch) || 0,
+      pendingReset: Boolean(pendingReset),
       expiresAt: ts + CONV_MEMORY_TTL_MS,
     })
   }
@@ -1081,6 +1803,10 @@ export function createGeminiScheduler({
     async stream({
       model,
       requestedEffort = null,
+      inboundProtocol = null,
+      rawInboundBody = null,
+      promptPolicy = null,
+      wantStream = true,
       geminiBody,
       targetBodyFor = null,
       restoreContext = null,
@@ -1105,6 +1831,10 @@ export function createGeminiScheduler({
       allowedEnvIds = null,
       catalogSnapshot = null,
       schedulerRuntime: callSchedulerRuntime = null,
+      onResetStream = null,
+      onOutboundBody = null,
+      onRawSseFrame = null,
+      thinkingCommitGraceMs = THINKING_COMMIT_GRACE_MS,
       onEvent = null,
     }) {
       const rt = resolveSchedulerRuntime(callSchedulerRuntime)
@@ -1276,12 +2006,7 @@ export function createGeminiScheduler({
         const attemptUsedConversationIds = new Set(prevConvMem?.usedConversationIds || [])
         if (prevConvMem?.outboundConversationId) attemptUsedConversationIds.add(prevConvMem.outboundConversationId)
         if (continuationBinding?.conversationId) attemptUsedConversationIds.add(continuationBinding.conversationId)
-        if (typeof inboundConversationId === 'string' && inboundConversationId) {
-          attemptUsedConversationIds.add(inboundConversationId)
-        }
-        if (typeof geminiBody?.conversation_id === 'string' && geminiBody.conversation_id) {
-          attemptUsedConversationIds.add(geminiBody.conversation_id)
-        }
+        let recoveryEpoch = Number(prevConvMem?.recoveryEpoch) || 0
 
         const maxAccountSwitches =
           typeof getRoutingConfig === 'function'
@@ -1295,7 +2020,18 @@ export function createGeminiScheduler({
         const resolvedOriginPoolId =
           originPoolId || poolAccess?.originPool?.id || poolAccess?.effectivePool?.id || VIRTUAL_POOL_IDS.gemini
         const resolvedSessionId =
-          inboundIdentity?.sessionId || (effectiveStickyKey ? String(effectiveStickyKey) : '') || crypto.randomUUID()
+          inboundIdentity?.sessionId ||
+          (typeof inboundConversationId === 'string' && inboundConversationId.trim()) ||
+          (effectiveStickyKey ? String(effectiveStickyKey) : '') ||
+          crypto.randomUUID()
+        const isDerivedSession =
+          typeof inboundIdentity?.sessionSource === 'string' && inboundIdentity.sessionSource.startsWith('derived_')
+        const canonicalConvId = scopedConversationId({
+          ownerScope,
+          poolId: resolvedOriginPoolId,
+          apiKeyId: apiKeyRecord?.id || apiKeyKind || 'anon',
+          sessionId: resolvedSessionId,
+        })
 
         // Security: mint an unpredictable per-dispatch UUIDv4 for Rust scheduler idempotency;
         // never reuse client-controlled X-Request-Id (`requestId`) as Rust's acquire key.
@@ -1321,13 +2057,40 @@ export function createGeminiScheduler({
           noQueue: noQueue === true,
         }
 
-        // Step 1: Acquire lease strictly from Rust `kin-scheduler`.
+        // Step 1: Acquire lease strictly from Rust `kin-scheduler`, pinning the suspended
+        // tool-continuation environment when eligible so continuations never drift across nodes.
+        const continuationPinNodeKey =
+          continuationBinding?.accountId && itemByEnvId.has(continuationBinding.accountId)
+            ? formatNodeKey('gemini_env', continuationBinding.accountId)
+            : null
         let acquired
-        try {
-          acquired = await rt.acquireNode(
-            { ...baseAcquireParams, attemptNo: 1, excludeNodes: [...excludedNodeKeys] },
+        const acquireInitial = async (pinNodeKey = null) =>
+          rt.acquireNode(
+            {
+              ...baseAcquireParams,
+              ...(pinNodeKey ? { pinNodeKey } : {}),
+              attemptNo: 1,
+              excludeNodes: [...excludedNodeKeys],
+            },
             { signal },
           )
+        try {
+          if (continuationPinNodeKey) {
+            try {
+              acquired = await acquireInitial(continuationPinNodeKey)
+            } catch (pinErr) {
+              if (
+                pinErr instanceof SchedulerApiError &&
+                (pinErr.code === 'pool_exhausted' || pinErr.code === 'pinned_node_unavailable')
+              ) {
+                acquired = await acquireInitial(null)
+              } else {
+                throw pinErr
+              }
+            }
+          } else {
+            acquired = await acquireInitial(null)
+          }
         } catch (err) {
           if (err instanceof SchedulerUnavailableError || err?.code === 'scheduler_unavailable') {
             throw err
@@ -1350,6 +2113,7 @@ export function createGeminiScheduler({
 
         while (attempts < maxAttempts) {
           signal?.throwIfAborted()
+          onResetStream?.()
           const item = itemByEnvId.get(activeEnvId)
           if (!item) {
             await releaseActiveLeaseNow({ outcome: 'error', error_class: 'unknown' })
@@ -1410,6 +2174,7 @@ export function createGeminiScheduler({
 
             let outboundConversationId = null
             let switchedAccount = false
+            let sessionReset = false
             if (target === 'antigravity') {
               if (isRestartResumeRetry && CONV_ID.test(restartResumeConvId || '')) {
                 outboundConversationId = restartResumeConvId
@@ -1424,89 +2189,191 @@ export function createGeminiScheduler({
                 prevConvMem &&
                 prevConvMem.accountId === id &&
                 attempts === 1 &&
+                !sessionConflictRetried &&
                 CONV_ID.test(prevConvMem.outboundConversationId || '')
               ) {
                 outboundConversationId = prevConvMem.outboundConversationId
-              } else {
-                outboundConversationId = mintOutboundConversationId(attemptUsedConversationIds)
-                attemptUsedConversationIds.add(outboundConversationId)
+              } else if (
+                attempts === 1 &&
+                !sessionConflictRetried &&
+                !prevConvMem?.pendingReset &&
+                (!prevConvMem || prevConvMem.accountId === id) &&
+                (!continuationBinding || continuationBinding.accountId === id) &&
+                !attemptUsedConversationIds.has(canonicalConvId)
+              ) {
+                outboundConversationId = canonicalConvId
+              } else if (isDerivedSession && (sessionConflictRetried || prevConvMem?.pendingReset)) {
+                // Concurrent identical-prompt derived_* calls must isolate onto a random conversation_id
+                // without sending X-Craggemini-Session-Reset (which would cancel the concurrent sibling).
+                outboundConversationId = randomConversationId(attemptUsedConversationIds)
                 switchedAccount = Boolean(
-                  (prevConvMem && prevConvMem.accountId !== id) ||
+                  (prevConvMem?.accountId && prevConvMem.accountId !== id) ||
                     (continuationBinding && continuationBinding.accountId !== id) ||
                     attempts > 1,
                 )
+                sessionReset = false
+              } else {
+                const nextRec = nextRecoveryConversationId(
+                  canonicalConvId,
+                  attemptUsedConversationIds,
+                  recoveryEpoch + 1,
+                )
+                outboundConversationId = nextRec.conversationId
+                recoveryEpoch = nextRec.epoch
+                switchedAccount = Boolean(
+                  (prevConvMem?.accountId && prevConvMem.accountId !== id) ||
+                    (continuationBinding && continuationBinding.accountId !== id) ||
+                    attempts > 1,
+                )
+                sessionReset = Boolean(sessionConflictRetried || switchedAccount || prevConvMem?.pendingReset)
               }
+              if (outboundConversationId) attemptUsedConversationIds.add(outboundConversationId)
             }
             attemptConversationId = outboundConversationId
             if (outboundConversationId) lastConversationId = outboundConversationId
 
-            // Google / Gemini nodes strictly enforce passthrough (never inject Anthropic prompts).
-            const rawOutboundBody = targetBodyFor
-              ? targetBodyFor(target, {
-                  upstreamModel: resolved.upstreamModel,
-                  publicModel: resolved.publicId,
-                  ...(outboundConversationId ? { conversationId: outboundConversationId } : {}),
-                  switchedAccount,
-                })
-              : outboundConversationId && geminiBody && typeof geminiBody === 'object'
-                ? { ...geminiBody, conversation_id: outboundConversationId }
-                : geminiBody
-            const outboundBody =
-              rawOutboundBody && typeof rawOutboundBody === 'object' && 'model' in rawOutboundBody
-                ? { ...rawOutboundBody, model: resolved.upstreamModel }
-                : rawOutboundBody
             const attemptRequestId = attempts === 1 ? requestId : `${requestId}_a${attempts}`.slice(0, 128)
+            const proxySha256 = proxyUrl ? crypto.createHash('sha256').update(proxyUrl).digest('hex') : undefined
+            const gatewayPolicy =
+              typeof getRoutingConfig === 'function'
+                ? {
+                    queue_wait_ms: policy.pool.queue_timeout_ms,
+                    first_byte_timeout_ms: policy.pool.first_byte_timeout_ms,
+                    stream_idle_timeout_ms: policy.pool.idle_timeout_ms,
+                  }
+                : undefined
+            const turnTimeoutMs = Math.max(STREAM_TURN_MS, (policy.pool.timeout_ms || 300_000) + 15_000)
+
+            let directTarget = null
+            if (streamHost && target === 'antigravity' && effectiveDirectClient) {
+              directTarget = await effectiveDirectClient.resolveTarget({
+                id,
+                proxyId,
+                proxyUrl,
+                proxySha256,
+                ...(egressOptions ? { egressOptions } : {}),
+                model: resolved.upstreamModel,
+              })
+            }
+
+            const supportsAnthropicWire =
+              target === 'antigravity' && targetSupportsWireProtocol(directTarget, 'anthropic')
+            const supportsGeminiWire = target === 'antigravity' && targetSupportsWireProtocol(directTarget, 'gemini')
+            const supportsCleanAcpText = target === 'antigravity' && targetSupportsCleanAcpText(directTarget)
+            const useProviderResult = target === 'antigravity' && targetSupportsProviderResult(directTarget)
+
+            let wireProtocol = null
+            let passthroughProtocol = null
+            let outboundBody = null
+
+            const lockedPromptMode = promptPolicy?.preset === 'zero' ? 'zero' : 'official_full'
+            const sanitizePassthroughInbound = (src) => {
+              const {
+                system_prompt_mode: _dropPromptMode,
+                crag_prompt: _dropCragPrompt,
+                gateway_policy: _dropGatewayPolicy,
+                restart_resume: _dropRestartResume,
+                request_id: _dropRequestId,
+                ...clean
+              } = src
+              return clean
+            }
+
+            if (
+              target === 'antigravity' &&
+              inboundProtocol === 'anthropic' &&
+              supportsAnthropicWire &&
+              rawInboundBody &&
+              typeof rawInboundBody === 'object' &&
+              Array.isArray(rawInboundBody.messages)
+            ) {
+              wireProtocol = 'anthropic'
+              passthroughProtocol = 'anthropic'
+              outboundBody = {
+                ...sanitizePassthroughInbound(rawInboundBody),
+                model: resolved.upstreamModel,
+                system_prompt_mode: lockedPromptMode,
+              }
+              onOutboundBody?.(outboundBody, { target, wireProtocol: 'anthropic', source: 'craggemini_anthropic' })
+            } else if (
+              target === 'antigravity' &&
+              inboundProtocol === 'gemini' &&
+              rawInboundBody &&
+              typeof rawInboundBody === 'object' &&
+              Array.isArray(rawInboundBody.contents) &&
+              (supportsGeminiWire || (!targetBodyFor && !geminiBody))
+            ) {
+              const candidateBody = {
+                ...sanitizePassthroughInbound(rawInboundBody),
+                model: resolved.upstreamModel,
+                ...(outboundConversationId ? { conversation_id: outboundConversationId } : {}),
+                system_prompt_mode: lockedPromptMode,
+              }
+              const preparedGemini = prepareDirectNativeTurnBody(resolved.upstreamModel, candidateBody, {
+                preserveThought: true,
+              })
+              if (preparedGemini) {
+                wireProtocol = supportsGeminiWire ? 'gemini' : null
+                passthroughProtocol = 'gemini'
+                outboundBody = preparedGemini
+                onOutboundBody?.(outboundBody, { target, wireProtocol: wireProtocol || 'raw', source: 'craggemini' })
+              }
+            }
+
+            if (!outboundBody) {
+              if (supportsGeminiWire) wireProtocol = 'gemini'
+              // Google / Gemini nodes strictly enforce passthrough (never inject Anthropic prompts).
+              const rawOutboundBody = targetBodyFor
+                ? targetBodyFor(target, {
+                    upstreamModel: resolved.upstreamModel,
+                    publicModel: resolved.publicId,
+                    ...(outboundConversationId ? { conversationId: outboundConversationId } : {}),
+                    switchedAccount,
+                    escapeSlashes: !supportsCleanAcpText,
+                  })
+                : outboundConversationId && geminiBody && typeof geminiBody === 'object'
+                  ? { ...geminiBody, conversation_id: outboundConversationId }
+                  : geminiBody
+              outboundBody =
+                rawOutboundBody && typeof rawOutboundBody === 'object' && 'model' in rawOutboundBody
+                  ? { ...rawOutboundBody, model: resolved.upstreamModel }
+                  : rawOutboundBody
+            }
 
             let streamResponse = null
             if (streamHost) {
-              const proxySha256 = proxyUrl ? crypto.createHash('sha256').update(proxyUrl).digest('hex') : undefined
-              const gatewayPolicy =
-                typeof getRoutingConfig === 'function'
-                  ? {
-                      queue_wait_ms: policy.pool.queue_timeout_ms,
-                      first_byte_timeout_ms: policy.pool.first_byte_timeout_ms,
-                      stream_idle_timeout_ms: policy.pool.idle_timeout_ms,
-                    }
-                  : undefined
-              const turnTimeoutMs = Math.max(STREAM_TURN_MS, (policy.pool.timeout_ms || 120_000) + 15_000)
-              if (target === 'antigravity' && effectiveDirectClient) {
-                const directTarget = await effectiveDirectClient.resolveTarget({
-                  id,
-                  proxyId,
-                  proxyUrl,
-                  proxySha256,
-                  ...(egressOptions ? { egressOptions } : {}),
+              if (directTarget) {
+                const directOutcome = await effectiveDirectClient.openDirectStream(directTarget, {
                   model: resolved.upstreamModel,
+                  requestId: attemptRequestId,
+                  bodyObj: outboundBody,
+                  gatewayPolicy,
+                  restartResume: isRestartResumeRetry,
+                  wireProtocol,
+                  providerResult: useProviderResult,
+                  sessionReset,
+                  conversationId: outboundConversationId,
+                  signal,
+                  timeoutMs: turnTimeoutMs,
                 })
-                if (directTarget) {
-                  const directOutcome = await effectiveDirectClient.openDirectStream(directTarget, {
-                    model: resolved.upstreamModel,
-                    requestId: attemptRequestId,
-                    bodyObj: outboundBody,
-                    gatewayPolicy,
-                    restartResume: isRestartResumeRetry,
-                    signal,
-                    timeoutMs: turnTimeoutMs,
-                  })
-                  if (directOutcome.ok) {
-                    lastUpstreamStatus = 200
-                    activeInfer = { id, request_id: attemptRequestId, directTarget }
-                    streamResponse = directOutcome.res
-                  } else if (!directOutcome.fallback) {
-                    if (
-                      typeof directOutcome.error?.code === 'string' &&
-                      (directOutcome.error.code.startsWith('license_') ||
-                        directOutcome.error.code === 'gemini_native_worker_unavailable')
-                    ) {
-                      effectiveDirectClient.invalidate(id)
-                    }
-                    if (Number.isInteger(directOutcome.error?.upstreamStatus)) {
-                      lastUpstreamStatus = directOutcome.error.upstreamStatus
-                    }
-                    throw directOutcome.error
-                  } else {
+                if (directOutcome.ok) {
+                  lastUpstreamStatus = 200
+                  activeInfer = { id, request_id: attemptRequestId, directTarget }
+                  streamResponse = directOutcome.res
+                } else if (!directOutcome.fallback) {
+                  if (
+                    typeof directOutcome.error?.code === 'string' &&
+                    (directOutcome.error.code.startsWith('license_') ||
+                      directOutcome.error.code === 'gemini_native_worker_unavailable')
+                  ) {
                     effectiveDirectClient.invalidate(id)
                   }
+                  if (Number.isInteger(directOutcome.error?.upstreamStatus)) {
+                    lastUpstreamStatus = directOutcome.error.upstreamStatus
+                  }
+                  throw directOutcome.error
+                } else {
+                  effectiveDirectClient.invalidate(id)
                 }
               }
               if (!streamResponse) {
@@ -1522,6 +2389,10 @@ export function createGeminiScheduler({
                     request_id: attemptRequestId,
                     ...(gatewayPolicy ? { gateway_policy: gatewayPolicy } : {}),
                     ...(isRestartResumeRetry ? { restart_resume: true } : {}),
+                    ...(wireProtocol ? { wire_protocol: wireProtocol } : {}),
+                    ...(useProviderResult ? { provider_result: true } : {}),
+                    ...(sessionReset ? { session_reset: true } : {}),
+                    ...(outboundConversationId ? { conversation_id: outboundConversationId } : {}),
                     body: outboundBody,
                   },
                   { signal, timeoutMs: turnTimeoutMs },
@@ -1611,7 +2482,20 @@ export function createGeminiScheduler({
             }
 
             let collected
-            if (streamResponse) {
+            if (streamResponse && passthroughProtocol) {
+              collected = await consumePassthroughStreamResponse(streamResponse, {
+                wireProtocol: passthroughProtocol,
+                model: resolved.publicId,
+                wantStream,
+                onRawSseFrame,
+                onCommit: markCommitted,
+                signal,
+                startedAt: turnStartedAt,
+                now,
+                thinkingCommitGraceMs,
+              })
+              activeInfer = null
+            } else if (streamResponse) {
               collected = await consumeStreamResponse(streamResponse, {
                 model: resolved.publicId,
                 target,
@@ -1730,7 +2614,14 @@ export function createGeminiScheduler({
               ? continuationBinding.parentRequestId || null
               : requestId || null
 
-            rememberConversation(effectiveStickyKey, id, reportedConvId, finishedAt, attemptUsedConversationIds)
+            rememberConversation(
+              effectiveStickyKey,
+              id,
+              reportedConvId,
+              finishedAt,
+              attemptUsedConversationIds,
+              recoveryEpoch,
+            )
             recordToolContinuation(
               id,
               collected,
@@ -1883,6 +2774,8 @@ export function createGeminiScheduler({
             const isUpstream502 =
               !isUpstream503 &&
               !isLocalBridgeDisconnect &&
+              failureCode !== 'gemini_inference_invalid_output' &&
+              failureCode !== 'gemini_tool_call_required' &&
               (attemptUpstreamStatus === 502 ||
                 failureCode === 'gemini_proxy_error' ||
                 (failureCode === 'gemini_inference_failed' &&
@@ -1984,7 +2877,9 @@ export function createGeminiScheduler({
             }
 
             if (!emittedOutput && failureCode === 'gemini_session_conflict') {
-              clearConversationMemory(effectiveStickyKey)
+              invalidateConversationBinding(effectiveStickyKey, attemptConversationId, failedAt, {
+                pendingReset: true,
+              })
               clearToolContinuation(continuationCallIds)
             }
 

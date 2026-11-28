@@ -24,6 +24,25 @@ import {
 import { createGeminiScheduler as createRawGeminiScheduler } from '../../src/lib/gemini/scheduler.mjs'
 import { FULL_GEMINI_CAPABILITIES, NATIVE_TUI_CAPABILITIES } from '../../src/lib/protocol/gemini-convert.mjs'
 import { SchedulerApiError } from '../../src/lib/transport/scheduler-client.mjs'
+import fs from 'node:fs'
+import {
+  createDirectCragClient,
+  mapCragWorkerError,
+  prepareDirectNativeTurnBody,
+  targetSupportsProviderResult,
+  targetSupportsWireProtocol,
+} from '../../src/lib/gemini/direct-client.mjs'
+import { isAntigravityRoutedModel, parseAntigravityModelSpec } from '../../src/lib/gemini/model-catalog.mjs'
+import { resolveSchedulerIdentity } from '../../src/lib/identity/identity-rewrite.mjs'
+import { firstUserFingerprint, isShortProbeRequest } from '../../src/lib/pool/sticky-router.mjs'
+import {
+  buildGeminiRequest,
+  createGeminiEventDecoder,
+  createGeminiRestoreTransform,
+  parseInboundToGemini,
+} from '../../src/lib/protocol/gemini-convert.mjs'
+import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs'
+import { handleUserCountTokens } from '../../src/lib/protocol/user-count-tokens.mjs'
 
 function makeMockGeminiRuntime({ now = () => Date.now(), quotaCooldownMs = 60_000, poolScheduler = null } = {}) {
   let seq = 0
@@ -1522,11 +1541,11 @@ test('CRAGGemini resume keeps conversation_id on same account and always remints
     return res.jsonBody()
   }
 
-  // Turn 1: lands on env-a, mints account-scoped outbound conversation_id C1 (!== caller raw ID).
+  // Turn 1: lands on env-a, derives tenant-scoped deterministic outbound conversation_id C1 (!== raw callerConv).
   const r1 = await postChat([{ role: 'user', content: 'Start project alpha' }])
   const t1 = calls[calls.length - 1]
   assert.equal(t1.id, 'env-a')
-  assert.match(t1.convId, /^gc_[a-f0-9]{24}$/)
+  assert.match(t1.convId, /^cs_[a-f0-9]{24}$/)
   assert.notEqual(t1.convId, callerConv)
   const c1 = t1.convId
 
@@ -1540,7 +1559,7 @@ test('CRAGGemini resume keeps conversation_id on same account and always remints
   assert.equal(t2.id, 'env-a')
   assert.equal(t2.convId, c1, 'same-account resume must preserve outbound conversation_id')
 
-  // Turn 3: env-a hits 429 -> intra-request failover to env-b MUST mint a brand-new conversation_id C2 !== C1
+  // Turn 3: env-a hits 429 -> intra-request failover to env-b MUST derive recovery conversation_id C2 !== C1
   // and deliver the full multi-turn history so env-b continues seamlessly.
   failAccounts = new Set(['env-a'])
   const callsBeforeT3 = calls.length
@@ -1563,9 +1582,8 @@ test('CRAGGemini resume keeps conversation_id on same account and always remints
   assert.equal(t3Attempts[1].convId, c1, 'same-account 429 retry keeps conv id for agy resume')
   assert.equal(t3Attempts[2].id, 'env-b')
   const c2 = t3Attempts[2].convId
-  assert.match(c2, /^gc_[a-f0-9]{24}$/)
-  assert.notEqual(c2, c1, 'account switch env-a -> env-b must mint a new conversation_id')
-  assert.notEqual(c2, callerConv)
+  assert.equal(c2, `${c1}:r1`)
+  assert.notEqual(c2, c1, 'account switch env-a -> env-b must derive a new recovery conversation_id')
   assert.equal(t3Attempts[2].body.contents.length, 5, 'failover target must receive full history for continuity')
 
   // Turn 4: stays on env-b and resumes with C2.
@@ -1583,7 +1601,7 @@ test('CRAGGemini resume keeps conversation_id on same account and always remints
   assert.equal(t4.convId, c2, 'subsequent turn on env-b must reuse C2')
 
   // Turn 5: advance clock so env-a exits cooldown, then env-b hits 429 -> switch BACK env-b -> env-a!
-  // MUST mint a 3rd brand-new conversation_id C3 !== C2 AND C3 !== C1!
+  // MUST derive a 3rd recovery conversation_id C3 !== C2 AND C3 !== C1!
   nowMs += 60_000
   failAccounts = new Set(['env-b'])
   const callsBeforeT5 = calls.length
@@ -1602,9 +1620,13 @@ test('CRAGGemini resume keeps conversation_id on same account and always remints
   const t5Ok = t5Attempts[t5Attempts.length - 1]
   assert.equal(t5Ok.id, 'env-a')
   const c3 = t5Ok.convId
-  assert.match(c3, /^gc_[a-f0-9]{24}$/)
+  assert.equal(c3, `${c1}:r2`)
   assert.notEqual(c3, c2, 'switch back env-b -> env-a must not reuse env-b conversation_id')
-  assert.notEqual(c3, c1, 'returning to previously used env-a must mint a fresh conversation_id (not stale C1)')
+  assert.notEqual(
+    c3,
+    c1,
+    'returning to previously used env-a must derive a fresh recovery conversation_id (not stale C1)',
+  )
   assert.equal(t5Ok.body.contents.length, 9)
 
   // Stateless client (NO conversation_id / NO x-session-id header) keeps same account + C_stateless via fingerprint,
@@ -1821,7 +1843,7 @@ test('CRAGGemini suspended MCP tool continuation remints conversation_id and cle
   assert.equal(calls[2].convId, 'conv_mcp_orig_7', '429 restart_resume retry stays on env-a with same conv id')
   assert.equal(calls[3].id, 'env-b')
   const envBConvId = calls[3].convId
-  assert.match(envBConvId, /^gc_[a-f0-9]{24}$/)
+  assert.match(envBConvId, /:r\d+$/)
   assert.notEqual(envBConvId, 'conv_mcp_orig_7', 'failover account must never inherit suspended account conv id')
   assert.notEqual(envBConvId, calls[0].convId)
   assert.equal(calls[3].body.contents.length, 3, 'failover account must receive full tool history')
@@ -3146,4 +3168,1448 @@ test('open unitCircuit surfaces gemini_native_worker_unavailable while genuine s
   } finally {
     scheduler._mockRuntime.acquireNode = origAcquire
   }
+})
+
+// ===========================================================================
+// Claude Code <-> CRAGGemini Boundary & Frozen Wire Contract Regressions
+// ===========================================================================
+
+function ccMakeEnv(id, extra = {}) {
+  return {
+    id,
+    proxy_id: `proxy-${id}`,
+    auth_state: 'authorized',
+    auth_method: 'oauth',
+    models_discovered: true,
+    models: ['gemini-4-hydrogen-high', 'gemini-4-neon-high', 'gemini-3-pro'],
+    capabilities: [...NATIVE_TUI_CAPABILITIES],
+    ...extra,
+  }
+}
+
+function ccMakeSseStream(chunks, headers = {}) {
+  const stream = new Readable({ read() {} })
+  stream.statusCode = 200
+  stream.headers = { 'content-type': 'text/event-stream; charset=utf-8', ...headers }
+  process.nextTick(() => {
+    for (const c of chunks) stream.push(c)
+    stream.push(null)
+  })
+  return stream
+}
+
+function ccMakeReq({
+  method = 'POST',
+  url = '/v1/messages',
+  headers = {},
+  body = {},
+  apiKeyRecord = null,
+  apiKeyKind = 'managed',
+}) {
+  const req = new EventEmitter()
+  req.method = method
+  req.url = url
+  req.headers = { 'content-type': 'application/json', ...headers }
+  req.body = body
+  req.apiKeyKind = apiKeyKind
+  req.apiKeyRecord = apiKeyRecord || { id: 'key-cc', group_type: 'all' }
+  return req
+}
+
+function ccMakeRes() {
+  const chunks = []
+  const headers = {}
+  const res = new EventEmitter()
+  res.statusCode = 200
+  res.headersSent = false
+  res.writableEnded = false
+  res.destroyed = false
+  res.writeHead = (code, hdrs = {}) => {
+    res.statusCode = code
+    res.headersSent = true
+    for (const [k, v] of Object.entries(hdrs)) headers[k.toLowerCase()] = v
+  }
+  res.setHeader = (k, v) => {
+    headers[k.toLowerCase()] = v
+  }
+  res.getHeader = (k) => headers[k.toLowerCase()]
+  res.write = (chunk) => {
+    res.headersSent = true
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk)))
+    return true
+  }
+  res.end = (chunk) => {
+    if (chunk !== undefined) res.write(chunk)
+    res.headersSent = true
+    res.writableEnded = true
+    res.emit('finish')
+  }
+  res.bodyText = () => Buffer.concat(chunks).toString('utf8')
+  res.jsonBody = () => JSON.parse(res.bodyText())
+  res.headers = headers
+  res.chunks = chunks
+  return res
+}
+
+function ccJsonResponder(res, status, body) {
+  res.writeHead(status, { 'content-type': 'application/json' })
+  res.end(JSON.stringify(body))
+}
+
+function ccMakeRecordingRuntime(recordedAcquires = []) {
+  let seq = 0
+  return {
+    async acquireNode(params) {
+      recordedAcquires.push({ ...params })
+      const excluded = new Set(params.excludeNodes || [])
+      const allowed = Array.isArray(params.allowedNodeKeys) ? params.allowedNodeKeys : []
+      let key = null
+      if (params.pinNodeKey && allowed.includes(params.pinNodeKey) && !excluded.has(params.pinNodeKey)) {
+        key = params.pinNodeKey
+      } else {
+        key = allowed.find((k) => !excluded.has(k))
+      }
+      if (!key) {
+        throw new SchedulerApiError({
+          status: 429,
+          code: 'pool_exhausted',
+          message: 'No gemini environment available',
+          retryAfterSec: 5,
+        })
+      }
+      const id = key.split(':').slice(1).join(':')
+      return {
+        lease_id: `gem-lease-${++seq}`,
+        lease_ttl_ms: 30_000,
+        resolved_pool_id: params.originPoolId || '__default_gemini__',
+        selected_node: { node_type: 'gemini_env', node_id: id, node_key: key },
+        explain: { affinity: { why: params.pinNodeKey === key ? 'pinned' : 'balanced' } },
+      }
+    },
+    async switchNode(body) {
+      return this.acquireNode(body.next_attempt || {})
+    },
+    async commitLease() {},
+    async releaseLease() {},
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 1. Frozen Internal Boundary Contract: capabilities, headers, wire passthrough
+// ---------------------------------------------------------------------------
+
+test('capabilities negotiation honors protocol_capabilities first and falls back to capabilities array', () => {
+  const modernTarget = {
+    capabilities: ['internal_wire_protocol_v1'],
+    protocolCapabilities: {
+      internal_wire_protocols: ['raw', 'gemini', 'anthropic'],
+      provider_result_v2: true,
+      per_session_mcp: true,
+    },
+  }
+  assert.equal(targetSupportsWireProtocol(modernTarget, 'anthropic'), true)
+  assert.equal(targetSupportsWireProtocol(modernTarget, 'gemini'), true)
+  assert.equal(targetSupportsWireProtocol(modernTarget, 'raw'), true)
+  assert.equal(targetSupportsProviderResult(modernTarget), true)
+
+  const arrayOnlyTarget = {
+    capabilities: ['internal_anthropic_wire_v1', 'internal_gemini_wire_v1', 'provider_result_v2'],
+    protocolCapabilities: {},
+  }
+  assert.equal(targetSupportsWireProtocol(arrayOnlyTarget, 'anthropic'), true)
+  assert.equal(targetSupportsWireProtocol(arrayOnlyTarget, 'gemini'), true)
+  assert.equal(targetSupportsProviderResult(arrayOnlyTarget), true)
+
+  const legacyTarget = { capabilities: [], protocolCapabilities: {} }
+  assert.equal(targetSupportsWireProtocol(legacyTarget, 'anthropic'), false)
+  assert.equal(targetSupportsWireProtocol(legacyTarget, 'gemini'), false)
+  assert.equal(targetSupportsProviderResult(legacyTarget), false)
+})
+
+test('directClient openDirectStream emits frozen X-Craggemini-* headers over Unix socket', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vm2api-direct-hdr-'))
+  const sockPath = path.join(tmpDir, 'worker.sock')
+  const captured = []
+  const server = http.createServer((req, res) => {
+    const chunks = []
+    req.on('data', (c) => chunks.push(c))
+    req.on('end', () => {
+      captured.push({
+        url: req.url,
+        headers: req.headers,
+        body: JSON.parse(Buffer.concat(chunks).toString('utf8')),
+      })
+      res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8' })
+      res.end('event: message_stop\ndata: {"type":"message_stop"}\n\n')
+    })
+  })
+  await new Promise((resolve) => server.listen(sockPath, resolve))
+  try {
+    const client = createDirectCragClient({
+      callHost: async () => ({
+        direct: true,
+        kind: 'session',
+        socket_path: sockPath,
+        token: 'a'.repeat(32),
+        message_path: '/internal/v1/messages',
+        cancel_path: '/internal/v1/cancel',
+        env_id: 'env-1',
+        capabilities: ['internal_anthropic_wire_v1', 'provider_result_v2'],
+        protocol_capabilities: {
+          internal_wire_protocols: ['raw', 'gemini', 'anthropic'],
+          provider_result_v2: true,
+        },
+      }),
+    })
+    const target = await client.resolveTarget({ id: 'env-1', proxyId: 'proxy-1' })
+    assert.ok(target)
+    assert.equal(targetSupportsWireProtocol(target, 'anthropic'), true)
+    assert.equal(targetSupportsProviderResult(target), true)
+
+    const opened = await client.openDirectStream(target, {
+      model: 'gemini-4-hydrogen-high',
+      requestId: 'req-direct-1',
+      bodyObj: {
+        model: 'gemini-vm/gemini-4-hydrogen-high',
+        max_tokens: 1024,
+        system: 'Be exact.',
+        messages: [{ role: 'user', content: 'Inspect /mnt/x/vm2api' }],
+      },
+      wireProtocol: 'anthropic',
+      providerResult: true,
+      sessionReset: true,
+      conversationId: '11111111-2222-4333-8444-555555555555:r1',
+    })
+    assert.equal(opened.ok, true)
+    assert.equal(opened.res.statusCode, 200)
+    for await (const _ of opened.res) {
+      // drain
+    }
+    assert.equal(captured.length, 1)
+    assert.equal(captured[0].headers['x-craggemini-wire-protocol'], 'anthropic')
+    assert.equal(captured[0].headers['x-craggemini-provider-result'], '1')
+    assert.equal(captured[0].headers['x-craggemini-session-reset'], '1')
+    assert.equal(captured[0].body.conversation_id, '11111111-2222-4333-8444-555555555555:r1')
+    assert.equal(captured[0].body.body.model, 'gemini-4-hydrogen-high')
+    assert.deepEqual(captured[0].body.body.messages, [{ role: 'user', content: 'Inspect /mnt/x/vm2api' }])
+  } finally {
+    await new Promise((resolve) => server.close(resolve))
+    fs.rmSync(tmpDir, { recursive: true, force: true })
+  }
+})
+
+test('Anthropic native passthrough skips IR conversion, strips kin_provider_result, and handles streaming & non-streaming', async () => {
+  const envs = [ccMakeEnv('env-anth')]
+  const directCalls = []
+  let streamFrames = []
+
+  const directClient = {
+    async resolveTarget({ id }) {
+      return {
+        kind: 'session',
+        socketPath: '/tmp/fake.sock',
+        token: 't'.repeat(32),
+        envId: id,
+        accountRoute: false,
+        capabilities: ['internal_anthropic_wire_v1', 'internal_gemini_wire_v1', 'provider_result_v2'],
+        protocolCapabilities: {
+          internal_wire_protocols: ['raw', 'gemini', 'anthropic'],
+          provider_result_v2: true,
+          per_session_mcp: true,
+        },
+      }
+    },
+    async openDirectStream(_target, opts) {
+      directCalls.push(opts)
+      return { ok: true, res: ccMakeSseStream(streamFrames) }
+    },
+    async cancelDirectTurn() {},
+    invalidate() {},
+  }
+
+  const scheduler = createRawGeminiScheduler({
+    schedulerRuntime: ccMakeRecordingRuntime(),
+    callHost: async (op, payload) => {
+      if (op === 'list') return { payload_state: 'installed', environments: envs }
+      if (op === 'get') return { id: payload.id, proxy_id: `proxy-${payload.id}`, auth_method: 'oauth' }
+      throw new Error(`unexpected op ${op}`)
+    },
+    callHostStream: async () => {
+      throw new Error('should use directClient when target supports anthropic wire')
+    },
+    resolveProxy: () => 'socks5h://127.0.0.1:1080',
+    directClient,
+  })
+  const handler = createGeminiPublicHandler({ json: ccJsonResponder, readBody: async () => ({}), scheduler })
+
+  const sessionUuid = '11111111-2222-4333-8444-555555555555'
+  const rawBody = {
+    model: 'gemini-vm/gemini-4-hydrogen-high',
+    max_tokens: 4096,
+    stream: true,
+    metadata: { user_id: `user_${'a'.repeat(64)}_account__session_${sessionUuid}` },
+    system: [{ type: 'text', text: 'Use Read on /mnt/x/vm2api' }],
+    tools: [
+      {
+        name: 'Read',
+        description: 'Read file',
+        input_schema: { type: 'object', properties: { path: { type: 'string' } } },
+      },
+    ],
+    messages: [
+      { role: 'user', content: 'Check /mnt/x/vm2api/src/server.mjs' },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'thinking', thinking: 'Checking path', signature: 'sig_keep_me' },
+          { type: 'tool_use', id: 'toolu_read_1', name: 'Read', input: { path: '/mnt/x/vm2api/src/server.mjs' } },
+        ],
+      },
+      {
+        role: 'user',
+        content: [
+          { type: 'tool_result', tool_use_id: 'toolu_read_1', content: 'ENOENT /mnt/x/vm2api/missing', is_error: true },
+          { type: 'text', text: '<system-reminder>stay focused</system-reminder>' },
+        ],
+      },
+    ],
+  }
+
+  streamFrames = [
+    `event: message_start\ndata: ${JSON.stringify({ type: 'message_start', message: { id: 'msg_native_1', type: 'message', role: 'assistant', model: 'gemini-4-hydrogen-high', content: [], stop_reason: null, usage: { input_tokens: 0, output_tokens: 0 } } })}\n\n`,
+    `event: content_block_start\ndata: ${JSON.stringify({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } })}\n\n`,
+    `event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'File was missing.' } })}\n\n`,
+    `event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index: 0 })}\n\n`,
+    `event: message_delta\ndata: ${JSON.stringify({ type: 'message_delta', delta: { stop_reason: 'end_turn', stop_sequence: null }, usage: { output_tokens: 45 } })}\n\n`,
+    `event: message_stop\ndata: ${JSON.stringify({ type: 'message_stop' })}\n\n`,
+    `event: kin_provider_result\ndata: ${JSON.stringify({ conversation_id: sessionUuid, native_conversation_id: 'nc_42', awaiting_tool_results: false, visible_output: true, provider_complete: true, finish_reason: 'end_turn', usage: { input_tokens: 120, output_tokens: 45, cache_read_input_tokens: 30 } })}\n\n`,
+  ]
+
+  const resStream = ccMakeRes()
+  await handler(
+    ccMakeReq({
+      url: '/v1/messages',
+      body: { ...rawBody, system_prompt_mode: 'zero', crag_prompt: 'client-injected-bypass' },
+    }),
+    resStream,
+  )
+  assert.equal(resStream.statusCode, 200)
+  assert.equal(directCalls.length, 1)
+  assert.equal(directCalls[0].wireProtocol, 'anthropic')
+  assert.equal(directCalls[0].providerResult, true)
+  assert.equal(
+    directCalls[0].bodyObj.system_prompt_mode,
+    'official_full',
+    'client-supplied system_prompt_mode must never override operator promptPolicy',
+  )
+  assert.equal(directCalls[0].bodyObj.crag_prompt, undefined, 'client-supplied crag_prompt must be stripped')
+  assert.match(directCalls[0].conversationId, /^cs_[a-f0-9]{24}$/)
+  assert.notEqual(directCalls[0].conversationId, sessionUuid, 'outbound conversation_id must be tenant-scoped')
+  // Native Anthropic payload passed through untouched (no contents[] conversion, no ZWSP, is_error preserved).
+  assert.ok(Array.isArray(directCalls[0].bodyObj.messages))
+  assert.equal(directCalls[0].bodyObj.contents, undefined)
+  assert.equal(directCalls[0].bodyObj.messages[2].content[0].is_error, true)
+  assert.equal(directCalls[0].bodyObj.messages[2].content[0].content.includes('\u200B'), false)
+  // Downstream SSE has visible output and ZERO kin_provider_result leakage.
+  const outSse = resStream.bodyText()
+  assert.match(outSse, /File was missing\./)
+  assert.match(outSse, /event: message_stop/)
+  assert.doesNotMatch(outSse, /kin_provider_result/)
+  assert.doesNotMatch(outSse, /craggeminiMeta/)
+
+  // Non-streaming Anthropic passthrough returns HTTP 200 Anthropic JSON message with usage from kin_provider_result.
+  const resJson = ccMakeRes()
+  await handler(ccMakeReq({ url: '/v1/messages', body: { ...rawBody, stream: false } }), resJson)
+  assert.equal(resJson.statusCode, 200)
+  const payload = resJson.jsonBody()
+  assert.equal(payload.type, 'message')
+  assert.equal(payload.role, 'assistant')
+  assert.equal(payload.stop_reason, 'end_turn')
+  assert.deepEqual(payload.content, [{ type: 'text', text: 'File was missing.' }])
+  assert.equal(payload.usage.input_tokens, 120)
+  assert.equal(payload.usage.output_tokens, 45)
+  assert.equal(payload.usage.cache_read_input_tokens, 30)
+})
+
+test('Gemini native /v1beta passthrough preserves historical thought parts and strips craggeminiMeta & kin_provider_result', async () => {
+  const envs = [ccMakeEnv('env-gem')]
+  const directCalls = []
+
+  const directClient = {
+    async resolveTarget({ id }) {
+      return {
+        kind: 'session',
+        socketPath: '/tmp/fake-gem.sock',
+        token: 't'.repeat(32),
+        envId: id,
+        accountRoute: false,
+        capabilities: ['internal_gemini_wire_v1', 'provider_result_v2'],
+        protocolCapabilities: {
+          internal_wire_protocols: ['raw', 'gemini'],
+          provider_result_v2: true,
+        },
+      }
+    },
+    async openDirectStream(_target, opts) {
+      directCalls.push(opts)
+      return {
+        ok: true,
+        res: ccMakeSseStream([
+          `data: ${JSON.stringify({
+            craggeminiMeta: { conversation_id: 'gem-sess-1', awaiting_tool_results: false },
+            candidates: [{ content: { role: 'model', parts: [{ text: 'checked /etc/hosts' }] }, finishReason: 'STOP' }],
+          })}\n\n`,
+          `event: kin_provider_result\ndata: ${JSON.stringify({ conversation_id: 'gem-sess-1', visible_output: true, provider_complete: true, finish_reason: 'STOP' })}\n\n`,
+        ]),
+      }
+    },
+    async cancelDirectTurn() {},
+    invalidate() {},
+  }
+
+  const scheduler = createRawGeminiScheduler({
+    schedulerRuntime: ccMakeRecordingRuntime(),
+    callHost: async (op, payload) => {
+      if (op === 'list') return { payload_state: 'installed', environments: envs }
+      if (op === 'get') return { id: payload.id, proxy_id: `proxy-${payload.id}`, auth_method: 'oauth' }
+      throw new Error(`unexpected op ${op}`)
+    },
+    callHostStream: async () => {
+      throw new Error('should use directClient')
+    },
+    resolveProxy: () => 'socks5h://127.0.0.1:1080',
+    directClient,
+  })
+  const handler = createGeminiPublicHandler({ json: ccJsonResponder, readBody: async () => ({}), scheduler })
+
+  const res = ccMakeRes()
+  await handler(
+    ccMakeReq({
+      url: '/v1beta/models/gemini-4-hydrogen-high:streamGenerateContent?alt=sse',
+      headers: { 'x-session-id': 'gem-sess-1' },
+      body: {
+        contents: [
+          { role: 'user', parts: [{ text: 'Read /etc/hosts' }] },
+          {
+            role: 'model',
+            parts: [
+              { thought: true, text: 'Need to inspect hosts', thoughtSignature: 'sig_gem_1' },
+              { functionCall: { id: 'fc_1', name: 'Read', args: { path: '/etc/hosts' } } },
+            ],
+          },
+          {
+            role: 'user',
+            parts: [{ functionResponse: { id: 'fc_1', name: 'Read', response: { output: '127.0.0.1 localhost' } } }],
+          },
+        ],
+      },
+    }),
+    res,
+  )
+  assert.equal(res.statusCode, 200)
+  assert.equal(directCalls.length, 1)
+  assert.equal(directCalls[0].wireProtocol, 'gemini')
+  const prepared = prepareDirectNativeTurnBody('gemini-4-hydrogen-high', directCalls[0].bodyObj, {
+    preserveThought: true,
+  })
+  assert.equal(prepared.contents[1].parts[0].thought, true)
+  assert.equal(prepared.contents[1].parts[0].thoughtSignature, 'sig_gem_1')
+  assert.deepEqual(prepared.contents[2].parts[0].functionResponse.response, { output: '127.0.0.1 localhost' })
+  assert.doesNotMatch(res.bodyText(), /craggeminiMeta/)
+  assert.doesNotMatch(res.bodyText(), /kin_provider_result/)
+  assert.match(res.bodyText(), /checked \/etc\/hosts/)
+})
+
+// ---------------------------------------------------------------------------
+// 2. Problem Class (A): Empty/Idle Turns, Pre-Commit Buffering, Abnormal Finish, 409
+// ---------------------------------------------------------------------------
+
+test('(A) thinking-only empty STOP does not commit downstream headers and fails over cleanly to second account', async () => {
+  const envs = [ccMakeEnv('env-empty-1'), ccMakeEnv('env-good-2')]
+  const calls = []
+  const scheduler = createRawGeminiScheduler({
+    schedulerRuntime: ccMakeRecordingRuntime(),
+    callHost: async (op, payload) => {
+      if (op === 'list') return { payload_state: 'installed', environments: envs }
+      if (op === 'get') return { id: payload.id, proxy_id: `proxy-${payload.id}`, auth_method: 'oauth' }
+      throw new Error(`unexpected op ${op}`)
+    },
+    callHostStream: async (_op, payload) => {
+      calls.push(payload.id)
+      if (payload.id === 'env-empty-1') {
+        return ccMakeSseStream([
+          `data: ${JSON.stringify({
+            craggeminiMeta: { conversation_id: 'sess-empty-1', awaiting_tool_results: false },
+            candidates: [
+              {
+                content: { role: 'model', parts: [{ thought: true, text: 'stale thought from env 1' }] },
+                finishReason: 'STOP',
+              },
+            ],
+            usageMetadata: { promptTokenCount: 100, thoughtsTokenCount: 50, totalTokenCount: 150 },
+          })}\n\n`,
+        ])
+      }
+      return ccMakeSseStream([
+        `data: ${JSON.stringify({
+          candidates: [
+            { content: { role: 'model', parts: [{ text: 'clean answer from env 2' }] }, finishReason: 'STOP' },
+          ],
+          usageMetadata: { promptTokenCount: 100, candidatesTokenCount: 12, totalTokenCount: 112 },
+        })}\n\n`,
+      ])
+    },
+    resolveProxy: () => 'socks5h://127.0.0.1:1080',
+  })
+  const handler = createGeminiPublicHandler({ json: ccJsonResponder, readBody: async () => ({}), scheduler })
+
+  const res = ccMakeRes()
+  await handler(
+    ccMakeReq({
+      url: '/v1/messages',
+      body: {
+        model: 'gemini-4-hydrogen-high',
+        stream: true,
+        max_tokens: 1024,
+        messages: [{ role: 'user', content: 'Say hello cleanly.' }],
+      },
+    }),
+    res,
+  )
+  assert.equal(res.statusCode, 200)
+  assert.deepEqual(calls, ['env-empty-1', 'env-good-2'])
+  const out = res.bodyText()
+  assert.match(out, /clean answer from env 2/)
+  assert.doesNotMatch(out, /stale thought from env 1/, 'attempt 1 buffered thinking must be cleared before attempt 2')
+})
+
+test('(A) abnormal finishReason (MALFORMED_FUNCTION_CALL/OTHER) & provider_complete=false reject instead of 200 end_turn', async () => {
+  const decodeStop = (finishReason) => {
+    const dec = createGeminiEventDecoder({ fallbackModel: 'gemini-4-hydrogen-high' })
+    const evs = []
+    dec.decodeSseFrame(
+      `data: ${JSON.stringify({ candidates: [{ content: { role: 'model', parts: [] }, finishReason }] })}`,
+      (ev) => evs.push(ev),
+    )
+    return evs.find((e) => e.kind === 'stop')?.stopReason
+  }
+  assert.equal(decodeStop('MALFORMED_FUNCTION_CALL'), 'malformed_tool_call')
+  assert.equal(decodeStop('UNEXPECTED_TOOL_CALL'), 'malformed_tool_call')
+  assert.equal(decodeStop('TOO_MANY_TOOL_CALLS'), 'malformed_tool_call')
+  assert.equal(decodeStop('OTHER'), 'other')
+
+  const envs = [ccMakeEnv('env-abn')]
+  let nextFrames = []
+  const scheduler = createRawGeminiScheduler({
+    schedulerRuntime: ccMakeRecordingRuntime(),
+    callHost: async (op, payload) => {
+      if (op === 'list') return { payload_state: 'installed', environments: envs }
+      if (op === 'get') return { id: payload.id, proxy_id: `proxy-${payload.id}`, auth_method: 'oauth' }
+      throw new Error(`unexpected op ${op}`)
+    },
+    callHostStream: async () => ccMakeSseStream(nextFrames),
+    resolveProxy: () => 'socks5h://127.0.0.1:1080',
+  })
+
+  // Case 1: MALFORMED_FUNCTION_CALL with no tool calls
+  nextFrames = [
+    `data: ${JSON.stringify({
+      candidates: [
+        { content: { role: 'model', parts: [{ text: 'broken call' }] }, finishReason: 'MALFORMED_FUNCTION_CALL' },
+      ],
+    })}\n\n`,
+  ]
+  await assert.rejects(
+    () =>
+      scheduler.stream({
+        model: 'gemini-4-hydrogen-high',
+        geminiBody: { contents: [{ role: 'user', parts: [{ text: 'call tool' }] }] },
+        apiKeyRecord: { id: 'k1', group_type: 'gemini' },
+      }),
+    (err) => err.code === 'gemini_inference_invalid_output' && err.status === 502,
+  )
+
+  // Case 2: kin_provider_result provider_complete: false
+  nextFrames = [
+    `data: ${JSON.stringify({
+      candidates: [{ content: { role: 'model', parts: [{ text: 'partial' }] }, finishReason: 'STOP' }],
+    })}\n\n`,
+    `event: kin_provider_result\ndata: ${JSON.stringify({ provider_complete: false, visible_output: true, finish_reason: 'STOP' })}\n\n`,
+  ]
+  await assert.rejects(
+    () =>
+      scheduler.stream({
+        model: 'gemini-4-hydrogen-high',
+        geminiBody: { contents: [{ role: 'user', parts: [{ text: 'hi' }] }] },
+        apiKeyRecord: { id: 'k1', group_type: 'gemini' },
+      }),
+    (err) => err.code === 'gemini_inference_invalid_output' && err.status === 502,
+  )
+})
+
+test('(A) createGeminiRestoreTransform does not early-stop long thinking via chars/4 before visible text', () => {
+  let earlyStopped = false
+  const emitted = []
+  const transform = createGeminiRestoreTransform(
+    { maxTokens: 100, toolMap: new Map(), stopSequences: [] },
+    {
+      target: 'antigravity',
+      model: 'gemini-4-hydrogen-high',
+      onEarlyStop: () => {
+        earlyStopped = true
+      },
+    },
+  )
+  const emit = (ev) => emitted.push(ev)
+  transform.push({ kind: 'thinking', text: 'x'.repeat(8000) }, emit)
+  assert.equal(earlyStopped, false, 'thinking must never trigger chars/4 early-stop')
+  transform.push({ kind: 'text', text: 'actual final answer' }, emit)
+  transform.push({ kind: 'stop', stopReason: 'stop', finishReason: 'STOP' }, emit)
+  transform.flush(emit)
+  assert.equal(earlyStopped, false)
+  assert.ok(emitted.some((e) => e.kind === 'text' && e.text === 'actual final answer'))
+})
+
+test('(A) 409 session conflict codes map to 409 gemini_session_conflict and retry with :r1 + X-Craggemini-Session-Reset', async () => {
+  for (const code of ['session_conflict', 'tool_continuation_already_settled', 'duplicate_request', 'session_busy']) {
+    const mapped = mapCragWorkerError(409, { code, error: code })
+    assert.equal(mapped.status, 409, `expected 409 for ${code}`)
+    assert.equal(mapped.code, 'gemini_session_conflict', `expected gemini_session_conflict for ${code}`)
+  }
+  const bare409 = mapCragWorkerError(409, { error: 'busy' })
+  assert.equal(bare409.status, 409)
+  assert.equal(bare409.code, 'gemini_session_conflict')
+
+  const envs = [ccMakeEnv('env-409')]
+  const directAttempts = []
+  const directClient = {
+    async resolveTarget({ id }) {
+      return {
+        kind: 'session',
+        socketPath: '/tmp/fake-409.sock',
+        token: 't'.repeat(32),
+        envId: id,
+        accountRoute: false,
+        capabilities: ['internal_anthropic_wire_v1', 'provider_result_v2'],
+        protocolCapabilities: { internal_wire_protocols: ['raw', 'gemini', 'anthropic'], provider_result_v2: true },
+      }
+    },
+    async openDirectStream(_target, opts) {
+      directAttempts.push({ conversationId: opts.conversationId, sessionReset: opts.sessionReset })
+      if (directAttempts.length === 1) {
+        const err = new Error('session busy')
+        err.status = 409
+        err.upstreamStatus = 409
+        err.code = 'gemini_session_conflict'
+        return { ok: false, fallback: false, error: err }
+      }
+      return {
+        ok: true,
+        res: ccMakeSseStream([
+          `event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'recovered after 409' } })}\n\n`,
+          `event: message_stop\ndata: ${JSON.stringify({ type: 'message_stop' })}\n\n`,
+          `event: kin_provider_result\ndata: ${JSON.stringify({ conversation_id: opts.conversationId, visible_output: true, provider_complete: true, finish_reason: 'end_turn' })}\n\n`,
+        ]),
+      }
+    },
+    async cancelDirectTurn() {},
+    invalidate() {},
+  }
+  const scheduler = createRawGeminiScheduler({
+    schedulerRuntime: ccMakeRecordingRuntime(),
+    callHost: async (op, payload) => {
+      if (op === 'list') return { payload_state: 'installed', environments: envs }
+      if (op === 'get') return { id: payload.id, proxy_id: `proxy-${payload.id}`, auth_method: 'oauth' }
+      throw new Error(`unexpected op ${op}`)
+    },
+    callHostStream: async () => {
+      throw new Error('should use directClient')
+    },
+    resolveProxy: () => 'socks5h://127.0.0.1:1080',
+    getRoutingConfig: () => ({ gemini: { failover: { max_account_switches: 1 } } }),
+    directClient,
+  })
+
+  const out = await scheduler.stream({
+    model: 'gemini-4-hydrogen-high',
+    inboundProtocol: 'anthropic',
+    rawInboundBody: { model: 'gemini-4-hydrogen-high', messages: [{ role: 'user', content: 'hi' }] },
+    wantStream: false,
+    geminiBody: { contents: [{ role: 'user', parts: [{ text: 'hi' }] }] },
+    inboundConversationId: 'sess-409-canon',
+    stickyKey: 'sess-409-canon',
+    apiKeyRecord: { id: 'k1', group_type: 'gemini' },
+  })
+  assert.equal(out.text, 'recovered after 409')
+  assert.equal(directAttempts.length, 2)
+  assert.match(directAttempts[0].conversationId, /^cs_[a-f0-9]{24}$/)
+  assert.equal(directAttempts[0].sessionReset, false)
+  assert.equal(directAttempts[1].conversationId, `${directAttempts[0].conversationId}:r1`)
+  assert.equal(directAttempts[1].sessionReset, true)
+})
+
+// ---------------------------------------------------------------------------
+// 3. Problem Class (B): T1->T2 Identity Parity, Unified Session Extraction, Continuation Pinning
+// ---------------------------------------------------------------------------
+
+test('(B) headerless /v1beta T1 and T2 derive identical sessionId while short probes remain random', () => {
+  const t1 = {
+    contents: [
+      {
+        role: 'user',
+        parts: [
+          { text: '<system-reminder>injected metadata</system-reminder>' },
+          { text: 'Analyze the transaction isolation model of PostgreSQL MVCC in detail.' },
+        ],
+      },
+    ],
+  }
+  const t2 = {
+    contents: [
+      ...t1.contents,
+      { role: 'model', parts: [{ text: 'PostgreSQL uses snapshot isolation...' }] },
+      { role: 'user', parts: [{ text: 'Now compare with SSI.' }] },
+    ],
+  }
+  const id1 = resolveSchedulerIdentity({ inbound: t1, poolId: 'pool_gem', apiKeyId: 'key_1' })
+  const id2 = resolveSchedulerIdentity({ inbound: t2, poolId: 'pool_gem', apiKeyId: 'key_1' })
+  assert.equal(id1.sessionId, id2.sessionId)
+  assert.equal(id1.sessionSource, 'derived_first_turn')
+  assert.equal(id2.sessionSource, 'derived_multi_turn')
+
+  // Short single-turn /v1beta probe without tools stays ephemeral & random.
+  const probe = { contents: [{ role: 'user', parts: [{ text: 'ping' }] }] }
+  assert.equal(isShortProbeRequest(probe), true)
+  const p1 = resolveSchedulerIdentity({ inbound: probe, poolId: 'pool_gem', apiKeyId: 'key_1' })
+  const p2 = resolveSchedulerIdentity({ inbound: probe, poolId: 'pool_gem', apiKeyId: 'key_1' })
+  assert.equal(p1.isEphemeralProbe, true)
+  assert.equal(p1.sessionSource, 'generated_random')
+  assert.notEqual(p1.sessionId, p2.sessionId)
+
+  // firstUserFingerprint hashes beyond 4000 chars and ignores <system-reminder>.
+  const prefix = 'A'.repeat(4200)
+  const fpA = firstUserFingerprint({ contents: [{ role: 'user', parts: [{ text: `${prefix}ALPHA` }] }] })
+  const fpB = firstUserFingerprint({ contents: [{ role: 'user', parts: [{ text: `${prefix}BETA` }] }] })
+  assert.ok(fpA && fpB)
+  assert.notEqual(fpA, fpB)
+})
+
+test('(B) inbound conversationId extraction enforces metadata.user_id > headers > body priority', () => {
+  const fromMeta = parseInboundToGemini(
+    'anthropic',
+    {
+      model: 'gemini-4-hydrogen-high',
+      metadata: { user_id: `user_${'b'.repeat(64)}_account__session_22222222-3333-4444-8555-666666666666` },
+      conversation_id: 'body-conv',
+      messages: [{ role: 'user', content: 'hi' }],
+    },
+    { headers: { 'x-session-id': 'hdr-conv' } },
+  ).conversationId
+  assert.equal(fromMeta, '22222222-3333-4444-8555-666666666666')
+
+  const fromJsonMeta = parseInboundToGemini(
+    'anthropic',
+    {
+      model: 'gemini-4-hydrogen-high',
+      metadata: { user_id: JSON.stringify({ device_id: 'dev-1', session_id: '33333333-4444-4555-8666-777777777777' }) },
+      conversation_id: 'body-conv',
+      messages: [{ role: 'user', content: 'hi' }],
+    },
+    { headers: { 'x-session-id': 'hdr-conv' } },
+  ).conversationId
+  assert.equal(fromJsonMeta, '33333333-4444-4555-8666-777777777777')
+
+  const fromHdr = parseInboundToGemini(
+    'anthropic',
+    {
+      model: 'gemini-4-hydrogen-high',
+      conversation_id: 'body-conv',
+      messages: [{ role: 'user', content: 'hi' }],
+    },
+    { headers: { 'x-session-id': 'hdr-conv' } },
+  ).conversationId
+  assert.equal(fromHdr, 'hdr-conv')
+
+  const fromBody = parseInboundToGemini(
+    'anthropic',
+    {
+      model: 'gemini-4-hydrogen-high',
+      conversation_id: 'body-conv',
+      messages: [{ role: 'user', content: 'hi' }],
+    },
+    { headers: {} },
+  ).conversationId
+  assert.equal(fromBody, 'body-conv')
+})
+
+test('(B) trailing [user(tool_result), user(<system-reminder>)] extracts continuationCallIds and pins continuation account', async () => {
+  const envs = [ccMakeEnv('env-pin-a'), ccMakeEnv('env-pin-b')]
+  const acquires = []
+  let turn = 0
+
+  const scheduler = createRawGeminiScheduler({
+    schedulerRuntime: ccMakeRecordingRuntime(acquires),
+    callHost: async (op, payload) => {
+      if (op === 'list') return { payload_state: 'installed', environments: envs }
+      if (op === 'get') return { id: payload.id, proxy_id: `proxy-${payload.id}`, auth_method: 'oauth' }
+      throw new Error(`unexpected op ${op}`)
+    },
+    callHostStream: async () => {
+      turn += 1
+      if (turn === 1) {
+        return ccMakeSseStream([
+          `data: ${JSON.stringify({
+            craggeminiMeta: { conversation_id: 'sess-pin-1', awaiting_tool_results: true },
+            candidates: [
+              {
+                content: {
+                  role: 'model',
+                  parts: [{ functionCall: { id: 'toolu_pin_99', name: 'Read', args: { path: '/etc/hosts' } } }],
+                },
+                finishReason: 'STOP',
+              },
+            ],
+          })}\n\n`,
+        ])
+      }
+      return ccMakeSseStream([
+        `data: ${JSON.stringify({
+          candidates: [
+            { content: { role: 'model', parts: [{ text: 'done after continuation' }] }, finishReason: 'STOP' },
+          ],
+        })}\n\n`,
+      ])
+    },
+    resolveProxy: () => 'socks5h://127.0.0.1:1080',
+  })
+  const handler = createGeminiPublicHandler({ json: ccJsonResponder, readBody: async () => ({}), scheduler })
+
+  // Turn 1 suspends waiting for toolu_pin_99 on env-pin-a
+  const r1 = ccMakeRes()
+  await handler(
+    ccMakeReq({
+      url: '/v1/messages',
+      body: {
+        model: 'gemini-4-hydrogen-high',
+        max_tokens: 1024,
+        metadata: { user_id: 'user_a_session_33333333-4444-4555-8666-777777777777' },
+        tools: [{ name: 'Read', input_schema: { type: 'object', properties: { path: { type: 'string' } } } }],
+        messages: [{ role: 'user', content: 'Read /etc/hosts' }],
+      },
+    }),
+    r1,
+  )
+  assert.equal(r1.statusCode, 200)
+
+  // Turn 2 sends [user(tool_result), user(<system-reminder>)] (Magpie / CC style trailing reminder turn)
+  const r2 = ccMakeRes()
+  await handler(
+    ccMakeReq({
+      url: '/v1/messages',
+      body: {
+        model: 'gemini-4-hydrogen-high',
+        max_tokens: 1024,
+        metadata: { user_id: 'user_a_session_33333333-4444-4555-8666-777777777777' },
+        tools: [{ name: 'Read', input_schema: { type: 'object', properties: { path: { type: 'string' } } } }],
+        messages: [
+          { role: 'user', content: 'Read /etc/hosts' },
+          {
+            role: 'assistant',
+            content: [{ type: 'tool_use', id: 'toolu_pin_99', name: 'Read', input: { path: '/etc/hosts' } }],
+          },
+          {
+            role: 'user',
+            content: [{ type: 'tool_result', tool_use_id: 'toolu_pin_99', content: '127.0.0.1 localhost' }],
+          },
+          {
+            role: 'user',
+            content: [{ type: 'text', text: '<system-reminder>keep concise</system-reminder>' }],
+          },
+        ],
+      },
+    }),
+    r2,
+  )
+  assert.equal(r2.statusCode, 200)
+  assert.equal(acquires.length, 2)
+  assert.equal(acquires[1].pinNodeKey, 'gemini_env:env-pin-a')
+})
+
+// ---------------------------------------------------------------------------
+// 4. Problem Class (C): Tool History Fidelity
+// ---------------------------------------------------------------------------
+
+test('(C) tool history preserves thoughtSignature, single user turn, is_error, rawResponse keys, tool_result files, and anyOf', () => {
+  const ir = parseInboundToGemini('anthropic', {
+    model: 'gemini-4-hydrogen-high',
+    max_tokens: 2048,
+    tools: [
+      {
+        name: 'Edit',
+        description: 'Edit file',
+        input_schema: {
+          type: 'object',
+          properties: {
+            target: {
+              anyOf: [
+                { type: 'string', description: 'absolute file path' },
+                { type: 'object', properties: { line: { type: 'integer' } } },
+              ],
+            },
+          },
+        },
+      },
+    ],
+    messages: [
+      { role: 'user', content: 'Edit /home/user/app.js' },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'thinking', thinking: 'Plan edit', signature: 'sig_across_text_123' },
+          { type: 'text', text: 'Editing now.' },
+          { type: 'tool_use', id: 'toolu_edit_1', name: 'Edit', input: { target: '/home/user/app.js' } },
+        ],
+      },
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'tool_result',
+            tool_use_id: 'toolu_edit_1',
+            is_error: true,
+            content: [
+              { type: 'text', text: 'Permission denied on /home/user/app.js' },
+              {
+                type: 'image',
+                source: { type: 'base64', media_type: 'image/png', data: 'iVBORw0KGgo=' },
+              },
+            ],
+          },
+          { type: 'text', text: '<system-reminder>retry carefully</system-reminder>' },
+        ],
+      },
+    ],
+  })
+
+  const agReq = buildGeminiRequest(ir, { target: 'antigravity', escapeSlashes: false })
+  // 1. thoughtSignature preserved across [thinking, text, tool_use]
+  const modelTurn = agReq.contents.find((c) => c.role === 'model')
+  const fcPart = modelTurn.parts.find((p) => p.functionCall)
+  assert.equal(fcPart.thoughtSignature, 'sig_across_text_123')
+
+  // 2. [tool_result, text(<system-reminder>)] stays a SINGLE role: 'user' turn (no consecutive user split!)
+  const userTurnsAfterModel = agReq.contents.slice(agReq.contents.indexOf(modelTurn) + 1)
+  assert.equal(userTurnsAfterModel.length, 1, 'must NOT split [tool_result, text] into consecutive user turns')
+  assert.equal(userTurnsAfterModel[0].role, 'user')
+
+  // 3. is_error preserved + zero \u200B corruption + tool_result multimodal attachment stays on tool turn
+  const frPart = userTurnsAfterModel[0].parts.find((p) => p.functionResponse)
+  assert.deepEqual(frPart.functionResponse.response, {
+    error: 'Permission denied on /home/user/app.js',
+    is_error: true,
+  })
+  assert.equal(frPart.functionResponse.response.error.includes('\u200B'), false)
+  assert.ok(userTurnsAfterModel[0].parts.some((p) => p.inlineData?.mimeType === 'image/png'))
+  assert.ok(userTurnsAfterModel[0].parts.some((p) => typeof p.text === 'string' && p.text.includes('retry carefully')))
+
+  // 4. anyOf preserves branch info in description
+  const targetSchema = agReq.tools[0].functionDeclarations[0].parameters.properties.target
+  assert.match(targetSchema.description || '', /Accepted \(anyOf\): string \| object\{line\}/)
+
+  // 5. /v1beta native functionResponse preserves original keys without wrapping into { result }
+  const gemIr = parseInboundToGemini(
+    'gemini',
+    {
+      contents: [
+        { role: 'user', parts: [{ text: 'run' }] },
+        { role: 'model', parts: [{ functionCall: { id: 'c1', name: 'Run', args: {} } }] },
+        {
+          role: 'user',
+          parts: [{ functionResponse: { id: 'c1', name: 'Run', response: { output: '/mnt/x/ok', exit_code: 0 } } }],
+        },
+      ],
+    },
+    { routeModel: 'gemini-4-hydrogen-high' },
+  )
+  const gemAgReq = buildGeminiRequest(gemIr, { target: 'antigravity', escapeSlashes: false })
+  const gemFr = gemAgReq.contents[2].parts[0].functionResponse
+  assert.deepEqual(gemFr.response, { output: '/mnt/x/ok', exit_code: 0 })
+})
+
+// ---------------------------------------------------------------------------
+// 5. Problem Class (D): Claude Code Direct /v1/messages & /v1/messages/count_tokens
+// ---------------------------------------------------------------------------
+
+test('(D) model catalog & inbound parser strip arbitrary <provider>/ prefix for Antigravity Gemini models', () => {
+  assert.equal(isAntigravityRoutedModel('gemini-vm/gemini-4-hydrogen-high'), true)
+  assert.equal(isAntigravityRoutedModel('google/gemini-4-neon-xhigh'), true)
+  assert.equal(parseAntigravityModelSpec('gemini-vm/gemini-4-hydrogen-high').cleaned, 'gemini-4-hydrogen-high')
+  assert.equal(
+    parseInboundToGemini('anthropic', {
+      model: 'gemini-vm/gemini-4-hydrogen-high',
+      messages: [{ role: 'user', content: 'hi' }],
+    }).model,
+    'gemini-4-hydrogen-high',
+  )
+  assert.equal(
+    parseInboundToGemini('anthropic', {
+      model: 'google/gemini-4-neon-xhigh',
+      messages: [{ role: 'user', content: 'hi' }],
+    }).model,
+    'gemini-4-neon-xhigh',
+  )
+})
+
+test('(D) handle-protocol routes master & Gemini-pool-bound keys on /v1/messages with gemini-vm/ prefix to Gemini handler', async () => {
+  const routed = []
+  let reqSeq = 0
+  const { handleProtocol } = createHandleProtocol({
+    cfg: {
+      rewrite: { enabled: false },
+      intercept: { rules: [] },
+      distill: { enabled: false },
+      limits: { max_body_bytes: 1024 * 1024 },
+      paths: {},
+    },
+    requireAuth: () => true,
+    readBody: async (req) => req.body,
+    json: ccJsonResponder,
+    writeSSEHeaders() {},
+    requestLog: { start: () => ({ request_id: `cc-route-${++reqSeq}`, t0: Date.now() }), finish() {} },
+    stickyRouter: {},
+    accountQuota: {},
+    stats: { errors: 0, requests: 0, by_route: {}, passthrough: 0, rewrite: 0, convert: 0 },
+    routingConfig: { failover: {} },
+    geminiScheduler: {
+      async catalog() {
+        return { accounts: [ccMakeEnv('env-cc-1')], models: ['gemini-4-hydrogen-high'], unlicensedAccounts: [] }
+      },
+    },
+    poolsRepo: {
+      listBindingsByKey: (keyId) => (keyId === 'key-pool-gem' ? [{ pool_id: 'pool_gem', is_default: true }] : []),
+      get: (poolId) =>
+        poolId === 'pool_gem'
+          ? {
+              id: 'pool_gem',
+              enabled: true,
+              members: [{ node_type: 'gemini_env', node_id: 'env-cc-1', enabled: true }],
+            }
+          : null,
+    },
+    handleGeminiPublic: async (req, res) => {
+      routed.push({ keyKind: req.apiKeyKind, model: req.body?.model })
+      ccJsonResponder(res, 200, { ok: true, routed: 'gemini' })
+    },
+  })
+
+  // 1. Master key + gemini-vm/gemini-4-hydrogen-high
+  const resMaster = ccMakeRes()
+  await handleProtocol(
+    ccMakeReq({
+      url: '/v1/messages',
+      apiKeyKind: 'master',
+      apiKeyRecord: { id: 'master', group_type: 'all' },
+      body: { model: 'gemini-vm/gemini-4-hydrogen-high', max_tokens: 128, messages: [{ role: 'user', content: 'hi' }] },
+    }),
+    resMaster,
+    'anthropic.messages',
+    '/v1/messages',
+  )
+  assert.equal(resMaster.statusCode, 200)
+
+  // 2. Managed key (group_type='claude', bound via default_pool_id='pool_gem' containing Gemini env)
+  const resPool = ccMakeRes()
+  await handleProtocol(
+    ccMakeReq({
+      url: '/v1/messages',
+      apiKeyKind: 'managed',
+      apiKeyRecord: {
+        id: 'key-pool-gem',
+        group_type: 'claude',
+        default_pool_id: 'pool_gem',
+        pool_binding_mode: 'strict_pool',
+      },
+      body: { model: 'gemini-vm/gemini-4-hydrogen-high', max_tokens: 128, messages: [{ role: 'user', content: 'hi' }] },
+    }),
+    resPool,
+    'anthropic.messages',
+    '/v1/messages',
+  )
+  assert.equal(resPool.statusCode, 200)
+  assert.equal(routed.length, 2)
+  assert.deepEqual(
+    routed.map((r) => r.keyKind),
+    ['master', 'managed'],
+  )
+})
+
+test('(D) /v1/messages/count_tokens handles Gemini models cleanly without hitting Claude poolScheduler', async () => {
+  const calls = []
+  let claudePoolTouched = false
+  await handleUserCountTokens(
+    {
+      apiKeyKind: 'managed',
+      apiKeyRecord: { id: 'key-gem', group_type: 'gemini' },
+      headers: {},
+    },
+    {},
+    {
+      json: (_res, status, body) => {
+        calls.push({ status, body })
+        return body
+      },
+      requireAuth: () => true,
+      readBody: async () => ({
+        model: 'gemini-vm/gemini-4-hydrogen-high',
+        system: 'You are Claude Code.',
+        tools: [
+          {
+            name: 'Read',
+            description: 'Read file',
+            input_schema: { type: 'object', properties: { path: { type: 'string' } } },
+          },
+        ],
+        messages: [{ role: 'user', content: 'Count tokens for this Gemini request please.' }],
+      }),
+      cfg: { limits: { max_body_bytes: 1024 * 1024 } },
+      getPoolScheduler: () => {
+        claudePoolTouched = true
+        throw new Error('Claude poolScheduler must not be touched for Gemini count_tokens')
+      },
+    },
+  )
+  assert.equal(claudePoolTouched, false)
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].status, 200)
+  assert.ok(Number.isInteger(calls[0].body.input_tokens) && calls[0].body.input_tokens > 0)
+})
+
+// ---------------------------------------------------------------------------
+// 6. Verifier Cross-Repo & Production Safety Regressions (V1-V5)
+// ---------------------------------------------------------------------------
+
+test('(V1) old kernel fallback preserves ZWSP slash escaping for valid_text while new kernel capability omits ZWSP', async () => {
+  const envs = [ccMakeEnv('env-v1')]
+  const sentBodies = []
+  let targetCaps = { capabilities: [], protocolCapabilities: {} }
+
+  const directClient = {
+    async resolveTarget({ id }) {
+      return {
+        kind: 'session',
+        socketPath: '/tmp/v1.sock',
+        token: 't'.repeat(32),
+        envId: id,
+        accountRoute: false,
+        ...targetCaps,
+      }
+    },
+    async openDirectStream(_target, opts) {
+      sentBodies.push(opts.bodyObj)
+      return {
+        ok: true,
+        res: ccMakeSseStream([
+          `data: ${JSON.stringify({
+            candidates: [{ content: { role: 'model', parts: [{ text: 'ok' }] }, finishReason: 'STOP' }],
+          })}\n\n`,
+        ]),
+      }
+    },
+    async cancelDirectTurn() {},
+    invalidate() {},
+  }
+
+  const scheduler = createRawGeminiScheduler({
+    schedulerRuntime: ccMakeRecordingRuntime(),
+    callHost: async (op, payload) => {
+      if (op === 'list') return { payload_state: 'installed', environments: envs }
+      if (op === 'get') return { id: payload.id, proxy_id: `proxy-${payload.id}`, auth_method: 'oauth' }
+      throw new Error(`unexpected op ${op}`)
+    },
+    callHostStream: async () => {
+      throw new Error('should use directClient')
+    },
+    resolveProxy: () => 'socks5h://127.0.0.1:1080',
+    directClient,
+  })
+  const handler = createGeminiPublicHandler({ json: ccJsonResponder, readBody: async () => ({}), scheduler })
+
+  // 1. Old kernel (no internal_wire_protocol_v1 / no protocol_capabilities): slash tokens MUST be ZWSP-escaped.
+  const resOld = ccMakeRes()
+  await handler(
+    ccMakeReq({
+      url: '/v1/chat/completions',
+      body: {
+        model: 'gemini-4-hydrogen-high',
+        messages: [{ role: 'user', content: '/quit\nInspect /tmp and /etc/hosts' }],
+      },
+    }),
+    resOld,
+  )
+  assert.equal(resOld.statusCode, 200)
+  const oldText = sentBodies[0].contents[0].parts[0].text
+  assert.equal(
+    oldText.split(/\p{White_Space}+/u).some((w) => w.startsWith('/')),
+    false,
+    'legacy kernel must receive ZWSP-escaped slash tokens for valid_text compatibility',
+  )
+
+  // 2. New kernel declaring internal_wire_protocol_v1: slash paths stay literal without ZWSP.
+  targetCaps = {
+    capabilities: ['internal_wire_protocol_v1'],
+    protocolCapabilities: { internal_wire_protocols: ['raw', 'gemini', 'anthropic'], provider_result_v2: true },
+  }
+  const resNew = ccMakeRes()
+  await handler(
+    ccMakeReq({
+      url: '/v1/chat/completions',
+      body: {
+        model: 'gemini-4-hydrogen-high',
+        messages: [{ role: 'user', content: '/quit\nInspect /tmp and /etc/hosts' }],
+      },
+    }),
+    resNew,
+  )
+  assert.equal(resNew.statusCode, 200)
+  const newText = sentBodies[1].contents[0].parts[0].text
+  assert.equal(newText.includes('\u200B'), false, 'new kernel with ACP wire capability must not get ZWSP injection')
+  assert.ok(newText.includes('/tmp') && newText.includes('/etc/hosts'))
+})
+
+test('(V2) outbound conversation_id is deterministic across restarts yet strictly isolated across tenants/keys', async () => {
+  const envs = [ccMakeEnv('env-v2')]
+  const runOnce = async ({ apiKeyRecord, ownerScope, originPoolId = null }) => {
+    const seenConvIds = []
+    const scheduler = createRawGeminiScheduler({
+      schedulerRuntime: ccMakeRecordingRuntime(),
+      getEnvOwner: () => (ownerScope?.type === 'user' ? ownerScope.userId : null),
+      callHost: async (op, payload) => {
+        if (op === 'list') return { payload_state: 'installed', environments: envs }
+        if (op === 'get') return { id: payload.id, proxy_id: `proxy-${payload.id}`, auth_method: 'oauth' }
+        throw new Error(`unexpected op ${op}`)
+      },
+      callHostStream: async (_op, payload) => {
+        seenConvIds.push(payload.body?.conversation_id)
+        return ccMakeSseStream([
+          `data: ${JSON.stringify({
+            candidates: [{ content: { role: 'model', parts: [{ text: 'ok' }] }, finishReason: 'STOP' }],
+          })}\n\n`,
+        ])
+      },
+      resolveProxy: () => 'socks5h://127.0.0.1:1080',
+    })
+    await scheduler.stream({
+      model: 'gemini-4-hydrogen-high',
+      geminiBody: { contents: [{ role: 'user', parts: [{ text: 'hi' }] }] },
+      inboundConversationId: 'shared-client-session-uuid',
+      stickyKey: 'shared-client-session-uuid',
+      apiKeyRecord,
+      ownerScope,
+      ...(originPoolId ? { originPoolId } : {}),
+    })
+    return seenConvIds[0]
+  }
+
+  const tenantA1 = await runOnce({
+    apiKeyRecord: { id: 'key-tenant-a', group_type: 'gemini' },
+    ownerScope: { type: 'platform' },
+  })
+  const tenantA2AfterRestart = await runOnce({
+    apiKeyRecord: { id: 'key-tenant-a', group_type: 'gemini' },
+    ownerScope: { type: 'platform' },
+  })
+  const tenantBKey = await runOnce({
+    apiKeyRecord: { id: 'key-tenant-b', group_type: 'gemini' },
+    ownerScope: { type: 'platform' },
+  })
+  const tenantBUser = await runOnce({
+    apiKeyRecord: { id: 'key-tenant-a', group_type: 'gemini' },
+    ownerScope: { type: 'user', userId: 'usr-99' },
+  })
+
+  assert.match(tenantA1, /^cs_[a-f0-9]{24}$/)
+  assert.equal(tenantA1, tenantA2AfterRestart, 'same tenant + session must survive scheduler restart deterministically')
+  assert.notEqual(tenantA1, tenantBKey, 'different API keys with identical session_id must never share conversation_id')
+  assert.notEqual(
+    tenantA1,
+    tenantBUser,
+    'different ownerScope with identical session_id must never share conversation_id',
+  )
+})
+
+test('(V3) kin_provider_result usage bills uncached input=70, cache_read=30, total=120 consistently with zero double-count', async () => {
+  const envs = [ccMakeEnv('env-v3')]
+  const billed = []
+  const directClient = {
+    async resolveTarget({ id }) {
+      return {
+        kind: 'session',
+        socketPath: '/tmp/v3.sock',
+        token: 't'.repeat(32),
+        envId: id,
+        accountRoute: false,
+        capabilities: ['internal_anthropic_wire_v1', 'provider_result_v2'],
+        protocolCapabilities: { internal_wire_protocols: ['raw', 'gemini', 'anthropic'], provider_result_v2: true },
+      }
+    },
+    async openDirectStream() {
+      return {
+        ok: true,
+        res: ccMakeSseStream([
+          `event: message_start\ndata: ${JSON.stringify({ type: 'message_start', message: { id: 'msg_v3', type: 'message', role: 'assistant', model: 'gemini-4-hydrogen-high', content: [], usage: { input_tokens: 70, cache_read_input_tokens: 30, output_tokens: 0 } } })}\n\n`,
+          `event: content_block_start\ndata: ${JSON.stringify({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } })}\n\n`,
+          `event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'billed cleanly' } })}\n\n`,
+          `event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index: 0 })}\n\n`,
+          `event: message_delta\ndata: ${JSON.stringify({ type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { input_tokens: 70, cache_read_input_tokens: 30, output_tokens: 20 } })}\n\n`,
+          `event: message_stop\ndata: ${JSON.stringify({ type: 'message_stop' })}\n\n`,
+          `event: kin_provider_result\ndata: ${JSON.stringify({ conversation_id: 'cs_v3', visible_output: true, provider_complete: true, finish_reason: 'end_turn', usage: { input_tokens: 70, cache_read_input_tokens: 30, output_tokens: 20, thinking_tokens: 5 } })}\n\n`,
+        ]),
+      }
+    },
+    async cancelDirectTurn() {},
+    invalidate() {},
+  }
+
+  const scheduler = createRawGeminiScheduler({
+    schedulerRuntime: ccMakeRecordingRuntime(),
+    callHost: async (op, payload) => {
+      if (op === 'list') return { payload_state: 'installed', environments: envs }
+      if (op === 'get') return { id: payload.id, proxy_id: `proxy-${payload.id}`, auth_method: 'oauth' }
+      throw new Error(`unexpected op ${op}`)
+    },
+    callHostStream: async () => {
+      throw new Error('should use directClient')
+    },
+    resolveProxy: () => 'socks5h://127.0.0.1:1080',
+    apiKeyStore: {
+      recordUsage: (_rec, usage) => billed.push(usage),
+    },
+    directClient,
+  })
+
+  const out = await scheduler.stream({
+    model: 'gemini-4-hydrogen-high',
+    inboundProtocol: 'anthropic',
+    rawInboundBody: { model: 'gemini-4-hydrogen-high', messages: [{ role: 'user', content: 'hi' }] },
+    wantStream: false,
+    geminiBody: { contents: [{ role: 'user', parts: [{ text: 'hi' }] }] },
+    apiKeyRecord: { id: 'key-v3', group_type: 'gemini' },
+  })
+
+  assert.equal(out.usage.input_tokens, 70)
+  assert.equal(out.usage.cache_read_tokens, 30)
+  assert.equal(out.usage.cache_read_input_tokens, 30)
+  assert.equal(out.usage.output_tokens, 20)
+  assert.equal(out.usage.reasoning_tokens, 5)
+  assert.equal(out.usage.total_tokens, 120)
+  assert.equal(billed.length, 1)
+  assert.equal(billed[0].input_tokens, 70)
+  assert.equal(billed[0].cache_read_input_tokens, 30)
+  assert.equal(billed[0].output_tokens, 20)
+
+  // Verify legacy createGeminiEventDecoder produces the exact same total_tokens = in + cache + out.
+  const dec = createGeminiEventDecoder({ fallbackModel: 'gemini-4-hydrogen-high' })
+  const evs = []
+  dec.decodeSseFrame(
+    `event: kin_provider_result\ndata: ${JSON.stringify({ usage: { input_tokens: 70, cache_read_input_tokens: 30, output_tokens: 20, thinking_tokens: 5 } })}`,
+    (ev) => evs.push(ev),
+  )
+  const usageEv = evs.find((e) => e.kind === 'usage')
+  assert.equal(usageEv.usage.input_tokens, 70)
+  assert.equal(usageEv.usage.cache_read_tokens, 30)
+  assert.equal(usageEv.usage.total_tokens, 120)
+})
+
+test('(V4) derived_first_turn hitting 409 isolates onto a random conversation_id without resetting concurrent sibling', async () => {
+  const envs = [ccMakeEnv('env-v4')]
+  const attempts = []
+  const directClient = {
+    async resolveTarget({ id }) {
+      return {
+        kind: 'session',
+        socketPath: '/tmp/v4.sock',
+        token: 't'.repeat(32),
+        envId: id,
+        accountRoute: false,
+        capabilities: ['internal_anthropic_wire_v1', 'provider_result_v2'],
+        protocolCapabilities: { internal_wire_protocols: ['raw', 'gemini', 'anthropic'], provider_result_v2: true },
+      }
+    },
+    async openDirectStream(_target, opts) {
+      attempts.push({ conversationId: opts.conversationId, sessionReset: opts.sessionReset })
+      if (attempts.length === 1) {
+        const err = new Error('session busy')
+        err.status = 409
+        err.upstreamStatus = 409
+        err.code = 'gemini_session_conflict'
+        return { ok: false, fallback: false, error: err }
+      }
+      return {
+        ok: true,
+        res: ccMakeSseStream([
+          `event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'isolated ok' } })}\n\n`,
+          `event: message_stop\ndata: ${JSON.stringify({ type: 'message_stop' })}\n\n`,
+          `event: kin_provider_result\ndata: ${JSON.stringify({ conversation_id: opts.conversationId, visible_output: true, provider_complete: true, finish_reason: 'end_turn' })}\n\n`,
+        ]),
+      }
+    },
+    async cancelDirectTurn() {},
+    invalidate() {},
+  }
+
+  const scheduler = createRawGeminiScheduler({
+    schedulerRuntime: ccMakeRecordingRuntime(),
+    callHost: async (op, payload) => {
+      if (op === 'list') return { payload_state: 'installed', environments: envs }
+      if (op === 'get') return { id: payload.id, proxy_id: `proxy-${payload.id}`, auth_method: 'oauth' }
+      throw new Error(`unexpected op ${op}`)
+    },
+    callHostStream: async () => {
+      throw new Error('should use directClient')
+    },
+    resolveProxy: () => 'socks5h://127.0.0.1:1080',
+    getRoutingConfig: () => ({ gemini: { failover: { max_account_switches: 1 } } }),
+    directClient,
+  })
+
+  const out = await scheduler.stream({
+    model: 'gemini-4-hydrogen-high',
+    inboundProtocol: 'anthropic',
+    rawInboundBody: {
+      model: 'gemini-4-hydrogen-high',
+      messages: [{ role: 'user', content: 'Identical concurrent batch evaluation prompt that exceeds 64 chars.' }],
+    },
+    wantStream: false,
+    geminiBody: { contents: [{ role: 'user', parts: [{ text: 'batch' }] }] },
+    inboundIdentity: { sessionId: '44444444-5555-4666-8777-888888888888', sessionSource: 'derived_first_turn' },
+    stickyKey: 'key-v4:derived',
+    apiKeyRecord: { id: 'key-v4', group_type: 'gemini' },
+  })
+  assert.equal(out.text, 'isolated ok')
+  assert.equal(attempts.length, 2)
+  assert.match(attempts[0].conversationId, /^cs_[a-f0-9]{24}$/)
+  assert.match(attempts[1].conversationId, /^cs_[a-f0-9]{24}$/)
+  assert.notEqual(attempts[1].conversationId, attempts[0].conversationId)
+  assert.equal(attempts[1].conversationId.includes(':r'), false, 'derived_* 409 retry must mint random isolated id')
+  assert.equal(attempts[1].sessionReset, false, 'derived_* 409 retry must not reset concurrent sibling session')
+})
+
+test('(V5) MALFORMED_FUNCTION_CALL after valid functionCall preserves stopReason=tool for client tool execution', async () => {
+  const dec = createGeminiEventDecoder({ fallbackModel: 'gemini-4-hydrogen-high' })
+  const evs = []
+  dec.decodeSseFrame(
+    `data: ${JSON.stringify({
+      candidates: [
+        {
+          content: {
+            role: 'model',
+            parts: [{ functionCall: { id: 'fc_valid_1', name: 'Read', args: { path: '/etc/hosts' } } }],
+          },
+          finishReason: 'MALFORMED_FUNCTION_CALL',
+        },
+      ],
+    })}`,
+    (ev) => evs.push(ev),
+  )
+  assert.equal(evs.find((e) => e.kind === 'stop')?.stopReason, 'tool')
 })

@@ -21,6 +21,7 @@ import {
 } from '../gemini/prompt-normalizer.mjs'
 import { isClientStream } from './convert.mjs'
 import { extractImpliedModelEffort, isGeminiSeriesId, resolveGeminiDefaultEffort } from './gemini-model-policy.mjs'
+import { parseUserId } from '../identity/identity-rewrite.mjs'
 import { firstNonEmptyEffort, isEmptyEffortValue } from './log-fields.mjs'
 import { buildAnthropicSseError } from './stream-truncation.mjs'
 
@@ -87,7 +88,7 @@ const GEN_READ_OR_BUILT = new Set([
 
 const GOOGLE_SEARCH_TOOLS = new Set(['googleSearch', 'googleSearchRetrieval'])
 const CRAGGEMINI_GOOGLE_TOOLS = new Set(['googleSearch', 'googleSearchRetrieval', 'urlContext'])
-const CRAGGEMINI_VALID_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
+const CRAGGEMINI_VALID_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
 const CRAGGEMINI_IMAGE_ASPECT_RATIOS = new Set([
   '1:1',
   '2:3',
@@ -328,6 +329,27 @@ function sanitizeConversationId(raw) {
   if (typeof raw !== 'string') return null
   const trimmed = raw.trim()
   return trimmed && CRAGGEMINI_VALID_ID_RE.test(trimmed) ? trimmed : null
+}
+
+function extractInboundConversationId(body, headers = {}) {
+  const fromMeta = parseUserId(body?.metadata?.user_id)?.session_id
+  const metaClean = sanitizeConversationId(fromMeta)
+  if (metaClean) return metaClean
+  const hdrs = headers && typeof headers === 'object' ? headers : {}
+  const lowerHeaders = {}
+  for (const [k, v] of Object.entries(hdrs)) {
+    if (v == null || v === '') continue
+    lowerHeaders[String(k).toLowerCase()] = Array.isArray(v) ? String(v[0] || '') : String(v)
+  }
+  for (const key of ['x-claude-code-session-id', 'x-session-id', 'x-conversation-id', 'session-id', 'thread-id']) {
+    const clean = sanitizeConversationId(lowerHeaders[key])
+    if (clean) return clean
+  }
+  for (const key of ['conversation_id', 'conversationId', 'session_id', 'thread_id']) {
+    const clean = sanitizeConversationId(body?.[key])
+    if (clean) return clean
+  }
+  return null
 }
 
 function domainMatchesList(urlOrHost, domains) {
@@ -655,15 +677,19 @@ function stripAnthropicBillingLines(text) {
   return stripVendorBillingLines(text)
 }
 
-function sanitizeNativeTuiResponseValue(value, depth = 0) {
+function sanitizeNativeTuiResponseValue(value, depth = 0, { escapeSlashes = true } = {}) {
   if (depth > 16) return value
-  if (typeof value === 'string') return sanitizeNativeTuiText(value)
-  if (Array.isArray(value)) return value.map((item) => sanitizeNativeTuiResponseValue(item, depth + 1))
+  if (typeof value === 'string') {
+    return escapeSlashes ? sanitizeNativeTuiText(value) : stripIllegalControlChars(value)
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => sanitizeNativeTuiResponseValue(item, depth + 1, { escapeSlashes }))
+  }
   if (isPlainObject(value)) {
     const out = {}
     for (const [k, v] of Object.entries(value)) {
       if (v === '[undefined]') continue
-      out[k] = sanitizeNativeTuiResponseValue(v, depth + 1)
+      out[k] = sanitizeNativeTuiResponseValue(v, depth + 1, { escapeSlashes })
     }
     return out
   }
@@ -708,8 +734,11 @@ function normalizeEffort(raw) {
 function parseInboundModelSpec(rawModel, { allowLeadingModelsPrefix = false } = {}) {
   let work = typeof rawModel === 'string' ? rawModel.trim() : ''
   if (!work) return { model: '', parenEffort: '' }
-  if (allowLeadingModelsPrefix && /^models\//i.test(work)) {
-    work = work.replace(/^models\//i, '')
+  if (work.includes('/')) {
+    if (allowLeadingModelsPrefix || /^models\//i.test(work) || !/^https?:/i.test(work)) {
+      const tail = work.split('/').filter(Boolean).pop()
+      if (tail) work = tail
+    }
   }
   if (/\[1m\]$/i.test(work)) {
     work = work.replace(/\[1m\]$/i, '')
@@ -1143,14 +1172,38 @@ export function sanitizeGeminiSchema(raw, { plain = false } = {}) {
     }
     for (const unionKey of ['anyOf', 'oneOf']) {
       if (Array.isArray(value[unionKey])) {
-        let pick = null
+        const nonNullAlts = []
         let nullable = false
         for (const alt of value[unionKey]) {
           if (isPlainObject(alt) && alt.type === 'null') nullable = true
-          else if (!pick && isPlainObject(alt)) pick = alt
+          else if (isPlainObject(alt)) nonNullAlts.push(alt)
         }
+        const pick =
+          nonNullAlts.find((a) => a.type === 'object' || a.properties != null) ||
+          nonNullAlts.find((a) => a.type === 'array' || a.items != null) ||
+          nonNullAlts[0] ||
+          null
         const out = pick ? walk(pick, depth + 1, `${pointer}/${unionKey}`) || {} : {}
         if (typeof value.description === 'string' && out.description === undefined) out.description = value.description
+        if (nonNullAlts.length > 1) {
+          const summaries = nonNullAlts.map((alt) => {
+            if (Array.isArray(alt.enum) && alt.enum.length) {
+              return `enum(${alt.enum.slice(0, 8).join('|')})`
+            }
+            if (alt.const !== undefined) return `const(${JSON.stringify(alt.const)})`
+            if (alt.type === 'object' || isPlainObject(alt.properties)) {
+              const keys = isPlainObject(alt.properties) ? Object.keys(alt.properties).slice(0, 8).join(',') : ''
+              return keys ? `object{${keys}}` : 'object'
+            }
+            if (alt.type === 'array' || alt.items != null) {
+              const itemType = isPlainObject(alt.items) && typeof alt.items.type === 'string' ? alt.items.type : 'any'
+              return `array<${itemType}>`
+            }
+            return typeof alt.type === 'string' ? alt.type : 'any'
+          })
+          const hint = `Accepted (${unionKey}): ${[...new Set(summaries)].join(' | ')}${nullable ? ' | null' : ''}`
+          out.description = out.description ? `${out.description} (${hint})` : hint
+        }
         if (nullable) out.nullable = true
         if (!out.type) out.type = 'string'
         return out
@@ -1332,7 +1385,7 @@ function formatExecutableCodePart(part) {
   return ''
 }
 
-function parseGeminiNativeInbound(rawBody, { routeModel, routeStream }) {
+function parseGeminiNativeInbound(rawBody, { routeModel, routeStream, headers = {} }) {
   const body = geminiCamelCase(rawBody)
   const rawSelected = routeModel || (typeof body.model === 'string' ? body.model : '')
   if (body.model != null && routeModel && body.model !== routeModel) {
@@ -1447,8 +1500,16 @@ function parseGeminiNativeInbound(rawBody, { routeModel, routeStream }) {
             }
           }
         }
-        msg.parts.push({ kind: 'tool_result', callId: id, name, text: mergedText, isError, images })
-        for (const f of extraFiles) msg.parts.push(f)
+        msg.parts.push({
+          kind: 'tool_result',
+          callId: id,
+          name,
+          text: mergedText,
+          isError,
+          images,
+          files: extraFiles,
+          rawResponse: isPlainObject(fr.response) ? fr.response : null,
+        })
       } else if (isPlainObject(part.inlineData)) {
         const mimeType = typeof part.inlineData.mimeType === 'string' ? part.inlineData.mimeType.trim() : ''
         const data = typeof part.inlineData.data === 'string' ? part.inlineData.data.trim() : ''
@@ -1659,7 +1720,7 @@ function parseGeminiNativeInbound(rawBody, { routeModel, routeStream }) {
     responseFormat,
     safetySettings: Array.isArray(body.safetySettings) ? body.safetySettings : null,
     cachedContent: typeof body.cachedContent === 'string' ? body.cachedContent : null,
-    conversationId: sanitizeConversationId(body.conversationId ?? body.conversation_id),
+    conversationId: extractInboundConversationId(body, headers),
   }
 }
 
@@ -2024,7 +2085,7 @@ function parseOpenAIChatInbound(body, { headers }) {
     responseFormat,
     safetySettings: null,
     cachedContent: null,
-    conversationId: sanitizeConversationId(body.conversation_id ?? headers?.['x-conversation-id']),
+    conversationId: extractInboundConversationId(body, headers),
   }
 }
 
@@ -2676,6 +2737,7 @@ function parseAnthropicInbound(body, { headers }) {
     inLeadingSystem = false
     const parts = []
     let pendingThinkingSig = ''
+    let turnThinkingSig = ''
     if (typeof raw.content === 'string') {
       if (!isPlaceholderText(raw.content)) parts.push({ kind: 'text', text: raw.content, signature: '' })
     } else if (Array.isArray(raw.content)) {
@@ -2746,9 +2808,10 @@ function parseAnthropicInbound(body, { headers }) {
             id,
             name: block.name,
             args: parseJsonObjectArgs(block.input),
-            signature: signature || pendingThinkingSig,
+            signature: signature || pendingThinkingSig || turnThinkingSig,
           })
           pendingThinkingSig = ''
+          turnThinkingSig = ''
         } else if (block.type === 'tool_result') {
           const { id } = unsignedToolCallId(block.tool_use_id || newCallId())
           let text = ''
@@ -2787,15 +2850,16 @@ function parseAnthropicInbound(body, { headers }) {
           if (!text.trim() && !images.length && !extraFiles.length) {
             text = isError ? EMPTY_TOOL_ERR_TEXT : EMPTY_TOOL_OK_TEXT
           }
-          parts.push({ kind: 'tool_result', callId: id, name: '', text, isError, images })
-          for (const f of extraFiles) parts.push(f)
+          parts.push({ kind: 'tool_result', callId: id, name: '', text, isError, images, files: extraFiles })
         } else if (block.type === 'thinking') {
           if (typeof block.signature === 'string' && block.signature.trim()) {
             pendingThinkingSig = block.signature.trim()
+            turnThinkingSig = pendingThinkingSig
           }
         } else if (block.type === 'redacted_thinking') {
           if (typeof block.data === 'string' && block.data.trim()) {
             pendingThinkingSig = block.data.trim()
+            turnThinkingSig = pendingThinkingSig
           }
         } else if (block.type === 'server_tool_use' || block.type === 'web_search_tool_result') {
           // Do not send foreign server tool replay blocks back to Gemini.
@@ -2930,7 +2994,7 @@ function parseAnthropicInbound(body, { headers }) {
     responseFormat,
     safetySettings: null,
     cachedContent: null,
-    conversationId: sanitizeConversationId(body.conversation_id ?? headers?.['x-conversation-id']),
+    conversationId: extractInboundConversationId(body, headers),
   }
 }
 
@@ -3176,7 +3240,7 @@ export function parseInboundToGemini(protocol, body, { routeModel = null, routeS
     throw makeProtocolError(400, 'gemini_invalid_request', 'Request body must be a JSON object.')
   }
   let rawIr
-  if (protocol === 'gemini') rawIr = parseGeminiNativeInbound(body, { routeModel, routeStream })
+  if (protocol === 'gemini') rawIr = parseGeminiNativeInbound(body, { routeModel, routeStream, headers })
   else if (protocol === 'openai-chat') rawIr = parseOpenAIChatInbound(body, { headers })
   else if (protocol === 'openai-responses') rawIr = parseOpenAIResponsesInbound(body, { headers })
   else if (protocol === 'anthropic') rawIr = parseAnthropicInbound(body, { headers })
@@ -3386,9 +3450,10 @@ function ensureGeminiContentsValid(contents, { antigravity = false } = {}) {
  */
 export function buildGeminiRequest(
   ir,
-  { target = 'gemini', model = ir.model, defaultEffort, includeThinkingConfig = false } = {},
+  { target = 'gemini', model = ir.model, defaultEffort, includeThinkingConfig = false, escapeSlashes = true } = {},
 ) {
   const ag = target === 'antigravity'
+  const sanitizeAgText = (value) => (escapeSlashes ? sanitizeNativeTuiText(value) : stripIllegalControlChars(value))
   const claude = /claude/i.test(model)
   const callNames = new Map()
   const contents = []
@@ -3416,7 +3481,7 @@ export function buildGeminiRequest(
         }
       } else if (p.kind === 'text') {
         let text = stripAnthropicBillingLines(p.text || '')
-        if (ag) text = sanitizeNativeTuiText(text)
+        if (ag) text = sanitizeAgText(text)
         const substantive = !isPlaceholderText(text)
         const realSig = p.signature && p.signature !== SKIP_THOUGHT_SIGNATURE ? p.signature : ''
         if (substantive || (realSig && !claude)) {
@@ -3428,7 +3493,7 @@ export function buildGeminiRequest(
         if (p.data) parts.push({ inlineData: { mimeType: p.mediaType, data: p.data } })
         else if (p.url) {
           if (ag) {
-            const refText = sanitizeNativeTuiText(`[Attached ${p.mediaType || 'file'}: ${p.url}]`)
+            const refText = sanitizeAgText(`[Attached ${p.mediaType || 'file'}: ${p.url}]`)
             if (refText.trim()) parts.push({ text: refText })
           } else {
             parts.push({ fileData: { mimeType: p.mediaType, fileUri: p.url } })
@@ -3460,51 +3525,76 @@ export function buildGeminiRequest(
         parts.push(part)
       } else if (p.kind === 'tool_result') {
         const safeName = p.name ? resolveWireName(p.name) : callNames.get(p.callId) || 'tool'
-        const key = ag ? 'result' : p.isError ? 'error' : 'output'
-        let resultText = typeof p.text === 'string' ? p.text : ''
-        if (ag) resultText = sanitizeNativeTuiText(resultText)
-        if (!resultText.trim() && !(Array.isArray(p.images) && p.images.length)) {
-          resultText = p.isError ? EMPTY_TOOL_ERR_TEXT : EMPTY_TOOL_OK_TEXT
+        const mediaAttachments = [
+          ...(Array.isArray(p.images) ? p.images : []),
+          ...(Array.isArray(p.files) ? p.files : []),
+        ]
+        let responsePayload
+        if (isPlainObject(p.rawResponse) && Object.keys(p.rawResponse).length > 0) {
+          responsePayload = ag ? sanitizeNativeTuiResponseValue(p.rawResponse, 0, { escapeSlashes }) : p.rawResponse
+        } else {
+          let resultText = typeof p.text === 'string' ? p.text : ''
+          if (ag) resultText = sanitizeAgText(resultText)
+          if (!resultText.trim() && !mediaAttachments.length) {
+            resultText = p.isError ? EMPTY_TOOL_ERR_TEXT : EMPTY_TOOL_OK_TEXT
+          }
+          if (p.isError) {
+            responsePayload = ag ? { error: resultText, is_error: true } : { error: resultText }
+          } else {
+            const key = ag ? 'result' : 'output'
+            responsePayload = { [key]: resultText }
+          }
         }
         const fr = {
           name: safeName,
-          response: ag ? sanitizeNativeTuiResponseValue({ [key]: resultText }) : { [key]: resultText },
+          response: responsePayload,
         }
         if (p.callId) fr.id = ag ? p.callId.replace(/[^a-zA-Z0-9_-]/g, '_') : p.callId
         parts.push({ functionResponse: fr })
-        if (Array.isArray(p.images)) {
-          for (const img of p.images) {
-            if (img.data) parts.push({ inlineData: { mimeType: img.mediaType, data: img.data } })
-            else if (img.url) {
-              if (ag) {
-                const refText = sanitizeNativeTuiText(`[Attached ${img.mediaType || 'image'}: ${img.url}]`)
-                if (refText.trim()) parts.push({ text: refText })
-              } else {
-                parts.push({ fileData: { mimeType: img.mediaType, fileUri: img.url } })
-              }
+        for (const media of mediaAttachments) {
+          if (media.data) parts.push({ inlineData: { mimeType: media.mediaType, data: media.data } })
+          else if (media.url) {
+            if (ag) {
+              const refText = sanitizeAgText(`[Attached ${media.mediaType || 'image'}: ${media.url}]`)
+              if (refText.trim()) parts.push({ text: refText })
+            } else {
+              parts.push({ fileData: { mimeType: media.mediaType, fileUri: media.url } })
             }
           }
         }
       }
     }
 
-    // Separate user text from functionResponse into distinct user turns (Gemini rejects mixed turns).
-    let toolParts = parts
-    let userTextParts = []
-    if (role === 'user' && hasFunctionResponse(parts)) {
-      toolParts = []
+    // On direct Google Gemini API (!ag), separate user text from functionResponse into distinct user turns.
+    // On CRAGGemini (ag), keep [functionResponse, text] in the same user turn so trailing reminders never
+    // split into a second consecutive user turn that breaks suspended tool continuations (409 / 90s deadlock).
+    let groups
+    if (!ag && role === 'user' && hasFunctionResponse(parts)) {
+      const toolParts = []
+      const userTextParts = []
       for (const part of parts) {
         if (part.functionResponse || part.inlineData || part.fileData) toolParts.push(part)
         else userTextParts.push(part)
       }
+      groups = [toolParts, userTextParts]
+    } else if (ag && role === 'user' && hasFunctionResponse(parts)) {
+      const toolParts = []
+      const userTextParts = []
+      for (const part of parts) {
+        if (part.functionResponse || part.inlineData || part.fileData) toolParts.push(part)
+        else userTextParts.push(part)
+      }
+      groups = [[...toolParts, ...userTextParts]]
+    } else {
+      groups = [parts]
     }
-    for (const group of [toolParts, userTextParts]) {
+    for (const group of groups) {
       if (!group.length) continue
       const prev = contents[contents.length - 1]
       if (
         prev &&
         prev.role === role &&
-        (role !== 'user' || hasFunctionResponse(prev.parts) === hasFunctionResponse(group))
+        (role !== 'user' || ag || hasFunctionResponse(prev.parts) === hasFunctionResponse(group))
       ) {
         prev.parts.push(...group)
       } else {
@@ -3787,10 +3877,14 @@ export function toAnthropicUsage(usage = {}) {
 function stopReasonFromGemini(finishReason, sawTool) {
   const raw = String(finishReason || '').toUpperCase()
   if (raw === 'MAX_TOKENS') return 'length'
-  if (
-    ['STOP', 'FINISH_REASON_UNSPECIFIED', 'OTHER', 'MALFORMED_FUNCTION_CALL', 'UNEXPECTED_TOOL_CALL', ''].includes(raw)
-  ) {
+  if (raw === 'STOP') {
     return sawTool ? 'tool' : 'stop'
+  }
+  if (raw === 'MALFORMED_FUNCTION_CALL' || raw === 'UNEXPECTED_TOOL_CALL' || raw === 'TOO_MANY_TOOL_CALLS') {
+    return sawTool ? 'tool' : 'malformed_tool_call'
+  }
+  if (raw === 'OTHER' || raw === 'FINISH_REASON_UNSPECIFIED' || raw === '') {
+    return sawTool ? 'tool' : 'other'
   }
   return 'filter'
 }
@@ -3830,6 +3924,16 @@ export function parseGeminiSseFrame(frame) {
     const value = rawVal.startsWith(' ') ? rawVal.slice(1) : rawVal
     if (field === 'event') eventName = value.trim()
     else if (field === 'data') dataLines.push(value)
+  }
+  if (eventName === 'kin_provider_result') {
+    const raw = dataLines.join('\n').trim()
+    if (!raw) return { kind: 'ignore' }
+    try {
+      const parsed = JSON.parse(raw)
+      return isPlainObject(parsed) ? { kind: 'provider_result', data: parsed } : { kind: 'ignore' }
+    } catch {
+      return { kind: 'ignore' }
+    }
   }
   if (eventName === 'error') {
     const raw = dataLines.join('\n')
@@ -4032,7 +4136,43 @@ export function createGeminiEventDecoder({ fallbackModel = '' } = {}) {
     decodeSseFrame(frame, emit) {
       const parsed = parseGeminiSseFrame(frame)
       if (parsed.kind === 'chunk') decodeChunk(parsed.chunk, emit, parsed.meta)
-      else if (parsed.kind === 'error') {
+      else if (parsed.kind === 'provider_result') {
+        const pr = parsed.data
+        emit({ kind: 'provider_result', providerResult: pr })
+        if (
+          typeof pr.conversation_id === 'string' ||
+          typeof pr.native_conversation_id === 'string' ||
+          typeof pr.awaiting_tool_results === 'boolean'
+        ) {
+          emit({
+            kind: 'meta',
+            conversationId: typeof pr.conversation_id === 'string' ? pr.conversation_id : '',
+            nativeConversationId: typeof pr.native_conversation_id === 'string' ? pr.native_conversation_id : '',
+            awaitingToolResults: pr.awaiting_tool_results === true,
+          })
+        }
+        if (isPlainObject(pr.usage)) {
+          const u = pr.usage
+          const inputTokens = Number.isFinite(Number(u.input_tokens)) ? Math.max(0, Number(u.input_tokens)) : 0
+          const outputTokens = Number.isFinite(Number(u.output_tokens)) ? Math.max(0, Number(u.output_tokens)) : 0
+          const cacheRead = Number.isFinite(Number(u.cache_read_input_tokens))
+            ? Math.max(0, Number(u.cache_read_input_tokens))
+            : 0
+          const thinkingTokens = Number.isFinite(Number(u.thinking_tokens)) ? Math.max(0, Number(u.thinking_tokens)) : 0
+          if (inputTokens > 0 || outputTokens > 0 || cacheRead > 0 || thinkingTokens > 0) {
+            latestUsage = {
+              input_tokens: inputTokens,
+              output_tokens: outputTokens,
+              total_tokens: inputTokens + cacheRead + outputTokens,
+              cache_read_tokens: cacheRead,
+              cache_read_input_tokens: cacheRead,
+              reasoning_tokens: thinkingTokens,
+            }
+            emittedUsage = latestUsage
+            emit({ kind: 'usage', usage: latestUsage })
+          }
+        }
+      } else if (parsed.kind === 'error') {
         emit({ kind: 'error', status: parsed.status, code: parsed.code, message: parsed.message })
       } else if (parsed.kind === 'invalid') {
         emit({ kind: 'error', status: 502, code: 'gemini_inference_invalid_output', message: parsed.message })
@@ -4179,7 +4319,7 @@ export function createGeminiRestoreTransform(
   }
 
   const checkTokenCap = (emit) => {
-    if (!enforceMaxTokens || terminated) return false
+    if (!enforceMaxTokens || terminated || emittedChars <= 0) return false
     const estTokens = Math.max(observedOutputTokens, Math.ceil(emittedChars / 4))
     if (estTokens >= ctx.maxOutputTokens) {
       if (stopBuf) {
@@ -4204,8 +4344,13 @@ export function createGeminiRestoreTransform(
         emit(event)
         return
       }
-      if (event.kind === 'meta' || event.kind === 'start' || event.kind === 'error') {
-        if (terminated && event.kind !== 'meta') return
+      if (
+        event.kind === 'meta' ||
+        event.kind === 'provider_result' ||
+        event.kind === 'start' ||
+        event.kind === 'error'
+      ) {
+        if (terminated && event.kind !== 'meta' && event.kind !== 'provider_result') return
         emit(event)
         return
       }
@@ -4213,9 +4358,9 @@ export function createGeminiRestoreTransform(
 
       if (event.kind === 'thinking') {
         if (ctx.hideThinking) return
-        emittedChars += (event.text || '').length
+        // Do not count thinking characters against the text chars/4 cap; thinking-only
+        // prefixes must never cancel upstream mid-thought into 200 length output_tokens=0.
         emit(event)
-        checkTokenCap(emit)
         return
       }
 
@@ -4360,6 +4505,7 @@ export function createGeminiCollector({ fallbackModel = '' } = {}) {
   let usage = null
   let error = null
   let meta = null
+  let providerResult = null
   const searches = []
 
   return {
@@ -4382,6 +4528,9 @@ export function createGeminiCollector({ fallbackModel = '' } = {}) {
             nativeConversationId: event.nativeConversationId || meta?.nativeConversationId || '',
             awaitingToolResults: event.awaitingToolResults === true || meta?.awaitingToolResults === true,
           }
+          break
+        case 'provider_result':
+          providerResult = event.providerResult || null
           break
         case 'thinking': {
           const last = parts[parts.length - 1]
@@ -4467,6 +4616,7 @@ export function createGeminiCollector({ fallbackModel = '' } = {}) {
         stopSequence,
         sawFinish,
         meta,
+        providerResult,
         usage: usage || {
           input_tokens: 0,
           output_tokens: 0,
@@ -5038,20 +5188,22 @@ export function createGeminiProtocolStreamEncoder(
       openBlock = null
       return out
     }
+    let initialStartUsage = null
     return {
       push(event) {
         if (finished || !event) return ''
         collector.push(event)
         if (event.kind === 'start') {
           if (event.model) resolvedModel = event.model
-          return ensureStart(event.usage)
+          if (event.usage) initialStartUsage = event.usage
+          return ''
         }
         if (event.kind === 'model') {
           if (event.model) resolvedModel = event.model
           return ''
         }
         if (event.kind === 'thinking') {
-          let out = ensureStart()
+          let out = ensureStart(initialStartUsage)
           if (openBlock?.type !== 'thinking' || openBlock.signed) {
             out += closeOpen()
             const index = blockIndex++
@@ -5065,7 +5217,7 @@ export function createGeminiProtocolStreamEncoder(
           return out
         }
         if (event.kind === 'thinking_signature') {
-          let out = ensureStart()
+          let out = ensureStart(initialStartUsage)
           if (openBlock?.type !== 'thinking' || openBlock.signed) {
             out += closeOpen()
             const index = blockIndex++
@@ -5080,7 +5232,7 @@ export function createGeminiProtocolStreamEncoder(
           return out
         }
         if (event.kind === 'text') {
-          let out = ensureStart()
+          let out = ensureStart(initialStartUsage)
           if (openBlock?.type !== 'text') {
             out += closeOpen()
             const index = blockIndex++
@@ -5091,7 +5243,7 @@ export function createGeminiProtocolStreamEncoder(
           return out
         }
         if (event.kind === 'image' && event.data) {
-          let out = ensureStart() + closeOpen()
+          let out = ensureStart(initialStartUsage) + closeOpen()
           const index = blockIndex++
           out += sse('content_block_start', { index, content_block: { type: 'text', text: '' } })
           out += sse('content_block_delta', {
@@ -5102,7 +5254,7 @@ export function createGeminiProtocolStreamEncoder(
           return out
         }
         if (event.kind === 'tool_call') {
-          let out = ensureStart() + closeOpen()
+          let out = ensureStart(initialStartUsage) + closeOpen()
           const index = blockIndex++
           out += sse('content_block_start', {
             index,
