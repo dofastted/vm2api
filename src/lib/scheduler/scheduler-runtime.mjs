@@ -39,7 +39,10 @@ import {
   vmOwnerId,
 } from '../admin/resource-owner.mjs'
 import { HOST_PRESSURE_CRITICAL, hostMemoryLevelForVm } from '../cluster/host-memory-pressure.mjs'
-import { getDb, isDbOpen, withTransaction } from '../db/database.mjs'
+import { getCacheRuntime } from '../cache/index.mjs'
+import { SchedulerSnapshotCache } from '../cache/scheduler-cache.mjs'
+import { getDb, getPgPool, isDbOpen, withTransaction } from '../db/database.mjs'
+import { listAllSnapshotsAsync, listAllVmsAsync } from '../db/repos/account-runtime-repo.mjs'
 import {
   SchedulerPoolsRepo,
   defaultSystemPromptModeForProvider,
@@ -832,6 +835,207 @@ function collectFallbackChainPoolIds(startPoolId, poolsById, maxDepth = 4) {
   return out
 }
 
+function buildAccountLookupFromSnapshot(byAccountId) {
+  const byId = new Map()
+  const byVmId = new Map()
+  if (!(byAccountId instanceof Map)) return { byId, byVmId }
+  for (const [key, entry] of byAccountId) {
+    const acc = entry?.account
+    if (!acc) continue
+    const id = String(acc.account_id || acc.id || key || '').trim()
+    if (id) byId.set(id, acc)
+    const vmId = String(acc.vm_id || entry?.state?.vm_id || '').trim()
+    if (vmId && !byVmId.has(vmId)) byVmId.set(vmId, acc)
+  }
+  return { byId, byVmId }
+}
+
+async function persistDrainBatchToPg(pgPool, batch, permanentThresholdMs) {
+  const rawStickyUpserts = Array.isArray(batch?.sticky_upserts) ? batch.sticky_upserts : []
+  const rawStickyDeletes = Array.isArray(batch?.sticky_deletes) ? batch.sticky_deletes : []
+  const rawPenaltyUpserts = Array.isArray(batch?.penalty_upserts) ? batch.penalty_upserts : []
+  const rawPenaltyDeletes = Array.isArray(batch?.penalty_deletes) ? batch.penalty_deletes : []
+  if (!rawStickyUpserts.length && !rawStickyDeletes.length && !rawPenaltyUpserts.length && !rawPenaltyDeletes.length) {
+    return
+  }
+
+  // Deduplicate by primary key (last-write-wins) so PostgreSQL UNNEST + ON CONFLICT
+  // never hits SQLSTATE 21000 ("cannot affect row a second time").
+  const stickyUpsertMap = new Map()
+  for (const s of rawStickyUpserts) {
+    const k = `${s.scope_kind}\0${s.pool_id}\0${s.model_family}\0${s.identity_id}`
+    stickyUpsertMap.set(k, s)
+  }
+  const stickyUpserts = [...stickyUpsertMap.values()]
+
+  const penaltyUpsertMap = new Map()
+  for (const p of rawPenaltyUpserts) {
+    const scope = p.model_scope || '*'
+    const k = `${p.node_type}\0${p.node_id}\0${scope}`
+    penaltyUpsertMap.set(k, { ...p, model_scope: scope })
+  }
+  const penaltyUpserts = [...penaltyUpsertMap.values()]
+
+  const penaltyDeletes = []
+  for (const d of rawPenaltyDeletes) {
+    const parsed = parseNodeKey(d.node_key)
+    if (!parsed) continue
+    penaltyDeletes.push({
+      node_type: parsed.node_type,
+      node_id: parsed.node_id,
+      model_scope: d.model_scope || '*',
+    })
+  }
+
+  const runStatements = async (executor) => {
+    if (stickyUpserts.length) {
+      const scopeKinds = []
+      const poolIds = []
+      const modelFamilies = []
+      const identityIds = []
+      const nodeTypes = []
+      const nodeIds = []
+      const machineIds = []
+      const stoodIns = []
+      const boundAtMs = []
+      const lastSeenMs = []
+      const expiresAtMs = []
+      const hits = []
+      const generations = []
+      const now = Date.now()
+      for (const s of stickyUpserts) {
+        scopeKinds.push(String(s.scope_kind))
+        poolIds.push(String(s.pool_id))
+        modelFamilies.push(String(s.model_family))
+        identityIds.push(String(s.identity_id))
+        nodeTypes.push(String(s.node_type))
+        nodeIds.push(String(s.node_id))
+        machineIds.push(s.machine_id == null ? null : String(s.machine_id))
+        stoodIns.push(s.stood_in ? 1 : 0)
+        boundAtMs.push(Number(s.bound_at_ms) || now)
+        lastSeenMs.push(Number(s.last_seen_ms) || now)
+        expiresAtMs.push(Number(s.expires_at_ms) || now)
+        hits.push(Number(s.hits) || 0)
+        generations.push(Number(s.generation) || 1)
+      }
+      await executor.query(
+        `INSERT INTO scheduler_sticky_bindings (
+           scope_kind, pool_id, model_family, identity_id, node_type, node_id, machine_id,
+           stood_in, bound_at_ms, last_seen_ms, expires_at_ms, hits, generation
+         )
+         SELECT * FROM UNNEST(
+           $1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::text[],
+           $8::integer[], $9::bigint[], $10::bigint[], $11::bigint[], $12::bigint[], $13::bigint[]
+         )
+         ON CONFLICT (scope_kind, pool_id, model_family, identity_id) DO UPDATE SET
+           node_type = EXCLUDED.node_type,
+           node_id = EXCLUDED.node_id,
+           machine_id = COALESCE(EXCLUDED.machine_id, scheduler_sticky_bindings.machine_id),
+           stood_in = EXCLUDED.stood_in,
+           bound_at_ms = EXCLUDED.bound_at_ms,
+           last_seen_ms = EXCLUDED.last_seen_ms,
+           expires_at_ms = EXCLUDED.expires_at_ms,
+           hits = EXCLUDED.hits,
+           generation = EXCLUDED.generation`,
+        [
+          scopeKinds,
+          poolIds,
+          modelFamilies,
+          identityIds,
+          nodeTypes,
+          nodeIds,
+          machineIds,
+          stoodIns,
+          boundAtMs,
+          lastSeenMs,
+          expiresAtMs,
+          hits,
+          generations,
+        ],
+      )
+    }
+
+    if (rawStickyDeletes.length) {
+      await executor.query(
+        `DELETE FROM scheduler_sticky_bindings AS t
+         USING UNNEST($1::text[], $2::text[], $3::text[], $4::text[])
+           AS d(scope_kind, pool_id, model_family, identity_id)
+         WHERE t.scope_kind = d.scope_kind
+           AND t.pool_id = d.pool_id
+           AND t.model_family = d.model_family
+           AND t.identity_id = d.identity_id`,
+        [
+          rawStickyDeletes.map((d) => String(d.scope_kind)),
+          rawStickyDeletes.map((d) => String(d.pool_id)),
+          rawStickyDeletes.map((d) => String(d.model_family)),
+          rawStickyDeletes.map((d) => String(d.identity_id)),
+        ],
+      )
+    }
+
+    if (penaltyUpserts.length) {
+      const now = Date.now()
+      const nowIso = new Date(now).toISOString()
+      await executor.query(
+        `INSERT INTO scheduler_node_penalties (
+           node_type, node_id, model_scope, reason, cooldown_until_ms, ladder_step, updated_at
+         )
+         SELECT * FROM UNNEST(
+           $1::text[], $2::text[], $3::text[], $4::text[], $5::bigint[], $6::integer[], $7::text[]
+         )
+         ON CONFLICT (node_type, node_id, model_scope) DO UPDATE SET
+           reason = EXCLUDED.reason,
+           cooldown_until_ms = EXCLUDED.cooldown_until_ms,
+           ladder_step = EXCLUDED.ladder_step,
+           updated_at = EXCLUDED.updated_at`,
+        [
+          penaltyUpserts.map((p) => String(p.node_type)),
+          penaltyUpserts.map((p) => String(p.node_id)),
+          penaltyUpserts.map((p) => String(p.model_scope || '*')),
+          penaltyUpserts.map((p) => String(p.reason || 'cooldown')),
+          penaltyUpserts.map((p) => (p.permanent ? permanentThresholdMs : Number(p.cooldown_until_ms) || now)),
+          penaltyUpserts.map((p) => Number(p.ladder_step) || 0),
+          penaltyUpserts.map((p) => (p.updated_at_ms ? new Date(Number(p.updated_at_ms)).toISOString() : nowIso)),
+        ],
+      )
+    }
+
+    if (penaltyDeletes.length) {
+      await executor.query(
+        `DELETE FROM scheduler_node_penalties AS t
+         USING UNNEST($1::text[], $2::text[], $3::text[])
+           AS d(node_type, node_id, model_scope)
+         WHERE t.node_type = d.node_type
+           AND t.node_id = d.node_id
+           AND t.model_scope = d.model_scope`,
+        [
+          penaltyDeletes.map((d) => d.node_type),
+          penaltyDeletes.map((d) => d.node_id),
+          penaltyDeletes.map((d) => d.model_scope),
+        ],
+      )
+    }
+  }
+
+  if (typeof pgPool.connect === 'function') {
+    const client = await pgPool.connect()
+    try {
+      await client.query('BEGIN')
+      await runStatements(client)
+      await client.query('COMMIT')
+    } catch (err) {
+      try {
+        await client.query('ROLLBACK')
+      } catch {}
+      throw err
+    } finally {
+      client.release?.()
+    }
+  } else {
+    await runStatements(pgPool)
+  }
+}
+
 export class SchedulerRuntime {
   #cfg
   #client
@@ -855,12 +1059,17 @@ export class SchedulerRuntime {
   #telemetryIntervalMs
   #drainIntervalMs
   #onError
+  #pgPool
+  #schedulerCache
+  #localSnapshotCache
 
   #configVersion = 0
   #lastSnapshot = null
   #poolsById = new Map()
   #nodesByKey = new Map()
   #inventoryByKey = new Map()
+  #hasClaudeNodes = false
+  #lastRuntimeRepo = null
   #telemetryTimer = null
   #syncInFlight = null
   #syncPending = false
@@ -870,6 +1079,12 @@ export class SchedulerRuntime {
 
   constructor(options = {}) {
     this.#cfg = options.cfg || {}
+    this.#pgPool = options.pgPool || null
+    this.#schedulerCache = options.schedulerCache || null
+    this.#localSnapshotCache = new SchedulerSnapshotCache(null, {
+      freshTtlMs: options.snapshotFreshTtlMs ?? 2_000,
+      staleTtlMs: options.snapshotStaleTtlMs ?? 10_000,
+    })
     this.#getDb =
       typeof options.getDb === 'function' ? options.getDb : () => (isDbOpen() ? getDb() : options.apiKeyStore?.db)
     this.#getVms =
@@ -986,6 +1201,188 @@ export class SchedulerRuntime {
 
   #resolveProxyPool() {
     return typeof this.#proxyPool === 'function' ? this.#proxyPool() : this.#proxyPool
+  }
+
+  #resolvePgPool(db = this.#resolveDb()) {
+    if (this.#pgPool) return this.#pgPool
+    if (db?.engine === 'postgres') return getPgPool() || null
+    return null
+  }
+
+  #resolveRuntimeRepo() {
+    return this.#accountQuota?.runtimeRepo || this.#resolvePoolScheduler()?.runtimeRepo || null
+  }
+
+  #resolveSnapshotCache(db = this.#resolveDb()) {
+    const runtimeRepo = this.#resolveRuntimeRepo()
+    const target =
+      this.#schedulerCache ||
+      (db && isDbOpen() && db === getDb() ? getCacheRuntime().scheduler : this.#localSnapshotCache)
+    if (runtimeRepo !== this.#lastRuntimeRepo) {
+      this.#lastRuntimeRepo = runtimeRepo
+      target?.invalidateSchedulingSnapshot?.({ broadcast: false })
+    }
+    return target
+  }
+
+  #candidateClaudeVms(vmsHint = null) {
+    if (Array.isArray(vmsHint)) {
+      return vmsHint.filter((vm) => vm?.id && !isCodexVm(vm))
+    }
+    const out = []
+    for (const [nodeKey, nodeCfg] of this.#nodesByKey.entries()) {
+      if (nodeCfg.node_type !== 'claude_vm') continue
+      const inv = this.#inventoryByKey.get(nodeKey)
+      if (inv?.item?.id) out.push(inv.item)
+    }
+    return out
+  }
+
+  #buildSnapshotFromParts(byAccountId, byVmId, { authoritative = false, vmsHint = null } = {}) {
+    const projectRoot = this.#cfg?.paths?.project || ''
+    const accountIdByVmId = new Map()
+    const claudeVms = this.#candidateClaudeVms(vmsHint)
+
+    if (!authoritative && byAccountId.size === 0 && this.#accountQuota) {
+      const lookup = buildAccountLookup(this.#accountQuota)
+      for (const [id, acc] of lookup.byId) {
+        if (!byAccountId.has(id)) {
+          byAccountId.set(id, { account: acc, state: null, runtime: null })
+        }
+      }
+    }
+
+    for (const item of claudeVms) {
+      const vmId = String(item.id)
+      let raw = byVmId.get(vmId) || null
+      if (!raw && projectRoot) {
+        raw = this.#rawVm(item, { strict: true })
+        if (raw) byVmId.set(vmId, raw)
+      }
+      const effectiveVm = raw || item
+      const accountId = accountIdOf(effectiveVm, projectRoot || null)
+      if (accountId) {
+        const key = String(accountId)
+        accountIdByVmId.set(vmId, key)
+        if (!authoritative) {
+          const existing = byAccountId.get(key)
+          if (!existing?.account) {
+            const acc = rawAccountForVm(this.#accountQuota, effectiveVm, key)
+            if (acc || existing) {
+              const st = existing?.state ?? existing?.runtime ?? null
+              byAccountId.set(key, { account: acc || null, state: st, runtime: st })
+            }
+          }
+        }
+      }
+    }
+
+    return {
+      byAccountId,
+      byVmId,
+      accountIdByVmId,
+      authoritative,
+    }
+  }
+
+  #loadSchedulingSnapshotSync({ vmsHint = null } = {}) {
+    const runtimeRepo = this.#resolveRuntimeRepo()
+    const projectRoot = this.#cfg?.paths?.project || ''
+    const byVmId = new Map()
+    let byAccountId = new Map()
+    let authoritative = false
+
+    if (typeof runtimeRepo?.listAllSnapshots === 'function') {
+      try {
+        byAccountId = runtimeRepo.listAllSnapshots()
+        authoritative = Boolean(runtimeRepo.db)
+      } catch {
+        byAccountId = new Map()
+      }
+    } else if (typeof runtimeRepo?.schedulingSnapshot === 'function') {
+      const claudeVms = this.#candidateClaudeVms(vmsHint)
+      const ids = []
+      const seen = new Set()
+      for (const item of claudeVms) {
+        const vmId = String(item.id)
+        let raw = null
+        if (projectRoot) {
+          raw = this.#rawVm(item, { strict: true })
+          if (raw) byVmId.set(vmId, raw)
+        }
+        const acctId = accountIdOf(raw || item, projectRoot || null)
+        if (acctId && !seen.has(String(acctId))) {
+          seen.add(String(acctId))
+          ids.push(String(acctId))
+        }
+      }
+      if (ids.length) {
+        try {
+          const snaps = runtimeRepo.schedulingSnapshot(ids)
+          if (snaps instanceof Map) {
+            for (const [k, v] of snaps) {
+              if (!k) continue
+              const st = v?.state ?? v?.runtime ?? null
+              byAccountId.set(String(k), { account: v?.account ?? null, state: st, runtime: st })
+            }
+          }
+        } catch {}
+      }
+    } else if (typeof runtimeRepo?.list === 'function') {
+      try {
+        for (const row of runtimeRepo.list() || []) {
+          if (row?.account_id) {
+            byAccountId.set(String(row.account_id), { account: null, state: row, runtime: row })
+          }
+        }
+      } catch {}
+    }
+
+    return this.#buildSnapshotFromParts(byAccountId, byVmId, { authoritative, vmsHint })
+  }
+
+  async #loadSchedulingSnapshotAsync({ vmsHint = null } = {}) {
+    const db = this.#resolveDb()
+    const pgPool = this.#resolvePgPool(db)
+    const runtimeRepo = this.#resolveRuntimeRepo()
+
+    if (pgPool && typeof pgPool.query === 'function' && (!runtimeRepo || runtimeRepo.db)) {
+      const [byAccountId, byVmId] = await Promise.all([listAllSnapshotsAsync(pgPool), listAllVmsAsync(pgPool)])
+      return this.#buildSnapshotFromParts(byAccountId, byVmId, { authoritative: true, vmsHint })
+    }
+    return this.#loadSchedulingSnapshotSync({ vmsHint })
+  }
+
+  async #ensureSchedulingSnapshotAsync({ vmsHint = null, forceRefresh = false } = {}) {
+    const cache = this.#resolveSnapshotCache()
+    return cache.getSchedulingSnapshotAsync(() => this.#loadSchedulingSnapshotAsync({ vmsHint }), { forceRefresh })
+  }
+
+  #getOrWarmSnapshotForRequest(params = {}) {
+    if (params.apiKeyScope || params.api_key_scope) return null
+    if (this.#nodesByKey.size === 0 || !this.#hasClaudeNodes) return null
+    const model = String(params.model || '').trim()
+    if (!model) return null
+    const pinNodeKey = params.pinNodeKey ?? params.pin_node_key ?? null
+    if (pinNodeKey) return null
+    const nodeTypes = params.nodeTypes || params.node_types || null
+    if (Array.isArray(nodeTypes) && nodeTypes.length > 0 && !nodeTypes.includes('claude_vm')) {
+      return null
+    }
+
+    const db = this.#resolveDb()
+    const cache = this.#resolveSnapshotCache(db)
+    const asyncLoader = () => this.#loadSchedulingSnapshotAsync()
+    const peek = cache.peekSchedulingSnapshot({ asyncRefresher: asyncLoader })
+    if (peek.hit) return peek.snapshot
+
+    const pgPool = this.#resolvePgPool(db)
+    if ((pgPool && typeof pgPool.query === 'function') || cache.cache?.hasRedis) {
+      return cache.getSchedulingSnapshotAsync(asyncLoader)
+    }
+    return cache.getSchedulingSnapshotSync(() => this.#loadSchedulingSnapshotSync(), {
+      asyncRefresher: asyncLoader,
+    })
   }
 
   #loadGeminiEnvs() {
@@ -1427,6 +1824,8 @@ export class SchedulerRuntime {
     this.#poolsById = poolsById
     this.#nodesByKey = nodesByKey
     this.#inventoryByKey = inventoryByKey
+    this.#hasClaudeNodes = claudeMembers.length > 0
+    this.#resolveSnapshotCache(db)?.invalidateSchedulingSnapshot?.({ broadcast: false })
     return snapshot
   }
 
@@ -1434,14 +1833,32 @@ export class SchedulerRuntime {
    * Build high-frequency node telemetry updates pushed to `/internal/v1/nodes/telemetry`
    * (zero `config_version` bump, zero `ArcSwap` rebuild).
    */
-  buildTelemetryBatch({ now = Date.now() } = {}) {
+  buildTelemetryBatch({ now = Date.now(), snapshot = null } = {}) {
     const updates = []
     const vms = this.#getVms() || []
-    const acctLookup = buildAccountLookup(this.#accountQuota)
+    const db = this.#resolveDb()
+    const pgPool = this.#resolvePgPool(db)
+    let schedSnap = snapshot
+    if (!schedSnap) {
+      const cache = this.#resolveSnapshotCache(db)
+      if (pgPool && typeof pgPool.query === 'function') {
+        schedSnap = cache.getSchedulingSnapshotSync(() => this.#loadSchedulingSnapshotSync({ vmsHint: vms }), {
+          now,
+          asyncRefresher: () => this.#loadSchedulingSnapshotAsync({ vmsHint: vms }),
+        })
+      } else {
+        const fresh = this.#loadSchedulingSnapshotSync({ vmsHint: vms })
+        schedSnap = cache.primeSchedulingSnapshot(fresh, { now })
+      }
+    }
+    const acctLookup =
+      schedSnap?.authoritative || (schedSnap?.byAccountId?.size ?? 0) > 0
+        ? buildAccountLookupFromSnapshot(schedSnap.byAccountId)
+        : buildAccountLookup(this.#accountQuota)
     const externalVms = this.#externalLoadProvider?.() || {}
     const routing = this.#getRoutingConfig() || {}
     const quotaPolicy = normalizeOpenAIQuotaPolicy(routing.codex?.quota || {})
-    const gateCtx = this.#claudeNodeGateContext()
+    const gateCtx = this.#claudeNodeGateContext(schedSnap)
 
     for (const vm of vms) {
       if (!vm?.id) continue
@@ -1488,14 +1905,15 @@ export class SchedulerRuntime {
       // root (as 238 did); without one there is nothing to read.
       let newSessionsBlocked = false
       if (schedulable && !codex && gateCtx.projectRoot) {
-        const gateReason = this.#claudeNodeGateReason(vm, acct, gateCtx, now)
+        const resolved = this.#resolveClaudeGateInputs(vm, gateCtx)
+        const gateReason = resolved ? this.#claudeNodeGateReason(vm, resolved, gateCtx, now) : null
         if (gateReason) {
           schedulable = false
           unschedReason = gateReason
-        } else {
+        } else if (resolved) {
           // 238 quotaGuardLevel: `stop` removes the account, `continuing` keeps
           // only conversations already pinned to it.
-          const guard = this.#claudeQuotaGuardLevel(vm, gateCtx, now)
+          const guard = this.#claudeQuotaGuardLevel(resolved, now)
           if (guard === 'stop') {
             schedulable = false
             unschedReason = 'quota_guard_stop'
@@ -1605,29 +2023,40 @@ export class SchedulerRuntime {
     }
   }
 
-  /** Shared per-batch inputs for `claudeNodeGate` (one runtime-table read per batch). */
-  #claudeNodeGateContext() {
+  /** Shared per-batch inputs for `claudeNodeGate` reusing the prefetched snapshot. */
+  #claudeNodeGateContext(snapshot = null) {
     const projectRoot = this.#cfg?.paths?.project || ''
     const poolScheduler = this.#resolvePoolScheduler()
-    const runtimeById = new Map()
-    try {
-      const repo = this.#accountQuota?.runtimeRepo || poolScheduler?.runtimeRepo
-      for (const row of repo?.list?.() || []) {
-        if (row?.account_id) runtimeById.set(String(row.account_id), row)
-        if (row?.vm_id && !runtimeById.has(`vm:${row.vm_id}`)) runtimeById.set(`vm:${row.vm_id}`, row)
-      }
-    } catch {}
-    return { projectRoot, poolScheduler, runtimeById }
+    return {
+      projectRoot,
+      poolScheduler,
+      snapshot,
+      byVmId: snapshot?.byVmId || new Map(),
+      byAccountId: snapshot?.byAccountId || new Map(),
+      byAccountVmId: snapshot?.byAccountVmId || new Map(),
+      accountIdByVmId: snapshot?.accountIdByVmId || new Map(),
+      authoritative: Boolean(snapshot?.authoritative),
+    }
   }
 
-  #claudeNodeGateReason(vm, acct, ctx, now) {
-    const { projectRoot, poolScheduler, runtimeById } = ctx
-    // Judge vm.json only; a flattened summary lacks proxy/credential fields.
-    const raw = this.#rawVm(vm, { strict: true })
+  /** Resolve raw VM, account, and runtime state ONCE per VM from the batch snapshot. */
+  #resolveClaudeGateInputs(vm, ctx) {
+    const vmId = String(vm?.id || '')
+    if (!vmId) return null
+    // Judge vm.json / mirrored vm_json only; a flattened summary lacks proxy/credential fields.
+    const raw = ctx.byVmId.get(vmId) || null
     if (!raw) return null
-    const accountId = accountIdOf(raw, projectRoot || null)
-    const account = rawAccountForVm(this.#accountQuota, raw, accountId) || null
-    const state = runtimeById.get(String(accountId)) || runtimeById.get(`vm:${vm.id}`) || null
+    const accountId = ctx.accountIdByVmId.get(vmId) || raw?.claude?.account_uuid || vmId
+    const entry = (accountId ? ctx.byAccountId.get(String(accountId)) : null) || ctx.byAccountVmId.get(vmId) || null
+    const account =
+      entry?.account || (!ctx.authoritative ? rawAccountForVm(this.#accountQuota, raw, accountId) : null) || null
+    const state = entry?.state || entry?.runtime || null
+    return { raw, accountId, account, state }
+  }
+
+  #claudeNodeGateReason(vm, resolved, ctx, now) {
+    const { projectRoot, poolScheduler } = ctx
+    const { raw, account, state } = resolved
     const ttl = Math.max(5_000, Number(poolScheduler?.config?.worker_health_ttl_ms) || 5_000)
     const cached = poolScheduler?.healthCache?.get?.(vm.id)
     const health = cached && now - Number(cached.at || 0) <= ttl * 6 ? cached.value : undefined
@@ -1653,11 +2082,8 @@ export class SchedulerRuntime {
     })
   }
 
-  #claudeQuotaGuardLevel(vm, ctx, now) {
-    const raw = this.#rawVm(vm, { strict: true })
-    if (!raw) return 'open'
-    const accountId = accountIdOf(raw, ctx.projectRoot || null)
-    const account = rawAccountForVm(this.#accountQuota, raw, accountId)
+  #claudeQuotaGuardLevel(resolved, now) {
+    const account = resolved?.account
     if (!account?.unified) return 'open'
     try {
       const config = quotaGuardConfigOf(this.#getRoutingConfig()?.quota || {})
@@ -1722,9 +2148,14 @@ export class SchedulerRuntime {
     }
   }
 
-  #persistDrainBatch(batch) {
+  async #persistDrainBatch(batch) {
     if (this.isStandby) return
     const db = this.#resolveDb()
+    const pgPool = this.#resolvePgPool(db)
+    if (pgPool && typeof pgPool.query === 'function') {
+      await persistDrainBatchToPg(pgPool, batch, PERMANENT_PENALTY_THRESHOLD_MS)
+      return
+    }
     if (!db) return
     const repo = new SchedulerPoolsRepo(db)
     withTransaction(db, () => {
@@ -1870,7 +2301,16 @@ export class SchedulerRuntime {
 
   async pushTelemetryNow(updates = null) {
     if (this.#client.stopped) return { ok: false, updated: 0 }
-    const batch = Array.isArray(updates) ? updates : this.buildTelemetryBatch()
+    let batch = updates
+    if (!Array.isArray(batch)) {
+      const db = this.#resolveDb()
+      const pgPool = this.#resolvePgPool(db)
+      const snapshot =
+        pgPool && typeof pgPool.query === 'function'
+          ? await this.#ensureSchedulingSnapshotAsync().catch(() => null)
+          : null
+      batch = this.buildTelemetryBatch({ snapshot })
+    }
     if (!batch.length) return { ok: true, updated: 0 }
     return this.#client.pushTelemetry(batch)
   }
@@ -1905,6 +2345,7 @@ export class SchedulerRuntime {
     poolAccess,
     pinned = false,
     gate = null,
+    snapshot = null,
   }) {
     const isMaster = apiKeyKind === 'master' || !apiKeyRecord
     const explicitSet = Array.isArray(explicitAllowedNodeKeys)
@@ -1923,24 +2364,20 @@ export class SchedulerRuntime {
 
     // 238 PoolScheduler.checkEligibility: `slotAllowsModel` (plan, per-account
     // model denial, slot allowlist) for every Claude candidate, skipped for a
-    // master pin.
+    // master pin. Read ONCE from L1 SchedulerSnapshotCache (O(1), 0 DB RPCs).
     const routing = this.#getRoutingConfig() || {}
     const fableRequiresMax = fableRequiresMaxEnabled(routing)
     const gateNow = Date.now()
-    const runtimeRepo = this.#accountQuota?.runtimeRepo || this.#resolvePoolScheduler()?.runtimeRepo || null
-    const snapshotCache = new Map()
-    const runtimeSnapshot = (accountId) => {
-      if (!accountId || !runtimeRepo?.schedulingSnapshot) return null
-      const key = String(accountId)
-      if (!snapshotCache.has(key)) {
-        let hit = null
-        try {
-          hit = runtimeRepo.schedulingSnapshot([key])?.get?.(key) || null
-        } catch {}
-        snapshotCache.set(key, hit)
-      }
-      return snapshotCache.get(key)
-    }
+    const needsClaudeSnapshot = Boolean(
+      model && !pinned && this.#hasClaudeNodes && (!typeFilter || typeFilter.has('claude_vm')),
+    )
+    const schedSnap = needsClaudeSnapshot
+      ? snapshot ||
+        this.#resolveSnapshotCache().getSchedulingSnapshotSync(() => this.#loadSchedulingSnapshotSync(), {
+          now: gateNow,
+          asyncRefresher: () => this.#loadSchedulingSnapshotAsync(),
+        })
+      : null
     const denyNode = (reason, nodeKey) => {
       if (!gate) return
       gate.denied ||= {}
@@ -1982,10 +2419,22 @@ export class SchedulerRuntime {
             continue
           }
           if (!pinned && inv?.item) {
-            const raw = this.#rawVm(inv.item)
-            const accountId = accountIdOf(raw, this.#cfg?.paths?.project || null)
-            const snapshot = runtimeSnapshot(accountId)
-            const account = snapshot?.account || rawAccountForVm(this.#accountQuota, raw, accountId)
+            const vmId = String(inv.item.id || nodeCfg.node_id)
+            const raw = schedSnap?.byVmId?.get(vmId) || inv.item
+            const accountId =
+              schedSnap?.accountIdByVmId?.get(vmId) ||
+              raw?.claude?.account_uuid ||
+              inv.item?.claude?.account_uuid ||
+              inv.item?.account_uuid ||
+              vmId
+            const snapEntry =
+              (accountId ? schedSnap?.byAccountId?.get(String(accountId)) : null) ||
+              schedSnap?.byAccountVmId?.get(vmId) ||
+              null
+            const account =
+              snapEntry?.account ||
+              (!schedSnap?.authoritative ? rawAccountForVm(this.#accountQuota, raw, accountId) : null) ||
+              null
             const verdict = slotAllowsModel({ vm: raw, account, model, fableRequiresMax })
             if (!verdict.ok) {
               denyNode(verdict.reason, nodeKey)
@@ -1996,7 +2445,7 @@ export class SchedulerRuntime {
             const wait = claudeModelWaitGate({
               accountId,
               account,
-              state: snapshot?.state || null,
+              state: snapEntry?.state || snapEntry?.runtime || null,
               model,
               accountQuota: this.#accountQuota,
               now: gateNow,
@@ -2037,7 +2486,7 @@ export class SchedulerRuntime {
     return matched
   }
 
-  #buildAcquireRequest(params = {}) {
+  #buildAcquireRequest(params = {}, { snapshot = null } = {}) {
     const model = String(params.model || '').trim()
     const protocol = String(params.protocol || '').trim()
     const modelFamily = params.modelFamily || params.model_family || inferModelFamily(model, protocol)
@@ -2079,6 +2528,7 @@ export class SchedulerRuntime {
         poolAccess,
         pinned: Boolean(pinNodeKey),
         gate,
+        snapshot,
       })
       api_key_scope = buildApiKeyScope({
         apiKeyRecord,
@@ -2182,7 +2632,9 @@ export class SchedulerRuntime {
   }
 
   async acquireNode(params = {}, opts = {}) {
-    const req = this.#buildAcquireRequest(params)
+    const snapOrPromise = this.#getOrWarmSnapshotForRequest(params)
+    const snapshot = snapOrPromise && typeof snapOrPromise.then === 'function' ? await snapOrPromise : snapOrPromise
+    const req = this.#buildAcquireRequest(params, { snapshot })
     const callOpts = this.#poolTimeoutsFor(req.jev_downgrade_pool_id || req.origin_pool_id, opts)
     let res
     try {
@@ -2221,10 +2673,13 @@ export class SchedulerRuntime {
     }
 
     const rawNext = params.nextAttempt ?? params.next_attempt ?? {}
-    const next_attempt = this.#buildAcquireRequest({
+    const nextParams = {
       ...rawNext,
       attemptNo: Math.max(2, Number(rawNext.attemptNo ?? rawNext.attempt_no ?? 2) || 2),
-    })
+    }
+    const snapOrPromise = this.#getOrWarmSnapshotForRequest(nextParams)
+    const snapshot = snapOrPromise && typeof snapOrPromise.then === 'function' ? await snapOrPromise : snapOrPromise
+    const next_attempt = this.#buildAcquireRequest(nextParams, { snapshot })
 
     const callOpts = this.#poolTimeoutsFor(next_attempt.jev_downgrade_pool_id || next_attempt.origin_pool_id, opts)
     let res
@@ -2309,7 +2764,9 @@ export class SchedulerRuntime {
   }
 
   async explainDispatch(params = {}, opts = {}) {
-    const req = this.#buildAcquireRequest(params)
+    const snapOrPromise = this.#getOrWarmSnapshotForRequest(params)
+    const snapshot = snapOrPromise && typeof snapOrPromise.then === 'function' ? await snapOrPromise : snapOrPromise
+    const req = this.#buildAcquireRequest(params, { snapshot })
     let res
     try {
       res = await this.#client.explain(req, opts)

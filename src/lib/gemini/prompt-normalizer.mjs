@@ -600,7 +600,10 @@ function extractSystemText(systemInstruction) {
   return ''
 }
 
-function normalizeContentPartText(text, { isFirstUserNoSystem, mode, appliedRules, scopesTouched }) {
+function normalizeContentPartText(
+  text,
+  { isFirstUserNoSystem, mode, appliedRules, scopesTouched, escapeSlashes = true },
+) {
   if (typeof text !== 'string' || !text || mode === 'off') return text
   let current = text
   let touchedEnvelope = false
@@ -674,14 +677,16 @@ function normalizeContentPartText(text, { isFirstUserNoSystem, mode, appliedRule
 
   if (touchedEnvelope) scopesTouched.add('contents_envelope')
   if (current !== text) {
-    // Re-enforce CRAGGemini TUI valid_text invariants on any mutated content part.
-    current = sanitizeNativeTuiText(current)
+    current = escapeSlashes ? sanitizeNativeTuiText(current) : stripIllegalControlChars(current)
     if (!current.trim()) return text
   }
   return current
 }
 
-function normalizeContentsField(contents, { hasSystemInstruction, mode, appliedRules, scopesTouched }) {
+function normalizeContentsField(
+  contents,
+  { hasSystemInstruction, mode, appliedRules, scopesTouched, escapeSlashes = true },
+) {
   if (!Array.isArray(contents) || !contents.length || mode === 'off') {
     return { value: contents, changed: false }
   }
@@ -700,6 +705,7 @@ function normalizeContentsField(contents, { hasSystemInstruction, mode, appliedR
         mode,
         appliedRules,
         scopesTouched,
+        escapeSlashes,
       })
       if (nextText !== part.text) {
         turnChanged = true
@@ -780,7 +786,10 @@ function measureTextBytes(body) {
  *
  * Returns `{ body, report }` where `report` contains strictly sanitized telemetry metadata.
  */
-export function normalizeGeminiOutboundPrompt(body, { target = 'antigravity', policy = {}, headers = {} } = {}) {
+export function normalizeGeminiOutboundPrompt(
+  body,
+  { target = 'antigravity', policy = {}, headers = {}, escapeSlashes = true } = {},
+) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) {
     return { body, report: null }
   }
@@ -872,6 +881,7 @@ export function normalizeGeminiOutboundPrompt(body, { target = 'antigravity', po
     mode,
     appliedRules,
     scopesTouched,
+    escapeSlashes,
   })
   if (nextContents.changed) out.contents = nextContents.value
 

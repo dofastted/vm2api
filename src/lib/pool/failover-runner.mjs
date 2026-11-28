@@ -748,6 +748,7 @@ export class FailoverRunner {
     stickyRouter = null,
     attemptsRepo = null,
     rateLimitService = null,
+    requestLog = null,
     config = {},
     onProxyFailure = null,
     onCredentialFailure = null,
@@ -761,6 +762,7 @@ export class FailoverRunner {
     this.stickyRouter = stickyRouter
     this.attemptsRepo = attemptsRepo
     this.rateLimitService = rateLimitService
+    this.requestLog = requestLog || null
     this.config = { ...DEFAULTS, ...(config || {}) }
     this.onProxyFailure = onProxyFailure
     this.onCredentialFailure = onCredentialFailure
@@ -997,6 +999,8 @@ export class FailoverRunner {
     quotaRequest = null,
     allowQueue = true,
     schedulerRuntime = null,
+    requestLog = null,
+    onPhase = null,
   } = {}) {
     if (typeof callAttempt !== 'function') throw new Error('FailoverRunner requires callAttempt')
 
@@ -1134,6 +1138,23 @@ export class FailoverRunner {
 
     let activeLeaseId = acquired.lease_id
     let activeSelected = this.#resolveSelected(acquired, { model, quotaRequest })
+    const liveLog = requestLog || this.requestLog || null
+    const emitPhase = (patch) => {
+      try {
+        liveLog?.updatePhase?.(reqId, patch)
+      } catch {}
+      if (typeof onPhase === 'function') {
+        try {
+          onPhase({ requestId: reqId, ...patch })
+        } catch {}
+      }
+    }
+    emitPhase({
+      phase: 'routing',
+      attempt_count: 1,
+      vm_id: activeSelected?.vmId || null,
+      account_id: activeSelected?.accountId || null,
+    })
 
     // 238 keep_session_home: a continuing conversation's home for this request
     // is the node its first attempt ran on. Subagents and batch members excluded.
@@ -1357,6 +1378,14 @@ export class FailoverRunner {
         const attemptNo = budget.hops + 1
         const selected = activeSelected
         lastSelected = selected
+        if (attemptNo > 1) {
+          emitPhase({
+            phase: 'retrying',
+            attempt_count: attemptNo,
+            vm_id: selected?.vmId || null,
+            account_id: selected?.accountId || null,
+          })
+        }
 
         if (signal?.aborted || isClientCancelledResult(lastResult)) {
           finalReleasePayload = { outcome: 'aborted' }
@@ -1504,6 +1533,13 @@ export class FailoverRunner {
             onCommit: () => {
               committed = true
               activeCommitted = true
+              emitPhase({
+                phase: 'streaming',
+                attempt_count: attemptNo,
+                vm_id: selected?.vmId || null,
+                account_id: selected?.accountId || null,
+                ttft_ms: Math.max(0, Date.now() - startedAt),
+              })
               if (activeLeaseId && !commitPromise) {
                 const lid = activeLeaseId
                 commitPromise = rt.commitLease(lid).catch(() => {})

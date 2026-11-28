@@ -1,3 +1,13 @@
+export type RequestLogLiveMeta = {
+  phase?: string
+  attempt_count?: number
+  started_at?: number
+  ttft_ms?: number | null
+  vm_id?: string | null
+  account_id?: string | null
+  active_provider?: string | null
+}
+
 export type RequestLogItem = {
   request_id?: string
   id?: string
@@ -5,6 +15,10 @@ export type RequestLogItem = {
   ts?: string
   created_at?: string
   status?: number | string
+  /** 是否仍在处理中（Redis 在飞请求合并到列表顶部时为 true）。 */
+  in_flight?: boolean
+  /** 进行中请求的实时阶段与节点元数据。 */
+  _live?: RequestLogLiveMeta | null
   model?: string
   requested_model?: string
   upstream_model?: string

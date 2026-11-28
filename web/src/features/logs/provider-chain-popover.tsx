@@ -19,8 +19,12 @@ import {
   chainItemStatus,
   effectiveMultiplier,
   finalProviderName,
+  isInFlightLog,
   isSuccessStatus,
+  livePhaseLabel,
+  liveProviderName,
   multiplierBadgeClass,
+  resolveLiveMeta,
   selectionReasonLabel,
   terminalStateLabel,
   type ChainItemStatus,
@@ -150,7 +154,7 @@ export function ProviderChainPopover({
   row: UsageLogRow
   onChainItemClick: (index: number) => void
 }) {
-  const chain = row.providerChain
+  const chain = row.providerChain ?? []
   const name = finalProviderName(row)
   if (chain.length <= 1) return <SingleAttempt name={name} item={chain[0]} />
 
@@ -252,7 +256,7 @@ export function ProviderChainPopover({
   )
 }
 
-/** 供应商列：被拦截 chip → 决策链 + 分组倍率 chip。 */
+/** 供应商列：被拦截 chip → 进行中实时节点 → 决策链 + 分组倍率 chip。 */
 export function ProviderCell({
   row,
   onChainItemClick,
@@ -272,6 +276,76 @@ export function ProviderCell({
     )
   }
   const multiplier = effectiveMultiplier(row.groupCostMultiplier)
+  if (isInFlightLog(row)) {
+    const live = resolveLiveMeta(row)
+    const chain = row.providerChain ?? []
+    const activeName = liveProviderName(row)
+    const attempts = live.attemptCount ?? (chain.length > 0 ? chain.length : null)
+    return (
+      <div className='flex min-w-0 flex-col items-start gap-0.5'>
+        <div className='flex w-full min-w-0 items-center gap-1.5 overflow-hidden'>
+          <span className='relative flex h-2 w-2 shrink-0'>
+            <span className='absolute inline-flex h-full w-full animate-ping rounded-full bg-sky-400 opacity-75' />
+            <span className='relative inline-flex h-2 w-2 rounded-full bg-sky-500' />
+          </span>
+          <div className='min-w-0 flex-1 overflow-hidden'>
+            {chain.length > 1 ? (
+              <ProviderChainPopover
+                row={row}
+                onChainItemClick={onChainItemClick}
+              />
+            ) : (
+              <Tooltip delayDuration={300}>
+                <TooltipTrigger asChild>
+                  <span className='flex min-w-0 cursor-help items-center gap-1'>
+                    <span className='min-w-0 truncate'>{activeName}</span>
+                    {attempts != null && attempts > 1 ? (
+                      <Badge
+                        variant='secondary'
+                        className='shrink-0 px-1 text-[10px]'
+                      >
+                        第{attempts}次
+                      </Badge>
+                    ) : null}
+                  </span>
+                </TooltipTrigger>
+                <TooltipContent
+                  side='bottom'
+                  align='start'
+                  className='max-w-[320px] space-y-1 text-xs'
+                >
+                  <div className='font-medium'>{activeName}</div>
+                  <div className='text-[11px] opacity-80'>
+                    阶段：{livePhaseLabel(live.phase)}
+                    {attempts != null && attempts > 0
+                      ? ` · 第 ${attempts} 次尝试`
+                      : ''}
+                  </div>
+                  {live.accountId || row.providerName ? (
+                    <div className='text-[11px] opacity-80'>
+                      账号：{row.providerName || live.accountId}
+                    </div>
+                  ) : null}
+                </TooltipContent>
+              </Tooltip>
+            )}
+          </div>
+          {multiplier != null ? (
+            <Badge
+              variant='outline'
+              className={cn(
+                'shrink-0 px-1 py-0 text-[10px]',
+                multiplierBadgeClass(multiplier)
+              )}
+              title='分组倍率'
+            >
+              x{multiplier.toFixed(2)}
+            </Badge>
+          ) : null}
+        </div>
+      </div>
+    )
+  }
   return (
     <div className='flex min-w-0 flex-col items-start gap-0.5'>
       <div className='flex w-full min-w-0 items-center gap-1 overflow-hidden'>

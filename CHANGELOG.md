@@ -1,5 +1,64 @@
 # Changelog
 
+## 1.4.269 — 2026-11-28 · Stage 1 10K RPM 热路径与 PG/Redis I/O 优化（含 PG 迁移 `012`）
+
+- **Stage 1 高并发热路径与 PG/Redis I/O 深度优化（#2129）**：针对 Phase 0 真 PostgreSQL 18.6 + Redis 8 20K 回放基准归因的 Top 5 主线程 `Atomics.wait` 阻塞与日志写放大瓶颈，完成三路并行重构（100% 兼容 SQLite 与无 Redis 降级）：
+  - **调度器 L1/L2 精简快照与双 PK 索引查询**：`AccountRuntimeRepo.schedulingSnapshot()` 移除 `COALESCE(a.id, r.account_id) IN (json_each(?))`，改写为双 PK 索引子查询 `FULL JOIN` 并新增异步 `pgPool` 批量加载器；`SchedulerCache` / `SchedulerSnapshotCache` 实现 2s 新鲜 / 10s SWR 宽限 + Redis L2（`sched:snapshot:v1` + `sched:rev`）+ 单飞后台刷新与跨实例 Pub/Sub 失效；`SchedulerRuntime` 移除 200-VM 同步循环，稳态 O(1) 读取共享快照并在 PG 模式走异步 `pgPool` `UNNEST` 批量排干。
+  - **热路径 `Atomics.wait` 清零（配额 / 调度 / Sticky / 并发批量读）**：`ConcurrencyCache.getBatchConcurrency()` 叠加 200ms 进程内短 TTL 缓存 + Promise coalescing (`singleflight`) + `{ fresh: true }` 绕过；`AccountQuota` 移除 `_batchAllocsStmt` `ROW_NUMBER()` 全表扫 `account_allocations`，改为进程内每账号 5 条近期分配环 + PG 异步 `CROSS JOIN LATERAL` 索引查询，`ingestHeaders()` 改为 L1 + Redis Hash 原地更新 + Dirty-Set `1000ms` 异步 `pgPool` `UNNEST` 合批刷盘（仅 429 / 耗尽 / 超安全线等高危态触发跨实例 `bumpRevision()` 失效，常规刷盘不触发调度与面板缓存雪崩），并接线 `src/server.mjs` 启停与优雅关停排干；`PoolScheduler` 与 `StickyRouter` 在 PG 模式全面走 Redis 优先 + 异步 `pgPool` 与共享调度快照。
+  - **`PgLogWriter` `UNNEST` 通道池、安全索引瘦身（PG 迁移 `012`）与实时态 50ms 微批**：`PgLogWriter` 升级固定参数 `UNNEST` 批写（`usage_logs` 76 列 / `request_attempts` 28 列 / `request_log_debug` 3 列，严格对齐 PG 18 类型）+ 多并发 writer 通道池 + 事务级 `SET LOCAL synchronous_commit = off`（`VM2API_LOG_SYNC_COMMIT` 可配）；新增线上安全幂等迁移 `012_optimize_usage_logs_and_attempts_indexes.sql`，删除 `request_attempts` 重复索引 `idx_request_attempt_request`、将 `usage_logs` 二级索引由 18 压降至 9（7 全量 + 2 部分索引）、补齐 `account_allocations` 复合索引 `idx_alloc_account_id_desc (account_id, id DESC)`；`LiveLogCache` 升级 50ms/64 条微批 Pipeline 并在 `closeCacheRuntime()` 停机前排干；`/api/panel/request-logs/stats` 在 15s SWR 缓存外实时叠加 `pg_log_writer` / `inflight_count`。
+  - **真 PG 18.6 + Redis 8 基准复测**：4 实例 1200 RPM（100K 上下文 ~403KB/req，200 VM）下 0% 代理错误吞吐由基线 ~240–300 RPM 提升至 **1,134.2 RPM**（~4.7–5×），主线程 `Atomics.wait` 由 636–963 次/req 降至 **26.77 次/req**（↓24–36×），面板 `dashboard` p95 由 15.8s 降至 **4.89s**，闭环校验 4/4 全绿（`usage_logs` 0% 丢失、`api_keys` 账单 0 误差、`PgLogWriter` 0 丢 0 错、Redis `live:inflight` 0 孤儿）。
+- 部署说明：包含 **PostgreSQL 迁移 `012_optimize_usage_logs_and_attempts_indexes.sql`**（控制面启动时自动幂等应用，仅清理重复/低效索引并新增 `idx_alloc_account_id_desc`，SQLite 不受影响）；零 Rust 变更、零 `deploy/payload.json` 变更；升级后重启控制面即可生效。
+
+## 1.4.268 — 2026-11-28 · fork 会话与父会话转发相同的 Bash 历史命令，恢复 fork 首轮的提示缓存复用（外部贡献）
+
+- **保留客户端回传的 Bash 命令，使父会话与 fork 的历史前缀一致（#2124，外部贡献 `Gitforxuyang`）**：同一段 Bash 历史在父会话与新 fork 中此前可能被转发成两种文本，导致 fork 首轮无法复用父会话的提示缓存。例如模型返回 `cd /example && pwd`，客户端随后在工具调用历史里回传 `pwd`：父会话命中工具调用回放记录，会补回目录前缀、转发 `cd /example && pwd`；新 fork 没有这条记录，转发 `pwd`。命令位于历史前部时，缓存前缀就此分叉，后面再多相同消息也无法命中。
+  - `src/lib/protocol/issued-tool-replay.mjs`：回放工具块时，对 `id` 与名称都匹配、且客户端回传了字符串 `input.command` 的 Bash 调用，保留客户端回传的命令，而不是用服务端记录的命令覆盖。回放块来自每次从存储字符串重新解析出的副本，不会改写存储的记录；非 Bash 工具、`id` 不匹配的调用行为不变
+  - **行为变化，升级前请知悉**：对 Bash 调用，父会话转发给上游的 `input.command` 现在是**客户端回传的命令**，不再是服务端记录的原始命令；两者不同时（如上例），父会话的历史文本会从 `cd /example && pwd` 变为 `pwd`。这是为了让父会话与 fork 一致而有意为之
+- **补记：#2122 已随 `1.4.267` 发出，当时的发布说明遗漏了它**。`1.4.267` 的二进制与源码中包含该修复（`unrestCodexNode`），但 `1.4.267` 的说明只写了 #2121：
+  - **Codex 重新授权后清除 Rust 调度器侧的节点惩罚（#2122，Fixes #2086）**：吊销的 Codex 凭据会把节点按 `oauth_revoked`、`until = MAX_SAFE_INTEGER` 永久停放；重新授权此前只清了 JS 侧（`clearOpenAIAccountHold`），没清 Rust 调度器自己的惩罚，所以额度查询正常、派发却一直报 `pinned node codex_vm:… is busy`，要重启调度器才恢复。现在 Codex 凭据导入（`commitImportedCodexVm`）与令牌刷新成功路径会同步调用新增的 `PoolScheduler.unrestCodexNode`（`unrestVmNode` 因硬编码 `claude_vm` 清不到 Codex 节点，其契约不变）
+  - 已知边界：未在真实 Codex 账号上复现；「吊销会让 Rust 持有惩罚」这一环是读 `handle-codex.mjs` 与 `health.rs` 推断的
+- 部署说明：本次改动零数据库迁移、零 Rust 变更、零 `deploy/payload.json` 变更；升级后重启控制面即可生效。
+
+## 1.4.267 — 2026-11-28 · 优化 Claude Code ↔ CRAGGemini 原生边界并钉选 `0.5.5` 签名载荷
+
+- **优化 Claude Code 与 CRAGGemini 边界并钉选 `payload-2026.11.28-gemini-0.5.5`（#2121，配套 `antigravity-cli-proxy#25`）**：围绕 Claude Code 稳定直连原生 Gemini（如 `gemini-vm/gemini-4-hydrogen-high`），系统性收敛跨仓协议契约、空转容错、会话粘性与工具历史保真：
+  - **跨仓能力协商与无损直传**：`/infer-target` 与 `direct-client.mjs` 同时协商 `/internal/health` 的 `capabilities` 数组与 `protocol_capabilities` 对象（旧内核自动兼容回退）；新增 `X-Craggemini-Wire-Protocol`（`anthropic` 零转换直传、`/v1beta` `gemini` 无损保留 `thought`）、`X-Craggemini-Provider-Result: 1`（消费并严格剥离 `event: kin_provider_result` / `x-kin-provider-result`，统一 uncached `input_tokens` 与 `total_tokens = in + cache + out` 计费口径）及 `X-Craggemini-Session-Reset: 1`；直传路径剥离客户端可控内部字段并锁定网关配置的 `system_prompt_mode`。
+  - **空转拦截、预提交缓冲与 409 恢复**：延迟 `message_start` 并引入 15s thinking 预提交缓冲（提交后才发保活心跳，切号前重置缓冲防串帧）；拦截空可见输出、`provider_complete=false` 与异常 `finishReason`（`MALFORMED_FUNCTION_CALL`/`UNEXPECTED_TOOL_CALL`/`TOO_MANY_TOOL_CALLS`/`OTHER`，已见有效工具调用时保持 `'tool'`）为可切换 502 且不误触发 `unschedulable_on_502`；全量 409 冲突码归类为 `gemini_session_conflict`；提升默认 `timeout_ms=300000`、`idle_timeout_ms=180000`、`TURN_TIMEOUT=305`、`shm.request_mb=16` 与请求体上限 `64 MiB`。
+  - **会话粘性与多租户隔离**：修复无头 `/v1beta` 非探测首轮 T1→T2 `identity_id` 漂移（短探测/纯 `<system-reminder>` 维持随机 UUIDv4）；出站 `conversation_id` 改为按租户、分组池与 API 密钥隔离的确定性 `cs_<sha256>`（故障/409 恢复派生 `:r<epoch>`，`derived_*` 并发 409 隔离至独立随机会话且不发 reset）；全量扫描尾部 `user` 消息提取 `continuationCallIds` 并通过 `pinNodeKey` 钉入 Rust 调度器。
+  - **工具历史保真与 CC 路由放行**：能力门控去 `\u200B`（旧内核默认维持 `sanitizeNativeTuiText`，新内核关闭斜杠转义）；保留 `tool_result.is_error`、`/v1beta` 原始 `functionResponse` 键、`[tool_result, text]` 单 `user` turn、跨文本 `thoughtSignature`、附件归属与 `anyOf`/`oneOf` 说明；`/v1/messages` 与 `/v1/messages/count_tokens` 放行任意 `<prefix>/` Gemini 模型、`master` 密钥及绑定含 Gemini 成员分组池的受管密钥，修复 `targetPlatform === null` 误判 `hasOwnedVm=true`。
+  - **载荷钉选与文档同步**：`deploy/payload.json` 的 `geminiDefaultLinuxAmd64` 更新至 `payload-2026.11.28-gemini-0.5.5`（CRAGGemini `0.5.5`，零密钥轮换，公钥 `f6e3ef3a...` 与官方 `agy` 摘要不变），同步更新 `docs/gemini-host.md`。
+- 部署说明：本次改动相对 `1.4.266` 零数据库迁移、零 Rust 变更；更新了 `deploy/payload.json` 中的 `geminiDefaultLinuxAmd64`（`payload-2026.11.28-gemini-0.5.5`）及宿主脚本 `scripts/gemini*.py`，升级时需同步更新控制面镜像、宿主脚本与 CRAGGemini `0.5.5` 签名载荷（若暂未同步新载荷，vm2api 能力门控自动兼容旧版 `0.5.4` 载荷）。
+
+## 1.4.266 — 2026-11-28 · 修复 PG 18 账单批写类型冲突、恢复清全缓存与断连在飞孤儿，新增 20K 回放基准套件
+
+- **修复 PostgreSQL 18 + Redis 8 真实闭环验证暴露的 3 项缺陷（#2119）**：承接 `1.4.264`（#2102）后的真库端到端与压测验证，根治以下 3 个问题：
+  - **`api_keys` 批写 PG 18 参数类型冲突与空串强转**：`ApiKeyStore._applyUsageBatchToPg` 统一将 `$1` 绑定为 `$1::text`，仅在 `EXTRACT(EPOCH FROM ...)` 中使用 `($1::text)::timestamptz` 与 `NULLIF(k.window_*_start, '')::timestamptz`，避免 PG 18 类型冲突及空串强转报错导致账单清零；`flushPendingUsage()` 保留 `readdDirtyKeyUsage` 防丢语义并补充失败计数/最近错误（`usageFlushStats()`）与 30s 节流 `console.error`；`startUsageFlusher()` 改为单 tick 最多排干 16 批（每批 200 keys，防重入）
+  - **备份恢复清全缓存与本地快照**：在 `src/lib/cache/index.mjs` 新增并导出 SSOT 方法 `invalidateAllCaches()`（覆盖 `apikey:`、`billing:`、`sched:`、`dash:`、`entity:`、`risk:`、`live:` 全部 7 前缀，清理 `dashboard.snapshotCache`、`liveLogs`、`apiKeys.negCache`、`scheduler.snapshots`，并通过 `registerLocalCacheClearer` 联动清除 `RefusalGuardsRepo` 进程内快照）；`BackupService.restoreBackup()` 在 PG 与 SQLite 恢复分支统一调用，根治恢复后读出旧脏用户
+  - **`vm2api:live:inflight` 断连孤儿清理**：`RequestLogStore` 新增幂等 `bindLifecycle()` / `abort()`（监听 `req` `aborted`、`req` `close` 仅 `!req.complete`、`res` `close` 仅 `!res.writableFinished` 并预检已断开请求），`handleProtocol` / `handleSearch` / `handleImages` 增加 `try/finally` 退出兜底并保持 `res.on('finish')` 兼容，确保超时断连或异常早退时 `vm2api:live:inflight` 与 `vm2api:live:sess:conc:*` 零孤儿残留
+- **新增 20K RPM × 100K 上下文脱敏回放基准套件与 Phase 0 基线报告（#2116）**：新增 `scripts/bench-20k/` 隔离压测与闭环零丢/零漂移校验脚本、合并单测 `test/unit/bench-20k.test.mjs`（20 用例）与 `docs/performance/phase0-baseline-20k-replay.md`，固化后续性能迭代标尺；离线脱敏语料置于 `.local/bench-20k/` 不入库。
+- 部署说明：本次改动相对 `1.4.265` 零数据库迁移、零 Rust 变更、零 `deploy/payload.json` 变更（若从 `1.4.263` 及更早版本跨版升级，控制面启动时会自动幂等应用 `1.4.264` 的 PG 迁移 `011`）；升级后重启控制面即可生效。
+## 1.4.265 — 2026-11-28 · 账号预热面板可见性：阶段汇总、徽章与手动启停（外部贡献）
+
+- **面板显示账号预热进度并支持手动操作（#2048，外部贡献 `grain-lu`）**：账号预热爬坡引擎（`1.4.246` 引入，默认关闭 `enabled: false`）此前在面板上没有任何可见状态。
+  - **阶段与徽章**：VM 列表与详情的数据新增 `warmup` 摘要（阶段 `warming` / `paused` / `abnormal`、已累计分钟数、目标 RPM、最近一次致命错误时间），列表行显示预热徽章；仅对已进入预热的 Claude 槽位出现，Codex 槽位不适用
+  - **手动操作**：新增 `POST /api/panel/vms/:id/warmup`（手动开始/重新开始，可带 `target_rpm`）与 `POST /api/panel/vms/:id/warmup/graduate`（立即毕业，沿用自动毕业的同一路径恢复分档/默认限流）；Codex 槽位返回 `400`，不在预热中的槽位毕业返回 `409`
+  - **「异常」阶段真正可达**：监控循环遇到窗口内的致命错误时现在会落盘 `last_fatal_at` 并记事件，而不是只打日志；窗口内去重（`fatal_window_hours`），持续故障下每个窗口只写一次盘、不会灌满事件历史，「异常」状态不闪烁
+- 部署说明：本次改动零数据库迁移、零 Rust 变更、零 `deploy/payload.json` 变更；预热引擎默认仍是关闭的，未开启预热的部署不会看到任何变化；升级后重启控制面即可生效。
+
+## 1.4.264 — 2026-11-28 · PostgreSQL + Redis 热路径与实时日志 I/O 优化（含 PG 迁移 `011`）
+
+- **缓存底座、面板读、请求热路径、日志批写四块性能优化（#2102）**：针对 PostgreSQL + Redis 部署，减少面板查询与请求热路径上的同步 PG 往返、修复缓存失效缺陷、把日志落库改为异步批写。
+  - **缓存底座**：`MultiTierCacheClient` 的 L2 前缀失效真正清除远端 Redis 键、L1 回填对齐 Redis 剩余 TTL；新增 SWR、进程内 `SnapshotCache`（含 ETag）、`DashboardCache` 分布式 Leader 锁、`EntityCache`（面板用户、分组费率、配置、池授权、VM 归属）与 `LiveLogCache`；常规 `api_keys` 用量更新不再触发全局 `apiKeys.invalidateAll()`；`auth/scheduler` outbox 默认不再写入
+  - **面板读**：5 张 `usage_dashboard_*` 预聚合表接入统计查询（非整点时区、SQLite、细粒度筛选自动回退）；VM 列表消除逐账户 N+1；`/dashboard`、`/vms`、`/usage`、`/pools`、`/api-keys`、`/statistics`、`/billing` 等高频接口接入 SWR / SnapshotCache / ETag(304)，面板与调度池写操作后精准失效
+  - **请求热路径**：`/v1/*` 鉴权走 L1+L2 缓存与有界负缓存；用户并发、RPM、Sticky、`AccountQuota.snapshot()`、拒答封禁、Thinking 签名查写由 Redis/内存优先；**`api_keys` 用量稳态改为 1.5 秒合批写回**，命中 USD / 请求数 / 消费窗口边界时同步直写以防透支；`server.mjs` 补齐优雅停机排干顺序
+  - **日志**：PG 引擎下新增 `PgLogWriter`（多行批写、故障隔离、自动分片避开 65535 参数上限、满队直写不丢日志、停机排干），日志页新增在飞（in-flight）实时展示与稳定行键；`usage_logs` 保留策略清理改为 `ctid` 分批
+  - **PG 迁移 `011_drop_duplicate_usage_logs_indexes.sql`**：幂等 `DROP INDEX IF EXISTS`，删除与 `idx_reqlog_ts`、唯一 `idx_reqlog_reqid` 重复的 `idx_reqlog_cost_ts`、`idx_usage_logs_request_id`；SQLite 不受影响
+- **升级前请知悉（已知未验证项）**：
+  - 作者在合并说明中确认**未在真实外置 PostgreSQL + Redis 上跑端到端与压测**，合并后另有 1 个依赖真实 PG 的用例被跳过；该版本已按项目负责人的决定合并，建议先在灰度/预发环境验证后再全量升级
+  - **多实例注意**：`api_keys` 用量稳态为本进程合批、1.5 秒刷盘，额度判断基于本进程快照。蓝绿切换窗口或多副本并行时，额度临界点附近可能出现少量超发；超发量级大致取决于「实例数 × 1.5 秒内的请求量」，这是评审时的推断，**没有测试覆盖也没有实测**；对按额度计费的租户请留意
+  - 回退方式：Redis 可用 `REDIS_URL=1` 禁用，自动降级为 L1 + PG `LISTEN/NOTIFY`；SQLite 部署不启用异步 PG 日志写入
+- 部署说明：包含 **PostgreSQL 迁移 `011`**（升级时自动应用，仅删除重复索引，可幂等重跑）；零 Rust 变更、零 `deploy/payload.json` 变更；升级后重启控制面生效。
+
 ## 1.4.263 — 2026-11-28 · 修复无参工具调用被误判为 `502 native_handoff_invalid`
 
 - **无参工具调用的空 `input_json_delta` 不再残留 `_inputJson`（#2101）**：Anthropic 在流式返回无参工具（如 `CronList`、`ListAgents`）时，会在 `content_block_start`（`input: {}`）与 `content_block_stop` 之间发一条空的 `input_json_delta`（`partial_json: ""`）。`src/lib/protocol/convert.mjs` 的 `applyClaudeSSELineToMessage` 在收尾时用 `if (block._inputJson)` 判断，空串为假值导致整段被跳过、`_inputJson` 没有删除；下游 `native-handoff.mjs` 看到 `Object.hasOwn(block, '_inputJson')` 就把这个合法的无参调用判成 `502 native_handoff_invalid: Native tool batch has invalid identity or arguments`，并让 `issued-tool-replay` 跳过记录。

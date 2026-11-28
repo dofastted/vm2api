@@ -878,3 +878,134 @@ test('clearing a finished dialog slot keeps the VM and the original sticky expir
   assert.equal(r.resolve('sess:a').slotIndex, null)
   r.db?.close?.()
 })
+
+test('StickyRouter PG mode runs resolve/bind/clear/purgeExpired via Redis + async pgPool with zero sync PgSyncDb RPCs', async (t) => {
+  const { closeCacheRuntime, initCacheRuntime } = await import('../../src/lib/cache/index.mjs')
+  const dir = tmpDir('kin-sticky-pg-')
+  t.after(async () => {
+    await closeCacheRuntime()
+    fs.rmSync(dir, { recursive: true, force: true })
+  })
+
+  await closeCacheRuntime()
+  const rt = await initCacheRuntime({ redisConfig: null })
+  const redisKv = new Map()
+  rt.client.redis = {
+    get: async (k) => (redisKv.has(k) ? redisKv.get(k) : null),
+    set: async (k, v) => {
+      redisKv.set(k, String(v))
+      return 'OK'
+    },
+    del: async (...keys) => {
+      let n = 0
+      for (const k of keys) if (redisKv.delete(k)) n += 1
+      return n
+    },
+    pexpire: async () => 1,
+    publish: async () => 0,
+    quit: async () => 'OK',
+  }
+  rt.client.redisReady = true
+
+  const pgRows = new Map()
+  const pgQueries = []
+  const mockPgPool = {
+    query: async (sql, params = []) => {
+      pgQueries.push({ sql, params })
+      if (/INSERT INTO sticky_sessions/i.test(sql)) {
+        pgRows.set(params[0], {
+          key: params[0],
+          account_id: params[1],
+          vm_id: params[2],
+          session_id: params[3],
+          device_id: params[4],
+          bound_at: params[5],
+          expires_at: params[6],
+          hits: params[7],
+          generation: params[8],
+          slot_index: params[9],
+        })
+        return { rows: [], rowCount: 1 }
+      }
+      if (/SELECT \* FROM sticky_sessions WHERE key = ANY/i.test(sql)) {
+        const rows = []
+        for (const k of params[0] || []) {
+          if (pgRows.has(k)) rows.push(pgRows.get(k))
+        }
+        return { rows }
+      }
+      if (/SELECT \* FROM sticky_sessions WHERE key = \$1/i.test(sql)) {
+        const row = pgRows.get(params[0])
+        return { rows: row ? [row] : [] }
+      }
+      if (/DELETE FROM sticky_sessions WHERE key = \$1/i.test(sql)) {
+        const deleted = pgRows.delete(params[0]) ? 1 : 0
+        return { rows: [], rowCount: deleted }
+      }
+      if (/DELETE FROM sticky_sessions WHERE expires_at < \$1/i.test(sql)) {
+        let count = 0
+        for (const [k, r] of pgRows) {
+          if (r.expires_at < params[0]) {
+            pgRows.delete(k)
+            count += 1
+          }
+        }
+        return { rows: [], rowCount: count }
+      }
+      return { rows: [], rowCount: 0 }
+    },
+  }
+
+  const router = new StickyRouter({
+    dataDir: dir,
+    config: { sticky: { enabled: true, ttl_seconds: 3600 } },
+    pgPool: mockPgPool,
+  })
+  await router.flushPendingWrites()
+
+  let syncRepoCalls = 0
+  for (const method of ['get', 'upsert', 'remove', 'removeByAccount', 'purgeExpired', 'all']) {
+    const orig = router.repo[method].bind(router.repo)
+    router.repo[method] = (...a) => {
+      syncRepoCalls += 1
+      return orig(...a)
+    }
+  }
+
+  // 1. bind() updates L1 + Redis and persists asynchronously via pgPool
+  router.bind('sess:pg-1', { accountId: 'acc-pg', vmId: 'vm-pg', sessionId: 'out-pg', deviceId: 'dev-pg' })
+  await router.flushPendingWrites()
+  assert.equal(syncRepoCalls, 0, 'PG bind must never call sync StickyRepo')
+  assert.equal(pgRows.get('sess:pg-1')?.vm_id, 'vm-pg')
+  assert.equal(router.resolve('sess:pg-1')?.vmId, 'vm-pg')
+
+  // 2. Cold L1 + cold Redis -> prewarmKeys loads positive + negative hits via batched async pgPool
+  router._l1.clear()
+  router._l1Neg.clear()
+  redisKv.clear()
+  await router.prewarmKeys(['sess:pg-1', 'sess:missing-1'])
+  assert.equal(router.resolve('sess:pg-1')?.accountId, 'acc-pg')
+  assert.equal(router.resolve('sess:missing-1'), null)
+  assert.equal(syncRepoCalls, 0, 'PG prewarmKeys + resolve must never call sync StickyRepo')
+
+  // 3. clear() / unbind() removes L1 + Redis + async PG row
+  router.clear('sess:pg-1')
+  await router.flushPendingWrites()
+  assert.equal(router.resolve('sess:pg-1'), null)
+  assert.equal(pgRows.has('sess:pg-1'), false)
+  assert.equal(syncRepoCalls, 0, 'PG clear/unbind must never call sync StickyRepo')
+
+  // 4. purgeExpiredAsync() deletes expired rows via async pgPool
+  pgRows.set('sess:old', {
+    key: 'sess:old',
+    account_id: 'acc-old',
+    vm_id: 'vm-old',
+    bound_at: 1000,
+    expires_at: 2000,
+  })
+  const purged = await router.purgeExpiredAsync(Date.now())
+  assert.equal(purged, 1)
+  assert.equal(pgRows.has('sess:old'), false)
+  assert.equal(syncRepoCalls, 0, 'PG purgeExpiredAsync must never call sync StickyRepo')
+  router.db?.close?.()
+})

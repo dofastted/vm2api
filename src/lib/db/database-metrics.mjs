@@ -7,6 +7,7 @@
  * L1/Redis cache metrics).
  */
 import fs from 'node:fs'
+import { DB_INSTANCE_ID } from './database.mjs'
 import { getPgPoolStats, probePgPool } from './pg/pg-pool.mjs'
 import { snapshotCacheMetrics } from '../cache/index.mjs'
 
@@ -163,7 +164,9 @@ export function snapshotDatabaseMetrics({
 
 /**
  * Full async database + cache metrics snapshot (preferred in server routes).
- * Queries PostgreSQL system views non-blockingly when running on PostgreSQL.
+ * Queries PostgreSQL system views non-blockingly when running on PostgreSQL,
+ * and uses SWR (10s fresh / 25s hard TTL) + singleflight via `cacheRuntime.dashboard`
+ * so multi-tab 30s polling shares one probe pass.
  */
 export async function snapshotDatabaseMetricsAsync({
   db,
@@ -171,179 +174,195 @@ export async function snapshotDatabaseMetricsAsync({
   pgPool = null,
   usageCache = null,
   cacheRuntime = null,
+  bypass = false,
   now = () => Date.now(),
   clock = () => performance.now(),
 } = {}) {
-  if (db?.engine !== 'postgres' && !pgPool) {
-    const base = snapshotDatabaseMetrics({ db, dbPath, usageCache, cacheRuntime, now, clock })
-    const cacheStats = cacheRuntime?.stats?.() ?? snapshotCacheMetrics()
-    if (cacheStats) base.cache = cacheStats
-    return base
-  }
-
-  if (!pgPool) {
-    return snapshotDatabaseMetrics({ db, dbPath, usageCache, cacheRuntime, now, clock })
-  }
-
-  const health = await probePgPool(pgPool, clock)
-  let serverVersion = null
-  let dbName = null
-  let dbSizeBytes = null
-  let cacheHitRatio = null
-  let activeConnections = null
-  let idleConnections = null
-  let totalConnections = null
-  let maxConnections = null
-  let deadlocks = null
-  let migrationCount = null
-  let latestMigration = null
-  let latestMigrationAt = null
-  let topTables = null
-  let dashboardWatermark = null
-
-  if (health.ok) {
-    const [metaRes, statRes, actRes, migCountRes, migLatestRes, sizesRes, wmRes] = await Promise.all([
-      pgPool
-        .query(
-          `SELECT
-             current_setting('server_version') AS server_version,
-             current_database() AS db_name,
-             pg_database_size(current_database())::bigint AS db_size_bytes,
-             current_setting('max_connections')::int AS max_connections`,
-        )
-        .catch(() => null),
-      pgPool
-        .query(
-          `SELECT blks_hit, blks_read, deadlocks
-           FROM pg_stat_database
-           WHERE datname = current_database()`,
-        )
-        .catch(() => null),
-      pgPool
-        .query(
-          `SELECT
-             COUNT(*)::int AS total,
-             COUNT(*) FILTER (WHERE state = 'active')::int AS active,
-             COUNT(*) FILTER (WHERE state = 'idle')::int AS idle
-           FROM pg_stat_activity
-           WHERE datname = current_database()`,
-        )
-        .catch(() => null),
-      pgPool.query('SELECT COUNT(*)::int AS count FROM schema_migrations').catch(() => null),
-      pgPool
-        .query('SELECT version, applied_at FROM schema_migrations ORDER BY applied_at DESC, version DESC LIMIT 1')
-        .catch(() => null),
-      pgPool
-        .query('SELECT table_name, total_bytes, table_bytes, index_bytes, est_rows FROM vm2api_table_sizes() LIMIT 12')
-        .catch(() => null),
-      pgPool
-        .query(
-          'SELECT last_aggregated_at, last_aggregated_id, updated_at FROM usage_dashboard_aggregation_watermark WHERE id = 1',
-        )
-        .catch(() => null),
-    ])
-
-    const meta = metaRes?.rows?.[0]
-    if (meta) {
-      serverVersion = meta.server_version == null ? null : String(meta.server_version)
-      dbName = meta.db_name == null ? null : String(meta.db_name)
-      dbSizeBytes = numberOrNull(meta.db_size_bytes)
-      maxConnections = numberOrNull(meta.max_connections)
+  const compute = async () => {
+    if (db?.engine !== 'postgres' && !pgPool) {
+      const base = snapshotDatabaseMetrics({ db, dbPath, usageCache, cacheRuntime, now, clock })
+      const cacheStats = cacheRuntime?.stats?.() ?? snapshotCacheMetrics()
+      if (cacheStats) base.cache = cacheStats
+      return base
     }
 
-    const st = statRes?.rows?.[0]
-    if (st) {
-      const hit = numberOrNull(st.blks_hit) ?? 0
-      const read = numberOrNull(st.blks_read) ?? 0
-      cacheHitRatio = hit + read > 0 ? Math.round((hit / (hit + read)) * 10_000) / 10_000 : null
-      deadlocks = numberOrNull(st.deadlocks)
+    if (!pgPool) {
+      return snapshotDatabaseMetrics({ db, dbPath, usageCache, cacheRuntime, now, clock })
     }
 
-    const act = actRes?.rows?.[0]
-    if (act) {
-      totalConnections = numberOrNull(act.total)
-      activeConnections = numberOrNull(act.active)
-      idleConnections = numberOrNull(act.idle)
-    }
+    const health = await probePgPool(pgPool, clock)
+    let serverVersion = null
+    let dbName = null
+    let dbSizeBytes = null
+    let cacheHitRatio = null
+    let activeConnections = null
+    let idleConnections = null
+    let totalConnections = null
+    let maxConnections = null
+    let deadlocks = null
+    let migrationCount = null
+    let latestMigration = null
+    let latestMigrationAt = null
+    let topTables = null
+    let dashboardWatermark = null
 
-    migrationCount = numberOrNull(migCountRes?.rows?.[0]?.count)
-    const latest = migLatestRes?.rows?.[0]
-    if (latest) {
-      latestMigration = latest.version == null ? null : String(latest.version)
-      latestMigrationAt = latest.applied_at == null ? null : String(latest.applied_at)
-    }
+    if (health.ok) {
+      const [metaRes, statRes, actRes, migCountRes, migLatestRes, sizesRes, wmRes] = await Promise.all([
+        pgPool
+          .query(
+            `SELECT
+               current_setting('server_version') AS server_version,
+               current_database() AS db_name,
+               pg_database_size(current_database())::bigint AS db_size_bytes,
+               current_setting('max_connections')::int AS max_connections`,
+          )
+          .catch(() => null),
+        pgPool
+          .query(
+            `SELECT blks_hit, blks_read, deadlocks
+             FROM pg_stat_database
+             WHERE datname = current_database()`,
+          )
+          .catch(() => null),
+        pgPool
+          .query(
+            `SELECT
+               COUNT(*)::int AS total,
+               COUNT(*) FILTER (WHERE state = 'active')::int AS active,
+               COUNT(*) FILTER (WHERE state = 'idle')::int AS idle
+             FROM pg_stat_activity
+             WHERE datname = current_database()`,
+          )
+          .catch(() => null),
+        pgPool.query('SELECT COUNT(*)::int AS count FROM schema_migrations').catch(() => null),
+        pgPool
+          .query('SELECT version, applied_at FROM schema_migrations ORDER BY applied_at DESC, version DESC LIMIT 1')
+          .catch(() => null),
+        pgPool
+          .query(
+            'SELECT table_name, total_bytes, table_bytes, index_bytes, est_rows FROM vm2api_table_sizes() LIMIT 12',
+          )
+          .catch(() => null),
+        pgPool
+          .query(
+            'SELECT last_aggregated_at, last_aggregated_id, updated_at FROM usage_dashboard_aggregation_watermark WHERE id = 1',
+          )
+          .catch(() => null),
+      ])
 
-    if (Array.isArray(sizesRes?.rows)) {
-      topTables = sizesRes.rows.map((r) => ({
-        table_name: String(r.table_name),
-        total_bytes: numberOrNull(r.total_bytes),
-        table_bytes: numberOrNull(r.table_bytes),
-        index_bytes: numberOrNull(r.index_bytes),
-        est_rows: numberOrNull(r.est_rows),
-      }))
-    }
+      const meta = metaRes?.rows?.[0]
+      if (meta) {
+        serverVersion = meta.server_version == null ? null : String(meta.server_version)
+        dbName = meta.db_name == null ? null : String(meta.db_name)
+        dbSizeBytes = numberOrNull(meta.db_size_bytes)
+        maxConnections = numberOrNull(meta.max_connections)
+      }
 
-    const wm = wmRes?.rows?.[0]
-    if (wm) {
-      dashboardWatermark = {
-        last_aggregated_at: wm.last_aggregated_at ? String(wm.last_aggregated_at) : null,
-        last_aggregated_id: wm.last_aggregated_id ? String(wm.last_aggregated_id) : null,
-        updated_at: wm.updated_at ? new Date(wm.updated_at).toISOString() : null,
+      const st = statRes?.rows?.[0]
+      if (st) {
+        const hit = numberOrNull(st.blks_hit) ?? 0
+        const read = numberOrNull(st.blks_read) ?? 0
+        cacheHitRatio = hit + read > 0 ? Math.round((hit / (hit + read)) * 10_000) / 10_000 : null
+        deadlocks = numberOrNull(st.deadlocks)
+      }
+
+      const act = actRes?.rows?.[0]
+      if (act) {
+        totalConnections = numberOrNull(act.total)
+        activeConnections = numberOrNull(act.active)
+        idleConnections = numberOrNull(act.idle)
+      }
+
+      migrationCount = numberOrNull(migCountRes?.rows?.[0]?.count)
+      const latest = migLatestRes?.rows?.[0]
+      if (latest) {
+        latestMigration = latest.version == null ? null : String(latest.version)
+        latestMigrationAt = latest.applied_at == null ? null : String(latest.applied_at)
+      }
+
+      if (Array.isArray(sizesRes?.rows)) {
+        topTables = sizesRes.rows.map((r) => ({
+          table_name: String(r.table_name),
+          total_bytes: numberOrNull(r.total_bytes),
+          table_bytes: numberOrNull(r.table_bytes),
+          index_bytes: numberOrNull(r.index_bytes),
+          est_rows: numberOrNull(r.est_rows),
+        }))
+      }
+
+      const wm = wmRes?.rows?.[0]
+      if (wm) {
+        dashboardWatermark = {
+          last_aggregated_at: wm.last_aggregated_at ? String(wm.last_aggregated_at) : null,
+          last_aggregated_id: wm.last_aggregated_id ? String(wm.last_aggregated_id) : null,
+          updated_at: wm.updated_at ? new Date(wm.updated_at).toISOString() : null,
+        }
       }
     }
-  }
 
-  const asyncPoolStats = getPgPoolStats(pgPool)
-  const syncPoolStats = typeof db?.poolStats === 'function' ? db.poolStats() : null
-  const cacheStats = cacheRuntime?.stats?.() ?? snapshotCacheMetrics()
-  let redisPing = null
-  if (cacheRuntime?.client?.hasRedis) {
-    redisPing = await cacheRuntime.client.pingRedis(clock)
-  }
+    const asyncPoolStats = getPgPoolStats(pgPool)
+    const syncPoolStats = typeof db?.poolStats === 'function' ? db.poolStats() : null
+    const cacheStats = cacheRuntime?.stats?.() ?? snapshotCacheMetrics()
+    let redisPing = null
+    if (cacheRuntime?.client?.hasRedis) {
+      redisPing = await cacheRuntime.client.pingRedis(clock)
+    }
 
-  return {
-    sampled_at: sampledAt(now),
-    database: {
-      ok: health.ok,
-      engine: 'postgres',
-      probe_latency_ms: health.latencyMs,
-      journal_mode: 'wal',
-      synchronous: 2,
-      foreign_keys: true,
-      busy_timeout_ms: null,
-      file_size_bytes: dbSizeBytes,
-      wal_size_bytes: null,
-      shm_size_bytes: null,
-      page_size_bytes: 8192,
-      page_count: dbSizeBytes == null ? null : Math.ceil(dbSizeBytes / 8192),
-      freelist_pages: null,
-      used_pages: null,
-      used_bytes: dbSizeBytes,
-      free_ratio: null,
-      migration_count: migrationCount,
-      latest_migration: latestMigration,
-      latest_migration_at: latestMigrationAt,
-      pg_version: serverVersion,
-      pg_database: dbName,
-      pg_cache_hit_ratio: cacheHitRatio,
-      pg_connections_total: totalConnections,
-      pg_connections_active: activeConnections,
-      pg_connections_idle: idleConnections,
-      pg_max_connections: maxConnections,
-      pg_deadlocks: deadlocks,
-      pg_top_tables: topTables,
-      pg_dashboard_watermark: dashboardWatermark,
-      pg_pool: {
-        async: asyncPoolStats,
-        sync: syncPoolStats,
+    return {
+      sampled_at: sampledAt(now),
+      database: {
+        ok: health.ok,
+        engine: 'postgres',
+        probe_latency_ms: health.latencyMs,
+        journal_mode: 'wal',
+        synchronous: 2,
+        foreign_keys: true,
+        busy_timeout_ms: null,
+        file_size_bytes: dbSizeBytes,
+        wal_size_bytes: null,
+        shm_size_bytes: null,
+        page_size_bytes: 8192,
+        page_count: dbSizeBytes == null ? null : Math.ceil(dbSizeBytes / 8192),
+        freelist_pages: null,
+        used_pages: null,
+        used_bytes: dbSizeBytes,
+        free_ratio: null,
+        migration_count: migrationCount,
+        latest_migration: latestMigration,
+        latest_migration_at: latestMigrationAt,
+        pg_version: serverVersion,
+        pg_database: dbName,
+        pg_cache_hit_ratio: cacheHitRatio,
+        pg_connections_total: totalConnections,
+        pg_connections_active: activeConnections,
+        pg_connections_idle: idleConnections,
+        pg_max_connections: maxConnections,
+        pg_deadlocks: deadlocks,
+        pg_top_tables: topTables,
+        pg_dashboard_watermark: dashboardWatermark,
+        pg_pool: {
+          async: asyncPoolStats,
+          sync: syncPoolStats,
+        },
       },
-    },
-    usage_cache: safeUsageStats(usageCache),
-    cache: cacheStats
-      ? {
-          ...cacheStats,
-          ...(redisPing ? { redis_ping_ms: redisPing.latencyMs, redis_ping_ok: redisPing.ok } : {}),
-        }
-      : null,
+      usage_cache: safeUsageStats(usageCache),
+      cache: cacheStats
+        ? {
+            ...cacheStats,
+            ...(redisPing ? { redis_ping_ms: redisPing.latencyMs, redis_ping_ok: redisPing.ok } : {}),
+          }
+        : null,
+    }
   }
+
+  if (typeof cacheRuntime?.dashboard?.getOrSetSWR === 'function') {
+    const engine = db?.engine === 'postgres' || pgPool ? 'postgres' : 'sqlite'
+    const scope = engine === 'postgres' ? 'pg' : db?.[DB_INSTANCE_ID] || dbPath || 'sqlite'
+    return cacheRuntime.dashboard.getOrSetSWR('metrics', { ep: 'database-metrics', engine, scope }, compute, {
+      freshTtlMs: 10_000,
+      ttlMs: 25_000,
+      bypass,
+    })
+  }
+  return compute()
 }

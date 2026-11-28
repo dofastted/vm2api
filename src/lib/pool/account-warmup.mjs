@@ -170,12 +170,32 @@ export function evaluateWarmup(vm, snapshot, config = DEFAULT_WARMUP) {
 }
 
 /** Panel-facing phase label. */
-export function warmupPhase(vm, { schedulable = true, recentFatal = 0 } = {}) {
+export function warmupPhase(vm, { schedulable = true, recentFatal = 0, fatalWindowMs = 0, now = 0 } = {}) {
   const w = warmupOf(vm)
   if (!w) return null
   if (recentFatal > 0) return 'abnormal'
+  if (fatalWindowMs > 0 && w.last_fatal_at) {
+    const t = Date.parse(w.last_fatal_at)
+    if (Number.isFinite(t) && (now || Date.now()) - t < fatalWindowMs) return 'abnormal'
+  }
   if (!schedulable) return 'paused'
   return 'warming'
+}
+
+/** Panel summary: the segment plus a phase, cheap enough for list views. */
+export function warmupSummary(policy, { schedulable = true, fatalWindowHours = 0 } = {}) {
+  const w = policy?.warmup
+  if (!w || !w.started_at) return null
+  return {
+    phase: warmupPhase({ policy }, {
+      schedulable,
+      fatalWindowMs: Number(fatalWindowHours) * 3600_000 || 0,
+    }),
+    started_at: w.started_at,
+    accumulated_minutes: Number(w.accumulated_minutes) || 0,
+    target_rpm: Number(w.target_rpm) || 0,
+    last_fatal_at: w.last_fatal_at || null,
+  }
 }
 
 /**
@@ -225,8 +245,23 @@ export async function applyWarmupAction(
       }
 
       case 'pause':
-      case 'hold_fatal':
-        return { applied: decision.action }
+        return { applied: 'pause' }
+
+      case 'hold_fatal': {
+        // Dedupe: record the first sighting of a fatal cluster only. Re-running
+        // every monitor tick would keep refreshing last_fatal_at (so the window
+        // never slides out) and flood the bounded event history.
+        const cfg = config || DEFAULT_WARMUP
+        const stampMs = Date.parse(stamp)
+        const prevMs = Date.parse(w.last_fatal_at || '')
+        const deduped = Number.isFinite(prevMs) && stampMs - prevMs < cfg.fatal_window_hours * 3600_000
+        if (!deduped) {
+          w.last_fatal_at = stamp
+          pushEvent(w, { kind: 'hold_fatal', count: decision.recentFatal }, stamp, cfg.max_events)
+          await save(vm)
+        }
+        return { applied: 'hold_fatal', last_fatal_at: w.last_fatal_at, deduped }
+      }
 
       default:
         return { applied: decision.action }

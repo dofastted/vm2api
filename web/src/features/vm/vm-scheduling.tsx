@@ -3,7 +3,7 @@ import { useMutation, useQueryClient } from '@tanstack/react-query'
 import type { Vm, VmQuotaOverride, VmQuotaView } from '@/types/panel-vm'
 import { SlidersHorizontal } from 'lucide-react'
 import { toast } from 'sonner'
-import { patchVm, type VmPatch } from '@/lib/api'
+import { graduateVmWarmup, patchVm, startVmWarmup, type VmPatch } from '@/lib/api'
 import { cn } from '@/lib/utils'
 import { isCodexVm } from '@/lib/vm-kind'
 import { seatTitle } from '@/lib/vm-status'
@@ -359,9 +359,41 @@ export function VmSchedulingBlock({
   const quotaOverride = vm.quota_override || {}
   const level = Number(vm.schedule_level)
   const canEdit = useVmPerms().admin
+  const qc = useQueryClient()
+
+  const warmupMutation = useMutation({
+    mutationFn: (kind: 'start' | 'graduate') =>
+      kind === 'start' ? startVmWarmup(vm.id) : graduateVmWarmup(vm.id),
+    onSuccess: async (_data, kind) => {
+      toast.success(kind === 'start' ? '已进入预热（rpm 坡道已钉）' : '已提前转正（预热段已清除）')
+      await qc.invalidateQueries()
+    },
+    onError: (error) => toast.error(String((error as Error)?.message || error)),
+  })
 
   return (
     <div className='space-y-2 rounded-md border border-primary/30 bg-primary/5 px-2.5 py-2'>
+      {!codex && vm.warmup ? (
+        <div className='flex items-center justify-between gap-2 rounded-sm bg-sky-100 px-1.5 py-1 dark:bg-sky-400/10'>
+          <span className='min-w-0 text-[11px] text-sky-900 dark:text-sky-300'>
+            {vm.warmup.phase === 'abnormal'
+              ? `预热异常 · 近窗致命错误 ${vm.warmup.last_fatal_at ?? ''}`
+              : vm.warmup.phase === 'paused'
+                ? '预热暂停 · 槽位当前不可调度或不在池'
+                : `预热中 · ${vm.warmup.accumulated_minutes} 分钟 · 目标 ${vm.warmup.target_rpm} RPM`}
+          </span>
+          {canEdit ? (
+            <button
+              type='button'
+              className='shrink-0 rounded-[3px] bg-sky-600 px-1.5 py-0.5 text-[10px] font-semibold text-white hover:bg-sky-700 disabled:opacity-50'
+              disabled={warmupMutation.isPending}
+              onClick={() => warmupMutation.mutate('graduate')}
+            >
+              立即转正
+            </button>
+          ) : null}
+        </div>
+      ) : null}
       <div className='flex items-center justify-between gap-2'>
         <div className='min-w-0'>
           <div className='text-xs font-medium'>调度</div>
@@ -373,6 +405,17 @@ export function VmSchedulingBlock({
           >
             {custom ? `本槽覆盖 ${custom} 项` : '全部跟随全局'}
           </div>
+          {!codex && canEdit && !vm.warmup ? (
+            <button
+              type='button'
+              className='shrink-0 rounded-[3px] border border-sky-400/60 px-1.5 py-0.5 text-[10px] font-semibold text-sky-700 hover:bg-sky-100 disabled:opacity-50 dark:text-sky-300 dark:hover:bg-sky-400/10'
+              disabled={warmupMutation.isPending}
+              onClick={() => warmupMutation.mutate('start')}
+              title='钉住 rpm 坡道进入预热（routing.warmup.target_rpm）'
+            >
+              开始预热
+            </button>
+          ) : null}
         </div>
         {canEdit ? <VmSchedulingEditor vm={vm} /> : null}
       </div>

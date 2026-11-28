@@ -219,7 +219,7 @@ test('Gemini cache + reasoning usage is never double-subtracted in RequestLogSto
   assert.equal(row.web_search_requests, 1)
   assert.equal(row.reasoning_effort, 'high')
   assert.equal(row.session_id, 'sess-gem-001')
-  assert.match(row.outbound_session_id || '', /^gc_[a-f0-9]{24}$/)
+  assert.match(row.outbound_session_id || '', /^cs_[a-f0-9]{24}$/)
   assert.equal(row.attempt_count, 1)
   assert.equal(row.upstream_status, 200)
   assert.equal(row.has_tools, true)

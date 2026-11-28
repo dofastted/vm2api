@@ -3,7 +3,103 @@
  * vm.json is SSOT for VM owner/origin; this module is the only decoder.
  */
 
+import { DB_INSTANCE_ID, getDb, isDbOpen } from '../db/database.mjs'
+import { getCacheRuntime } from '../cache/index.mjs'
 import { isValidVmId } from '../vm/vm-file.mjs'
+
+const requestOwnerMemo = new WeakMap()
+
+function userEntityCacheKey(db, userId) {
+  if (isDbOpen() && db === getDb()) return String(userId)
+  return `${db?.[DB_INSTANCE_ID] || 'isolated'}:${userId}`
+}
+
+/**
+ * Resolve the key owner user record with minimal DB I/O:
+ * 1. Reuse `_authProjection.owner` populated during API key authentication (0 RPC).
+ * 2. Reuse request-scoped memoization across multiple checks in the same request (0 RPC).
+ * 3. Read through `cache.entity.getPanelUserByIdSync` for DB-backed UsersRepo instances.
+ * Plain mock `usersRepo` objects without `.db` bypass global EntityCache to preserve test isolation.
+ */
+export function resolveOwnerUserSync(req, userId, usersRepo = null) {
+  const uid = normalizeOwnerId(userId)
+  if (!uid) return null
+
+  const proj = req?.apiKeyRecord?._authProjection
+  if (proj?.ownerLoaded && normalizeOwnerId(proj.userId) === uid) {
+    return proj.owner || null
+  }
+
+  const hasReqObj = req && typeof req === 'object'
+  if (hasReqObj && usersRepo?.db) {
+    const memo = requestOwnerMemo.get(req)
+    if (memo?.has(uid)) return memo.get(uid)
+  }
+
+  if (!usersRepo?.getById) return null
+
+  let owner = null
+  try {
+    if (usersRepo.db) {
+      const cacheKey = userEntityCacheKey(usersRepo.db, uid)
+      owner = getCacheRuntime().entity.getPanelUserByIdSync(cacheKey, () => usersRepo.getById(uid))
+    } else {
+      owner = usersRepo.getById(uid)
+    }
+  } catch {
+    owner = null
+  }
+
+  if (hasReqObj && usersRepo.db) {
+    let memo = requestOwnerMemo.get(req)
+    if (!memo) {
+      memo = new Map()
+      requestOwnerMemo.set(req, memo)
+    }
+    memo.set(uid, owner || null)
+  }
+  return owner || null
+}
+
+export async function resolveOwnerUserAsync(req, userId, usersRepo = null) {
+  const uid = normalizeOwnerId(userId)
+  if (!uid) return null
+
+  const proj = req?.apiKeyRecord?._authProjection
+  if (proj?.ownerLoaded && normalizeOwnerId(proj.userId) === uid) {
+    return proj.owner || null
+  }
+
+  const hasReqObj = req && typeof req === 'object'
+  if (hasReqObj && usersRepo?.db) {
+    const memo = requestOwnerMemo.get(req)
+    if (memo?.has(uid)) return memo.get(uid)
+  }
+
+  if (!usersRepo?.getById) return null
+
+  let owner = null
+  try {
+    if (usersRepo.db) {
+      const cacheKey = userEntityCacheKey(usersRepo.db, uid)
+      owner = await getCacheRuntime().entity.getPanelUserById(cacheKey, () => usersRepo.getById(uid))
+    } else {
+      owner = usersRepo.getById(uid)
+    }
+  } catch {
+    owner = null
+  }
+
+  if (hasReqObj && usersRepo.db) {
+    let memo = requestOwnerMemo.get(req)
+    if (!memo) {
+      memo = new Map()
+      requestOwnerMemo.set(req, memo)
+    }
+    memo.set(uid, owner || null)
+  }
+  return owner || null
+}
 
 export const VM_ORIGIN = {
   platform: 'platform',
@@ -98,12 +194,8 @@ export function ownerScopeFromRequest(req, usersRepo = null) {
   }
   let ownerRole = null
   const userId = normalizeOwnerId(rec?.user_id)
-  if (userId && usersRepo?.getById) {
-    try {
-      ownerRole = usersRepo.getById(userId)?.role || null
-    } catch {
-      ownerRole = null
-    }
+  if (userId) {
+    ownerRole = resolveOwnerUserSync(req, userId, usersRepo)?.role || null
   }
   return ownerScopeFromApiKey(rec, { apiKeyKind: req?.apiKeyKind, ownerRole })
 }
@@ -118,12 +210,9 @@ export function pinnedVmIdFromRequest(req, usersRepo = null) {
   if (!isValidVmId(pin)) return null
   if (req?.apiKeyKind === 'master') return pin
   const userId = normalizeOwnerId(req?.apiKeyRecord?.user_id)
-  if (req?.apiKeyKind !== 'managed' || !userId || !usersRepo?.getById) return null
-  try {
-    return isAdminRole(usersRepo.getById(userId)?.role) ? pin : null
-  } catch {
-    return null
-  }
+  if (req?.apiKeyKind !== 'managed' || !userId) return null
+  const owner = resolveOwnerUserSync(req, userId, usersRepo)
+  return isAdminRole(owner?.role) ? pin : null
 }
 
 export function vmMatchesOwnerScope(vm, scope = PLATFORM_SCOPE) {

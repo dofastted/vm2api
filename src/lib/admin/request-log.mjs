@@ -19,8 +19,10 @@ import path from 'node:path'
 import crypto from 'node:crypto'
 import { redactSecrets } from '../core/security.mjs'
 import { sanitizeErrorDetailsForLog, sanitizeErrorToken } from '../core/errors.mjs'
-import { resolveStoreDb, withSavepoint } from '../db/database.mjs'
+import { getDb, getPgPool, isDbOpen, resolveStoreDb, withSavepoint } from '../db/database.mjs'
 import { enqueueWrite, writeBehindArmed } from '../db/write-behind.mjs'
+import { getPgLogWriter, runRetentionCleanupAsync } from '../db/pg/pg-log-writer.mjs'
+import { getCacheRuntime } from '../cache/index.mjs'
 import { UsageLogsRepo } from '../db/repos/usage-logs-repo.mjs'
 import { classifyRequestError, resolveMutedErrorClasses } from './error-class.mjs'
 import { advisorUsageFromIterations, costColumnsFromUsage, normalizeUsage } from './pricing.mjs'
@@ -45,6 +47,10 @@ const DEFAULT_RETAIN_DAYS = 7
 const DEFAULT_DEBUG_RETAIN_DAYS = 3
 const DEFAULT_MAX_MB = 2048
 const CLEANUP_INTERVAL_MS = 10 * 60 * 1000
+const PG_TOTAL_ROWS_CACHE_TTL_MS = 30_000
+const SQLITE_TOTAL_ROWS_CACHE_TTL_MS = 5_000
+const INFLIGHT_COUNT_CACHE_TTL_MS = 2_000
+const CLEANUP_INVALIDATE_NAMESPACES = ['stats', 'overview', 'panel', 'filter-options', 'active-sessions']
 
 function loggingValidationError(message) {
   const error = new TypeError(message)
@@ -555,6 +561,10 @@ export class RequestLogStore {
     debugRetainDays = Number(process.env.KIN_REQUEST_LOG_DEBUG_RETAIN_DAYS || DEFAULT_DEBUG_RETAIN_DAYS),
     maxMb = Number(process.env.KIN_REQUEST_LOG_MAX_MB || DEFAULT_MAX_MB),
     jsonlMirror = process.env.KIN_REQUEST_LOG_JSONL === '1',
+    cache = null,
+    pgLogWriter = null,
+    pgPool = null,
+    forceSyncWrite = false,
   } = {}) {
     this.dataDir = dataDir || path.join(process.cwd(), 'data')
     this.db = resolveStoreDb({ db, dataDir: this.dataDir })
@@ -569,9 +579,174 @@ export class RequestLogStore {
     this.maxMb = Number.isFinite(maxMb) && maxMb >= 0 ? maxMb : DEFAULT_MAX_MB
     this.jsonlMirror = !!jsonlMirror
     this.mutedErrorClasses = resolveMutedErrorClasses(null)
-    this._mem = [] // recent normal summaries for panel hot path
+    this._cache = cache
+    this._hasExplicitCache = cache != null
+    this._pgLogWriter = pgLogWriter
+    this._pgPool = pgPool
+    this._forceSyncWrite = !!forceSyncWrite
+    this._recentNormalCount = 0
     this._memMax = 200
+    this._totalRowsCache = { value: null, at: 0 }
+    this._totalRowsRefreshPromise = null
+    this._inflightCache = { value: null, at: 0 }
+    this._inflightRefreshPromise = null
     this._cleanupTimer = null
+    this._cleanupInFlight = null
+  }
+
+  _getCache() {
+    if (this._cache) return this._cache
+    try {
+      return getCacheRuntime()
+    } catch {
+      return null
+    }
+  }
+
+  _activePgLogWriter() {
+    if (this._forceSyncWrite) return null
+    if (this._pgLogWriter) {
+      return this._pgLogWriter.stats?.().closed ? null : this._pgLogWriter
+    }
+    if (this.db?.engine !== 'postgres') return null
+    const writer = getPgLogWriter()
+    return writer && !writer.stats?.().closed ? writer : null
+  }
+
+  _resolvePgPool() {
+    if (this._pgPool) return this._pgPool
+    if (this.db?.engine !== 'postgres') return null
+    return getPgPool()
+  }
+
+  _resolveVmOwner(vmId) {
+    if (!vmId) return null
+    const id = String(vmId)
+    const cache = this._getCache()
+    const entity = cache?.entity
+    const useCache =
+      entity &&
+      typeof entity.getVmOwnerSync === 'function' &&
+      (this.db?.engine === 'postgres' || this._hasExplicitCache || Boolean(cache?.client?.hasRedis))
+    if (useCache) {
+      return entity.getVmOwnerSync(id, () => this.repo.vmOwnerOf(id)) ?? null
+    }
+    return this.repo.vmOwnerOf(id) ?? null
+  }
+
+  _finishLive(requestId, completedSummary = null) {
+    if (!requestId) return
+    try {
+      const liveLogs = this._getCache()?.liveLogs
+      if (liveLogs && typeof liveLogs.finishRequest === 'function') {
+        Promise.resolve(liveLogs.finishRequest(requestId, completedSummary)).catch(() => {})
+      }
+    } catch {}
+  }
+
+  _buildDebugRecord(ctx, summary, extra) {
+    return {
+      ...summary,
+      headers: ctx.headers,
+      inbound_summary: extra.inbound_summary || summarizeBody(extra.inbound_body),
+      request_body_snapshot:
+        !extra.classifier && extra.inbound_body != null ? sanitizeRequestBodySnapshot(extra.inbound_body) : null,
+      inbound_body:
+        !extra.classifier && extra.inbound_body != null ? clampBody(extra.inbound_body, this.maxDebugBodyChars) : null,
+      hop_meta: extra.hop_meta || null,
+      batch_member: extra.batch_member || null,
+      via: extra.via || extra.hop_meta?.via || null,
+      outbound_summary: extra.outbound_summary || null,
+      cache_prefix: extra.cache_prefix || null,
+      cache_continuity: extra.cache_continuity || null,
+      classifier: extra.classifier || null,
+      outbound_headers:
+        ctx.capture_outbound && extra.outbound_headers != null ? redactHeaders(extra.outbound_headers) : null,
+      outbound_headers_source: ctx.capture_outbound ? extra.outbound_headers_source || null : null,
+      worker_envelope_headers:
+        ctx.capture_outbound && extra.worker_envelope_headers != null
+          ? redactHeaders(extra.worker_envelope_headers)
+          : null,
+      outbound_body:
+        ctx.capture_outbound && !extra.classifier && extra.outbound_body != null
+          ? clampBody(extra.outbound_body, this.maxDebugBodyChars)
+          : null,
+      outbound_body_source: ctx.capture_outbound ? extra.outbound_body_source || null : null,
+      outbound_body_truncated: ctx.capture_outbound ? extra.outbound_body_truncated === true : false,
+      response: ctx.response ? debugResponse(ctx.response) : null,
+    }
+  }
+
+  _invalidateTotalRowsCache() {
+    this._totalRowsCache = { value: null, at: 0 }
+  }
+
+  _snapshotTotalRows() {
+    const now = Date.now()
+    if (this.db?.engine === 'postgres') {
+      if (this._totalRowsCache.value != null && now - this._totalRowsCache.at < PG_TOTAL_ROWS_CACHE_TTL_MS) {
+        return this._totalRowsCache.value
+      }
+      const pool = this._resolvePgPool()
+      if (pool && typeof pool.query === 'function' && !this._totalRowsRefreshPromise) {
+        this._totalRowsRefreshPromise = (async () => {
+          try {
+            const est = await pool.query(
+              "SELECT COALESCE(reltuples, -1)::bigint AS est FROM pg_class WHERE relname = 'usage_logs' LIMIT 1",
+            )
+            let count = Number(est?.rows?.[0]?.est ?? -1)
+            if (!Number.isFinite(count) || count < 0) {
+              const exact = await pool.query('SELECT COUNT(*)::bigint AS c FROM usage_logs')
+              count = Number(exact?.rows?.[0]?.c ?? 0)
+            }
+            this._totalRowsCache = { value: Math.max(0, Math.trunc(count)), at: Date.now() }
+          } catch {
+            // Preserve last known value on failure
+          } finally {
+            this._totalRowsRefreshPromise = null
+          }
+        })()
+      }
+      return this._totalRowsCache.value
+    }
+
+    const useSqliteCache = isDbOpen() && this.db === getDb()
+    if (
+      useSqliteCache &&
+      this._totalRowsCache.value != null &&
+      now - this._totalRowsCache.at < SQLITE_TOTAL_ROWS_CACHE_TTL_MS
+    ) {
+      return this._totalRowsCache.value
+    }
+    try {
+      const count = this.repo.count()
+      if (useSqliteCache) {
+        this._totalRowsCache = { value: count, at: now }
+      }
+      return count
+    } catch {
+      return null
+    }
+  }
+
+  _snapshotInflightCount() {
+    const liveLogs = this._getCache()?.liveLogs
+    if (!liveLogs) return 0
+    if (liveLogs.cache?.hasRedis && typeof liveLogs.getInflightCount === 'function') {
+      const now = Date.now()
+      if (!this._inflightRefreshPromise && now - this._inflightCache.at >= INFLIGHT_COUNT_CACHE_TTL_MS) {
+        this._inflightRefreshPromise = Promise.resolve(liveLogs.getInflightCount())
+          .then((n) => {
+            this._inflightCache = { value: Math.max(0, Number(n) || 0), at: Date.now() }
+          })
+          .catch(() => {})
+          .finally(() => {
+            this._inflightRefreshPromise = null
+          })
+      }
+      return this._inflightCache.value ?? liveLogs._localInflight?.size ?? 0
+    }
+    return liveLogs._localInflight?.size ?? 0
   }
 
   setConfig({ mode, retainDays, debugRetainDays, maxMb, mutedErrorClasses } = {}) {
@@ -600,40 +775,213 @@ export class RequestLogStore {
 
   /** Kept for API compat + post-restore hook (state lives in DB). */
   reload() {
-    this._mem = []
+    this._recentNormalCount = 0
+    this._invalidateTotalRowsCache()
   }
 
   /** Re-bind to a fresh DB connection (after backup restore). */
   rebind(db) {
     this.db = db
     this.repo = new UsageLogsRepo(db)
-    this._mem = []
+    this._recentNormalCount = 0
+    this._invalidateTotalRowsCache()
   }
 
-  start(req, { protocol = null, pathName = null } = {}) {
+  start(
+    req,
+    {
+      protocol = null,
+      pathName = null,
+      model = null,
+      user_id = null,
+      owner_user_id = null,
+      api_key_id = null,
+      session_key = null,
+      session_id = null,
+      outbound_session_id = null,
+      vm_id = null,
+      account_id = null,
+      stream = null,
+      has_tools = null,
+      phase = 'routing',
+      res = null,
+    } = {},
+  ) {
     const requestId = newRequestId(req)
     try {
       req.headers = req.headers || {}
     } catch {}
     const mode = resolveLogMode(this.mode, req)
-    return {
+    const t0 = Date.now()
+    const cleanPath = pathName || String(req?.url || '').split('?', 1)[0]
+    const method = req?.method || 'POST'
+    const ip = safeIp(req)
+    const userAgent = String(req?.headers?.['user-agent'] || '').slice(0, 512)
+    const ctx = {
       request_id: requestId,
       mode,
-      t0: Date.now(),
+      t0,
       protocol,
       // 兜底剥掉查询串：调用方都传 url.pathname，但 #1637 起 /v1beta/models 允许
       // 用 ?key= 携带凭据，一旦有新调用点漏传 pathName，原始 req.url 会带着真 key
       // 被 _appendJsonl 原样写进 request-logs（redactSecrets 只作用于 body）。
-      path: pathName || String(req.url || '').split('?', 1)[0],
-      method: req.method || 'POST',
-      ip: safeIp(req),
-      user_agent: String(req.headers?.['user-agent'] || '').slice(0, 512),
-      headers: mode === 'debug' ? redactHeaders(req.headers) : null,
+      path: cleanPath,
+      method,
+      ip,
+      user_agent: userAgent,
+      headers: mode === 'debug' ? redactHeaders(req?.headers) : null,
       // Outbound bodies carry the gateway's rewrite (persona / overlay) and are
       // readable by the owning tenant; only the operator's configured mode may
       // enable them, never the caller's x-kin-debug / x-kin-log header.
       capture_outbound: this.mode === 'debug',
+      _liveSettled: false,
+      _detachLifecycle: null,
     }
+
+    if (mode !== 'off') {
+      const alreadyClosed =
+        Boolean(req?.aborted) ||
+        (req?.destroyed === true && req?.complete === false) ||
+        Boolean(res && (res.destroyed || res.closed) && !res.writableFinished)
+      if (alreadyClosed) {
+        ctx._liveSettled = true
+      } else {
+        try {
+          const liveLogs = this._getCache()?.liveLogs
+          if (liveLogs && typeof liveLogs.startRequest === 'function') {
+            const resolvedUserId = user_id ?? req?.apiKeyRecord?.user_id ?? null
+            const resolvedVmOwnerId = vm_id ? this._resolveVmOwner(vm_id) : null
+            const resolvedOwnerId = owner_user_id ?? resolvedUserId ?? resolvedVmOwnerId ?? null
+            const resolvedKeyId = api_key_id ?? req?.apiKeyRecord?.id ?? null
+            const resolvedSessionKey = session_key || session_id || outbound_session_id || null
+            Promise.resolve(
+              liveLogs.startRequest(requestId, {
+                request_id: requestId,
+                started_at: t0,
+                created_at: new Date(t0).toISOString(),
+                log_mode: mode,
+                method,
+                path: cleanPath,
+                endpoint: cleanPath,
+                protocol,
+                model: model || null,
+                requested_model: model || null,
+                stream: stream == null ? null : !!stream,
+                has_tools: has_tools == null ? null : !!has_tools,
+                user_id: resolvedUserId ?? null,
+                owner_user_id: resolvedOwnerId ?? null,
+                vm_owner_user_id: resolvedVmOwnerId ?? null,
+                api_key_id: resolvedKeyId ?? null,
+                session_key: resolvedSessionKey,
+                session_id: session_id ?? resolvedSessionKey ?? null,
+                outbound_session_id: outbound_session_id ?? null,
+                client_ip: ip || null,
+                ip_address: ip || null,
+                user_agent: userAgent || null,
+                vm_id: vm_id || null,
+                account_id: account_id || null,
+                phase,
+                attempt_count: 0,
+              }),
+            ).catch(() => {})
+          }
+        } catch {}
+        this.bindLifecycle(ctx, req, res)
+      }
+    }
+
+    return ctx
+  }
+
+  _detachLifecycle(ctx) {
+    if (!ctx || typeof ctx._detachLifecycle !== 'function') return
+    const detach = ctx._detachLifecycle
+    ctx._detachLifecycle = null
+    try {
+      detach()
+    } catch {}
+  }
+
+  /**
+   * Bind idempotent abort/close listeners on `req` and `res` so client disconnects,
+   * timeouts, or premature socket closes that never emit `res` `finish` still
+   * clean up `live:inflight` and `live:sess:conc:*` via `liveLogs.finishRequest(id, null)`.
+   */
+  bindLifecycle(ctx, req = null, res = null) {
+    if (!ctx || ctx.mode === 'off' || ctx._liveSettled) return () => {}
+    this._detachLifecycle(ctx)
+    if (
+      req?.aborted ||
+      (req?.destroyed === true && req?.complete === false) ||
+      (res && (res.destroyed || res.closed) && !res.writableFinished)
+    ) {
+      this.abort(ctx)
+      return () => {}
+    }
+    const cleanups = []
+    const onAbort = () => {
+      this.abort(ctx)
+    }
+    const onReqClose = () => {
+      if (req?.aborted || req?.complete === false) {
+        this.abort(ctx)
+      }
+    }
+    const onResClose = () => {
+      if (!res?.writableFinished) {
+        this.abort(ctx)
+      }
+    }
+    const bind = (emitter, event, fn) => {
+      if (!emitter || typeof emitter.once !== 'function') return
+      emitter.once(event, fn)
+      cleanups.push(() => {
+        try {
+          if (typeof emitter.off === 'function') emitter.off(event, fn)
+          else if (typeof emitter.removeListener === 'function') emitter.removeListener(event, fn)
+        } catch {}
+      })
+    }
+    bind(req, 'aborted', onAbort)
+    bind(req, 'close', onReqClose)
+    bind(res, 'close', onResClose)
+    const detach = () => {
+      if (ctx._detachLifecycle === detach) ctx._detachLifecycle = null
+      for (const fn of cleanups.splice(0)) fn()
+    }
+    ctx._detachLifecycle = detach
+    return detach
+  }
+
+  /**
+   * Idempotently settle an in-flight request that aborted, disconnected, or exited
+   * early without reaching `finish()`, cleaning up `live:inflight` and `live:sess:conc:*`.
+   */
+  abort(ctx) {
+    if (!ctx || ctx.mode === 'off' || ctx._liveSettled) return false
+    ctx._liveSettled = true
+    this._detachLifecycle(ctx)
+    this._finishLive(ctx.request_id, null)
+    return true
+  }
+
+  /**
+   * Non-blocking phase/attempt/TTFT update for an in-flight request.
+   * Forwards to `LiveLogCache.updatePhase()` (microtask coalesced, zero PG write).
+   */
+  updatePhase(requestId, patch = {}) {
+    const id = typeof requestId === 'object' ? requestId?.request_id : requestId
+    if (!id || !patch || typeof patch !== 'object') return
+    try {
+      const liveLogs = this._getCache()?.liveLogs
+      if (liveLogs && typeof liveLogs.updatePhase === 'function') {
+        const enrichedPatch =
+          patch.vm_id && patch.vm_owner_user_id === undefined
+            ? { ...patch, vm_owner_user_id: this._resolveVmOwner(patch.vm_id) }
+            : patch
+        liveLogs.updatePhase(id, enrichedPatch)
+      }
+    } catch {}
   }
 
   /**
@@ -713,8 +1061,11 @@ export class RequestLogStore {
    */
   finish(ctx, extra = {}) {
     if (!ctx || ctx.mode === 'off') return null
+    ctx._liveSettled = true
+    this._detachLifecycle(ctx)
     const duration_ms = Math.max(0, Date.now() - (ctx.t0 || Date.now()))
     if (extra.merge_into_request_id) {
+      this._finishLive(ctx.request_id, null)
       const parentId = String(extra.merge_into_request_id).trim()
       if (parentId) {
         const continuation =
@@ -735,16 +1086,27 @@ export class RequestLogStore {
             })
           } catch {}
         }
-        const memParent = this._mem.find((item) => item?.request_id === parentId)
-        if (memParent) {
-          memParent.duration_ms = (Number(memParent.duration_ms) || 0) + duration_ms
+        const pgWriter = this._activePgLogWriter()
+        if (pgWriter && pgWriter.pending() > 0) {
+          // Ensure parent row queued in PgLogWriter is flushed before merging continuation duration/debug.
+          Promise.resolve(pgWriter.flush())
+            .catch(() => {})
+            .finally(() => {
+              if (writeBehindArmed()) enqueueWrite(persistMerge)
+              else persistMerge()
+            })
+        } else if (writeBehindArmed()) {
+          enqueueWrite(persistMerge)
+        } else {
+          persistMerge()
         }
-        if (writeBehindArmed()) enqueueWrite(persistMerge)
-        else persistMerge()
       }
       return null
     }
-    if (extra.skip_log) return null
+    if (extra.skip_log) {
+      this._finishLive(ctx.request_id, null)
+      return null
+    }
     const usage = normalizeUsage(disjointOpenaiUsage(extra.usage || {}) || {})
     const breakdown = cacheCreationBreakdown(usage)
     const webSearch = extra.web_search_requests ?? webSearchRequestsOf(usage)
@@ -858,8 +1220,35 @@ export class RequestLogStore {
     const classified = classifyRequestError(summary)
     if (classified?.error_class) summary.error_class = classified.error_class
 
+    summary.vm_owner_user_id = this._resolveVmOwner(extra.vm_id)
+
+    this._finishLive(ctx.request_id, {
+      ...summary,
+      created_at: summary.ts,
+      ip_address: summary.ip,
+      completed_at: Date.now(),
+      owner_user_id: summary.user_id ?? summary.vm_owner_user_id ?? null,
+      session_key: summary.session_id || summary.outbound_session_id || null,
+    })
+
+    this._recentNormalCount = Math.min(this._memMax, this._recentNormalCount + 1)
+    if (this.db?.engine === 'postgres') {
+      if (this._totalRowsCache.value != null) {
+        this._totalRowsCache.value += 1
+      }
+    } else {
+      this._invalidateTotalRowsCache()
+    }
+
+    const pgWriter = this._activePgLogWriter()
+    if (pgWriter) {
+      const debugRec = ctx.mode === 'debug' ? this._buildDebugRecord(ctx, summary, extra) : null
+      pgWriter.enqueueUsageLog(summary, debugRec)
+      if (this.jsonlMirror) this._appendJsonl(summary)
+      return summary
+    }
+
     const persist = () => {
-      summary.vm_owner_user_id = this.repo.vmOwnerOf(extra.vm_id)
       try {
         withSavepoint(this.repo.db, 'reqlog_sum', () => {
           this.repo.insertSummaryIfAbsent(summary)
@@ -867,46 +1256,13 @@ export class RequestLogStore {
       } catch {}
       if (this.jsonlMirror) this._appendJsonl(summary)
       if (ctx.mode !== 'debug') return
-      const debugRec = {
-        ...summary,
-        headers: ctx.headers,
-        inbound_summary: extra.inbound_summary || summarizeBody(extra.inbound_body),
-        request_body_snapshot:
-          !extra.classifier && extra.inbound_body != null ? sanitizeRequestBodySnapshot(extra.inbound_body) : null,
-        inbound_body:
-          !extra.classifier && extra.inbound_body != null
-            ? clampBody(extra.inbound_body, this.maxDebugBodyChars)
-            : null,
-        hop_meta: extra.hop_meta || null,
-        batch_member: extra.batch_member || null,
-        via: extra.via || extra.hop_meta?.via || null,
-        outbound_summary: extra.outbound_summary || null,
-        cache_prefix: extra.cache_prefix || null,
-        cache_continuity: extra.cache_continuity || null,
-        classifier: extra.classifier || null,
-        outbound_headers:
-          ctx.capture_outbound && extra.outbound_headers != null ? redactHeaders(extra.outbound_headers) : null,
-        outbound_headers_source: ctx.capture_outbound ? extra.outbound_headers_source || null : null,
-        worker_envelope_headers:
-          ctx.capture_outbound && extra.worker_envelope_headers != null
-            ? redactHeaders(extra.worker_envelope_headers)
-            : null,
-        outbound_body:
-          ctx.capture_outbound && !extra.classifier && extra.outbound_body != null
-            ? clampBody(extra.outbound_body, this.maxDebugBodyChars)
-            : null,
-        outbound_body_source: ctx.capture_outbound ? extra.outbound_body_source || null : null,
-        outbound_body_truncated: ctx.capture_outbound ? extra.outbound_body_truncated === true : false,
-        response: ctx.response ? debugResponse(ctx.response) : null,
-      }
+      const debugRec = this._buildDebugRecord(ctx, summary, extra)
       try {
         withSavepoint(this.repo.db, 'reqlog_dbg', () => {
           this.repo.insertDebug(summary.request_id || summary.id, summary.ts, debugRec)
         })
       } catch {}
     }
-    this._mem.push(summary)
-    if (this._mem.length > this._memMax) this._mem = this._mem.slice(-this._memMax)
     if (writeBehindArmed()) enqueueWrite(persist)
     else persist()
     return summary
@@ -1035,36 +1391,74 @@ export class RequestLogStore {
   }
 
   snapshot() {
+    const pgWriter = this._activePgLogWriter()
     return {
       mode: this.mode,
       retain_days: this.retainDays,
       debug_retain_days: this.debugRetainDays,
       max_mb: this.maxMb,
       muted_error_classes: this.mutedErrorClasses.slice(),
-      recent_normal: this._mem.length,
+      recent_normal: this._recentNormalCount,
       backend: this.db?.engine === 'postgres' ? 'postgres' : 'sqlite',
       jsonl_mirror: this.jsonlMirror,
-      total_rows: (() => {
-        try {
-          return this.repo.count()
-        } catch {
-          return null
-        }
-      })(),
+      total_rows: this._snapshotTotalRows(),
+      inflight_count: this._snapshotInflightCount(),
+      pg_log_writer: pgWriter ? pgWriter.stats() : null,
     }
   }
 
-  /** Retention: delete rows older than retain windows, then enforce max_mb. */
+  /**
+   * Retention: delete rows older than retain windows, then enforce max_mb.
+   * On PostgreSQL with an async pool, runs non-blocking ctid-batched cleanup off
+   * the main thread and invalidates dashboard caches afterward; on SQLite runs
+   * the synchronous repository cleanup.
+   */
   cleanup() {
+    const opts = {
+      retainDays: this.retainDays,
+      debugRetainDays: this.debugRetainDays,
+      maxBytes: this.maxMb > 0 ? this.maxMb * 1024 * 1024 : 0,
+    }
+    this._invalidateTotalRowsCache()
+
+    const pool = this._resolvePgPool()
+    if (this.db?.engine === 'postgres' && pool && typeof pool.query === 'function') {
+      if (this._cleanupInFlight) return this._cleanupInFlight
+      const task = (async () => {
+        try {
+          const result = await runRetentionCleanupAsync(pool, opts)
+          this._invalidateTotalRowsCache()
+          if (result && !result.skipped && (result.usage_logs > 0 || result.request_log_debug > 0)) {
+            await this._getCache()
+              ?.dashboard?.invalidateNamespaces?.(CLEANUP_INVALIDATE_NAMESPACES)
+              .catch(() => {})
+          }
+          this._cleanupLegacyFiles(this.retainDays, this.root)
+          this._cleanupLegacyFiles(this.debugRetainDays, path.join(this.root, 'debug'))
+          return result
+        } catch (err) {
+          console.warn('[request-log] async retention cleanup failed:', err?.message || err)
+          return null
+        } finally {
+          this._cleanupInFlight = null
+        }
+      })()
+      this._cleanupInFlight = task
+      return task
+    }
+
+    let result = null
     try {
-      this.repo.cleanup({
-        retainDays: this.retainDays,
-        debugRetainDays: this.debugRetainDays,
-        maxBytes: this.maxMb > 0 ? this.maxMb * 1024 * 1024 : 0,
-      })
+      result = this.repo.cleanup(opts)
     } catch {}
+    if (result && (result.usage_logs > 0 || result.request_log_debug > 0)) {
+      this._getCache()
+        ?.dashboard?.invalidateNamespaces?.(CLEANUP_INVALIDATE_NAMESPACES)
+        .catch(() => {})
+    }
     this._cleanupLegacyFiles(this.retainDays, this.root)
     this._cleanupLegacyFiles(this.debugRetainDays, path.join(this.root, 'debug'))
+    return result
   }
 
   startCleanupScheduler({ intervalMs = CLEANUP_INTERVAL_MS } = {}) {
@@ -1072,7 +1466,7 @@ export class RequestLogStore {
     const ms = Math.max(60_000, Number(intervalMs) || CLEANUP_INTERVAL_MS)
     const run = () => {
       try {
-        this.cleanup()
+        Promise.resolve(this.cleanup()).catch(() => {})
       } catch {}
     }
     this._cleanupTimer = setInterval(run, ms)
