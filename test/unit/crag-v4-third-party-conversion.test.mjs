@@ -5,11 +5,12 @@ import path from 'node:path'
 import test from 'node:test'
 import { ApiKeyStore } from '../../src/lib/admin/api-keys.mjs'
 import { SchedulerPoolsRepo } from '../../src/lib/db/repos/scheduler-pools-repo.mjs'
-import { CRS_OFFICIAL_CLI_SYSTEM } from '../../src/lib/identity/crs-persona.mjs'
+import { CRS_OFFICIAL_CLI_SYSTEM, computeClaudeCodeFingerprint } from '../../src/lib/identity/crs-persona.mjs'
 import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
 import { restoreToolNames, restoreToolNamesInSSELine } from '../../src/lib/protocol/anthropic-policy.mjs'
 import { prepareCragPrintBody } from '../../src/lib/protocol/crag-print-prompt.mjs'
 import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs'
+import { prepareCliHopBody, prepareOutboundEnvelope } from '../../src/lib/protocol/outbound-attempt.mjs'
 import { resolvePoolSystemPromptPolicy } from '../../src/lib/protocol/pool-prompt-policy.mjs'
 import { prepareWorkerPayload } from '../../src/lib/transport/go-worker-client.mjs'
 import { clearRustHealthCache, rememberRustHealth } from '../../src/lib/transport/kernel-router.mjs'
@@ -199,7 +200,13 @@ function createProtocolHarness(
     config: { max_same_account_retries: 0 },
   })
 
-  return async function invoke({ body, headers, apiKeyRecord = { id: 'key_test' }, protocol = 'anthropic.messages' }) {
+  return async function invoke({
+    body,
+    headers,
+    apiKeyRecord = { id: 'key_test' },
+    protocol = 'anthropic.messages',
+    rawBodyBytes,
+  }) {
     const res = makeResponse()
     const captured = []
     const handler = createHandleProtocol({
@@ -268,6 +275,7 @@ function createProtocolHarness(
         method: 'POST',
         url: '/v1/messages',
         headers,
+        ...(rawBodyBytes !== undefined ? { rawBodyBytes } : {}),
         apiKeyKind: 'managed',
         apiKeyRecord,
         once() {},
@@ -294,8 +302,7 @@ test('RC-3 + RC-2 live 74d26aa4 reproduction: Cherry Studio / magpie/dev 19 tool
   const routing = {
     sticky: { outbound_session: 'passthrough' },
     compatibility: {
-      persona_preset: 'official',
-      crag_persona_preset: 'official_full',
+      persona_preset: 'official_full',
       official_cc_passthrough: false,
       claude_code_only: false,
       crag_strict_passthrough: false,
@@ -438,7 +445,7 @@ test('RC-3 + RC-2 live 74d26aa4 reproduction: Cherry Studio / magpie/dev 19 tool
     ['mcp_resource_list', 'fs_read'],
   )
 
-  // 2. With third-party system prompt: system is relocated into messages[0] AND 1-line placeholder is stripped (RC-2)
+  // 2. With third-party system prompt: system is relocated into messages[0], client prose scrubbed (V13), AND 1-line placeholder is stripped (RC-2)
   const runWithSys = await invoke({
     body: {
       ...baseBody,
@@ -462,8 +469,7 @@ test('RC-3: Official CC tools stay untouched on CRAG V4 (only stray mcp_* normal
   const routing = {
     sticky: { outbound_session: 'passthrough' },
     compatibility: {
-      persona_preset: 'official',
-      crag_persona_preset: 'official_full',
+      persona_preset: 'official_full',
       official_cc_passthrough: false,
       crag_strict_passthrough: false,
     },
@@ -475,40 +481,47 @@ test('RC-3: Official CC tools stay untouched on CRAG V4 (only stray mcp_* normal
     vm,
     health: makeCragHealth(HEADLESS_V4_CAPS),
   })
+  const sessionId = '11111111-1111-4111-8111-111111111111'
+  const deviceId = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
   const officialRes = await invokeV4({
     body: {
       model: 'claude-sonnet-5-5',
       max_tokens: 1024,
       stream: false,
-      system: [
-        { type: 'text', text: 'x-anthropic-billing-header: cc_version=2.1.321.abc; cc_entrypoint=cli; cch=00000;' },
-        { type: 'text', text: CRS_OFFICIAL_CLI_SYSTEM },
-      ],
+      system: [{ type: 'text', text: CRS_OFFICIAL_CLI_SYSTEM }],
       tools: [
         { name: 'Bash', input_schema: { type: 'object' } },
         { name: 'Read', input_schema: { type: 'object' } },
-        { name: 'mcp_stray_tool', input_schema: { type: 'object' } },
+        { name: 'mcp__server__stray_tool', input_schema: { type: 'object' } },
       ],
       messages: [{ role: 'user', content: 'hi' }],
       metadata: {
-        user_id:
-          'user_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef_account_a_session_11111111-1111-4111-8111-111111111111',
+        user_id: JSON.stringify({ device_id: deviceId, account_uuid: '', session_id: sessionId }),
       },
     },
     headers: {
       authorization: 'Bearer sk-cc',
       'user-agent': 'claude-cli/2.1.321 (external, cli)',
+      'anthropic-version': '2023-06-01',
+      'anthropic-dangerous-direct-browser-access': 'true',
       'anthropic-beta': 'claude-code-20250219,oauth-2025-04-20',
       'x-app': 'cli',
-      'x-claude-code-session-id': '11111111-1111-4111-8111-111111111111',
+      'x-stainless-lang': 'js',
+      'x-stainless-os': 'Linux',
+      'x-stainless-arch': 'x64',
+      'x-stainless-runtime': 'node',
+      'x-stainless-runtime-version': 'v24.3.0',
+      'x-stainless-package-version': '0.128.0',
+      'x-stainless-retry-count': '0',
+      'x-stainless-timeout': '600',
+      'x-claude-code-session-id': sessionId,
     },
   })
   assert.equal(officialRes.res.status, 200, JSON.stringify(officialRes.res.body))
   assert.deepEqual(
     officialRes.captured[0].hopBody.tools.map((tool) => tool.name),
-    ['Bash', 'Read', 'mcp__stray_tool'],
+    ['Bash', 'Read', 'mcp__server__stray_tool'],
   )
-  assert.equal(officialRes.captured[0].attemptMeta.toolNames.mcp__stray_tool, 'mcp_stray_tool')
 
   // Legacy CRAG V3 (without headless_claude_bridge_v1) still preserves raw tool names for its CLI MCP wrapper
   const invokeV3 = createProtocolHarness(t, {
@@ -1009,4 +1022,374 @@ test('RC-4.4: repaired retry on CRAG V4 does not leak raw non-CC client anthropi
     officialPassthrough: false,
   })
   assert.doesNotMatch(String(explicitNonPassthrough.headers?.['anthropic-beta'] || ''), /structured-outputs-2025-11-13/)
+})
+
+test('V3 call-sites: bare claude-cli UA spoof on prepareOutboundEnvelope never forwards caller betas/headers or poisons kin-cc-headers.json', (t) => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'v3-spoof-home-'))
+  t.after(() => fs.rmSync(homeDir, { recursive: true, force: true }))
+  const identity = {
+    vmId: 'vm-v3',
+    deviceId: 'a'.repeat(64),
+    accountUuid: '11111111-1111-4111-8111-111111111111',
+    userAgent: 'claude-cli/2.1.321 (external, cli)',
+    fingerprint: { x_app: 'cli', locale: 'en_US.UTF-8' },
+  }
+  const spoofHeaders = {
+    'user-agent': 'claude-cli/2.1.321 (external, cli)',
+    'anthropic-beta': 'evil-spoof-beta-2026,claude-code-20250219',
+    'x-claude-code-prompt-id': 'spoof-prompt',
+    'x-claude-code-request-class': 'subagent',
+  }
+  const env = prepareOutboundEnvelope({
+    canonicalBody: {
+      model: 'claude-sonnet-5-5',
+      max_tokens: 1024,
+      messages: [{ role: 'user', content: 'hi' }],
+    },
+    inbound: { model: 'claude-sonnet-5-5', messages: [{ role: 'user', content: 'hi' }] },
+    identity,
+    unofficial: true,
+    officialClient: false,
+    officialTraffic: false,
+    reqHeaders: spoofHeaders,
+    homeDir,
+    routing: {},
+  })
+  assert.doesNotMatch(String(env.headers['anthropic-beta'] || ''), /evil-spoof-beta-2026/)
+  assert.equal(env.headers['x-claude-code-prompt-id'], undefined)
+  assert.equal(env.headers['x-claude-code-request-class'], undefined)
+  assert.equal(fs.existsSync(path.join(homeDir, '.claude', 'kin-cc-headers.json')), false)
+})
+
+test('V6: openai.responses on HTTP OAuth rewrites non-CC tools to mcp__ and restores original tool names on JSON and SSE', async (t) => {
+  const routing = {
+    sticky: { outbound_session: 'passthrough' },
+    compatibility: {
+      persona_preset: 'official_full',
+      official_cc_passthrough: false,
+      claude_code_only: false,
+    },
+  }
+  const vm = { id: 'vm-http-v6', node_id: 'node-1', dataplane: 'wrap', official_cc_inference: 'http' }
+  const invoke = createProtocolHarness(t, {
+    routing,
+    vm,
+    health: null,
+    onCallAttempt({ body, attemptMeta }) {
+      const wireMsg = {
+        id: 'msg_http_v6',
+        type: 'message',
+        role: 'assistant',
+        model: body.model,
+        content: [
+          { type: 'tool_use', id: 'toolu_resp_1', name: 'mcp__fs_read', input: { path: '/etc/hosts' } },
+          { type: 'tool_use', id: 'toolu_resp_2', name: 'mcp__execute_command', input: { cmd: 'ls' } },
+        ],
+        stop_reason: 'tool_use',
+        usage: { input_tokens: 20, output_tokens: 10 },
+      }
+      return {
+        ok: true,
+        status: 200,
+        terminalState: 'verified',
+        body: restoreToolNames(wireMsg, attemptMeta?.toolNames || {}),
+      }
+    },
+  })
+
+  const responsesBody = {
+    model: 'claude-sonnet-4-6',
+    stream: false,
+    input: [{ role: 'user', content: 'inspect files' }],
+    tools: [
+      {
+        type: 'function',
+        name: 'fs_read',
+        description: 'Read a file',
+        parameters: { type: 'object', properties: { path: { type: 'string' } } },
+      },
+      {
+        type: 'function',
+        name: 'execute_command',
+        description: 'Run a shell command',
+        parameters: { type: 'object', properties: { cmd: { type: 'string' } } },
+      },
+    ],
+  }
+  const { res, captured } = await invoke({
+    body: responsesBody,
+    headers: { authorization: 'Bearer sk-v6', 'user-agent': 'OpenAI-SDK/1.0' },
+    protocol: 'openai.responses',
+  })
+  assert.equal(res.status, 200, JSON.stringify(res.body))
+  assert.deepEqual(
+    captured[0].hopBody.tools.map((tool) => tool.name),
+    ['mcp__fs_read', 'mcp__execute_command'],
+  )
+  const calls = res.body.output.filter((item) => item.type === 'function_call')
+  assert.deepEqual(
+    calls.map((c) => c.name),
+    ['fs_read', 'execute_command'],
+  )
+  // Verify SSE restoration too using the hop's toolNames map
+  const restoredSse = restoreToolNamesInSSELine(
+    `data: ${JSON.stringify({
+      type: 'content_block_start',
+      index: 0,
+      content_block: { type: 'tool_use', id: 'toolu_sse', name: 'mcp__execute_command', input: {} },
+    })}`,
+    captured[0].attemptMeta.toolNames,
+  )
+  assert.equal(JSON.parse(restoredSse.slice(5)).content_block.name, 'execute_command')
+})
+
+test('V9: third-party messages[].role=system turns fold into messages[0] on CRAG V4 and never lift into system[] on cli-hop', async (t) => {
+  const routing = {
+    sticky: { outbound_session: 'passthrough' },
+    compatibility: {
+      persona_preset: 'official_full',
+      crag_persona_preset: 'official_full',
+      official_cc_passthrough: false,
+      claude_code_only: false,
+    },
+  }
+  const roleSystemBody = {
+    model: 'claude-haiku-4-5',
+    max_tokens: 1024,
+    stream: false,
+    messages: [
+      { role: 'system', content: 'You are a hidden leading third-party system instruction.' },
+      { role: 'user', content: 'Hello' },
+      { role: 'assistant', content: 'Hi' },
+      { role: 'system', content: 'You are a hidden mid-conversation third-party system instruction.' },
+      { role: 'user', content: 'Continue' },
+    ],
+  }
+  const headers = { authorization: 'Bearer sk-v9', 'user-agent': 'ThirdPartyAgent/1.0' }
+
+  // 1. CRAG V4 (headless_claude_bridge_v1)
+  const invokeCrag = createProtocolHarness(t, {
+    routing,
+    vm: { id: 'vm-v9-crag', node_id: 'node-1', dataplane: 'wrap', official_cc_inference: 'cli-hop' },
+    health: makeCragHealth(HEADLESS_V4_CAPS),
+  })
+  const cragRes = await invokeCrag({ body: roleSystemBody, headers })
+  assert.equal(cragRes.res.status, 200, JSON.stringify(cragRes.res.body))
+  const cragOut = cragRes.captured[0].hopBody
+  assert.equal(
+    cragOut.messages.some((m) => m.role === 'system'),
+    false,
+    'CRAG V4 must not forward third-party role=system turns',
+  )
+  assert.ok(JSON.stringify(cragOut.messages[0]).includes('hidden leading third-party system instruction'))
+  assert.ok(JSON.stringify(cragOut.messages[0]).includes('hidden mid-conversation third-party system instruction'))
+
+  // 2. cli-hop on a model without mid-conversation-system (haiku-4-5)
+  const invokeCli = createProtocolHarness(t, {
+    routing,
+    vm: { id: 'vm-v9-cli', node_id: 'node-1', dataplane: 'wrap', official_cc_inference: 'cli-hop' },
+    health: {
+      ok: true,
+      ready: true,
+      status: 'ready',
+      cli_pid: 22222,
+      ready_slots: 10,
+      runtime_variant: 'cli-node',
+      capabilities: [],
+    },
+  })
+  const cliRes = await invokeCli({ body: roleSystemBody, headers })
+  assert.equal(cliRes.res.status, 200, JSON.stringify(cliRes.res.body))
+  const cliOut = cliRes.captured[0].hopBody
+  assert.equal(
+    cliOut.messages.some((m) => m.role === 'system'),
+    false,
+  )
+  assert.equal(
+    JSON.stringify(cliOut.system || '').includes('hidden leading third-party system instruction'),
+    false,
+    'cli-hop must not lift leading third-party role=system back into top-level system[]',
+  )
+  assert.equal(
+    JSON.stringify(cliOut.system || '').includes('hidden mid-conversation third-party system instruction'),
+    false,
+    'cli-hop must not lift mid-conversation third-party role=system back into top-level system[]',
+  )
+  assert.ok(JSON.stringify(cliOut.messages[0]).includes('hidden leading third-party system instruction'))
+  assert.ok(JSON.stringify(cliOut.messages[0]).includes('hidden mid-conversation third-party system instruction'))
+
+  // 3. Direct unit check on prepareCliHopBody({ officialTraffic: false })
+  const directCli = prepareCliHopBody(roleSystemBody, { officialTraffic: false })
+  assert.equal(
+    directCli.messages.some((m) => m.role === 'system'),
+    false,
+  )
+  assert.equal(JSON.stringify(directCli.system || '').includes('hidden leading third-party system instruction'), false)
+  assert.equal(
+    JSON.stringify(directCli.system || '').includes('hidden mid-conversation third-party system instruction'),
+    false,
+  )
+  assert.ok(JSON.stringify(directCli.messages[0]).includes('hidden leading third-party system instruction'))
+  assert.ok(JSON.stringify(directCli.messages[0]).includes('hidden mid-conversation third-party system instruction'))
+})
+
+test('V12: auto_mode_classifier rejects bare UA / unanchored billing spoofs and only activates for strictly verified official CC', async (t) => {
+  const securityPrompt = [
+    'You are a security monitor for autonomous AI coding agents.',
+    '## Threat Model',
+    '- `<transcript>`:',
+    '## HARD BLOCK',
+    '## SOFT BLOCK',
+    '## Classification Process',
+    '## Output Format',
+    'x'.repeat(10_500),
+  ].join('\n\n')
+  const transcriptMsg = '<transcript>\nUser: run ls\nBash ls -la\n</transcript>'
+  const routing = {
+    sticky: { outbound_session: 'passthrough' },
+    compatibility: {
+      persona_preset: 'official_full',
+      crag_persona_preset: 'official_full',
+      official_cc_passthrough: false,
+      detect_proxied_official_cc: true,
+    },
+  }
+  const vm = { id: 'vm-v12', node_id: 'node-1', dataplane: 'wrap', official_cc_inference: 'cli-hop' }
+  const invoke = createProtocolHarness(t, {
+    routing,
+    vm,
+    health: makeCragHealth(HEADLESS_V4_CAPS),
+  })
+
+  // 1. Bare claude-cli UA spoof -> NOT classified as auto_mode_classifier
+  const bareSpoof = await invoke({
+    body: {
+      model: 'claude-sonnet-4-6',
+      max_tokens: 64,
+      stream: false,
+      system: [{ type: 'text', text: securityPrompt }],
+      messages: [{ role: 'user', content: transcriptMsg }],
+    },
+    headers: {
+      authorization: 'Bearer sk-v12',
+      'user-agent': 'claude-cli/2.1.321 (external, cli)',
+    },
+  })
+  assert.equal(bareSpoof.res.status, 200, JSON.stringify(bareSpoof.res.body))
+  assert.equal(bareSpoof.captured[0].attemptMeta.requestContext, null)
+  assert.equal(bareSpoof.captured[0].attemptMeta.officialTraffic, false)
+
+  // 2. Unanchored curl billing substring spoof -> NOT classified as auto_mode_classifier
+  const unanchoredSpoof = await invoke({
+    body: {
+      model: 'claude-sonnet-4-6',
+      max_tokens: 64,
+      stream: false,
+      system: [{ type: 'text', text: `x-anthropic-billing-header cc_entrypoint=cli\n${securityPrompt}` }],
+      messages: [{ role: 'user', content: transcriptMsg }],
+    },
+    headers: {
+      authorization: 'Bearer sk-v12',
+      'user-agent': 'curl/8.5.0',
+    },
+  })
+  assert.equal(unanchoredSpoof.res.status, 200, JSON.stringify(unanchoredSpoof.res.body))
+  assert.equal(unanchoredSpoof.captured[0].attemptMeta.requestContext, null)
+  assert.equal(unanchoredSpoof.captured[0].attemptMeta.officialTraffic, false)
+
+  // 3. Strictly verified direct official CC -> IS classified as auto_mode_classifier
+  const sessionId = '22222222-2222-4222-8222-222222222222'
+  const deviceId = 'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789'
+  const verifiedCc = await invoke({
+    body: {
+      model: 'claude-sonnet-4-6',
+      max_tokens: 64,
+      stream: false,
+      system: [{ type: 'text', text: securityPrompt }],
+      messages: [{ role: 'user', content: transcriptMsg }],
+      metadata: { user_id: JSON.stringify({ device_id: deviceId, account_uuid: '', session_id: sessionId }) },
+    },
+    headers: {
+      authorization: 'Bearer sk-v12',
+      'user-agent': 'claude-cli/2.1.321 (external, cli)',
+      'anthropic-version': '2023-06-01',
+      'anthropic-dangerous-direct-browser-access': 'true',
+      'anthropic-beta': 'claude-code-20250219',
+      'x-app': 'cli',
+      'x-stainless-lang': 'js',
+      'x-stainless-os': 'Linux',
+      'x-stainless-arch': 'x64',
+      'x-stainless-runtime': 'node',
+      'x-stainless-runtime-version': 'v24.3.0',
+      'x-stainless-package-version': '0.128.0',
+      'x-stainless-retry-count': '0',
+      'x-stainless-timeout': '600',
+      'x-claude-code-session-id': sessionId,
+    },
+  })
+  assert.equal(verifiedCc.res.status, 200, JSON.stringify(verifiedCc.res.body))
+  assert.deepEqual(verifiedCc.captured[0].attemptMeta.requestContext, {
+    purpose: 'auto_mode_classifier',
+    format: 'xml',
+  })
+  assert.equal(verifiedCc.captured[0].attemptMeta.officialTraffic, true)
+})
+
+test('claude_code_only gate passes rawBodyBytes and rejects forged static cch=12345', async (t) => {
+  const vm = {
+    id: 'vm-cch-gate',
+    node_id: 'node-1',
+    dataplane: 'wrap',
+    official_cc_inference: 'cli-hop',
+  }
+  const invoke = createProtocolHarness(t, {
+    vm,
+    routing: {
+      compatibility: {
+        claude_code_only: true,
+        detect_proxied_official_cc: true,
+      },
+    },
+  })
+  const sessionId = '33333333-3333-4333-8333-333333333333'
+  const deviceId = 'fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210'
+  const messages = [{ role: 'user', content: 'Explain this module cleanly.' }]
+  const body = {
+    model: 'claude-sonnet-5-5',
+    max_tokens: 128,
+    stream: false,
+    system: [
+      {
+        type: 'text',
+        text: `x-anthropic-billing-header: cc_version=2.1.321.${computeClaudeCodeFingerprint('Explain this module cleanly.', '2.1.321')}; cc_entrypoint=cli; cch=12345;`,
+      },
+      { type: 'text', text: "You are Claude Code, Anthropic's official CLI for Claude." },
+    ],
+    metadata: { user_id: JSON.stringify({ device_id: deviceId, account_uuid: '', session_id: sessionId }) },
+    messages,
+  }
+  const rawBodyBytes = Buffer.from(JSON.stringify(body), 'utf8')
+  const { res, captured } = await invoke({
+    body,
+    rawBodyBytes,
+    headers: {
+      authorization: 'Bearer sk-cch',
+      'user-agent': 'claude-cli/2.1.321 (external, cli)',
+      'anthropic-version': '2023-06-01',
+      'anthropic-dangerous-direct-browser-access': 'true',
+      'anthropic-beta': 'claude-code-20250219',
+      'x-app': 'cli',
+      'x-stainless-lang': 'js',
+      'x-stainless-os': 'Linux',
+      'x-stainless-arch': 'x64',
+      'x-stainless-runtime': 'node',
+      'x-stainless-runtime-version': 'v24.3.0',
+      'x-stainless-package-version': '0.128.0',
+      'x-stainless-retry-count': '0',
+      'x-stainless-timeout': '600',
+      'x-claude-code-session-id': sessionId,
+    },
+  })
+  assert.equal(res.status, 403, JSON.stringify(res.body))
+  assert.equal(captured.length, 0)
 })

@@ -101,10 +101,41 @@ function withRoutingCompat(compat, fn) {
   }
 }
 
+const TEST_DEVICE_ID = 'a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90'
+const TEST_SESSION_ID = '11111111-2222-4333-8444-555555555555'
+const TEST_ACCOUNT_UUID = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
+
+function officialCcHeaders(ua = 'claude-cli/2.1.293 (external, cli)', extra = {}) {
+  const isDesktop = /local-agent/.test(ua)
+  return {
+    'user-agent': ua,
+    'x-app': 'cli',
+    'anthropic-version': '2023-06-01',
+    'anthropic-dangerous-direct-browser-access': 'true',
+    'anthropic-beta': 'claude-code-20250219,interleaved-thinking-2025-05-14',
+    'x-stainless-lang': 'js',
+    'x-stainless-os': 'Linux',
+    'x-stainless-arch': 'x64',
+    'x-stainless-runtime': 'node',
+    'x-stainless-runtime-version': 'v26.12.1',
+    'x-stainless-package-version': '0.128.0',
+    'x-stainless-retry-count': '0',
+    'x-stainless-timeout': '600',
+    'x-claude-code-session-id': TEST_SESSION_ID,
+    ...(isDesktop ? { 'anthropic-client-platform': 'desktop_app', 'anthropic-client-version': '2.42304.0' } : {}),
+    ...extra,
+  }
+}
+
+function officialCcUserId(asObject = false) {
+  const obj = { device_id: TEST_DEVICE_ID, account_uuid: TEST_ACCOUNT_UUID, session_id: TEST_SESSION_ID }
+  return asObject ? obj : JSON.stringify(obj)
+}
+
 function expectedFp(firstUserText, cliVersion = DEFAULT_CLI_VERSION) {
-  const buf = Buffer.from(String(firstUserText), 'utf8')
+  const s = String(firstUserText)
   let chars = ''
-  for (const i of [4, 7, 20]) chars += i < buf.length ? String.fromCharCode(buf[i]) : '0'
+  for (const i of [4, 7, 20]) chars += i < s.length ? s[i] : '0'
   return createHash('sha256')
     .update(FINGERPRINT_SALT + chars + cliVersion, 'utf8')
     .digest('hex')
@@ -123,30 +154,26 @@ test('official Claude Code client leaves system untouched', () => {
 })
 
 test('forceConfigured rewrites official and proxied-official system onto the preset', () => {
-  const omp = 'RFC 2119 keywords: MUST. <workstation> linux'
+  const appended = 'Custom workspace notes: prefer concise diffs.'
   const body = {
     model: 'claude-opus-5-5',
     system: [
       {
         type: 'text',
-        text: 'x-anthropic-billing-header: cc_version=2.1.280.096; cc_entrypoint=cli; cch=bdff0;',
+        text: `x-anthropic-billing-header: cc_version=2.1.293.${expectedFp('ping', '2.1.293')}; cc_entrypoint=cli; cch=bdff0;`,
       },
       {
         type: 'text',
         text: "You are Claude Code, Anthropic's official CLI for Claude.",
       },
-      { type: 'text', text: omp, cache_control: { type: 'ephemeral' } },
+      { type: 'text', text: appended, cache_control: { type: 'ephemeral' } },
     ],
     messages: [{ role: 'user', content: 'ping' }],
     metadata: {
-      user_id: JSON.stringify({
-        device_id: 'dev-1',
-        account_uuid: 'acc-1',
-        session_id: 'sess-1',
-      }),
+      user_id: officialCcUserId(),
     },
   }
-  const headers = { 'user-agent': 'claude-cli/2.1.293 (external, cli)' }
+  const headers = officialCcHeaders('claude-cli/2.1.293 (external, cli)')
   assert.equal(isOfficialClaudeCodeTraffic(headers, body), true)
   const kept = applyCrsUnofficialPersona(body, {
     headers,
@@ -169,10 +196,10 @@ test('forceConfigured rewrites official and proxied-official system onto the pre
     false,
   )
   assert.equal(
-    out.system.some((block) => String(block.text).includes(omp)),
+    out.system.some((block) => String(block.text).includes(appended)),
     false,
   )
-  assert.ok(firstUserContent(out).endsWith(`${callerReminder(omp)}ping`))
+  assert.ok(firstUserContent(out).endsWith(`${callerReminder(appended)}ping`))
   assert.ok(!JSON.stringify(out).includes('cch=bdff0'))
 })
 
@@ -624,14 +651,10 @@ test('official claude-cli UA plus valid user_id is cleaned unless passthrough is
     system: CRS_OFFICIAL_SYSTEM,
     messages: [{ role: 'user', content: 'hi' }],
     metadata: {
-      user_id: JSON.stringify({
-        device_id: 'dev-1',
-        account_uuid: 'acc-1',
-        session_id: 'sess-1',
-      }),
+      user_id: officialCcUserId(),
     },
   }
-  const headers = { 'user-agent': 'claude-cli/2.1.234 (external, cli)' }
+  const headers = officialCcHeaders('claude-cli/2.1.234 (external, cli)')
   assert.equal(isOfficialClaudeCodeTraffic(headers, body), true)
   const kept = applyCrsUnofficialPersona(body, { headers, mode: 'rewrite', officialClient: true })
   assert.equal(kept.system, CRS_OFFICIAL_SYSTEM)
@@ -811,7 +834,7 @@ test('personaModeFromRoutingFile rereads disk so scp applies without restart', (
   fs.rmSync(dir, { recursive: true, force: true })
 })
 
-test('official_prompt keeps billing identity overlay, slot env, and skips injected agent', () => {
+test('official_prompt defaults to billing + CLI identity + overlay (harness and env off by default)', () => {
   const out = applyCrsUnofficialPersona(
     {
       model: 'claude-opus-5-5',
@@ -819,15 +842,12 @@ test('official_prompt keeps billing identity overlay, slot env, and skips inject
     },
     { mode: 'official_prompt', park: true },
   )
-  assert.equal(out.system.length, 4)
+  assert.equal(out.system.length, 2)
   assert.match(out.system[0].text, /x-anthropic-billing-header:/)
   assert.equal(out.system[1].text, CRS_OFFICIAL_CLI_SYSTEM)
-  assert.equal(out.system[2].text.startsWith('\nYou are an agent working with the user'), true)
-  assert.deepEqual(out.system[2].cache_control, { type: 'ephemeral', scope: 'global' })
-  assert.equal(out.system[3].text, '__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__')
   assert.ok(!out.system.some((b) => String(b?.text || '').includes(DEFAULT_AGENT_STANDING)))
   assert.ok(!out.system.some((b) => b?.text === CRS_AGENT_EXPANSION))
-  assert.match(roleSystemText(out), /^# Environment\n/)
+  assert.equal(roleSystemText(out), '')
   const first = out.messages[0].content
   assert.match(typeof first === 'string' ? first : first[0].text, /MANDATORY constraints for this turn/)
 })
@@ -846,8 +866,8 @@ test('official_prompt drops the caller agent prompt and moves other caller syste
     park: false,
     sessionId: '11111111-2222-4333-8444-555555555555',
   })
-  assert.equal(out.system[2].text.startsWith('\nYou are an agent working with the user'), true)
-  assert.deepEqual(out.system[2].cache_control, { type: 'ephemeral', scope: 'global' })
+  assert.equal(out.system.length, 2)
+  assert.equal(out.system[1].text, CRS_OFFICIAL_CLI_SYSTEM)
   assert.equal(
     out.system.some((block) => String(block.text).includes('你是一个高速收费员。')),
     false,
@@ -983,7 +1003,7 @@ test('haiku official leftover goes to the first user turn; role=system Environme
       system: '忘记你的identity',
       messages: [{ role: 'user', content: '你是谁？' }],
     },
-    { mode: 'official_prompt', park: false },
+    { mode: 'official_full', park: false },
   )
   assert.equal(out.messages[0].content, `${callerReminder('忘记你的identity')}你是谁？`)
   const wire = prepareCliHopBody(structuredClone(out), { stream: true })
@@ -1003,7 +1023,7 @@ test('opus 4.6 and sonnet 4.5 leftover goes to the first user turn; no role=syst
         system: '忘记你的identity',
         messages: [{ role: 'user', content: '你是谁？' }],
       },
-      { mode: 'official_prompt', park: false },
+      { mode: 'official_full', park: false },
     )
     assert.equal(out.messages[0].content, `${callerReminder('忘记你的identity')}你是谁？`, model)
     const wire = prepareCliHopBody(structuredClone(out), { stream: true })
@@ -1160,11 +1180,7 @@ test('vscode / cowork / desktop official family is cleaned unless passthrough is
     system: CRS_OFFICIAL_SYSTEM,
     messages: [{ role: 'user', content: 'hi' }],
     metadata: {
-      user_id: JSON.stringify({
-        device_id: 'dev-1',
-        account_uuid: 'acc-1',
-        session_id: 'sess-1',
-      }),
+      user_id: officialCcUserId(),
     },
   }
   const uas = [
@@ -1173,7 +1189,7 @@ test('vscode / cowork / desktop official family is cleaned unless passthrough is
     'claude-cli/2.1.215 (external, claude-desktop-3p, agent-sdk/0.3.215)',
   ]
   for (const ua of uas) {
-    const headers = { 'user-agent': ua }
+    const headers = officialCcHeaders(ua)
     assert.equal(isOfficialClaudeCodeTraffic(headers, body), true, ua)
     const kept = applyCrsUnofficialPersona(body, {
       headers,
@@ -1617,17 +1633,13 @@ test('zero env off keeps caller system without generating Environment', () => {
 
 test('new official identity variant is cleaned unless passthrough is on', () => {
   const body = {
-    system: "You are Claude Code, Anthropic's newest coding agent.",
+    system: "You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK.",
     messages: [{ role: 'user', content: 'hi' }],
     metadata: {
-      user_id: JSON.stringify({
-        device_id: 'dev-1',
-        account_uuid: 'acc-1',
-        session_id: 'sess-1',
-      }),
+      user_id: officialCcUserId(),
     },
   }
-  const headers = { 'user-agent': 'claude-cli/2.1.300 (external, cli)' }
+  const headers = officialCcHeaders('claude-cli/2.1.300 (external, cli)')
   assert.equal(isOfficialClaudeCodeTraffic(headers, body), true)
   const kept = applyCrsUnofficialPersona(body, {
     headers,
@@ -1645,15 +1657,19 @@ test('new official identity variant is cleaned unless passthrough is on', () => 
   assert.notEqual(out.system, body.system)
 })
 
-test('official entrypoint without exact identity line is cleaned unless passthrough is on', () => {
+test('official anchored vscode billing + identity is cleaned unless passthrough is on', () => {
   const body = {
-    system: 'cc_entrypoint=vscode\nFollow the workspace instructions.',
+    system: [
+      {
+        type: 'text',
+        text: `x-anthropic-billing-header: cc_version=2.1.241.${expectedFp('hi', '2.1.241')}; cc_entrypoint=claude-vscode;`,
+      },
+      { type: 'text', text: CRS_OFFICIAL_CLI_SYSTEM },
+    ],
     messages: [{ role: 'user', content: 'hi' }],
-    metadata: { user_id: { device_id: 'dev-1', session_id: 'sess-1' } },
+    metadata: { user_id: officialCcUserId(true) },
   }
-  const headers = {
-    'user-agent': 'claude-cli/2.1.241 (external, claude-vscode, agent-sdk/0.3.241)',
-  }
+  const headers = officialCcHeaders('claude-cli/2.1.241 (external, claude-vscode, agent-sdk/0.3.241)')
   assert.equal(looksLikeOfficialClaudeSystem(body.system), true)
   assert.equal(isOfficialClaudeCodeTraffic(headers, body), true)
   const kept = applyCrsUnofficialPersona(body, { headers, mode: 'rewrite', officialClient: true })
@@ -1753,16 +1769,12 @@ test('mergeIdentityIntoBilling keeps one billing line and drops standalone ident
 })
 
 function officialChildHeaders() {
-  return { 'user-agent': 'claude-cli/2.1.241 (external, sdk-cli)' }
+  return officialCcHeaders('claude-cli/2.1.241 (external, sdk-cli)')
 }
 
 function officialChildMeta() {
   return {
-    user_id: {
-      device_id: 'dev-child',
-      account_uuid: 'acc-child',
-      session_id: 'sess-child',
-    },
+    user_id: officialCcUserId(true),
   }
 }
 
@@ -1777,7 +1789,7 @@ test('Explore / Compact / web-search child hops are cleaned unless passthrough i
       system: [
         {
           type: 'text',
-          text: 'x-anthropic-billing-header: cc_version=2.1.241.abc; cc_entrypoint=sdk-cli;',
+          text: `x-anthropic-billing-header: cc_version=2.1.241.${expectedFp('hi', '2.1.241')}; cc_entrypoint=sdk-cli;`,
         },
         { type: 'text', text },
       ],
@@ -1842,7 +1854,7 @@ test('security monitor child hop is official', () => {
 })
 
 test('official prompt env message stays at a stable position across turns so the cache prefix survives', () => {
-  const opts = { mode: 'official_prompt', park: false }
+  const opts = { mode: 'official_full', park: false }
   const history = [
     { role: 'user', content: 'first question' },
     { role: 'assistant', content: 'first answer' },
@@ -1879,7 +1891,7 @@ test('persona environment respects directive-only turns and extends an existing 
   const render = (messages) =>
     applyCrsUnofficialPersona(
       { model: 'claude-opus-5-5', system: 'caller rules', messages },
-      { mode: 'official_prompt', park: false },
+      { mode: 'official_full', park: false },
     ).messages
   const withDirective = render([user, directive, assistant, user])
   assert.deepEqual(

@@ -27,12 +27,27 @@ test('claude-cli prefix treats vscode / cowork / desktop as official UA', () => 
   assert.equal(isOfficialClaudeUa('claude-cli/'), false)
 })
 
-test('official family UA stores protocol and still pins slot UA', () => {
+test('official family UA stores protocol and still pins slot UA (only when officialTraffic=true)', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-cc-desk-'))
   const identity = {
     userAgent: 'claude-cli/2.1.234 (external, cli)',
     fingerprint: { x_app: 'cli', stainless_os: 'Linux' },
   }
+  // V3: bare spoofed claude-cli UA without verified officialTraffic=true must NOT store or pass betas/conditional headers!
+  const spoofed = resolveCrsHeaders(
+    {
+      'user-agent': 'claude-cli/2.1.321 (external, cli)',
+      'anthropic-beta': 'foo-spoof-beta-2026,context-1m-2025-08-07',
+      'x-claude-code-agent-id': 'spoof-agent',
+    },
+    dir,
+    identity,
+    'claude-sonnet-5',
+  )
+  assert.doesNotMatch(String(spoofed['anthropic-beta'] || ''), /foo-spoof-beta-2026|context-1m/)
+  assert.equal(spoofed['x-claude-code-agent-id'], undefined)
+  assert.equal(fs.existsSync(path.join(dir, '.claude', 'kin-cc-headers.json')), false)
+
   const stored = resolveCrsHeaders(
     {
       'user-agent': 'claude-cli/2.1.241 (external, claude-vscode, agent-sdk/0.3.241)',
@@ -41,6 +56,7 @@ test('official family UA stores protocol and still pins slot UA', () => {
     dir,
     identity,
     'claude-sonnet-5',
+    { officialTraffic: true },
   )
   assert.equal(stored['user-agent'], 'claude-cli/2.1.234 (external, cli)')
   assert.doesNotMatch(stored['user-agent'], /claude-vscode|agent-sdk/)
@@ -88,6 +104,7 @@ test('official sonnet-5 keeps context-1m; others and unofficial drop it', () => 
     dir,
     null,
     'claude-sonnet-5',
+    { officialTraffic: true },
   )
   assert.match(String(officialSonnet['anthropic-beta'] || ''), /context-1m-2025-08-07/)
   const officialOpus = resolveCrsHeaders(
@@ -98,6 +115,7 @@ test('official sonnet-5 keeps context-1m; others and unofficial drop it', () => 
     dir,
     null,
     'claude-opus-5',
+    { officialTraffic: true },
   )
   assert.doesNotMatch(String(officialOpus['anthropic-beta'] || ''), /context-1m-2025-08-07/)
   const unofficial = resolveCrsHeaders(
@@ -223,9 +241,9 @@ test('unofficial inbound two-token beta does not leak; UA is Claude Code', () =>
   fs.rmSync(dir, { recursive: true, force: true })
 })
 
-test('official inbound does not persist device headers', () => {
+test('official inbound does not persist device headers (and bare UA without officialTraffic=true stores nothing)', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-cc-lock-'))
-  const wrote = storeAccountHeaders(dir, {
+  const req = {
     'user-agent': 'claude-cli/2.1.234 (external, cli)',
     'anthropic-version': '2023-06-01',
     'anthropic-beta': 'oauth-2025-04-20,claude-code-20250219',
@@ -233,7 +251,11 @@ test('official inbound does not persist device headers', () => {
     'x-stainless-arch': 'arm64',
     'x-claude-code-session-id': 'user-session-aaa',
     'accept-language': 'zh-CN,zh;q=0.9',
-  })
+  }
+  assert.equal(storeAccountHeaders(dir, req).stored, false)
+  assert.equal(fs.existsSync(path.join(dir, '.claude', 'kin-cc-headers.json')), false)
+
+  const wrote = storeAccountHeaders(dir, req, { officialTraffic: true })
   assert.equal(wrote.stored, true)
   const stored = JSON.parse(fs.readFileSync(path.join(dir, '.claude', 'kin-cc-headers.json'), 'utf8'))
   assert.equal(stored.headers['anthropic-beta'].includes('oauth-2025-04-20'), true)
@@ -431,6 +453,7 @@ test('official agent ids pass through and are not stored', () => {
     dir,
     identity,
     model,
+    { officialTraffic: true },
   )
   assert.equal(out['x-claude-code-agent-id'], 'agent-a')
   assert.equal(out['x-claude-code-parent-agent-id'], 'agent-parent')
@@ -447,6 +470,7 @@ test('official agent ids pass through and are not stored', () => {
     dir,
     identity,
     model,
+    { officialTraffic: true },
   )
   assert.equal(absent['x-claude-code-agent-id'], undefined)
   assert.equal(absent['x-claude-code-parent-agent-id'], undefined)

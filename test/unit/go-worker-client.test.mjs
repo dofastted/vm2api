@@ -7,6 +7,7 @@ import path from 'node:path'
 import {
   callGoWorker,
   finalizeWorkerPayload,
+  prepareWorkerPayload,
   streamGoWorker,
   workerEnvelope,
   workerHealth,
@@ -2545,3 +2546,98 @@ unixTest(
     assert.equal(new Set([r1.hopRequestId, r2.hopRequestId, r3.hopRequestId]).size, 3)
   },
 )
+
+test('V4: CRAG V4 happy-path and repaired retries never forward spoofed caller headers unless verified officialTraffic', async () => {
+  const exec = {
+    vmId: 'vm-v4',
+    homeDir: '/tmp/vm-v4-nonexistent',
+    vm: { id: 'vm-v4', dataplane: 'crag', crag_kernel_version: 'v2', claude: {} },
+    workerStatus: {
+      runtime_variant: 'crag-v2',
+      capabilities: ['generation_controls_v3', 'headless_claude_bridge_v1', 'native_handoff_v1'],
+    },
+  }
+  const spoofedHeaders = {
+    'user-agent': 'claude-cli/9.9.9 (external, local-agent)',
+    'x-app': 'cli-bg',
+    'x-client-request-id': 'spoof-req-1',
+    'x-claude-code-session-id': '11111111-1111-4111-8111-111111111111',
+    'x-claude-code-request-class': 'subagent',
+    'anthropic-beta': 'structured-outputs-2025-11-13,evil-beta-2026',
+  }
+  const baseBody = {
+    model: 'claude-sonnet-5-5',
+    max_tokens: 1024,
+    messages: [{ role: 'user', content: 'hi' }],
+  }
+
+  // 1. Happy path (nativeOwnsHeaders === true) with officialTraffic=false -> envelope.headers is omitted completely
+  const happySpoof = await workerEnvelope({
+    body: baseBody,
+    reqHeaders: spoofedHeaders,
+    exec,
+    routing: {},
+    stream: true,
+    cliHop: true,
+    cragPrint: true,
+    officialTraffic: false,
+    officialPassthrough: false,
+  })
+  assert.equal(happySpoof.envelope.headers, undefined)
+
+  // 2. Happy path when officialTraffic omitted -> fails closed (envelope.headers is undefined)
+  const happyDefault = await workerEnvelope({
+    body: baseBody,
+    reqHeaders: spoofedHeaders,
+    exec,
+    routing: {},
+    stream: true,
+    cliHop: true,
+    cragPrint: true,
+  })
+  assert.equal(happyDefault.envelope.headers, undefined)
+
+  // 3. Repaired retry (nativeOwnsHeaders === false) with officialTraffic=false -> never leaks spoofed UA/x-app/x-claude-code-*/beta
+  const repairedSpoof = prepareWorkerPayload({
+    body: baseBody,
+    reqHeaders: spoofedHeaders,
+    exec,
+    routing: {},
+    cliHop: true,
+    cragPrint: true,
+    repaired: true,
+    officialTraffic: false,
+    officialPassthrough: false,
+  })
+  assert.notEqual(repairedSpoof.headers['user-agent'], spoofedHeaders['user-agent'])
+  assert.notEqual(repairedSpoof.headers['x-app'], 'cli-bg')
+  assert.equal(repairedSpoof.headers['x-client-request-id'], undefined)
+  assert.equal(repairedSpoof.headers['x-claude-code-session-id'], undefined)
+  assert.equal(repairedSpoof.headers['x-claude-code-request-class'], undefined)
+  assert.doesNotMatch(String(repairedSpoof.headers['anthropic-beta'] || ''), /structured-outputs-2025-11-13|evil-beta/)
+
+  // 4. Verified officialTraffic=true -> forwards allowlisted caller trace headers cleanly through workerEnvelope
+  const verifiedOfficial = await workerEnvelope({
+    body: baseBody,
+    reqHeaders: {
+      'user-agent': 'claude-cli/2.1.321 (external, cli-bg)',
+      'x-app': 'cli-bg',
+      'x-client-request-id': 'creq-ok',
+      'x-claude-code-session-id': '11111111-1111-4111-8111-111111111111',
+      authorization: 'Bearer secret',
+    },
+    exec,
+    routing: {},
+    stream: true,
+    cliHop: true,
+    cragPrint: true,
+    officialTraffic: true,
+    officialPassthrough: true,
+  })
+  assert.deepEqual(verifiedOfficial.envelope.headers, {
+    'user-agent': 'claude-cli/2.1.321 (external, cli-bg)',
+    'x-app': 'cli-bg',
+    'x-client-request-id': 'creq-ok',
+    'x-claude-code-session-id': '11111111-1111-4111-8111-111111111111',
+  })
+})

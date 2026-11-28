@@ -4,6 +4,7 @@ import {
   DEFAULT_PERSONA_TEMPLATES,
   OVERLAY_TEMPLATE_KEYS,
   PERSONA_PRESETS,
+  canonicalPersonaCompat,
   parsePersonaTemplateLines,
   migrateLegacyOfficialTemplate,
   presetSeed,
@@ -35,13 +36,12 @@ export function seedText<K extends string>(
 }
 
 export function seedPersonaDrafts(compat: Compat): PersonaDrafts {
-  const stored = compat.persona_templates
-  const drafts = {
+  const stored = canonicalPersonaCompat(compat).persona_templates
+  const drafts: PersonaDrafts = {
     official: seedText(stored, DEFAULT_PERSONA_TEMPLATES, 'official'),
     official_full: seedText(stored, DEFAULT_PERSONA_TEMPLATES, 'official_full'),
     zero: seedText(stored, DEFAULT_PERSONA_TEMPLATES, 'zero'),
     custom: seedText(stored, DEFAULT_PERSONA_TEMPLATES, 'custom'),
-    official_303: seedText(stored, DEFAULT_PERSONA_TEMPLATES, 'official_303'),
   }
   const { blocks } = parsePersonaTemplateLines(drafts.official)
   drafts.official = stringifyPersonaTemplate(

@@ -1,16 +1,21 @@
 import { type ComponentProps, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link } from '@tanstack/react-router'
-import { ArrowRight } from 'lucide-react'
+import { ArrowRight, Plus, RefreshCw, X } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { Checkbox } from '@/components/ui/checkbox'
 import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
 import { SettingRow } from '@/components/setting-row'
 import {
   healthProbeQueryOptions,
   runHealthProbe,
+  type HealthCatalogModel,
+  type HealthModelSnapshotView,
+  type HealthProbePlatform,
   type HealthSnapshotView,
 } from '@/features/settings/queries'
 import { settleInt, typingInt } from './int-input'
@@ -27,8 +32,218 @@ type HealthPaneProps = {
   onCompatibilityChange: (next: Obj) => void
 }
 
+type PlatformDraft = {
+  enabled: boolean
+  interval_sec: number
+  cache_ttl_sec: number
+  all_models: boolean
+  models: string[]
+  probe_all_slots?: boolean
+}
+
+type PlatformMeta = {
+  id: HealthProbePlatform
+  name: string
+  cardTitle: string
+  subtitle: string
+  minInterval: number
+  minTtl: number
+  defaultInterval: number
+  defaultTtl: number
+  supportsAllSlots: boolean
+  allModelsDesc: string
+  emptyModelsHint: string
+  customPlaceholder: string
+}
+
+const PLATFORM_METAS: readonly PlatformMeta[] = [
+  {
+    id: 'anthropic',
+    name: 'Anthropic',
+    cardTitle: 'Anthropic 健康缓存',
+    subtitle: 'Claude 槽位 · 覆盖 /v1/messages 及映射入站的流式与非流式探测。',
+    minInterval: 30,
+    minTtl: 30,
+    defaultInterval: 600,
+    defaultTtl: 900,
+    supportsAllSlots: true,
+    allModelsDesc:
+      '开启后自动覆盖 Anthropic 模型矩阵中全部已启用模型（排除 auto 并按别名去重），新同步模型自动生效。',
+    emptyModelsHint: '未选择任何模型时，Anthropic 探测请求均直接进入调度池。',
+    customPlaceholder: '如 claude-sonnet-4-6',
+  },
+  {
+    id: 'openai',
+    name: 'OpenAI',
+    cardTitle: 'OpenAI 健康缓存',
+    subtitle:
+      'GPT / Codex 槽位 · 覆盖 /v1/responses 与 /v1/chat/completions 探测。',
+    minInterval: 30,
+    minTtl: 30,
+    defaultInterval: 600,
+    defaultTtl: 900,
+    supportsAllSlots: true,
+    allModelsDesc:
+      '开启后自动覆盖 OpenAI 模型矩阵中全部已启用对话模型（自动排除图像模型），新同步模型自动生效。',
+    emptyModelsHint: '未选择任何模型时，OpenAI 探测请求均直接进入调度池。',
+    customPlaceholder: '如 gpt-5.4',
+  },
+  {
+    id: 'google',
+    name: 'Google',
+    cardTitle: 'Google 健康缓存',
+    subtitle:
+      'Gemini 槽位 · 覆盖 Gemini 原生、OpenAI、Anthropic 协议的 Gemini 模型探测。',
+    minInterval: 60,
+    minTtl: 60,
+    defaultInterval: 3600,
+    defaultTtl: 5400,
+    supportsAllSlots: false,
+    allModelsDesc:
+      '开启后自动覆盖 Google 模型矩阵中已启用且当前在线槽位支持的全部 Gemini 模型（自动跳过无账号支持的模型）。',
+    emptyModelsHint:
+      '未勾选具体模型时，将自动选取在线槽位中的轻量 Gemini 模型进行探测。',
+    customPlaceholder: '如 gemini-3-flash',
+  },
+] as const
+
 function obj(value: unknown): Obj {
-  return value && typeof value === 'object' ? (value as Obj) : {}
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Obj)
+    : {}
+}
+
+function normalizeModelIds(raw: unknown): string[] {
+  const list = Array.isArray(raw)
+    ? raw
+    : typeof raw === 'string'
+      ? raw.split(/[,，\n]+/)
+      : []
+  const out: string[] = []
+  const seen = new Set<string>()
+  for (const item of list) {
+    const id = String(item ?? '').trim()
+    const key = id.toLowerCase()
+    if (!key || seen.has(key)) continue
+    seen.add(key)
+    out.push(id)
+  }
+  return out
+}
+
+function hasExplicitPlatformBlocks(probe: Obj): boolean {
+  return (
+    (probe.anthropic != null && typeof probe.anthropic === 'object') ||
+    (probe.openai != null && typeof probe.openai === 'object') ||
+    (probe.google != null && typeof probe.google === 'object')
+  )
+}
+
+function readPlatformDraft(probe: Obj, meta: PlatformMeta): PlatformDraft {
+  const explicit = hasExplicitPlatformBlocks(probe)
+  const legacyEnabled = probe.enabled === true
+  const real = obj(probe.real)
+  const gemini = obj(probe.gemini)
+  const block = obj(probe[meta.id])
+  const hasBlock = probe[meta.id] != null && typeof probe[meta.id] === 'object'
+
+  if (meta.id === 'anthropic') {
+    const fallbackModels = normalizeModelIds(
+      real.model ? [real.model] : ['claude-haiku-4-5']
+    )
+    const models =
+      hasBlock && 'models' in block
+        ? normalizeModelIds(block.models)
+        : fallbackModels
+    return {
+      enabled: hasBlock
+        ? block.enabled === true
+        : explicit
+          ? false
+          : legacyEnabled,
+      interval_sec: Number(
+        block.interval_sec ??
+          (explicit
+            ? meta.defaultInterval
+            : (probe.interval_sec ?? meta.defaultInterval))
+      ),
+      cache_ttl_sec: Number(
+        block.cache_ttl_sec ??
+          (explicit
+            ? meta.defaultTtl
+            : (probe.cache_ttl_sec ?? probe.max_stale_sec ?? meta.defaultTtl))
+      ),
+      all_models: block.all_models === true,
+      models,
+      probe_all_slots: hasBlock
+        ? block.probe_all_slots === true
+        : explicit
+          ? false
+          : probe.probe_all_slots === true,
+    }
+  }
+
+  if (meta.id === 'openai') {
+    const fallbackModels = normalizeModelIds(
+      real.openai_model ? [real.openai_model] : []
+    )
+    const models =
+      hasBlock && 'models' in block
+        ? normalizeModelIds(block.models)
+        : fallbackModels
+    return {
+      enabled: hasBlock
+        ? block.enabled === true
+        : explicit
+          ? false
+          : legacyEnabled && models.length > 0,
+      interval_sec: Number(
+        block.interval_sec ??
+          (explicit
+            ? meta.defaultInterval
+            : (probe.interval_sec ?? meta.defaultInterval))
+      ),
+      cache_ttl_sec: Number(
+        block.cache_ttl_sec ??
+          (explicit
+            ? meta.defaultTtl
+            : (probe.cache_ttl_sec ?? probe.max_stale_sec ?? meta.defaultTtl))
+      ),
+      all_models: block.all_models === true,
+      models,
+      probe_all_slots: hasBlock
+        ? block.probe_all_slots === true
+        : explicit
+          ? false
+          : probe.probe_all_slots === true,
+    }
+  }
+
+  const fallbackModels =
+    'models' in gemini
+      ? normalizeModelIds(gemini.models)
+      : normalizeModelIds(gemini.model ? [gemini.model] : [])
+  const models =
+    hasBlock && 'models' in block
+      ? normalizeModelIds(block.models)
+      : fallbackModels
+  return {
+    enabled: hasBlock
+      ? block.enabled === true
+      : explicit
+        ? false
+        : legacyEnabled && gemini.enabled !== false,
+    interval_sec: Number(
+      block.interval_sec ?? gemini.interval_sec ?? meta.defaultInterval
+    ),
+    cache_ttl_sec: Number(
+      block.cache_ttl_sec ?? gemini.cache_ttl_sec ?? meta.defaultTtl
+    ),
+    all_models: hasBlock
+      ? block.all_models === true
+      : gemini.all_models === true,
+    models,
+  }
 }
 
 /**
@@ -82,13 +297,8 @@ export function HealthPane(props: HealthPaneProps) {
     onCompatibilityChange,
   } = props
   const probe = obj(healthProbe)
-  const real = obj(probe.real)
-  const gemini = obj(probe.gemini)
   const minTokens = obj(compatibility.min_max_tokens)
   const setProbe = (patch: Obj) => onHealthProbeChange({ ...probe, ...patch })
-  const setReal = (patch: Obj) => setProbe({ real: { ...real, ...patch } })
-  const setGemini = (patch: Obj) =>
-    setProbe({ gemini: { ...gemini, ...patch } })
   const minTokensMode = String(minTokens.mode ?? minTokens.tier ?? '').trim()
   const explicitFloor = ['floor', 'default', 'raise'].includes(minTokensMode)
   // Match the backend: an explicit mode takes precedence over legacy flags.
@@ -195,209 +405,614 @@ export function HealthPane(props: HealthPaneProps) {
           </SettingRow>
         </CardContent>
       </Card>
-      <HealthCacheCard
+      <PlatformHealthCacheSection
         probe={probe}
-        real={real}
-        gemini={gemini}
-        onProbeChange={setProbe}
-        onRealChange={setReal}
-        onGeminiChange={setGemini}
+        onProbeReplace={onHealthProbeChange}
       />
       <SignatureRepairCard failover={failover} />
     </>
   )
 }
 
-function HealthCacheCard({
+function PlatformHealthCacheSection({
   probe,
-  real,
-  gemini,
-  onProbeChange,
-  onRealChange,
-  onGeminiChange,
+  onProbeReplace,
 }: {
   probe: Obj
-  real: Obj
-  gemini: Obj
-  onProbeChange: (patch: Obj) => void
-  onRealChange: (patch: Obj) => void
-  onGeminiChange: (patch: Obj) => void
+  onProbeReplace: (next: Obj) => void
 }) {
   const queryClient = useQueryClient()
   const status = useQuery(healthProbeQueryOptions())
+  const [probingTarget, setProbingTarget] = useState<string | null>(null)
   const probeNow = useMutation({
-    mutationFn: (platform: 'all' | 'gemini') => runHealthProbe(platform),
+    mutationFn: ({
+      platform,
+      model,
+    }: {
+      platform: 'all' | HealthProbePlatform
+      model?: string
+    }) => runHealthProbe(platform, model),
+    onMutate: ({ platform, model }) => {
+      setProbingTarget(model ? `${platform}:${model}` : platform)
+    },
     onSuccess: (data) => {
       queryClient.setQueryData(['panel', 'health-probe'], data)
     },
+    onSettled: () => {
+      setProbingTarget(null)
+    },
   })
+
+  const drafts: Record<HealthProbePlatform, PlatformDraft> = {
+    anthropic: readPlatformDraft(probe, PLATFORM_METAS[0]),
+    openai: readPlatformDraft(probe, PLATFORM_METAS[1]),
+    google: readPlatformDraft(probe, PLATFORM_METAS[2]),
+  }
+
+  const updatePlatform = (
+    platform: HealthProbePlatform,
+    patch: Partial<PlatformDraft>
+  ) => {
+    const nextDrafts: Record<HealthProbePlatform, PlatformDraft> = {
+      ...drafts,
+      [platform]: { ...drafts[platform], ...patch },
+    }
+    const baseAnthropic = { ...obj(probe.anthropic), ...nextDrafts.anthropic }
+    const baseOpenai = { ...obj(probe.openai), ...nextDrafts.openai }
+    const baseGoogle = { ...obj(probe.google), ...nextDrafts.google }
+    const anyEnabled =
+      nextDrafts.anthropic.enabled ||
+      nextDrafts.openai.enabled ||
+      nextDrafts.google.enabled
+    onProbeReplace({
+      ...probe,
+      enabled: anyEnabled,
+      interval_sec: nextDrafts.anthropic.interval_sec,
+      cache_ttl_sec: nextDrafts.anthropic.cache_ttl_sec,
+      max_stale_sec: nextDrafts.anthropic.cache_ttl_sec,
+      probe_all_slots: nextDrafts.anthropic.probe_all_slots === true,
+      anthropic: baseAnthropic,
+      openai: baseOpenai,
+      google: baseGoogle,
+      real: {
+        ...obj(probe.real),
+        model: nextDrafts.anthropic.models[0] || 'claude-haiku-4-5',
+        openai_model: nextDrafts.openai.models[0] || '',
+      },
+      gemini: {
+        ...obj(probe.gemini),
+        enabled: nextDrafts.google.enabled,
+        interval_sec: nextDrafts.google.interval_sec,
+        cache_ttl_sec: nextDrafts.google.cache_ttl_sec,
+        all_models: nextDrafts.google.all_models,
+        models: nextDrafts.google.models,
+        model: nextDrafts.google.models[0] || '',
+      },
+    })
+  }
+
   const snaps = status.data?.snapshots
+  const catalog = status.data?.catalog
+  const enabledCount = PLATFORM_METAS.filter((m) => drafts[m.id].enabled).length
+
+  return (
+    <div className='space-y-3'>
+      <Card>
+        <CardHeader className='flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between'>
+          <div className='space-y-1'>
+            <div className='flex items-center gap-2'>
+              <CardTitle>多平台健康缓存探测</CardTitle>
+              <Badge variant={enabledCount > 0 ? 'default' : 'secondary'}>
+                已启用 {enabledCount}/3 平台
+              </Badge>
+            </div>
+            <p className='text-xs text-muted-foreground'>
+              Anthropic、OpenAI、Google
+              三个平台各自独立开关、独立定时串行探测并按模型分别缓存。
+              命中同模型有效缓存直接回放，未配置或探测失败的模型自动透传至真实调度池。
+            </p>
+          </div>
+          <Button
+            type='button'
+            size='sm'
+            variant='outline'
+            disabled={probeNow.isPending}
+            onClick={() => probeNow.mutate({ platform: 'all' })}
+          >
+            <RefreshCw
+              className={`mr-1.5 size-3.5 ${probingTarget === 'all' ? 'animate-spin' : ''}`}
+              aria-hidden
+            />
+            {probingTarget === 'all' ? '探测中…' : '立即探测全部'}
+          </Button>
+        </CardHeader>
+      </Card>
+
+      {PLATFORM_METAS.map((meta) => {
+        const snap =
+          meta.id === 'google'
+            ? snaps?.google || snaps?.gemini
+            : snaps?.[meta.id]
+        return (
+          <PlatformHealthCard
+            key={meta.id}
+            meta={meta}
+            draft={drafts[meta.id]}
+            snapshot={snap}
+            catalog={catalog?.[meta.id] || []}
+            probingTarget={probingTarget}
+            isMutating={probeNow.isPending}
+            onChange={(patch) => updatePlatform(meta.id, patch)}
+            onProbePlatform={() => probeNow.mutate({ platform: meta.id })}
+            onProbeModel={(model) =>
+              probeNow.mutate({ platform: meta.id, model })
+            }
+          />
+        )
+      })}
+    </div>
+  )
+}
+
+function PlatformStatusBadge({
+  enabled,
+  snapshot,
+}: {
+  enabled: boolean
+  snapshot: HealthSnapshotView | undefined
+}) {
+  if (!enabled) {
+    return <Badge variant='secondary'>已关闭</Badge>
+  }
+  if (snapshot?.probing) {
+    return <Badge variant='outline'>探测中…</Badge>
+  }
+  const total = snapshot?.total_models ?? 0
+  const ok = snapshot?.ok_models ?? 0
+  const failed = snapshot?.failed_models ?? 0
+  if (total > 0) {
+    const tone =
+      ok === total
+        ? 'default'
+        : ok > 0
+          ? 'secondary'
+          : failed > 0
+            ? 'destructive'
+            : 'secondary'
+    return (
+      <Badge variant={tone}>
+        可用 {ok}/{total}
+      </Badge>
+    )
+  }
+  if (snapshot?.at) {
+    return (
+      <Badge
+        variant={
+          snapshot.ok ? 'default' : snapshot.error ? 'destructive' : 'secondary'
+        }
+      >
+        {snapshot.ok ? '可用' : snapshot.error ? '失败' : '已过期'}
+      </Badge>
+    )
+  }
+  return <Badge variant='outline'>待探测</Badge>
+}
+
+function PlatformHealthCard({
+  meta,
+  draft,
+  snapshot,
+  catalog,
+  probingTarget,
+  isMutating,
+  onChange,
+  onProbePlatform,
+  onProbeModel,
+}: {
+  meta: PlatformMeta
+  draft: PlatformDraft
+  snapshot: HealthSnapshotView | undefined
+  catalog: HealthCatalogModel[]
+  probingTarget: string | null
+  isMutating: boolean
+  onChange: (patch: Partial<PlatformDraft>) => void
+  onProbePlatform: () => void
+  onProbeModel: (model: string) => void
+}) {
+  const [customModel, setCustomModel] = useState('')
+  const selectedLower = new Set(draft.models.map((m) => m.toLowerCase()))
+  const catalogIdsLower = new Set(catalog.map((c) => c.id.toLowerCase()))
+  const customOnlyModels = draft.models.filter(
+    (m) => !catalogIdsLower.has(m.toLowerCase())
+  )
+  const effectiveAllCatalog =
+    meta.id === 'google' && catalog.some((c) => c.online !== undefined)
+      ? catalog.filter((c) => c.online === true)
+      : catalog
+
+  const toggleModel = (id: string, checked: boolean) => {
+    const lower = id.toLowerCase()
+    if (checked) {
+      if (selectedLower.has(lower)) return
+      onChange({ models: [...draft.models, id] })
+    } else {
+      onChange({
+        models: draft.models.filter((m) => m.toLowerCase() !== lower),
+      })
+    }
+  }
+
+  const addCustomModel = () => {
+    const trimmed = customModel.trim()
+    if (!trimmed) return
+    const next = normalizeModelIds([...draft.models, trimmed])
+    onChange({ models: next })
+    setCustomModel('')
+  }
+
+  const selectAllCatalog = () => {
+    const ids = effectiveAllCatalog.map((m) => m.id)
+    onChange({ models: normalizeModelIds([...draft.models, ...ids]) })
+  }
+
+  const modelSnaps = snapshot?.models || []
+  const isThisPlatformProbing =
+    probingTarget === meta.id || snapshot?.probing === true
+
   return (
     <Card>
-      <CardHeader>
-        <CardTitle>健康缓存</CardTitle>
-        <p className='text-xs text-muted-foreground'>
-          定时用真实槽位跑一次对话并缓存结果。渠道或账号测试发出的简短 hi / ping
-          探测请求直接回放缓存，覆盖 Messages、Chat、Responses、Gemini
-          的流式和非流式。
-        </p>
+      <CardHeader className='flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between'>
+        <div className='space-y-1'>
+          <div className='flex flex-wrap items-center gap-2'>
+            <CardTitle>{meta.cardTitle}</CardTitle>
+            <PlatformStatusBadge enabled={draft.enabled} snapshot={snapshot} />
+          </div>
+          <p className='text-xs text-muted-foreground'>{meta.subtitle}</p>
+        </div>
+        <Button
+          type='button'
+          size='sm'
+          variant='outline'
+          disabled={isMutating}
+          aria-label={`立即探测 ${meta.name}`}
+          onClick={onProbePlatform}
+        >
+          <RefreshCw
+            className={`mr-1.5 size-3.5 ${isThisPlatformProbing ? 'animate-spin' : ''}`}
+            aria-hidden
+          />
+          {isThisPlatformProbing ? '探测中…' : '立即探测'}
+        </Button>
       </CardHeader>
       <CardContent className='divide-y'>
-        <SettingRow label='启用' desc='关闭时探测请求照常进入调度'>
+        <SettingRow
+          label={`启用 ${meta.name} 健康缓存`}
+          desc='关闭时该平台的探测请求照常进入真实调度池'
+        >
           <Switch
-            checked={probe.enabled === true}
-            onCheckedChange={(checked) => onProbeChange({ enabled: checked })}
-            aria-label='启用健康缓存'
+            checked={draft.enabled}
+            onCheckedChange={(checked) => onChange({ enabled: checked })}
+            aria-label={`启用 ${meta.name} 健康缓存`}
           />
         </SettingRow>
-        <SettingRow label='探测间隔' desc='秒，30–86400'>
+
+        <SettingRow
+          label={`${meta.name} 探测间隔`}
+          desc={`秒，${meta.minInterval}–86400，默认 ${meta.defaultInterval}`}
+        >
           <DeferredIntInput
             className='w-28'
-            min={30}
+            min={meta.minInterval}
             max={86400}
-            fallback={600}
-            value={Number(probe.interval_sec ?? 600)}
-            onCommit={(next) => onProbeChange({ interval_sec: next })}
-            aria-label='探测间隔'
+            fallback={meta.defaultInterval}
+            value={draft.interval_sec}
+            onCommit={(next) => onChange({ interval_sec: next })}
+            aria-label={`${meta.name} 探测间隔`}
           />
         </SettingRow>
+
         <SettingRow
-          label='全号轮询'
-          desc='每个间隔对所有可调度槽按顺序逐个各探一次（严格串行、不并发，受工作时段、冷却与凭证排除约束）。列表中首个成功的结果仍写入健康缓存；关闭时探测到第一个可用槽即停止。'
+          label={`${meta.name} 缓存有效期`}
+          desc={`秒，${meta.minTtl}–172800，默认 ${meta.defaultTtl}；过期后该模型探测请求照常进入调度`}
         >
-          <Switch
-            checked={probe.probe_all_slots === true}
-            onCheckedChange={(checked) =>
-              onProbeChange({ probe_all_slots: checked })
-            }
-            aria-label='全号轮询'
-          />
-        </SettingRow>
-        <SettingRow label='缓存有效期' desc='秒，过期后探测请求照常进入调度'>
           <DeferredIntInput
             className='w-28'
-            min={30}
+            min={meta.minTtl}
             max={172800}
-            fallback={900}
-            value={Number(probe.cache_ttl_sec ?? 900)}
-            onCommit={(next) => onProbeChange({ cache_ttl_sec: next })}
-            aria-label='缓存有效期'
+            fallback={meta.defaultTtl}
+            value={draft.cache_ttl_sec}
+            onCommit={(next) => onChange({ cache_ttl_sec: next })}
+            aria-label={`${meta.name} 缓存有效期`}
           />
         </SettingRow>
-        <SettingRow label='Claude 探测模型' desc='在 Claude 槽上跑真实探测'>
-          <Input
-            className='w-56'
-            value={String(real.model ?? 'claude-haiku-4-5')}
-            onChange={(event) => onRealChange({ model: event.target.value })}
-            aria-label='Claude 探测模型'
-          />
-        </SettingRow>
-        <SettingRow
-          label='GPT 探测模型'
-          desc='在 GPT 槽上跑真实探测。留空则 GPT 模型的探测请求不走缓存。'
-        >
-          <Input
-            className='w-56'
-            placeholder='gpt-5.4'
-            value={String(real.openai_model ?? '')}
-            onChange={(event) =>
-              onRealChange({ openai_model: event.target.value })
-            }
-            aria-label='GPT 探测模型'
-          />
-        </SettingRow>
-        <SettingRow
-          label='Gemini 健康缓存'
-          desc='开启健康缓存后，Gemini 系列模型按独立间隔定时探测，匹配的探测请求统一返回缓存值。'
-        >
+
+        {meta.supportsAllSlots ? (
+          <SettingRow
+            label={`${meta.name} 全号轮询`}
+            desc='每个间隔对该平台支持对应模型的可调度槽按顺序逐槽探测（严格串行不并发）；关闭时首个成功槽即写入该模型缓存。'
+          >
+            <Switch
+              checked={draft.probe_all_slots === true}
+              onCheckedChange={(checked) =>
+                onChange({ probe_all_slots: checked })
+              }
+              aria-label={`${meta.name} 全号轮询`}
+            />
+          </SettingRow>
+        ) : null}
+
+        <SettingRow label='一键支持全部模型' desc={meta.allModelsDesc}>
           <Switch
-            checked={gemini.enabled !== false}
-            onCheckedChange={(checked) => onGeminiChange({ enabled: checked })}
-            aria-label='启用 Gemini 健康缓存'
+            checked={draft.all_models}
+            onCheckedChange={(checked) => onChange({ all_models: checked })}
+            aria-label={`${meta.name} 一键支持全部模型`}
           />
         </SettingRow>
-        <SettingRow
-          label='Gemini 探测间隔'
-          desc='秒，60–86400，默认 3600（每 1 小时探测一次）'
-        >
-          <DeferredIntInput
-            className='w-28'
-            min={60}
-            max={86400}
-            fallback={3600}
-            value={Number(gemini.interval_sec ?? 3600)}
-            onCommit={(next) => onGeminiChange({ interval_sec: next })}
-            aria-label='Gemini 探测间隔'
-          />
-        </SettingRow>
-        <SettingRow
-          label='Gemini 缓存有效期'
-          desc='秒，60–172800，默认 5400；过期后探测请求照常进入调度'
-        >
-          <DeferredIntInput
-            className='w-28'
-            min={60}
-            max={172800}
-            fallback={5400}
-            value={Number(gemini.cache_ttl_sec ?? 5400)}
-            onCommit={(next) => onGeminiChange({ cache_ttl_sec: next })}
-            aria-label='Gemini 缓存有效期'
-          />
-        </SettingRow>
-        <SettingRow
-          label='Gemini 探测模型'
-          desc='指定 Gemini 定时探测所用模型；留空则自动选取已授权 Gemini 槽位中的轻量模型。'
-        >
-          <Input
-            className='w-56'
-            placeholder='留空自动选择'
-            value={String(gemini.model ?? '')}
-            onChange={(event) => onGeminiChange({ model: event.target.value })}
-            aria-label='Gemini 探测模型'
-          />
-        </SettingRow>
-        <SettingRow label='最近快照'>
-          <div className='flex flex-col items-end gap-1.5 text-xs'>
-            <SnapshotLine label='Claude' snap={snaps?.anthropic} />
-            <SnapshotLine label='GPT' snap={snaps?.openai} />
-            <SnapshotLine label='Gemini' snap={snaps?.gemini} />
-            <Button
-              type='button'
-              size='sm'
-              variant='outline'
-              disabled={probeNow.isPending}
-              onClick={() => probeNow.mutate('all')}
-            >
-              {probeNow.isPending ? '探测中…' : '立即探测'}
-            </Button>
+
+        <div className='space-y-3 py-3.5'>
+          <div className='flex flex-wrap items-center justify-between gap-2'>
+            <div>
+              <div className='text-sm font-medium'>{meta.name} 探测模型</div>
+              <p className='text-xs text-muted-foreground'>
+                {draft.all_models
+                  ? effectiveAllCatalog.length
+                    ? `当前自动覆盖 ${effectiveAllCatalog.length} 个已启用模型（严格串行逐个探测）。`
+                    : '已开启全模型模式，探测时将动态读取模型矩阵中全部已启用模型。'
+                  : draft.models.length
+                    ? `已选 ${draft.models.length} 个模型，未选模型探测请求将直接透传。`
+                    : meta.emptyModelsHint}
+              </p>
+            </div>
+            {!draft.all_models ? (
+              <div className='flex flex-wrap gap-1.5'>
+                <Button
+                  type='button'
+                  size='sm'
+                  variant='ghost'
+                  disabled={effectiveAllCatalog.length === 0}
+                  onClick={selectAllCatalog}
+                >
+                  全选目录
+                </Button>
+                <Button
+                  type='button'
+                  size='sm'
+                  variant='ghost'
+                  disabled={draft.models.length === 0}
+                  onClick={() => onChange({ models: [] })}
+                >
+                  清空
+                </Button>
+              </div>
+            ) : null}
           </div>
-        </SettingRow>
+
+          {draft.all_models ? (
+            effectiveAllCatalog.length > 0 ? (
+              <div className='flex flex-wrap gap-1.5'>
+                {effectiveAllCatalog.map((m) => (
+                  <Badge
+                    key={m.id}
+                    variant='secondary'
+                    className='font-mono text-[11px] font-normal'
+                    title={m.label !== m.id ? m.label : undefined}
+                  >
+                    {m.id}
+                  </Badge>
+                ))}
+              </div>
+            ) : null
+          ) : (
+            <div className='space-y-3'>
+              {catalog.length > 0 ? (
+                <div className='grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-3'>
+                  {catalog.map((m) => {
+                    const checked = selectedLower.has(m.id.toLowerCase())
+                    const inputId = `health-model-${meta.id}-${m.id}`
+                    const offline = m.online === false
+                    return (
+                      <div
+                        key={m.id}
+                        className={`flex items-center gap-2 rounded-md border px-2.5 py-1.5 text-xs ${
+                          checked
+                            ? 'border-primary/40 bg-primary/5'
+                            : 'border-border/60'
+                        } ${offline ? 'opacity-65' : ''}`}
+                      >
+                        <Checkbox
+                          id={inputId}
+                          checked={checked}
+                          onCheckedChange={(v) => toggleModel(m.id, v === true)}
+                        />
+                        <Label
+                          htmlFor={inputId}
+                          className='flex min-w-0 flex-1 cursor-pointer flex-col gap-0.5 font-normal'
+                        >
+                          <span className='truncate font-mono text-[11px]'>
+                            {m.id}
+                          </span>
+                          {m.label && m.label !== m.id ? (
+                            <span className='truncate text-[10px] text-muted-foreground'>
+                              {m.label}
+                              {offline ? ' · 暂无在线槽位' : ''}
+                            </span>
+                          ) : offline ? (
+                            <span className='text-[10px] text-muted-foreground'>
+                              暂无在线槽位
+                            </span>
+                          ) : null}
+                        </Label>
+                      </div>
+                    )
+                  })}
+                </div>
+              ) : (
+                <p className='text-xs text-muted-foreground'>
+                  模型目录加载中或为空，可直接输入模型 ID
+                  或先前往「模型」页同步目录。
+                </p>
+              )}
+
+              {customOnlyModels.length > 0 ? (
+                <div className='flex flex-wrap items-center gap-1.5'>
+                  <span className='text-xs text-muted-foreground'>
+                    自定义：
+                  </span>
+                  {customOnlyModels.map((id) => (
+                    <Badge
+                      key={id}
+                      variant='outline'
+                      className='gap-1 font-mono text-[11px] font-normal'
+                    >
+                      <span>{id}</span>
+                      <button
+                        type='button'
+                        className='rounded-sm hover:text-destructive focus:ring-1 focus:ring-ring focus:outline-none'
+                        aria-label={`移除模型 ${id}`}
+                        onClick={() => toggleModel(id, false)}
+                      >
+                        <X className='size-3' aria-hidden />
+                      </button>
+                    </Badge>
+                  ))}
+                </div>
+              ) : null}
+
+              <div className='flex max-w-md gap-2'>
+                <Input
+                  value={customModel}
+                  placeholder={meta.customPlaceholder}
+                  aria-label={`添加 ${meta.name} 探测模型`}
+                  onChange={(event) => setCustomModel(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter') {
+                      event.preventDefault()
+                      addCustomModel()
+                    }
+                  }}
+                />
+                <Button
+                  type='button'
+                  size='sm'
+                  variant='outline'
+                  disabled={!customModel.trim()}
+                  onClick={addCustomModel}
+                >
+                  <Plus className='mr-1 size-3.5' aria-hidden />
+                  添加
+                </Button>
+              </div>
+            </div>
+          )}
+        </div>
+
+        <div className='space-y-2 py-3.5'>
+          <div className='flex flex-wrap items-center justify-between gap-2 text-xs'>
+            <span className='font-medium text-foreground'>
+              {meta.name} 模型快照
+            </span>
+            <span className='text-muted-foreground'>
+              {modelSnaps.length > 0
+                ? `可用 ${snapshot?.ok_models ?? 0} · 失败 ${snapshot?.failed_models ?? 0} · 过期 ${snapshot?.stale_models ?? 0}`
+                : `${meta.name}：暂无`}
+            </span>
+          </div>
+          {modelSnaps.length > 0 ? (
+            <div className='divide-y rounded-md border'>
+              {modelSnaps.map((item) => (
+                <ModelSnapshotRow
+                  key={item.model || 'unknown'}
+                  platform={meta.id}
+                  item={item}
+                  probing={
+                    probingTarget === `${meta.id}:${item.model || ''}` ||
+                    isThisPlatformProbing
+                  }
+                  disabled={isMutating}
+                  onReprobe={() => {
+                    if (item.model) onProbeModel(item.model)
+                  }}
+                />
+              ))}
+            </div>
+          ) : null}
+        </div>
       </CardContent>
     </Card>
   )
 }
 
-function SnapshotLine({
-  label,
-  snap,
+function ModelSnapshotRow({
+  platform,
+  item,
+  probing,
+  disabled,
+  onReprobe,
 }: {
-  label: string
-  snap: HealthSnapshotView | undefined
+  platform: HealthProbePlatform
+  item: HealthModelSnapshotView
+  probing: boolean
+  disabled: boolean
+  onReprobe: () => void
 }) {
-  if (!snap?.at) {
-    return <span className='text-muted-foreground'>{label}：暂无</span>
-  }
-  const tone = snap.ok ? 'default' : snap.error ? 'destructive' : 'secondary'
-  const text = snap.ok ? '可用' : snap.error ? '失败' : '已过期'
+  const tone = !item.at
+    ? 'outline'
+    : item.ok
+      ? 'default'
+      : item.error
+        ? 'destructive'
+        : 'secondary'
+  const statusText = !item.at
+    ? '未探测'
+    : item.ok
+      ? '可用'
+      : item.error
+        ? '失败'
+        : '已过期'
+  const detailErr = item.error || item.last_error || undefined
+
   return (
-    <span className='flex items-center gap-2'>
-      <span className='text-muted-foreground'>
-        {label} · {snap.vm_id || '—'} · {snap.model || '—'}
-      </span>
-      <Badge variant={tone} title={snap.error || undefined}>
-        {text}
-      </Badge>
-    </span>
+    <div className='flex flex-wrap items-center justify-between gap-2 px-3 py-2 text-xs'>
+      <div className='min-w-0 flex-1 space-y-0.5'>
+        <div className='flex flex-wrap items-center gap-2'>
+          <span className='font-mono font-medium'>{item.model || '—'}</span>
+          <span className='text-muted-foreground'>{item.vm_id || '—'}</span>
+          {item.duration_ms != null ? (
+            <span className='text-muted-foreground'>{item.duration_ms}ms</span>
+          ) : null}
+        </div>
+        {detailErr ? (
+          <p
+            className='truncate text-[11px] text-destructive'
+            title={detailErr}
+          >
+            {detailErr}
+          </p>
+        ) : null}
+      </div>
+      <div className='flex items-center gap-2'>
+        <Badge variant={tone} title={detailErr}>
+          {statusText}
+        </Badge>
+        {item.model ? (
+          <Button
+            type='button'
+            size='sm'
+            variant='ghost'
+            className='h-7 px-2 text-xs'
+            disabled={disabled}
+            aria-label={`重新探测 ${platform} ${item.model}`}
+            onClick={onReprobe}
+          >
+            <RefreshCw
+              className={`size-3 ${probing ? 'animate-spin' : ''}`}
+              aria-hidden
+            />
+          </Button>
+        ) : null}
+      </div>
+    </div>
   )
 }
 

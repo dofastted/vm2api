@@ -113,7 +113,7 @@ export function cragV2Arch({
   return normalizeCragArch(arch)
 }
 
-function elfMachineArch(file) {
+export function elfMachineArch(file) {
   let fd
   try {
     const st = fs.lstatSync(file)

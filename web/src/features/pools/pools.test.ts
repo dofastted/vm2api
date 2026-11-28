@@ -16,6 +16,7 @@ import {
   formatExplainSummary,
   formatTtlLabel,
   isPromptLockedProvider,
+  normalizePoolPromptPreset,
   normalizeProviderScope,
   POOL_LOCKED_DEFAULTS,
   poolToDraft,
@@ -119,6 +120,18 @@ describe('v4 locked defaults & provider prompt lock', () => {
       })
     )
     expect(missingModeDraft.system_prompt_mode).toBe('inherit_global')
+
+    // Retired official_303 canonicalizes cleanly to official_full on read & payload build
+    expect(normalizePoolPromptPreset('official_303')).toBe('official_full')
+    expect(normalizePoolPromptPreset('official')).toBe('official')
+    expect(
+      poolToDraft(
+        makePool({
+          system_prompt_preset:
+            'official_303' as unknown as SchedulerPool['system_prompt_preset'],
+        })
+      ).system_prompt_preset
+    ).toBe('official_full')
   })
 
   it('locks openai and google (including gemini alias) pools to passthrough', () => {

@@ -534,3 +534,68 @@ test('Req 4: Periodic account status checker updates unschedulable errors, reple
   assert.equal(projected.account.error_message, 'OAuth token revoked (401)')
   assert.equal(projected.account.http_status, 401)
 })
+
+test('local bridge_disconnected 502 does not mark accounts unschedulable or cascade across entire pool (#1985)', async (t) => {
+  const mapped = mapCragWorkerError(502, {
+    code: 'bridge_disconnected',
+    error: 'native bridge disconnected',
+  })
+  assert.equal(mapped.code, 'gemini_inference_failed')
+  assert.equal(mapped.status, 502)
+  assert.equal(mapped.workerCode, 'bridge_disconnected')
+  assert.equal(mapped.bridgeDisconnected, true)
+
+  // Genuine upstream 502 is NOT flagged as bridgeDisconnected.
+  const real502 = mapCragWorkerError(502, {
+    code: 'upstream_error',
+    upstream_status: 502,
+    error: '502 bad gateway',
+  })
+  assert.equal(real502.bridgeDisconnected, undefined)
+
+  const envs = [makeEnv('env-bridge-a'), makeEnv('env-bridge-b'), makeEnv('env-bridge-c')]
+  const slotPrefs = createGeminiSlotPrefs()
+  const pool = new PoolScheduler()
+  pool.unitCircuit.configure({ failureThreshold: 1, openMs: 30_000 })
+  for (const env of envs) pool.unitCircuit.reset(`gemini:${env.id}`)
+  t.after(() => {
+    for (const env of envs) pool.unitCircuit.reset(`gemini:${env.id}`)
+  })
+  const stickyRouter = makeMemoryStickyRouter()
+  const routing = { gemini: mergeGeminiRouting(DEFAULT_GEMINI_ROUTING, { failover: { unschedulable_on_502: true } }) }
+  const calls = []
+
+  const scheduler = createGeminiScheduler({
+    schedulerRuntime: makeMockGeminiRuntime(),
+    slotPrefs,
+    poolScheduler: pool,
+    stickyRouter,
+    resolveProxy: () => 'socks5h://u:p@192.0.2.10:1080',
+    callHost: async (op, payload) => {
+      if (op === 'list') return { payload_state: 'installed', environments: envs }
+      if (op === 'get') return envs.find((e) => e.id === payload.id)
+      return {}
+    },
+    callHostStream: async (_op, payload) => {
+      calls.push(payload.id)
+      return sseResponse([JSON.stringify({ code: 'bridge_disconnected', error: 'native bridge disconnected' })], {
+        statusCode: 502,
+        contentType: 'application/json',
+      })
+    },
+    getRoutingConfig: () => routing,
+  })
+
+  await assert.rejects(
+    () => scheduler.complete({ model: 'gemini-3-pro', text: 'trigger bridge disconnect', stickyKey: 'k1:bridge' }),
+    (err) => err?.code === 'gemini_inference_failed',
+  )
+
+  // At most 2 attempts (initial + 1 failover), never cascading to env-bridge-c.
+  assert.deepEqual(calls, ['env-bridge-a', 'env-bridge-b'])
+  // Zero accounts marked unschedulable and zero circuits tripped.
+  for (const env of envs) {
+    assert.equal(slotPrefs.resolved(env.id).unschedulable, null, `${env.id} must stay schedulable`)
+    assert.equal(pool.unitCircuit.inspect(`gemini:${env.id}`).ok, true, `${env.id} circuit must stay closed`)
+  }
+})

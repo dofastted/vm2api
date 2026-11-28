@@ -396,7 +396,7 @@ import {
 } from '../vm/crag-license.mjs'
 import { applyNativeTelemetry } from '../vm/fleet-update.mjs'
 import { codexKernelHealth } from '../transport/codex-kernel-client.mjs'
-import { normalizeHealthProbeConfig } from './health-probe.mjs'
+import { listPlatformCatalogModels, normalizeHealthProbeConfig } from './health-probe.mjs'
 import { normalizeUsageProbeConfig } from '../oauth/usage-probe-monitor.mjs'
 import {
   isNotifyChannel,
@@ -4851,6 +4851,18 @@ export function createPanelHandler(ctx) {
           if (hasAuthScheme) {
             const vm = persistSlotAuthScheme(cfg.paths.project, id, body.auth_scheme || body.authScheme)
             if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+            try {
+              const host = slotHost(vm)
+              await (host.syncCredentials || host.onImport)?.(vm, path.join(cfg.paths.project, 'vms', id))
+            } catch (error) {
+              return json(res, 502, {
+                ok: false,
+                error: {
+                  code: 'credential_sync_failed',
+                  message: String(error?.message || 'failed to sync auth_scheme to slot'),
+                },
+              })
+            }
           }
           let slotPolicyResult = null
           if (hasSlotPolicy) {
@@ -7320,6 +7332,17 @@ export function createPanelHandler(ctx) {
         return json(res, 200, result)
       }
       if (req.method === 'GET' && p === '/api/panel/health-probe') {
+        let geminiCatalog = null
+        try {
+          if (typeof ctx.geminiScheduler?.catalog === 'function') {
+            geminiCatalog = await ctx.geminiScheduler.catalog()
+          }
+        } catch {}
+        const catalog = {
+          anthropic: listPlatformCatalogModels('anthropic'),
+          openai: listPlatformCatalogModels('openai'),
+          google: listPlatformCatalogModels('google', { geminiCatalog }),
+        }
         return json(
           res,
           200,
@@ -7327,6 +7350,7 @@ export function createPanelHandler(ctx) {
             config: ctx.healthMonitor?.getConfig?.() || ctx.routingConfig.health_probe,
             snapshot: ctx.healthMonitor?.getSnapshot?.() || null,
             snapshots: ctx.healthMonitor?.getSnapshots?.() || null,
+            catalog,
           }),
         )
       }
@@ -7334,7 +7358,19 @@ export function createPanelHandler(ctx) {
         const body = await readBody(req, 4096).catch(() => ({}))
         const platform =
           typeof body?.platform === 'string' && body.platform.trim() ? body.platform.trim().toLowerCase() : 'all'
-        const snapshot = await ctx.healthMonitor.runRealProbe({ platform })
+        const model = typeof body?.model === 'string' ? body.model.trim() : ''
+        const snapshot = await ctx.healthMonitor.runRealProbe({ platform, ...(model ? { model } : {}) })
+        let geminiCatalog = null
+        try {
+          if (typeof ctx.geminiScheduler?.catalog === 'function') {
+            geminiCatalog = await ctx.geminiScheduler.catalog()
+          }
+        } catch {}
+        const catalog = {
+          anthropic: listPlatformCatalogModels('anthropic'),
+          openai: listPlatformCatalogModels('openai'),
+          google: listPlatformCatalogModels('google', { geminiCatalog }),
+        }
         return json(
           res,
           200,
@@ -7342,6 +7378,7 @@ export function createPanelHandler(ctx) {
             config: ctx.healthMonitor.getConfig(),
             snapshot,
             snapshots: ctx.healthMonitor.getSnapshots?.() || null,
+            catalog,
           }),
         )
       }

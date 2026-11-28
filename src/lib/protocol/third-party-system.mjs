@@ -14,44 +14,26 @@
  * relocates their system; on rejects them at the gate with 403
  * claude_code_only before any slot is picked, so nothing is relocated.
  */
-import {
-  CRS_OFFICIAL_CLI_SYSTEM,
-  hasEnvironmentSection,
-  hasOfficialClaudeChildPrompt,
-  hasOfficialClaudeEntrypoint,
-  hasOfficialClaudeLine,
-  isKnownOfficialSystemText,
-  isOfficialClaudeSecurityMonitorPrompt,
-  looksLikeAgentPrompt,
-} from '../identity/crs-persona.mjs'
+import { CRS_OFFICIAL_CLI_SYSTEM, isKnownOfficialSystemText } from '../identity/crs-persona.mjs'
 import { claudeCodeOnlyFromRouting } from '../identity/claude-code-only.mjs'
-import { classifySystemText } from '../identity/official-profiles.mjs'
+import { findSecurityMonitorSystemBlock, isForeignOfficialSystemBlock } from '../identity/official-cc-verifier.mjs'
 
-function isForeignSystemBlock(block) {
-  const text = block?.text
-  if (block?.type !== 'text' || typeof text !== 'string' || !text.trim()) return false
-  // Agent prompts evolve independently of the identity and Environment blocks.
-  // The wire profile also has standalone harness, boundary and guidance blocks.
-  // Do not split an official-looking block: a suffix can be a new official section.
-  return !(
-    looksLikeAgentPrompt(text) ||
-    isKnownOfficialSystemText(text) ||
-    classifySystemText(text) !== 'other' ||
-    /^[ \t]*x-anthropic-billing-header:/im.test(text) ||
-    hasOfficialClaudeEntrypoint(text) ||
-    hasOfficialClaudeLine(text) ||
-    hasEnvironmentSection(text) ||
-    hasOfficialClaudeChildPrompt(text) ||
-    isOfficialClaudeSecurityMonitorPrompt(text)
-  )
+function isForeignSystemBlock(block, opts = {}) {
+  return isForeignOfficialSystemBlock(block, opts)
 }
 
 export function hasForeignSystemBlock(system) {
-  return systemBlocks(system).some(isForeignSystemBlock)
+  const isSecurityMonitor = findSecurityMonitorSystemBlock(system) !== null
+  return systemBlocks(system).some((block) => isForeignSystemBlock(block, { isSecurityMonitor }))
 }
 
-/** Third-party clients are admitted (and relocated) exactly when claude_code_only is off. */
-export function thirdPartyRelocateEnabled(routing = null) {
+/**
+ * Third-party clients are admitted (and relocated) when claude_code_only is off.
+ * V10: when `onlyForeign: true` (admitted official/hybrid client with a foreign
+ * appended block), relocation MUST stay enabled even when claude_code_only is on.
+ */
+export function thirdPartyRelocateEnabled(routing = null, { onlyForeign = false } = {}) {
+  if (onlyForeign === true) return true
   return !claudeCodeOnlyFromRouting(routing)
 }
 
@@ -82,11 +64,12 @@ function systemBlocks(system) {
  *   strip the official envelope while removing the appended block.
  */
 function splitSystem(system, { onlyForeign = false } = {}) {
+  const isSecurityMonitor = findSecurityMonitorSystemBlock(system) !== null
   const move = []
   for (const block of systemBlocks(system)) {
     if (!block || block.type !== 'text' || typeof block.text !== 'string') continue
     if (onlyForeign) {
-      if (!isForeignSystemBlock(block)) continue
+      if (!isForeignSystemBlock(block, { isSecurityMonitor })) continue
     } else if (!block.text.trim() || isKnownOfficialSystemText(block.text)) continue
     move.push(
       block.cache_control == null
@@ -99,6 +82,70 @@ function splitSystem(system, { onlyForeign = false } = {}) {
     )
   }
   return move
+}
+
+function isSystemMessageRole(role) {
+  const r = String(role || '')
+    .trim()
+    .toLowerCase()
+  return r === 'system' || r === 'developer'
+}
+
+/**
+ * V9: Extract text blocks from third-party `messages[].role === 'system' | 'developer'`
+ * turns so they relocate into `messages[0]` instead of leaking on CRAG V4 or lifting
+ * back into top-level `system[]` on cli-hop. Directive-only / non-text turns stay.
+ */
+function extractThirdPartySystemMessages(messages) {
+  const moved = []
+  const kept = []
+  for (const msg of messages) {
+    if (!msg || !isSystemMessageRole(msg.role)) {
+      kept.push(msg)
+      continue
+    }
+    const hasTurnControl = msg.output_config != null || msg.cache_control != null
+    if (typeof msg.content === 'string') {
+      if (msg.content.trim()) {
+        moved.push({ type: 'text', text: msg.content })
+        if (hasTurnControl) kept.push({ ...msg, content: [] })
+      } else {
+        kept.push(msg)
+      }
+      continue
+    }
+    if (Array.isArray(msg.content)) {
+      const remaining = []
+      let extractedAny = false
+      for (const block of msg.content) {
+        if (typeof block === 'string') {
+          if (block.trim()) {
+            moved.push({ type: 'text', text: block })
+            extractedAny = true
+          }
+        } else if (block && block.type === 'text' && typeof block.text === 'string') {
+          if (block.text.trim()) {
+            moved.push(
+              block.cache_control == null
+                ? { type: 'text', text: block.text }
+                : { type: 'text', text: block.text, cache_control: block.cache_control },
+            )
+            extractedAny = true
+          }
+        } else if (block != null) {
+          remaining.push(block)
+        }
+      }
+      if (!extractedAny) {
+        kept.push(msg)
+      } else if (remaining.length > 0 || hasTurnControl) {
+        kept.push({ ...msg, content: remaining })
+      }
+      continue
+    }
+    kept.push(msg)
+  }
+  return { moved, messages: kept }
 }
 
 function firstUserIndex(messages) {
@@ -115,9 +162,13 @@ function firstUserIndex(messages) {
 export function relocateThirdPartySystem(body, { onlyForeign = false } = {}) {
   const none = { body, moved: false, blocks: 0, chars: 0 }
   if (!body || typeof body !== 'object' || !Array.isArray(body.messages) || !body.messages.length) return none
-  const moved = splitSystem(body.system, { onlyForeign })
+  const movedFromSystem = splitSystem(body.system, { onlyForeign })
+  const fromMessages = onlyForeign
+    ? { moved: [], messages: body.messages.slice() }
+    : extractThirdPartySystemMessages(body.messages)
+  const moved = [...movedFromSystem, ...fromMessages.moved]
   if (!moved.length) return none
-  const messages = body.messages.slice()
+  const messages = fromMessages.messages.slice()
   const at = firstUserIndex(messages)
   const first = at >= 0 ? messages[at] : null
   if (first) {
@@ -132,12 +183,15 @@ export function relocateThirdPartySystem(body, { onlyForeign = false } = {}) {
     // No user turn to attach to; an alternation-safe one goes first.
     messages.unshift({ role: 'user', content: moved })
   }
+  const nextBody = {
+    ...body,
+    messages,
+  }
+  if (movedFromSystem.length > 0) {
+    nextBody.system = [{ type: 'text', text: CRS_OFFICIAL_CLI_SYSTEM }]
+  }
   return {
-    body: {
-      ...body,
-      system: [{ type: 'text', text: CRS_OFFICIAL_CLI_SYSTEM }],
-      messages,
-    },
+    body: nextBody,
     moved: true,
     blocks: moved.length,
     chars: moved.reduce((n, b) => n + b.text.length, 0),

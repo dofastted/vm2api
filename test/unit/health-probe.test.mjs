@@ -11,6 +11,10 @@ import {
   formatHealthSse,
   healthUnavailableError,
   selectHealthProbeTargets,
+  selectHealthProbeTargetsForModel,
+  canonicalHealthModelKey,
+  listPlatformCatalogModels,
+  resolvePlatformProbeModels,
   createHealthProbeMonitor,
   hasCachedMessage,
   HEALTH_REAL_HEADER,
@@ -145,8 +149,31 @@ test('official Claude Code is never a health shape', () => {
   assert.equal(isHealthShape(headers, body, cfg), false)
 })
 
-test('official UA skipped even without official body', () => {
-  assert.equal(isHealthShape({ 'user-agent': 'claude-cli/2.1.241 (external, sdk-cli)' }, hiBody, cfg), false)
+test('V13: bare official UA spoof is NOT skipped; complete verified CC headers or officialTraffic=true are skipped', () => {
+  assert.equal(isHealthShape({ 'user-agent': 'claude-cli/2.1.241 (external, sdk-cli)' }, hiBody, cfg), true)
+  assert.equal(
+    isHealthShape({ 'user-agent': 'claude-cli/2.1.241 (external, sdk-cli)' }, hiBody, cfg, 'anthropic.messages', {
+      officialTraffic: true,
+    }),
+    false,
+  )
+  const fullHeaders = {
+    'user-agent': 'claude-cli/2.1.321 (external, sdk-cli)',
+    'x-app': 'cli',
+    'anthropic-version': '2023-06-01',
+    'anthropic-dangerous-direct-browser-access': 'true',
+    'anthropic-beta': 'claude-code-20250219,interleaved-thinking-2025-05-14',
+    'x-stainless-lang': 'js',
+    'x-stainless-os': 'Linux',
+    'x-stainless-arch': 'x64',
+    'x-stainless-runtime': 'node',
+    'x-stainless-runtime-version': 'v26.12.1',
+    'x-stainless-package-version': '0.128.0',
+    'x-stainless-retry-count': '0',
+    'x-stainless-timeout': '600',
+    'x-claude-code-session-id': '11111111-2222-4333-8444-555555555555',
+  }
+  assert.equal(isHealthShape(fullHeaders, hiBody, cfg), false)
 })
 
 test('bypass header skips match', () => {
@@ -651,4 +678,262 @@ test('health probe streams include protocol-specific completion markers', () => 
 
   const msg = formatHealthSse('anthropic.messages', hiBody, snap, cfg)
   assert.match(msg, /event: message_stop/)
+})
+
+test('three platforms configure and toggle independently without cross-coupling', async () => {
+  const probed = []
+  const monitor = createHealthProbeMonitor({
+    config: {
+      run_on_start: false,
+      anthropic: { enabled: false, models: ['claude-haiku-4-5'] },
+      openai: { enabled: true, interval_sec: 120, cache_ttl_sec: 300, models: ['gpt-5.4', 'gpt-5.4-mini'] },
+      google: { enabled: false, models: ['gemini-3-flash'] },
+    },
+    listTargets: () => [
+      { id: 'vm-claude', platform: 'anthropic', schedulable: true, status: 'running', has_token: true },
+      { id: 'vm-codex', platform: 'openai', schedulable: true, status: 'running', has_token: true },
+    ],
+    runChat: async (vm, real) => {
+      probed.push(`${vm.id}:${real.model}`)
+      return {
+        ok: true,
+        status: 200,
+        text: `ok:${real.model}`,
+        vm_id: vm.id,
+        model: real.model,
+        body: {
+          id: `msg_${real.model}`,
+          content: [{ type: 'text', text: `ok:${real.model}` }],
+          usage: { input_tokens: 2, output_tokens: 2 },
+        },
+      }
+    },
+  })
+
+  const normalized = monitor.getConfig()
+  assert.equal(normalized.enabled, true)
+  assert.equal(normalized.anthropic.enabled, false)
+  assert.equal(normalized.openai.enabled, true)
+  assert.equal(normalized.openai.interval_sec, 120)
+  assert.equal(normalized.openai.cache_ttl_sec, 300)
+  assert.equal(normalized.google.enabled, false)
+
+  await monitor.runRealProbe()
+  // Only OpenAI is enabled; Anthropic and Google must not be probed.
+  assert.deepEqual(probed, ['vm-codex:gpt-5.4', 'vm-codex:gpt-5.4-mini'])
+
+  // OpenAI models hit their own per-model snapshots.
+  const hit54 = monitor.decide(unofficial, { model: 'gpt-5.4', input: 'hi' }, 'openai.responses')
+  assert.equal(hit54.action, 'cache')
+  assert.equal(hit54.snapshot.model, 'gpt-5.4')
+  assert.equal(hit54.snapshot.body.id, 'msg_gpt-5.4')
+
+  const hitMini = monitor.decide(unofficial, { model: 'gpt-5.4-mini', input: 'hi' }, 'openai.responses')
+  assert.equal(hitMini.action, 'cache')
+  assert.equal(hitMini.snapshot.model, 'gpt-5.4-mini')
+  assert.equal(hitMini.snapshot.body.id, 'msg_gpt-5.4-mini')
+
+  // Uncached OpenAI model and disabled Anthropic platform pass through strictly.
+  assert.equal(monitor.decide(unofficial, { model: 'gpt-5.3-codex', input: 'hi' }, 'openai.responses').action, 'pass')
+  assert.equal(monitor.decide(unofficial, hiBody, 'anthropic.messages').action, 'pass')
+
+  const openaiView = monitor.getSnapshots().openai
+  assert.equal(openaiView.total_models, 2)
+  assert.equal(openaiView.ok_models, 2)
+  assert.equal(openaiView.failed_models, 0)
+  assert.deepEqual(
+    openaiView.models.map((m) => m.model),
+    ['gpt-5.4', 'gpt-5.4-mini'],
+  )
+  monitor.stop()
+})
+
+test('strict per-model isolation and alias canonicalization on Anthropic', async () => {
+  const probed = []
+  const monitor = createHealthProbeMonitor({
+    config: {
+      run_on_start: false,
+      anthropic: {
+        enabled: true,
+        models: ['claude-haiku-4-5', 'claude-opus-5-5'],
+      },
+    },
+    listTargets: () => [{ id: 'vm-01', platform: 'anthropic', schedulable: true, status: 'running', has_token: true }],
+    runChat: async (vm, real) => {
+      probed.push(real.model)
+      return {
+        ok: true,
+        status: 200,
+        text: `reply:${real.model}`,
+        vm_id: vm.id,
+        model: real.model,
+        body: {
+          id: `msg_${real.model}`,
+          content: [{ type: 'text', text: `reply:${real.model}` }],
+          usage: { input_tokens: 3, output_tokens: 2 },
+        },
+      }
+    },
+  })
+
+  await monitor.runRealProbe({ platform: 'anthropic' })
+  assert.deepEqual(probed, ['claude-haiku-4-5', 'claude-opus-5-5'])
+
+  // Canonical aliases resolve to the exact model cache.
+  const datedHaiku = monitor.decide(unofficial, { ...hiBody, model: 'claude-haiku-4-5-20251001' }, 'anthropic.messages')
+  assert.equal(datedHaiku.action, 'cache')
+  assert.equal(datedHaiku.snapshot.body.id, 'msg_claude-haiku-4-5')
+
+  const dottedOpus55 = monitor.decide(unofficial, { ...hiBody, model: 'claude-opus-5.5[1m]' }, 'anthropic.messages')
+  assert.equal(dottedOpus55.action, 'cache')
+  assert.equal(dottedOpus55.snapshot.body.id, 'msg_claude-opus-5-5')
+
+  // Unconfigured / different models (even prefix sibling claude-opus-5) must pass through.
+  assert.equal(monitor.decide(unofficial, { ...hiBody, model: 'claude-opus-5' }, 'anthropic.messages').action, 'pass')
+  assert.equal(
+    monitor.decide(unofficial, { ...hiBody, model: 'claude-sonnet-4-6' }, 'anthropic.messages').action,
+    'pass',
+  )
+
+  // Removing a model from config prunes its cached snapshot immediately.
+  monitor.setConfig(
+    {
+      ...monitor.getConfig(),
+      anthropic: { ...monitor.getConfig().anthropic, models: ['claude-haiku-4-5'] },
+    },
+    { restart: false },
+  )
+  assert.equal(monitor.decide(unofficial, { ...hiBody, model: 'claude-opus-5-5' }, 'anthropic.messages').action, 'pass')
+  assert.equal(
+    monitor.decide(unofficial, { ...hiBody, model: 'claude-haiku-4-5' }, 'anthropic.messages').action,
+    'cache',
+  )
+  monitor.stop()
+})
+
+test('all_models mode dynamically resolves enabled models per platform with deduplication', async () => {
+  const anthropicCatalog = listPlatformCatalogModels('anthropic', {
+    listPlatformModels: () => [
+      { id: 'auto', enabled: true, family: 'auto' },
+      { id: 'claude-haiku-4-5-20251001', enabled: true, family: 'haiku' },
+      { id: 'claude-haiku-4-5', enabled: true, family: 'haiku' },
+      { id: 'claude-sonnet-4-6', enabled: true, family: 'sonnet' },
+      { id: 'claude-opus-4-6', enabled: false, family: 'opus' },
+      { id: 'gpt-5.4', enabled: true, family: 'codex' },
+    ],
+  })
+  assert.deepEqual(
+    anthropicCatalog.map((m) => m.id),
+    ['claude-haiku-4-5-20251001', 'claude-sonnet-4-6'],
+  )
+
+  const resolvedOpenai = resolvePlatformProbeModels(
+    'openai',
+    normalizeHealthProbeConfig({ openai: { enabled: true, all_models: true } }),
+    {
+      listPlatformModels: () => [
+        { id: 'gpt-5.4', enabled: true, family: 'codex' },
+        { id: 'gpt-5.4-mini', enabled: true, family: 'codex' },
+        { id: 'gpt-5.3-codex', enabled: false, family: 'codex' },
+      ],
+    },
+  )
+  assert.deepEqual(resolvedOpenai, ['gpt-5.4', 'gpt-5.4-mini'])
+  assert.equal(
+    canonicalHealthModelKey('anthropic', 'claude-haiku-4-5'),
+    canonicalHealthModelKey('anthropic', 'claude-haiku-4-5-20251001'),
+  )
+})
+
+test('per-model slot gating respects allowed_models and fable_requires_max', async () => {
+  const vms = [
+    {
+      id: 'vm-pro',
+      platform: 'anthropic',
+      schedulable: true,
+      status: 'running',
+      has_token: true,
+      account_tier: 'pro',
+      allowed_models: ['claude-haiku-4-5-20251001'],
+    },
+    {
+      id: 'vm-max',
+      platform: 'anthropic',
+      schedulable: true,
+      status: 'running',
+      has_token: true,
+      account_tier: 'max',
+    },
+  ]
+  const multiCfg = normalizeHealthProbeConfig({
+    anthropic: { enabled: true, models: ['claude-haiku-4-5', 'claude-fable-5'] },
+  })
+  assert.deepEqual(
+    selectHealthProbeTargetsForModel(vms, multiCfg, 'anthropic', 'claude-haiku-4-5', Date.now(), {
+      fableRequiresMax: true,
+    }).map((v) => v.id),
+    ['vm-pro', 'vm-max'],
+  )
+  assert.deepEqual(
+    selectHealthProbeTargetsForModel(vms, multiCfg, 'anthropic', 'claude-fable-5', Date.now(), {
+      fableRequiresMax: true,
+    }).map((v) => v.id),
+    ['vm-max'],
+  )
+
+  const calls = []
+  const monitor = createHealthProbeMonitor({
+    config: { run_on_start: false, anthropic: { enabled: true, models: ['claude-fable-5'] } },
+    getFableRequiresMax: () => true,
+    listTargets: () => vms,
+    runChat: async (vm, real) => {
+      calls.push(`${vm.id}:${real.model}`)
+      return {
+        ok: true,
+        status: 200,
+        text: 'fable-ok',
+        vm_id: vm.id,
+        model: real.model,
+        body: {
+          id: 'msg_fable',
+          content: [{ type: 'text', text: 'fable-ok' }],
+          usage: { input_tokens: 1, output_tokens: 1 },
+        },
+      }
+    },
+  })
+  await monitor.runRealProbe({ platform: 'anthropic' })
+  assert.deepEqual(calls, ['vm-max:claude-fable-5'])
+  monitor.stop()
+})
+
+test('runRealProbe supports single-model targeted reprobe', async () => {
+  const probed = []
+  const monitor = createHealthProbeMonitor({
+    config: {
+      run_on_start: false,
+      anthropic: { enabled: true, models: ['claude-haiku-4-5', 'claude-sonnet-4-6'] },
+    },
+    listTargets: () => [{ id: 'vm-01', platform: 'anthropic', schedulable: true, status: 'running', has_token: true }],
+    runChat: async (vm, real) => {
+      probed.push(real.model)
+      return {
+        ok: true,
+        status: 200,
+        text: real.model,
+        vm_id: vm.id,
+        model: real.model,
+        body: { id: `msg_${real.model}_${probed.length}`, content: [{ type: 'text', text: real.model }] },
+      }
+    },
+  })
+  await monitor.runRealProbe({ platform: 'anthropic' })
+  assert.deepEqual(probed, ['claude-haiku-4-5', 'claude-sonnet-4-6'])
+
+  probed.length = 0
+  const single = await monitor.runRealProbe({ platform: 'anthropic', model: 'claude-sonnet-4-6' })
+  assert.deepEqual(probed, ['claude-sonnet-4-6'])
+  assert.equal(single.ok, true)
+  assert.equal(single.model, 'claude-sonnet-4-6')
+  monitor.stop()
 })

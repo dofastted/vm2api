@@ -1,3 +1,6 @@
+import { buildDirectEnvelope } from '../../src/lib/gemini/direct-client.mjs'
+import { normalizeGeminiOutboundPrompt } from '../../src/lib/gemini/prompt-normalizer.mjs'
+import { resolveUpstreamModel } from '../../src/lib/gemini/model-catalog.mjs'
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
@@ -23,6 +26,7 @@ import {
   clientDeclaredAgyBridgeParam,
   forwardAgyBridgeToolArgs,
   restoreAgyBridgeToolArgs,
+  isRe2CompatibleRegex,
   sanitizeGeminiSchema,
   sanitizeNativeTuiText,
   signedToolCallId,
@@ -2142,4 +2146,152 @@ test('makeWireToolName caps wire names at 55 chars so mcp_crag_<wireName> stays 
 
   const restoredNames = collector.result().toolCalls.map((c) => c.name)
   assert.deepEqual(restoredNames, toolNames)
+})
+
+test('gemini-4-neon preserves xhigh thinkingLevel alongside gemini-4-neon-xhigh variant (#1975)', () => {
+  const available = ['gemini-4-neon-low', 'gemini-4-neon-medium', 'gemini-4-neon-high', 'gemini-4-neon-xhigh']
+  const cases = [
+    { effort: 'low', model: 'gemini-4-neon-low', thinkingLevel: 'low' },
+    { effort: 'medium', model: 'gemini-4-neon-medium', thinkingLevel: 'medium' },
+    { effort: 'high', model: 'gemini-4-neon-high', thinkingLevel: 'high' },
+    { effort: 'xhigh', model: 'gemini-4-neon-xhigh', thinkingLevel: 'xhigh' },
+    { effort: 'max', model: 'gemini-4-neon-xhigh', thinkingLevel: 'xhigh' },
+  ]
+  for (const c of cases) {
+    const inbound = {
+      model: 'gemini-4-neon',
+      max_tokens: 64,
+      stream: false,
+      output_config: { effort: c.effort },
+      messages: [{ role: 'user', content: 'Reply with exactly OK.' }],
+    }
+    const parsed = parseInboundToGemini('anthropic', inbound)
+    const selected = resolveUpstreamModel(parsed.model, available, { requestedEffort: parsed.thinking.effort })
+    const nativeRequest = buildGeminiRequest(
+      { ...parsed, model: selected.upstreamModel, requestedModel: inbound.model },
+      { target: 'antigravity', defaultEffort: 'medium', includeThinkingConfig: true },
+    )
+    const { body } = normalizeGeminiOutboundPrompt(nativeRequest, { target: 'antigravity' })
+    const envelope = buildDirectEnvelope({ model: selected.upstreamModel, requestId: 'req-neon-xhigh', bodyObj: body })
+    assert.equal(envelope.body.model, c.model)
+    assert.equal(envelope.body.generationConfig.thinkingConfig.thinkingLevel, c.thinkingLevel)
+  }
+
+  // Untiered catalog preserves gemini-4-neon-xhigh while still clamping non-xhigh families (e.g. carbon).
+  const untieredNeon = resolveUpstreamModel('gemini-4-neon-xhigh[1m]', ['gemini-4-neon'])
+  assert.equal(untieredNeon.upstreamModel, 'gemini-4-neon')
+  assert.equal(untieredNeon.publicId, 'gemini-4-neon-xhigh')
+
+  const untieredNeonBare = resolveUpstreamModel('gemini-4-neon', ['gemini-4-neon'], { requestedEffort: 'xhigh' })
+  assert.equal(untieredNeonBare.upstreamModel, 'gemini-4-neon')
+  const untieredNeonReq = buildGeminiRequest(
+    {
+      ...parseInboundToGemini('anthropic', {
+        model: 'gemini-4-neon',
+        max_tokens: 64,
+        stream: false,
+        output_config: { effort: 'xhigh' },
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+      model: untieredNeonBare.upstreamModel,
+      requestedModel: 'gemini-4-neon',
+    },
+    { target: 'antigravity', defaultEffort: 'medium', includeThinkingConfig: true },
+  )
+  assert.equal(untieredNeonReq.generationConfig.thinkingConfig.thinkingLevel, 'xhigh')
+
+  const untieredCarbon = resolveUpstreamModel('gemini-4-carbon-xhigh[1m]', ['gemini-4-carbon'])
+  assert.equal(untieredCarbon.upstreamModel, 'gemini-4-carbon')
+  assert.equal(untieredCarbon.publicId, 'gemini-4-carbon-high')
+
+  const carbonIr = parseInboundToGemini('anthropic', {
+    model: 'gemini-4-carbon',
+    max_tokens: 64,
+    stream: false,
+    output_config: { effort: 'xhigh' },
+    messages: [{ role: 'user', content: 'hi' }],
+  })
+  const carbonReq = buildGeminiRequest(carbonIr, {
+    target: 'antigravity',
+    defaultEffort: 'medium',
+    includeThinkingConfig: true,
+  })
+  assert.equal(carbonReq.generationConfig.thinkingConfig.thinkingLevel, 'high')
+})
+
+test('sanitizeGeminiSchema strips non-RE2 pattern lookarounds/backrefs while keeping valid RE2 patterns (#1985)', () => {
+  // Unit checks on isRe2CompatibleRegex
+  assert.equal(isRe2CompatibleRegex('^[a-z]+$'), true)
+  assert.equal(isRe2CompatibleRegex('^[a-zA-Z0-9_-]{1,64}$'), true)
+  assert.equal(isRe2CompatibleRegex('^(?:foo|bar)+?$'), true)
+  assert.equal(isRe2CompatibleRegex('^\\(\\?!literal\\)$'), true)
+  assert.equal(isRe2CompatibleRegex('^[a-z(?!)]+$'), true)
+  assert.equal(isRe2CompatibleRegex('^(?!x)[a-z]+$'), false)
+  assert.equal(isRe2CompatibleRegex('^(?=.*[A-Z])[a-zA-Z0-9]+$'), false)
+  assert.equal(isRe2CompatibleRegex('(?<=foo)bar'), false)
+  assert.equal(isRe2CompatibleRegex('(?<!foo)bar'), false)
+  assert.equal(isRe2CompatibleRegex('^([a-z]+)-\\1$'), false)
+  assert.equal(isRe2CompatibleRegex('^(?<id>[a-z]+)-\\k<id>$'), false)
+  assert.equal(isRe2CompatibleRegex('^[a-z]++$'), false)
+  assert.equal(isRe2CompatibleRegex('^(?>foo|bar)$'), false)
+
+  const originalSchema = {
+    type: 'object',
+    properties: {
+      collection: { type: 'string', description: 'Collection name', minLength: 1, pattern: '^(?!x)[a-z]+$' },
+      safe: { type: 'string', pattern: '^[a-z]+$' },
+      writes: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: {
+            doc_id: { type: 'string', pattern: '^(?!_)[a-zA-Z0-9_-]+$' },
+            tag: { type: 'string', pattern: '^[a-z0-9-]+$' },
+          },
+          required: ['doc_id'],
+        },
+      },
+    },
+    required: ['collection'],
+  }
+
+  for (const plain of [true, false]) {
+    const cleaned = sanitizeGeminiSchema(originalSchema, { plain })
+    assert.equal(cleaned.properties.collection.pattern, undefined)
+    assert.equal(cleaned.properties.collection.type, 'string')
+    assert.equal(cleaned.properties.collection.description, 'Collection name')
+    assert.equal(cleaned.properties.collection.minLength, 1)
+    assert.equal(cleaned.properties.safe.pattern, '^[a-z]+$')
+    assert.equal(cleaned.properties.writes.items.properties.doc_id.pattern, undefined)
+    assert.equal(cleaned.properties.writes.items.properties.tag.pattern, '^[a-z0-9-]+$')
+    assert.deepEqual(cleaned.properties.writes.items.required, ['doc_id'])
+  }
+  // Caller's original schema object is never mutated.
+  assert.equal(originalSchema.properties.collection.pattern, '^(?!x)[a-z]+$')
+  assert.equal(originalSchema.properties.writes.items.properties.doc_id.pattern, '^(?!_)[a-zA-Z0-9_-]+$')
+
+  // End-to-end Google native inbound -> Antigravity outbound strips incompatible lookahead pattern.
+  const ir = parseInboundToGemini(
+    'gemini',
+    {
+      contents: [{ role: 'user', parts: [{ text: 'Reply with OK.' }] }],
+      tools: [
+        {
+          functionDeclarations: [
+            {
+              name: 'ArtifactData',
+              description: 'Read/write artifacts',
+              parameters: originalSchema,
+            },
+          ],
+        },
+      ],
+    },
+    { routeModel: 'gemini-4-carbon-high', routeStream: true },
+  )
+  const req = buildGeminiRequest(ir, { target: 'antigravity' })
+  const outParams = req.tools[0].functionDeclarations[0].parameters
+  assert.equal(outParams.properties.collection.pattern, undefined)
+  assert.equal(outParams.properties.safe.pattern, '^[a-z]+$')
+  assert.equal(outParams.properties.writes.items.properties.doc_id.pattern, undefined)
 })

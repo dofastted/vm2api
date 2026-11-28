@@ -97,26 +97,44 @@ function fixtureIdentity(homeDir) {
 }
 
 function seedStoredOfficial(homeDir) {
-  storeAccountHeaders(homeDir, {
-    'user-agent': CLAUDE_CLI_UA,
-    'anthropic-version': '2023-06-01',
-    'anthropic-beta': 'oauth-2025-04-20,prompt-caching-scope-2025-01-01',
-    'x-app': 'cli',
-    'x-stainless-os': 'Linux',
-  })
+  storeAccountHeaders(
+    homeDir,
+    {
+      'user-agent': CLAUDE_CLI_UA,
+      'anthropic-version': '2023-06-01',
+      'anthropic-beta': 'oauth-2025-04-20,prompt-caching-scope-2025-01-01',
+      'x-app': 'cli',
+      'x-stainless-os': 'Linux',
+    },
+    { officialTraffic: true },
+  )
+}
+
+function completeOfficialHeaders(headers, sessionId) {
+  return {
+    ...headers,
+    'anthropic-dangerous-direct-browser-access': 'true',
+    'anthropic-beta': 'claude-code-20250219,interleaved-thinking-2025-05-14',
+    'x-stainless-retry-count': '0',
+    'x-stainless-timeout': '600',
+    'x-claude-code-session-id': sessionId,
+  }
 }
 
 test('vm connectivity inbound matches probe Claude Code shape', () => {
+  const sessionId = '11111111-1111-4111-8111-111111111111'
   const { inbound, headers } = buildVmTestInbound({
     model: 'claude-haiku-4-5',
     prompt: 'hello',
     maxTokens: 8192,
-    sessionId: 'vm-test-vm-01',
+    sessionId,
   })
   assert.equal(headers['user-agent'], CLAUDE_CLI_UA)
   assert.equal(headers['anthropic-beta'], undefined)
   assert.equal(inbound.system, CRS_OFFICIAL_SYSTEM)
-  assert.equal(isOfficialClaudeCodeTraffic(headers, inbound), true)
+  // Probe headers intentionally omit anthropic-beta/browser-access so strict verifier fails closed unless complete.
+  assert.equal(isOfficialClaudeCodeTraffic(headers, inbound), false)
+  assert.equal(isOfficialClaudeCodeTraffic(completeOfficialHeaders(headers, sessionId), inbound), true)
 })
 
 test('spoofed CLI UA + user_id on test14 messages is third-party, not official CC', () => {
@@ -210,12 +228,16 @@ test('official empty beta default includes context-management and keeps the body
 
 test('official envelope keeps context_management when stored CLI beta has the token', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-ctxkeep-'))
-  storeAccountHeaders(dir, {
-    'user-agent': CLAUDE_CLI_UA,
-    'anthropic-version': '2023-06-01',
-    'anthropic-beta': `claude-code-20250219,oauth-2025-04-20,${CONTEXT_MANAGEMENT_BETA}`,
-    'x-app': 'cli',
-  })
+  storeAccountHeaders(
+    dir,
+    {
+      'user-agent': CLAUDE_CLI_UA,
+      'anthropic-version': '2023-06-01',
+      'anthropic-beta': `claude-code-20250219,oauth-2025-04-20,${CONTEXT_MANAGEMENT_BETA}`,
+      'x-app': 'cli',
+    },
+    { officialTraffic: true },
+  )
   const identity = fixtureIdentity(dir)
   const { inbound, headers } = thinkingInbound('vm-test-vm-01')
   const envelope = prepareOutboundEnvelope({
@@ -234,18 +256,20 @@ test('official envelope keeps context_management when stored CLI beta has the to
 
 test('rewritten vm-test inbound stays official Claude Code, not third-party', () => {
   const identity = fixtureIdentity(os.tmpdir())
+  const sessionId = '11111111-1111-4111-8111-111111111111'
   const { inbound, headers } = buildVmTestInbound({
     model: 'claude-haiku-4-5',
     prompt: 'hello',
     maxTokens: 8192,
-    sessionId: '11111111-1111-4111-8111-111111111111',
+    sessionId,
     deviceId: 'd'.repeat(64),
     accountUuid: '11111111-1111-4111-8111-111111111111',
     identity,
     rewrite: true,
   })
-  assert.equal(isOfficialClaudeCodeTraffic(headers, inbound), true)
-  assert.equal(classifyClient(headers, inbound), 'claude_code_official')
+  const fullHeaders = completeOfficialHeaders(headers, sessionId)
+  assert.equal(isOfficialClaudeCodeTraffic(fullHeaders, inbound), true)
+  assert.equal(classifyClient(fullHeaders, inbound), 'claude_code_official')
   assert.equal(inbound.system.length, 4)
   assert.equal(inbound.system[0].text, CRS_OFFICIAL_SYSTEM)
   const out = prepareOutboundAttempt({

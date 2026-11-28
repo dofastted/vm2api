@@ -8,6 +8,7 @@
  * into CRAG or Anthropic upstream.
  */
 import { CRS_OFFICIAL_CLI_SYSTEM } from '../identity/crs-persona.mjs'
+import { isPromptSpecV1Caps, sanitizePromptSpec } from '../identity/system-prompt-spec.mjs'
 import {
   DEFAULT_CACHE_TTL,
   isCleanCacheControl,
@@ -42,6 +43,7 @@ export const CRAG_CORE_ALLOWED_TOP_KEYS = Object.freeze(
 export const CRAG_INTERNAL_ALLOWED_TOP_KEYS = Object.freeze(
   new Set([
     'crag_prompt',
+    'crag_prompt_spec',
     'crag_options',
     'crag_model',
     'crag_persona_preset',
@@ -85,6 +87,7 @@ export const CRAG_SILENT_STRIP_TOP_KEYS = Object.freeze(
     'kin_outbound_shape',
     'request_id',
     'delivery_mode',
+    'prompt_spec',
   ]),
 )
 
@@ -252,6 +255,60 @@ function applySanitizedCacheControl(target, control) {
 
 function isCleanCragCacheControl(control) {
   return control == null || isCleanCacheControl(control, { stripExtraFields: true })
+}
+
+/**
+ * Breakpoints contributed by legacy CRAG V4 (<= 3.1.26) `tui_system_template`
+ * when prepended under `official_full` without `enforce_post_injection_cache_controls`.
+ */
+export const CRAG_V4_OFFICIAL_TEMPLATE_BREAKPOINTS = 2
+
+const CRAG_V4_OFFICIAL_IDENTITY_PREFIXES = Object.freeze([
+  'You are Claude Code',
+  "You are a Claude agent, built on Anthropic's Claude Agent SDK",
+])
+
+function systemStartsWithOfficialIdentity(system) {
+  if (system == null) return false
+  const blocks =
+    typeof system === 'string' ? [{ type: 'text', text: system }] : Array.isArray(system) ? system : [system]
+  for (const block of blocks) {
+    const raw =
+      typeof block === 'string' ? block : block?.type === 'text' && typeof block.text === 'string' ? block.text : ''
+    const cleaned = raw
+      .split('\n')
+      .filter((line) => !BILLING_LINE_RE.test(line.trim()))
+      .join('\n')
+      .trim()
+    if (!cleaned) continue
+    return CRAG_V4_OFFICIAL_IDENTITY_PREFIXES.some((prefix) => cleaned.startsWith(prefix))
+  }
+  return false
+}
+
+/**
+ * Legacy CRAG V4 (`headless_claude_bridge_v1` without `prompt_spec_v1`, i.e. <= 3.1.26)
+ * prepends its probed `tui_system_template` (carrying 2 `cache_control` breakpoints)
+ * without post-injection cache budgeting when `crag_persona_preset === 'official_full'`,
+ * `crag_prompt.mode !== 'replace'`, and caller `system` does not already begin with an
+ * official identity block.
+ *
+ * CRAG 3.1.27+ (`prompt_spec_v1`) enforces the 4-breakpoint budget after injection in
+ * `wire.rs::enforce_post_injection_cache_controls` by shedding injected template markers
+ * first and keeping all 4 caller breakpoints intact, so Node must return 0 for it.
+ */
+export function cragV4TemplateCacheBreakpoints(body, capabilities, health = null) {
+  const caps = Array.isArray(capabilities)
+    ? capabilities
+    : Array.isArray(health?.capabilities)
+      ? health.capabilities
+      : null
+  if (!caps || !caps.includes('headless_claude_bridge_v1')) return 0
+  if (isPromptSpecV1Caps(caps, health) || body?.crag_prompt_spec != null) return 0
+  if (body?.crag_persona_preset !== 'official_full') return 0
+  if (body?.crag_prompt?.mode === 'replace') return 0
+  if (systemStartsWithOfficialIdentity(body?.system)) return 0
+  return CRAG_V4_OFFICIAL_TEMPLATE_BREAKPOINTS
 }
 
 /** True when system only carries the placeholder CLI identity left by third-party relocation. */
@@ -752,10 +809,11 @@ function sanitizeCragPrompt(value) {
   return out
 }
 
-function repairCragCacheBreakpoints(body) {
+function repairCragCacheBreakpoints(body, capabilities = null, health = null) {
   const fallbackTtl = body.cache_ttl || body.crag_options?.cache_ttl || DEFAULT_CACHE_TTL
+  const reserved = cragV4TemplateCacheBreakpoints(body, capabilities, health)
   return repairCacheBreakpoints(body, {
-    limit: 4,
+    limit: Math.max(0, 4 - reserved),
     fallbackTtl,
     fillMissing: false,
     stripExtraFields: true,
@@ -808,6 +866,7 @@ export function sanitizeCragBodyWhitelist(
   input,
   {
     capabilities,
+    health = null,
     preserveCanonicalHistory = false,
     rejectUnknownTopKeys = true,
     validateCacheBudget = true,
@@ -980,6 +1039,15 @@ export function sanitizeCragBodyWhitelist(
     const value = materialized[key]
     if (value === undefined) continue
     if (key === 'effort' && isEmptyEffortValue(value)) continue
+    if (key === 'crag_prompt_spec') {
+      if ((caps || health) && !isPromptSpecV1Caps(caps, health)) {
+        strippedFields.push(key)
+        continue
+      }
+      const cleanSpec = sanitizePromptSpec(value)
+      if (cleanSpec) out[key] = cleanSpec
+      continue
+    }
     if (key === 'crag_persona_preset' || key === 'crag_prompt_version') {
       if (caps && !caps.includes('headless_claude_bridge_v1')) {
         strippedFields.push(key)
@@ -988,7 +1056,9 @@ export function sanitizeCragBodyWhitelist(
       if (typeof value !== 'string') continue
       const trimmed = value.trim()
       if (!trimmed || trimmed.length > 512 || /[\r\n\0]/.test(trimmed)) continue
-      if (key === 'crag_persona_preset' && trimmed !== 'zero' && trimmed !== 'official_full') continue
+      if (key === 'crag_persona_preset' && !['official', 'official_full', 'zero', 'custom'].includes(trimmed)) {
+        continue
+      }
       out[key] = trimmed
       continue
     }
@@ -1020,7 +1090,7 @@ export function sanitizeCragBodyWhitelist(
     out[key] = value
   }
 
-  const finalBody = validateCacheBudget ? repairCragCacheBreakpoints(out) : out
+  const finalBody = validateCacheBudget ? repairCragCacheBreakpoints(out, caps, health) : out
 
   return { body: finalBody, strippedFields, strippedSafeguards }
 }

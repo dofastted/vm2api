@@ -47,6 +47,7 @@ import { verifyCragTelemetryPolicy } from '../../src/lib/transport/rust-kernel-c
 import { readSlotProcessStatus } from '../../src/lib/vm/slot-process-status.mjs'
 import { applyNativeTelemetry } from '../../src/lib/vm/fleet-update.mjs'
 import { CRS_COMPACT_IDENTITY, CRS_OFFICIAL_CLI_SYSTEM } from '../../src/lib/identity/crs-persona.mjs'
+import { computeClaudeCodeFingerprintUtf16 } from '../../src/lib/identity/official-cc-verifier.mjs'
 import { DEFAULT_PERSONA_TEMPLATES } from '../../src/lib/identity/persona-template.mjs'
 import { applyClaudeSSELineToMessage, createClaudeMessageAssembler } from '../../src/lib/protocol/convert.mjs'
 import { costColumnsFromUsage, normalizeUsage } from '../../src/lib/admin/pricing.mjs'
@@ -962,6 +963,7 @@ test('Phase B+ P0: allowlisted x-claude-code-*, x-app, x-client-request-id & off
       cliHop: true,
       cragPrint: true,
       strictPassthrough,
+      officialTraffic: true,
     })
     assert.deepEqual(envelope.headers, {
       'user-agent': 'claude-cli/2.1.321 (external, cli-bg)',
@@ -1289,20 +1291,6 @@ unixTest(
 // ---------------------------------------------------------------------------
 
 test('Phase B-R: default crag_strict_passthrough=false + officialPassthrough=true + headless_claude_bridge_v1 preserves native system[] and mid-conv role:"system" verbatim (unit + handleProtocol)', async (t) => {
-  const nativeSystem = [
-    { type: 'text', text: 'x-anthropic-billing-header: cc_version=2.1.321.abc; cc_entrypoint=cli; cch=00000;' },
-    { type: 'text', text: CRS_OFFICIAL_CLI_SYSTEM },
-    {
-      type: 'text',
-      text: 'Official TUI harness prompt block.',
-      cache_control: { type: 'ephemeral', ttl: '1h', scope: 'global' },
-    },
-    {
-      type: 'text',
-      text: 'Official guidance block.',
-      cache_control: { type: 'ephemeral', ttl: '1h' },
-    },
-  ]
   const nativeMessages = [
     { role: 'user', content: [{ type: 'text', text: 'Inspect the repo.' }] },
     {
@@ -1312,6 +1300,23 @@ test('Phase B-R: default crag_strict_passthrough=false + officialPassthrough=tru
     },
     { role: 'assistant', content: [{ type: 'text', text: 'Checking now.' }] },
     { role: 'user', content: [{ type: 'text', text: 'Continue.' }] },
+  ]
+  const nativeFp3 = computeClaudeCodeFingerprintUtf16(nativeMessages, '2.1.321')
+  const nativeHarnessText = '# Doing tasks\nOfficial TUI harness prompt block.\n# Tone and style\nBe concise.'
+  const nativeEnvText = '# Environment\n - Primary working directory: /workspace'
+  const nativeSystem = [
+    { type: 'text', text: `x-anthropic-billing-header: cc_version=2.1.321.${nativeFp3}; cc_entrypoint=cli;` },
+    { type: 'text', text: CRS_OFFICIAL_CLI_SYSTEM },
+    {
+      type: 'text',
+      text: nativeHarnessText,
+      cache_control: { type: 'ephemeral', ttl: '1h', scope: 'global' },
+    },
+    {
+      type: 'text',
+      text: nativeEnvText,
+      cache_control: { type: 'ephemeral', ttl: '1h' },
+    },
   ]
 
   // 1. Unit level: prepareCragPrintBody -> prepareCragRequest
@@ -1436,6 +1441,8 @@ test('Phase B-R: default crag_strict_passthrough=false + officialPassthrough=tru
                 cliHop: attemptMeta?.cliHop === true,
                 cragPrint: attemptMeta?.cragPrint === true,
                 strictPassthrough: attemptMeta?.strictPassthrough === true,
+                officialPassthrough: attemptMeta?.officialPassthrough === true,
+                officialTraffic: attemptMeta?.officialTraffic === true,
                 safeguardsSanitized: attemptMeta?.safeguardsSanitized === true,
               })
               sent.push({ hopBody: structuredClone(body), payload, meta: attemptMeta })
@@ -1486,8 +1493,11 @@ test('Phase B-R: default crag_strict_passthrough=false + officialPassthrough=tru
       messages: nativeMessages,
       tools: [{ name: 'Bash', description: 'Run shell', input_schema: { type: 'object', properties: {} } }],
       metadata: {
-        user_id:
-          'user_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef_account_a_session_11111111-1111-4111-8111-111111111111',
+        user_id: JSON.stringify({
+          device_id: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
+          account_uuid: '',
+          session_id: '11111111-1111-4111-8111-111111111111',
+        }),
       },
       diagnostics: { previous_message_id: 'msg_01prev' },
       request_tags: ['tui-native'],
@@ -1495,8 +1505,18 @@ test('Phase B-R: default crag_strict_passthrough=false + officialPassthrough=tru
     {
       authorization: 'Bearer sk-vm-test',
       'user-agent': 'claude-cli/2.1.321 (external, cli)',
+      'anthropic-version': '2023-06-01',
+      'anthropic-dangerous-direct-browser-access': 'true',
       'anthropic-beta': 'claude-code-20250219,oauth-2025-04-20',
       'x-app': 'cli',
+      'x-stainless-lang': 'js',
+      'x-stainless-os': 'Linux',
+      'x-stainless-arch': 'x64',
+      'x-stainless-runtime': 'node',
+      'x-stainless-runtime-version': 'v24.3.0',
+      'x-stainless-package-version': '0.128.0',
+      'x-stainless-retry-count': '0',
+      'x-stainless-timeout': '600',
       'x-claude-code-session-id': '11111111-1111-4111-8111-111111111111',
       'x-claude-code-request-class': 'main',
     },
@@ -1504,7 +1524,7 @@ test('Phase B-R: default crag_strict_passthrough=false + officialPassthrough=tru
   assert.equal(nativeRun.meta.strictPassthrough, false)
   assert.equal(nativeRun.payload.gated.system.length, 3, 'all 3 non-billing native TUI system blocks survive intact')
   assert.equal(nativeRun.payload.gated.system[0].text, CRS_OFFICIAL_CLI_SYSTEM)
-  assert.equal(nativeRun.payload.gated.system[1].text, 'Official TUI harness prompt block.')
+  assert.equal(nativeRun.payload.gated.system[1].text, nativeHarnessText)
   assert.deepEqual(nativeRun.payload.gated.system[1].cache_control, { type: 'ephemeral', ttl: '1h', scope: 'global' })
   assert.equal(nativeRun.payload.gated.messages[1].role, 'system')
   assert.equal(nativeRun.payload.gated.messages[1].clear_at, 'tool_uses')
@@ -2337,6 +2357,9 @@ test('Phase B-R3 Item 3: persona_env/timezone/locale_presets control crag_env ge
   assert.equal('crag_env' in envDisabledRes, false)
 
   // Native CC officialPassthrough === true -> NEVER attaches crag_env even when all switches are true
+  const nativeEnvSession = '11111111-1111-4111-8111-111111111111'
+  const nativeEnvMessages = [{ role: 'user', content: 'hi' }]
+  const nativeEnvFp3 = computeClaudeCodeFingerprintUtf16(nativeEnvMessages, '2.1.321')
   const nativeRes = await runEnvCase(
     {
       persona_env_presets: { official_full: true },
@@ -2348,19 +2371,34 @@ test('Phase B-R3 Item 3: persona_env/timezone/locale_presets control crag_env ge
       max_tokens: 1024,
       stream: false,
       system: [
-        { type: 'text', text: 'x-anthropic-billing-header: cc_version=2.1.321.abc; cc_entrypoint=cli; cch=00000;' },
+        { type: 'text', text: `x-anthropic-billing-header: cc_version=2.1.321.${nativeEnvFp3}; cc_entrypoint=cli;` },
         { type: 'text', text: CRS_OFFICIAL_CLI_SYSTEM },
       ],
-      messages: [{ role: 'user', content: 'hi' }],
+      messages: nativeEnvMessages,
       metadata: {
-        user_id:
-          'user_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef_account_a_session_11111111-1111-4111-8111-111111111111',
+        user_id: JSON.stringify({
+          device_id: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
+          account_uuid: '',
+          session_id: nativeEnvSession,
+        }),
       },
     },
     {
       authorization: 'Bearer sk-cc',
       'user-agent': 'claude-cli/2.1.321 (external, cli)',
+      'anthropic-version': '2023-06-01',
+      'anthropic-dangerous-direct-browser-access': 'true',
       'anthropic-beta': 'claude-code-20250219,oauth-2025-04-20',
+      'x-app': 'cli',
+      'x-stainless-lang': 'js',
+      'x-stainless-os': 'Linux',
+      'x-stainless-arch': 'x64',
+      'x-stainless-runtime': 'node',
+      'x-stainless-runtime-version': 'v24.3.0',
+      'x-stainless-package-version': '0.128.0',
+      'x-stainless-retry-count': '0',
+      'x-stainless-timeout': '600',
+      'x-claude-code-session-id': nativeEnvSession,
     },
   )
   assert.equal('crag_env' in nativeRes, false)

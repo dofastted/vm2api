@@ -15,7 +15,7 @@ import (
 	"github.com/dofastted/kin-gateway/worker/internal/credential"
 )
 
-func TestExpiredCredentialRefreshesBeforeProfileAndPersists(t *testing.T) {
+func TestNonRefreshOpsAreReadOnlyAndNeverRefresh(t *testing.T) {
 	var refreshCalls, profileCalls int
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		switch request.URL.Path {
@@ -25,7 +25,7 @@ func TestExpiredCredentialRefreshesBeforeProfileAndPersists(t *testing.T) {
 			_, _ = writer.Write([]byte(`{"access_token":"access-new","refresh_token":"refresh-new","expires_in":28800}`))
 		case "/api/oauth/profile":
 			profileCalls++
-			if request.Header.Get("Authorization") != "Bearer access-new" {
+			if request.Header.Get("Authorization") != "Bearer access-old" {
 				t.Fatalf("authorization = %q", request.Header.Get("Authorization"))
 			}
 			writer.Header().Set("Content-Type", "application/json")
@@ -53,8 +53,46 @@ func TestExpiredCredentialRefreshesBeforeProfileAndPersists(t *testing.T) {
 	if !envelope.OK {
 		t.Fatalf("envelope = %+v", envelope)
 	}
-	if refreshCalls != 1 || profileCalls != 1 {
-		t.Fatalf("refresh calls=%d profile calls=%d", refreshCalls, profileCalls)
+	if refreshCalls != 0 || profileCalls != 1 {
+		t.Fatalf("refresh calls=%d profile calls=%d (want 0, 1)", refreshCalls, profileCalls)
+	}
+	current, err := credential.NewStore(credPath).Status()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.AccessToken != "access-old" || current.RefreshToken != "refresh-old" {
+		t.Fatalf("non-refresh op mutated credential: %+v", current)
+	}
+}
+
+func TestRefreshOpRotatesAndPersistsCredential(t *testing.T) {
+	var refreshCalls int
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/oauth/token" {
+			t.Fatalf("unexpected path %s", request.URL.Path)
+		}
+		refreshCalls++
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write([]byte(`{"access_token":"access-new","refresh_token":"refresh-new","expires_in":28800}`))
+	}))
+	defer server.Close()
+
+	configPath, _ := testConfig(t, server.URL, server.URL+"/oauth/token", nil)
+	credPath := filepath.Join(filepath.Dir(configPath), "credentials.json")
+	saveCredential(t, credPath, credential.Credential{
+		AccessToken:  "access-old",
+		RefreshToken: "refresh-old",
+		ExpiresAt:    time.Now().Add(-time.Minute).UnixMilli(),
+	})
+
+	var output bytes.Buffer
+	if code := Run([]string{"refresh", "--config", configPath, "--attempt-guard"}, nil, &output); code != 0 {
+		t.Fatalf("exit code = %d, output = %s", code, output.String())
+	}
+	var envelope responseEnvelope
+	decodeOutput(t, &output, &envelope)
+	if !envelope.OK || refreshCalls != 1 {
+		t.Fatalf("envelope=%+v refreshCalls=%d", envelope, refreshCalls)
 	}
 	current, err := credential.NewStore(credPath).Status()
 	if err != nil {

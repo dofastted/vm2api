@@ -14,6 +14,7 @@ import { modelDirectiveForCrag } from '../protocol/model-policy.mjs'
 import { capOutboundBody } from '../protocol/outbound-snapshot.mjs'
 import { cacheTtlFromRouting } from '../protocol/cache-ttl.mjs'
 import { ccEntrypointFromRouting, stripSubagentBilling } from '../identity/crs-persona.mjs'
+import { isPromptSpecV1Caps, sanitizePromptSpec } from '../identity/system-prompt-spec.mjs'
 import { sealClaudeCodeCch } from '../identity/cch.mjs'
 import { canRefreshCredential, credentialModeFromOauth, isApiKeyMode } from '../oauth/credential-mode.mjs'
 import { isCrsMock, writeCrsTrace, mockCrsPayload, emitMockSse } from './crs-mock.mjs'
@@ -28,10 +29,12 @@ import {
   refreshErrorCodeOf,
   REFRESH_SKEW_MS,
   stripWorkerCredentialEmail,
+  withCredentialRefreshLock,
   writeWorkerCredentialFile,
   ensureOfficialCredentialLink,
   slotUidGidFromHomeDir,
 } from '../oauth/oauth-credentials.mjs'
+export { withCredentialRefreshLock }
 import { probeAttemptGuard, runSlotOauth } from './slot-oauth.mjs'
 import { slotHost } from '../vm/slot-host.mjs'
 import { ensureRemoteOfficialCredentialLink } from '../cluster/remote-slot-files.mjs'
@@ -71,35 +74,6 @@ import {
 const MAX_BODY = 64 * 1024 * 1024
 const MAX_GATEWAY_CLOCK_MS = 86_400_000
 const CRAG_HEADER_ALLOWANCE_MS = 5_000
-const credentialRefreshTail = new Map()
-
-/**
- * Process-local per-key refresh serialization. Codex paths share the same lock
- * (key = `codex:<vmId>`) so the panel refresh button, traffic-side quota
- * rotation and the search path can never consume the same refresh token
- * concurrently — the loser of a rotation race would otherwise replay a retired
- * RT and clobber the winner's fresher ticket on the read-modify-write
- * credential file.
- */
-export function withCredentialRefreshLock(key, fn) {
-  const prev = credentialRefreshTail.get(key) || Promise.resolve()
-  let release
-  const gate = new Promise((resolve) => {
-    release = resolve
-  })
-  const tail = prev.catch(() => {}).then(() => gate)
-  credentialRefreshTail.set(key, tail)
-  return prev
-    .catch(() => {})
-    .then(async () => {
-      try {
-        return await fn()
-      } finally {
-        release()
-        if (credentialRefreshTail.get(key) === tail) credentialRefreshTail.delete(key)
-      }
-    })
-}
 
 export function workerPaths(exec = {}) {
   const slotRoot = exec.homeDir ? path.dirname(exec.homeDir) : null
@@ -713,6 +687,7 @@ function gateCragBody(body, print, health, isolated = false, dropSampling = fals
   if (print && !strictPassthrough) alignSamplingWithThinking(body, { drop: dropSampling })
   const caps = print && Array.isArray(health?.capabilities) ? health.capabilities : []
   const headlessBridge = print && isHeadlessBridgeCaps(caps)
+  const promptSpecV1 = print && isPromptSpecV1Caps(caps, health)
   const prompt = body.crag_prompt
   const model =
     print && !isolated && body.thread == null && cragConsumesModelDirective(health)
@@ -724,12 +699,19 @@ function gateCragBody(body, print, health, isolated = false, dropSampling = fals
     (Object.hasOwn(body, 'crag_persona_preset') ||
       Object.hasOwn(body, 'crag_prompt_version') ||
       Object.hasOwn(body, 'crag_env'))
+  const stripPromptSpec = !promptSpecV1 && Object.hasOwn(body, 'crag_prompt_spec')
+  const stripNonLegacyPreset =
+    headlessBridge &&
+    !promptSpecV1 &&
+    (body.crag_persona_preset === 'official' || body.crag_persona_preset === 'custom')
   if (
     !model &&
     !Object.hasOwn(body, 'crag_prompt') &&
     !Object.hasOwn(body, 'crag_model') &&
     !hasAlias &&
-    !stripHeadlessFields
+    !stripHeadlessFields &&
+    !stripPromptSpec &&
+    !stripNonLegacyPreset
   ) {
     return body
   }
@@ -741,6 +723,12 @@ function gateCragBody(body, print, health, isolated = false, dropSampling = fals
     delete out.crag_persona_preset
     delete out.crag_prompt_version
     delete out.crag_env
+  }
+  if (stripPromptSpec) {
+    delete out.crag_prompt_spec
+  }
+  if (stripNonLegacyPreset) {
+    delete out.crag_persona_preset
   }
   if (model) out.crag_model = model
   else delete out.crag_model
@@ -757,7 +745,14 @@ function stripClientNonCcHeaders(reqHeaders) {
   const out = {}
   for (const [key, value] of Object.entries(reqHeaders)) {
     const lower = String(key || '').toLowerCase()
-    if (lower === 'anthropic-beta' || lower === 'user-agent') continue
+    if (
+      lower === 'anthropic-beta' ||
+      lower === 'user-agent' ||
+      lower === 'x-app' ||
+      lower === 'x-client-request-id' ||
+      lower.startsWith('x-claude-code-')
+    )
+      continue
     out[key] = value
   }
   return out
@@ -785,6 +780,7 @@ export function prepareWorkerPayload({
   dropSampling = false,
   strictPassthrough = false,
   officialPassthrough = null,
+  officialTraffic = null,
   safeguardsSanitized = false,
 } = {}) {
   const health = exec?.workerStatus
@@ -805,7 +801,9 @@ export function prepareWorkerPayload({
   // accept the panel's legacy cli-node beta body extension.
   const officialBetas = print && health?.capabilities?.includes('generation_controls_v3')
   const headlessBridge = print && isHeadlessBridgeCaps(health?.capabilities)
-  const callerHeaders = print ? extractCragCallerHeaders(reqHeaders, { includeUserAgent: headlessBridge }) : undefined
+  const verifiedOfficial = officialTraffic === true || officialPassthrough === true || strictCrag
+  const callerHeaders =
+    print && verifiedOfficial ? extractCragCallerHeaders(reqHeaders, { includeUserAgent: headlessBridge }) : undefined
   const nativeOwnsHeaders =
     cliHop &&
     cragPrint === true &&
@@ -821,15 +819,18 @@ export function prepareWorkerPayload({
     const nonPassthroughHeadless =
       headlessBridge &&
       !strictCrag &&
-      (officialPassthrough === false ||
+      (!verifiedOfficial ||
+        officialPassthrough === false ||
         body?.crag_persona_preset != null ||
         body?.crag_prompt != null ||
-        body?.crag_env != null)
-    const headerReq = nonPassthroughHeadless ? stripClientNonCcHeaders(reqHeaders) : reqHeaders
+        body?.crag_env != null ||
+        (body?.crag_prompt_spec != null && body.crag_prompt_spec?.passthrough !== true))
+    const headerReq = !verifiedOfficial || nonPassthroughHeadless ? stripClientNonCcHeaders(reqHeaders) : reqHeaders
     headers = prepareOutboundHeaders(headerReq, exec?.homeDir, identity, canonicalBody?.model || '', {
       credentialMode: credentialModeFromOauth(exec?.vm?.claude || {}),
       routing,
       want1m: want1m === true,
+      officialTraffic: verifiedOfficial && !nonPassthroughHeadless,
     })
     if (callerHeaders) {
       for (const [k, v] of Object.entries(callerHeaders)) {
@@ -902,10 +903,13 @@ export async function workerEnvelope({
   preserveCacheBreakpoints = null,
   cliHop = false,
   cragPrint = null,
+  promptSpec = null,
   callerCwd = null,
   repaired = false,
   dropSampling = false,
   strictPassthrough = false,
+  officialPassthrough = null,
+  officialTraffic = null,
   safeguardsSanitized = false,
   redactionPrincipal = '',
   redactionSession = '',
@@ -923,6 +927,8 @@ export async function workerEnvelope({
     repaired,
     dropSampling,
     strictPassthrough,
+    officialPassthrough,
+    officialTraffic,
     safeguardsSanitized,
   })
   const redaction = await redactionContext({ routing, exec, redactionPrincipal, redactionSession })
@@ -932,8 +938,10 @@ export async function workerEnvelope({
   const gated = redaction ? masked.body : prepared.gated
   const outgoingCwd = redaction ? validateCallerCwd(masked.caller_cwd) : cwd
   const finalized = sealPreparedPayload(prepared, gated)
-  const nativeV3 =
-    nativeCragRequest(exec, cragPrint) && exec?.workerStatus?.capabilities?.includes('generation_controls_v3')
+  const print = nativeCragRequest(exec, cragPrint)
+  const nativeV3 = print && exec?.workerStatus?.capabilities?.includes('generation_controls_v3')
+  // Top-level `prompt_spec` rides on the worker envelope for cli-node (never inside `envelope.body`).
+  const cleanPromptSpec = !print && promptSpec ? sanitizePromptSpec(promptSpec) : null
   // Resolve execution defaults even when cacheTtl is null for mixed-TTL accounting.
   const defaultCacheTtl = prepared.strictPassthrough
     ? (cacheTtl ?? null)
@@ -944,6 +952,7 @@ export async function workerEnvelope({
   const envelope = {
     ...(requestContext ? { request_context: requestContext } : {}),
     ...(typeof outgoingCwd === 'string' ? { caller_cwd: outgoingCwd } : {}),
+    ...(cleanPromptSpec ? { prompt_spec: cleanPromptSpec } : {}),
     body: finalized.body,
     ...(finalized.headers ? { headers: finalized.headers } : {}),
     stream: !!stream,
@@ -988,8 +997,8 @@ async function preparePrebuiltEnvelope(envelope, redaction, messages, exec, crag
       )
     }
   }
-  if (out.body && Object.hasOwn(out.body, 'caller_cwd')) {
-    const { caller_cwd: _bodyCwd, ...body } = out.body
+  if (out.body && (Object.hasOwn(out.body, 'caller_cwd') || Object.hasOwn(out.body, 'prompt_spec'))) {
+    const { caller_cwd: _bodyCwd, prompt_spec: _bodyPromptSpec, ...body } = out.body
     out.body = body
   }
   if (redaction && out.body) out.body = await maskJson(out.body, redaction)
@@ -1125,9 +1134,12 @@ async function callGoWorkerRaw({
   envelope = null,
   cliHop = false,
   cragPrint = null,
+  promptSpec = null,
   callerCwd = null,
   repaired = false,
   strictPassthrough = false,
+  officialPassthrough = null,
+  officialTraffic = null,
   safeguardsSanitized = false,
   onEnvelope = null,
   redactionPrincipal = '',
@@ -1150,9 +1162,16 @@ async function callGoWorkerRaw({
       requestContext,
       repaired,
       strictPassthrough,
+      officialPassthrough,
+      officialTraffic,
       safeguardsSanitized,
     })
-    reportEnvelope(onEnvelope, { body: outboundBody, headers })
+    const cleanPromptSpec = !nativeCragRequest(exec, cragPrint) && promptSpec ? sanitizePromptSpec(promptSpec) : null
+    reportEnvelope(onEnvelope, {
+      ...(cleanPromptSpec ? { prompt_spec: cleanPromptSpec } : {}),
+      body: outboundBody,
+      headers,
+    })
     const rejection = await beforeInferencePost?.()
     if (rejection) return rejection
     writeCrsTrace({ body: outboundBody, headers, stream: false })
@@ -1202,10 +1221,13 @@ async function callGoWorkerRaw({
           preserveCacheBreakpoints,
           cliHop,
           cragPrint,
+          promptSpec,
           callerCwd,
           requestContext,
           repaired,
           strictPassthrough,
+          officialPassthrough,
+          officialTraffic,
           safeguardsSanitized,
           redactionPrincipal,
           redactionSession,
@@ -1360,10 +1382,13 @@ async function streamGoWorkerRaw({
   envelope = null,
   cliHop = false,
   cragPrint = null,
+  promptSpec = null,
   callerCwd = null,
   repaired = false,
   dropSampling = false,
   strictPassthrough = false,
+  officialPassthrough = null,
+  officialTraffic = null,
   safeguardsSanitized = false,
   onEnvelope = null,
   onOutboundHeaders = null,
@@ -1388,9 +1413,16 @@ async function streamGoWorkerRaw({
       repaired,
       dropSampling,
       strictPassthrough,
+      officialPassthrough,
+      officialTraffic,
       safeguardsSanitized,
     })
-    reportEnvelope(onEnvelope, { body: outboundBody, headers })
+    const cleanPromptSpec = !nativeCragRequest(exec, cragPrint) && promptSpec ? sanitizePromptSpec(promptSpec) : null
+    reportEnvelope(onEnvelope, {
+      ...(cleanPromptSpec ? { prompt_spec: cleanPromptSpec } : {}),
+      body: outboundBody,
+      headers,
+    })
     const rejection = await beforeInferencePost?.()
     if (rejection) return rejection
     writeCrsTrace({ body: outboundBody, headers, stream: true })
@@ -1502,11 +1534,14 @@ async function streamGoWorkerRaw({
           preserveCacheBreakpoints,
           cliHop,
           cragPrint,
+          promptSpec,
           callerCwd,
           requestContext,
           repaired,
           dropSampling,
           strictPassthrough,
+          officialPassthrough,
+          officialTraffic,
           safeguardsSanitized,
           redactionPrincipal,
           redactionSession,
@@ -2049,20 +2084,20 @@ export async function workerHealth(exec, { timeoutMs = 3000, signal, requireInte
 }
 
 /**
- * Relink a local slot's `.credentials.json` onto credentials.json. A regular file
- * left by the CLI's write-then-rename is adopted first when it holds the later
- * grant, so the refresh token the CLI already rotated to is the one kept.
+ * Relink a local slot's `.credentials.json` onto the panel's authoritative
+ * `credentials.json`. Under Panel SSOT a slot-written regular `.credentials.json`
+ * is never adopted over the panel store.
  */
 export function repairLocalCredentialLink(homeDir) {
   if (!homeDir) return Promise.resolve({ linked: false, error: 'home missing' })
-  return withCredentialRefreshLock(String(homeDir), async () => relinkKeepingRotation(homeDir))
+  return withCredentialRefreshLock(String(homeDir), async () => relinkPanelCredential(homeDir))
 }
 
-function relinkKeepingRotation(homeDir) {
-  return ensureOfficialCredentialLink(homeDir, { ...slotUidGidFromHomeDir(homeDir), adoptOfficial: 'rotation' })
+function relinkPanelCredential(homeDir) {
+  return ensureOfficialCredentialLink(homeDir, { ...slotUidGidFromHomeDir(homeDir), adoptOfficial: false })
 }
 
-/** Whether the worker on this slot's node keeps the refresh attempt journal (no token, no network). */
+/** Whether the control plane's `bin/kin-worker` keeps the refresh attempt journal (no token, no network). */
 export function probeWorkerAttemptGuard(exec, opts = {}) {
   return probeAttemptGuard(exec, opts)
 }
@@ -2081,8 +2116,8 @@ export async function ensureWorkerCredential(exec, { force = false, skewMs = REF
     }
   }
 
-  // Adopt a later CLI grant: dropping it and refreshing the older RT revokes the grant.
-  if (exec?.homeDir) relinkKeepingRotation(exec.homeDir)
+  // Keep the local `.credentials.json` alias pointed at panel `credentials.json` without ever adopting CLI writes.
+  if (exec?.homeDir) relinkPanelCredential(exec.homeDir)
   const credential = readWorkerCredentialFile(exec.homeDir)
   if (!credential) {
     return {
@@ -2109,7 +2144,7 @@ export async function ensureWorkerCredential(exec, { force = false, skewMs = REF
   const snapshotRefresh = String(credential.refresh_token || '')
   const lockKey = String(exec.homeDir || exec.vm?.id || 'credential')
   return withCredentialRefreshLock(lockKey, async () => {
-    if (exec?.homeDir) relinkKeepingRotation(exec.homeDir)
+    if (exec?.homeDir) relinkPanelCredential(exec.homeDir)
     const live = readWorkerCredentialFile(exec.homeDir) || credential
     const liveRefresh = String(live?.refresh_token || '')
     if (snapshotRefresh && liveRefresh && snapshotRefresh !== liveRefresh) {
@@ -2131,7 +2166,7 @@ export async function ensureWorkerCredential(exec, { force = false, skewMs = REF
         credential: credentialSummary(live, liveNow),
       }
     }
-    // The slot oauth helper only refreshes inside its own 5-minute window; an early
+    // The panel worker only refreshes inside its own 5-minute window; an early
     // scheduled refresh has to force it.
     const result = await runSlotOauth(exec, 'refresh', { force: !!force || skewMs > REFRESH_SKEW_MS })
     const body = result?.body || {}
@@ -2178,8 +2213,10 @@ export async function importWorkerCredential(exec, credential, { timeoutMs = 600
   return withCredentialRefreshLock(String(exec.homeDir || exec.vm?.id || 'credential'), async () => {
     try {
       if (!writeWorkerCredentialFile(exec.homeDir, credential)) throw new Error('credential_required')
-      // Import is the one case where the control plane's credential replaces the slot's copy.
-      await slotHost(exec.vm).onImport(exec.vm, path.dirname(exec.homeDir))
+      // Panel SSOT: one-way project the imported credential down to the slot.
+      const host = slotHost(exec.vm)
+      const push = host.syncCredentials || host.onImport
+      if (typeof push === 'function') await push(exec.vm, path.dirname(exec.homeDir))
     } catch (error) {
       return {
         ok: false,
@@ -2233,31 +2270,21 @@ async function reconcileClaudeClientCredentials(
     try {
       if (!exec.homeDir) return clientCredentialRequired()
       const slotDir = path.dirname(exec.homeDir)
-      const repairRemoteLink = async () => {
-        if (host.kind === 'node' && !(await ensureRemoteLink(exec.vm, slotDir))?.linked) {
-          throw new Error('remote_link_failed')
-        }
-      }
       const repairLocalLink = () => {
-        // A loose native alias is never a panel import source.
-        if (!ensureOfficialCredentialLink(exec.homeDir, { adoptOfficial: false }).linked) {
+        // Panel SSOT: a loose native alias is never adopted over panel credentials.json.
+        if (
+          !ensureOfficialCredentialLink(exec.homeDir, { ...slotUidGidFromHomeDir(exec.homeDir), adoptOfficial: false })
+            .linked
+        ) {
           throw new Error('credential_link_failed')
         }
       }
-      const sanitizeCredentials = async () => {
-        const stripped = stripWorkerCredentialEmail(exec.homeDir)
-        if (stripped.changed && host.kind === 'node' && typeof host.onImport === 'function') {
-          await host.onImport(exec.vm, slotDir)
+      const projectToSlot = async () => {
+        const push = host.syncCredentials || host.onImport
+        if (typeof push === 'function') await push(exec.vm, slotDir)
+        if (host.kind === 'node' && !(await ensureRemoteLink(exec.vm, slotDir))?.linked) {
+          throw new Error('remote_link_failed')
         }
-      }
-      if (host.kind === 'node') {
-        const pulled = await host.afterRefresh(exec.vm, slotDir)
-        if (pulled?.reason === 'remote_missing') {
-          if (refreshInSlot) return clientCredentialRequired()
-          throw new Error('remote_missing')
-        }
-        await sanitizeCredentials()
-        await repairRemoteLink()
       }
       const credential = readWorkerCredentialFile(exec.homeDir)
       const mode = credential?.type || credential?.mode
@@ -2265,9 +2292,10 @@ async function reconcileClaudeClientCredentials(
       const hasAccess = hasAccessPresence(credential || {})
       const hasRefresh = hasRefreshPresence(credential || {})
       if (!hasAccess && !(refreshInSlot && refreshable && hasRefresh)) return clientCredentialRequired()
-      await sanitizeCredentials()
+      stripWorkerCredentialEmail(exec.homeDir)
       repairLocalLink()
       if (!refreshInSlot) {
+        await projectToSlot()
         return {
           ok: true,
           synced: true,
@@ -2275,30 +2303,29 @@ async function reconcileClaudeClientCredentials(
         }
       }
 
-      let live = credential
+      let live = readWorkerCredentialFile(exec.homeDir) || credential
       let refreshed = false
-      if (refreshable && (!hasAccess || needsRefresh(credential.expires_at))) {
+      if (refreshable && (!hasAccess || needsRefresh(live.expires_at))) {
         if (!hasRefresh) return staleClientCredential({ error: { code: 'refresh_token_missing' } })
         let result
         try {
-          // This already holds the same lock as imports and worker refreshes.
+          // This already holds the same lock as imports and panel refreshes.
           result = await refreshInSlot(exec, 'refresh', { force: false })
         } catch {
           return staleClientCredential()
         }
         if (!result?.ok) return staleClientCredential({ error: result?.body?.error })
-        // Slot refresh also pulls the remote file back. Verify persisted expiry,
-        // not the subprocess's reported expiry, before admitting the client.
-        await sanitizeCredentials()
+        stripWorkerCredentialEmail(exec.homeDir)
         live = readWorkerCredentialFile(exec.homeDir)
         if (!live || !hasAccessPresence(live) || needsRefresh(live.expires_at)) return staleClientCredential()
-        await repairRemoteLink()
         repairLocalLink()
         refreshed = !!result.body?.refreshed
       } else if (!refreshable && !isApiKeyMode(mode)) {
-        const expiry = expiresAtToMs(credential.expires_at)
+        const expiry = expiresAtToMs(live.expires_at)
         if (expiry && expiry <= Date.now()) return staleClientCredential({ error: { code: 'refresh_token_missing' } })
       }
+      // One-way project the panel's authoritative credential down to the slot before admitting the client.
+      await projectToSlot()
       return {
         ok: true,
         status: 200,

@@ -156,12 +156,9 @@ def atomic_write_in_dir(
         pass
 
     tmp_name = f".kin-tmp-{uuid.uuid4().hex}"
-    fd = os.open(tmp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode, dir_fd=dir_fd)
+    fd = os.open(tmp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dir_fd)
     try:
         try:
-            os.fchmod(fd, mode)
-            if os.geteuid() == 0 and uid is not None and gid is not None:
-                os.fchown(fd, uid, gid)
             view = memoryview(content)
             written = 0
             while written < len(view):
@@ -170,6 +167,9 @@ def atomic_write_in_dir(
                     raise OSError("short write")
                 written += n
             os.fsync(fd)
+            os.fchmod(fd, mode)
+            if os.geteuid() == 0 and uid is not None and gid is not None:
+                os.fchown(fd, uid, gid)
         finally:
             os.close(fd)
         os.replace(tmp_name, filename, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
@@ -591,7 +591,10 @@ class SlotAgentService:
                 dir_fd = open_dir_nofollow(self.cfg.state_dir, ("claude",), create_sub=True, mode=0o700)
                 dest_path = self.cfg.state_dir / "claude" / "credentials.json"
             filename = "credentials.json"
-            mode, uid, gid = 0o600, self.cfg.kincli_uid, self.cfg.kincli_gid
+            # Panel SSOT: guest credentials are a read-only projection owned by root
+            # and group-readable by the slot user (0440), so guest processes cannot
+            # mutate or chmod the file in place.
+            mode, uid, gid = 0o440, 0, self.cfg.kincli_gid
         elif target == "kernel_config":
             dir_fd = open_dir_nofollow(self.cfg.run_dir)
             filename = "kernel.json"

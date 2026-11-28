@@ -23,14 +23,19 @@ function renderHealthPane({
   compatibility = {},
   healthProbe,
   failover = {},
+  probeStatus,
 }: {
   compatibility?: Record<string, unknown>
   healthProbe?: Record<string, unknown>
   failover?: Record<string, unknown>
+  probeStatus?: Record<string, unknown>
 } = {}) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   })
+  if (probeStatus) {
+    client.setQueryData(['panel', 'health-probe'], probeStatus)
+  }
   try {
     return renderToStaticMarkup(
       createElement(
@@ -98,64 +103,190 @@ describe('max_tokens mode display', () => {
   })
 })
 
-describe('Gemini health probe settings', () => {
-  it('renders default 1-hour (3600s) interval, 5400s TTL, enabled switch, and Gemini snapshot row', () => {
+describe('Three-platform multi-model health probe settings', () => {
+  it('renders independent Anthropic, OpenAI, and Google cards with all-models switches and legacy fallback', () => {
     const html = renderHealthPane({ healthProbe: { enabled: true } })
-    const toggle = html.match(
-      /<button[^>]*aria-label="启用 Gemini 健康缓存"[^>]*>/
-    )?.[0]
-    expect(toggle).toBeDefined()
-    expect(toggle).toContain('aria-checked="true"')
 
-    const intervalInput = html.match(
-      /<input[^>]*aria-label="Gemini 探测间隔"[^>]*>/
-    )?.[0]
-    expect(intervalInput).toBeDefined()
-    expect(intervalInput).toContain('value="3600"')
+    expect(html).toContain('Anthropic 健康缓存')
+    expect(html).toContain('OpenAI 健康缓存')
+    expect(html).toContain('Google 健康缓存')
 
-    const ttlInput = html.match(
-      /<input[^>]*aria-label="Gemini 缓存有效期"[^>]*>/
+    // Legacy { enabled: true } activates Anthropic and Google (default gemini.enabled !== false), while OpenAI stays off with no model.
+    const anthropicToggle = html.match(
+      /<button[^>]*aria-label="启用 Anthropic 健康缓存"[^>]*>/
     )?.[0]
-    expect(ttlInput).toBeDefined()
-    expect(ttlInput).toContain('value="5400"')
+    expect(anthropicToggle).toContain('aria-checked="true"')
 
-    const modelInput = html.match(
-      /<input[^>]*aria-label="Gemini 探测模型"[^>]*>/
+    const openaiToggle = html.match(
+      /<button[^>]*aria-label="启用 OpenAI 健康缓存"[^>]*>/
     )?.[0]
-    expect(modelInput).toBeDefined()
-    expect(html).toContain('Gemini：暂无')
+    expect(openaiToggle).toContain('aria-checked="false"')
+
+    const googleToggle = html.match(
+      /<button[^>]*aria-label="启用 Google 健康缓存"[^>]*>/
+    )?.[0]
+    expect(googleToggle).toContain('aria-checked="true"')
+
+    const googleInterval = html.match(
+      /<input[^>]*aria-label="Google 探测间隔"[^>]*>/
+    )?.[0]
+    expect(googleInterval).toContain('value="3600"')
+
+    const googleTtl = html.match(
+      /<input[^>]*aria-label="Google 缓存有效期"[^>]*>/
+    )?.[0]
+    expect(googleTtl).toContain('value="5400"')
+
+    for (const name of ['Anthropic', 'OpenAI', 'Google']) {
+      expect(html).toContain(`aria-label="${name} 一键支持全部模型"`)
+      expect(html).toContain(`aria-label="立即探测 ${name}"`)
+      expect(html).toContain(`${name}：暂无`)
+    }
   })
 
-  it('reflects custom Gemini health probe values', () => {
+  it('reflects independent platform values, all_models badges, custom models, and per-model snapshots', () => {
     const html = renderHealthPane({
       healthProbe: {
-        enabled: true,
-        gemini: {
+        anthropic: {
+          enabled: true,
+          interval_sec: 300,
+          cache_ttl_sec: 600,
+          all_models: true,
+          models: [],
+        },
+        openai: {
+          enabled: true,
+          interval_sec: 900,
+          cache_ttl_sec: 1800,
+          all_models: false,
+          models: ['gpt-5.4', 'gpt-custom-preview'],
+        },
+        google: {
           enabled: false,
           interval_sec: 7200,
           cache_ttl_sec: 10800,
-          model: 'gemini-3-flash',
+          all_models: false,
+          models: ['gemini-3-flash'],
+        },
+      },
+      probeStatus: {
+        config: {},
+        snapshot: null,
+        catalog: {
+          anthropic: [
+            { id: 'claude-haiku-4-5-20251001', label: 'Haiku 4.5' },
+            { id: 'claude-sonnet-4-6', label: 'Sonnet 4.6' },
+          ],
+          openai: [
+            { id: 'gpt-5.4', label: 'GPT-5.4' },
+            { id: 'gpt-5.4-mini', label: 'GPT-5.4 Mini' },
+          ],
+          google: [
+            { id: 'gemini-3-flash', label: 'Gemini 3 Flash', online: true },
+            { id: 'gemini-4-neon', label: 'Gemini 4 Neon', online: false },
+          ],
+        },
+        snapshots: {
+          anthropic: {
+            ok: true,
+            at: '2026-11-28T00:00:00.000Z',
+            stale: false,
+            vm_id: 'vm-01',
+            model: 'claude-haiku-4-5-20251001',
+            error: null,
+            age_ms: 1000,
+            total_models: 2,
+            ok_models: 1,
+            failed_models: 1,
+            stale_models: 0,
+            models: [
+              {
+                ok: true,
+                at: '2026-11-28T00:00:00.000Z',
+                stale: false,
+                vm_id: 'vm-01',
+                model: 'claude-haiku-4-5-20251001',
+                error: null,
+                duration_ms: 320,
+                age_ms: 1000,
+              },
+              {
+                ok: false,
+                at: '2026-11-28T00:00:01.000Z',
+                stale: true,
+                vm_id: 'vm-01',
+                model: 'claude-sonnet-4-6',
+                error: 'upstream_timeout',
+                duration_ms: 5000,
+                age_ms: 900,
+              },
+            ],
+          },
+          openai: {
+            ok: true,
+            at: '2026-11-28T00:00:00.000Z',
+            stale: false,
+            vm_id: 'vm-codex',
+            model: 'gpt-5.4',
+            error: null,
+            age_ms: 1000,
+            total_models: 1,
+            ok_models: 1,
+            failed_models: 0,
+            stale_models: 0,
+            models: [
+              {
+                ok: true,
+                at: '2026-11-28T00:00:00.000Z',
+                stale: false,
+                vm_id: 'vm-codex',
+                model: 'gpt-5.4',
+                error: null,
+                duration_ms: 410,
+                age_ms: 1000,
+              },
+            ],
+          },
+          google: {
+            ok: false,
+            at: null,
+            stale: true,
+            vm_id: null,
+            model: null,
+            error: null,
+            age_ms: null,
+            total_models: 0,
+            ok_models: 0,
+            failed_models: 0,
+            stale_models: 0,
+            models: [],
+          },
         },
       },
     })
-    const toggle = html.match(
-      /<button[^>]*aria-label="启用 Gemini 健康缓存"[^>]*>/
-    )?.[0]
-    expect(toggle).toContain('aria-checked="false"')
 
-    const intervalInput = html.match(
-      /<input[^>]*aria-label="Gemini 探测间隔"[^>]*>/
-    )?.[0]
-    expect(intervalInput).toContain('value="7200"')
-
-    const ttlInput = html.match(
-      /<input[^>]*aria-label="Gemini 缓存有效期"[^>]*>/
-    )?.[0]
-    expect(ttlInput).toContain('value="10800"')
-
-    const modelInput = html.match(
-      /<input[^>]*aria-label="Gemini 探测模型"[^>]*>/
-    )?.[0]
-    expect(modelInput).toContain('value="gemini-3-flash"')
+    expect(html).toContain('已启用 2/3 平台')
+    expect(
+      html.match(
+        /<button[^>]*aria-label="Anthropic 一键支持全部模型"[^>]*>/
+      )?.[0]
+    ).toContain('aria-checked="true"')
+    expect(html).toContain('当前自动覆盖 2 个已启用模型')
+    expect(html).toContain('claude-haiku-4-5-20251001')
+    expect(html).toContain('claude-sonnet-4-6')
+    expect(html).toContain('upstream_timeout')
+    expect(html).toContain('可用 1/2')
+    expect(html).toContain('gpt-custom-preview')
+    expect(html).toContain('移除模型 gpt-custom-preview')
+    expect(html).toContain('暂无在线槽位')
+    expect(
+      html.match(/<input[^>]*aria-label="OpenAI 探测间隔"[^>]*>/)?.[0]
+    ).toContain('value="900"')
+    expect(
+      html.match(/<input[^>]*aria-label="Google 探测间隔"[^>]*>/)?.[0]
+    ).toContain('value="7200"')
+    expect(
+      html.match(/<button[^>]*aria-label="启用 Google 健康缓存"[^>]*>/)?.[0]
+    ).toContain('aria-checked="false"')
   })
 })

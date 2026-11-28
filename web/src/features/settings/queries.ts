@@ -102,16 +102,44 @@ export function changelogQueryOptions() {
   })
 }
 
-export type HealthSnapshotView = {
+export type HealthProbePlatform = 'anthropic' | 'openai' | 'google'
+
+export type HealthCatalogModel = {
+  id: string
+  label: string
+  family?: string
+  online?: boolean
+  probe_id?: string
+}
+
+export type HealthModelSnapshotView = {
   ok: boolean
   at: string | null
   stale: boolean
   vm_id: string | null
   model: string | null
+  message_id?: string | null
+  text?: string | null
+  status?: number
   error: string | null
+  last_error?: string | null
+  last_failed_at?: string | null
+  duration_ms?: number | null
   age_ms: number | null
   next_at?: string | null
   cache_ttl_sec?: number
+}
+
+export type HealthSnapshotView = HealthModelSnapshotView & {
+  platform?: HealthProbePlatform
+  enabled?: boolean
+  all_models?: boolean
+  probing?: boolean
+  total_models?: number
+  ok_models?: number
+  failed_models?: number
+  stale_models?: number
+  models?: HealthModelSnapshotView[]
 }
 
 export type HealthProbePayload = {
@@ -120,8 +148,10 @@ export type HealthProbePayload = {
   snapshots: {
     anthropic: HealthSnapshotView
     openai: HealthSnapshotView
+    google?: HealthSnapshotView
     gemini?: HealthSnapshotView
   } | null
+  catalog?: Partial<Record<HealthProbePlatform, HealthCatalogModel[]>>
 }
 
 export function healthProbeQueryOptions() {
@@ -132,11 +162,17 @@ export function healthProbeQueryOptions() {
   })
 }
 
-export function runHealthProbe(platform: 'all' | 'gemini' = 'all') {
+export function runHealthProbe(
+  platform: 'all' | HealthProbePlatform | 'gemini' = 'all',
+  model?: string
+) {
   return api<HealthProbePayload>('/api/panel/health-probe', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ platform }),
+    body: JSON.stringify({
+      platform,
+      ...(model ? { model } : {}),
+    }),
   })
 }
 

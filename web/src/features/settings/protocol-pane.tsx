@@ -15,7 +15,6 @@ import {
   cacheTtlFromCompat,
   detectProxiedOfficialCcFromCompat,
 } from '@/lib/cache-breakpoints'
-import { cn } from '@/lib/utils'
 import { Badge } from '@/components/ui/badge'
 import { Switch } from '@/components/ui/switch'
 import { SettingRow } from '@/components/setting-row'
@@ -37,15 +36,15 @@ const BLOCKABLE_CLIENTS: [string, string, string][] = [
   ['openclaw', 'OpenClaw', 'system 自述 OpenClaw 或带 mcp__openclaw__ 工具'],
 ]
 
-/** Mirrors `hasClaudeCodeClientHeaders` + body checks in src/lib/identity/claude-code-only.mjs. */
+/** Mirrors `verifyOfficialClaudeCode` in src/lib/identity/official-cc-verifier.mjs. */
 const CLAUDE_CODE_FINGERPRINT: [string, string][] = [
-  ['UA', 'claude-cli/x.y.z'],
-  ['x-app', 'cli'],
-  ['anthropic-beta', 'claude-code-20250219'],
-  ['Stainless SDK', 'x-stainless-lang: js'],
-  ['会话头', '= user_id.session_id'],
-  ['system', '官方计费块 / 身份行'],
-  ['计费块', 'cc_version = UA 版本'],
+  ['UA 语法', 'claude-cli/x.y.z (external, <ep>)'],
+  ['请求头', 'x-app + 8 项 Stainless JS + browser-access'],
+  ['会话与身份', '非零 64-hex device_id + UUIDv4 session_id'],
+  ['anthropic-beta', 'claude-code-20250219（辅助子类型除外）'],
+  ['计费块', '首块锚定 fp3 摘要一致、拒绝 cch=00000'],
+  ['工具白名单', '区分大小写官方 PascalCase / mcp__'],
+  ['system 与克隆', '官方身份前缀，排除第三方仿冒/克隆'],
 ]
 
 function autoCompactWindowValue(value: unknown) {
@@ -109,7 +108,7 @@ export function ProtocolPane({
             label='识别中转来的官方 Claude Code'
             desc={
               relay
-                ? 'UA 被改写但系统里有官方计费块的请求按官方处理，准入也放行。计费块被丢掉时，还要官方 system 和合法 user_id。'
+                ? 'UA 被改写时须通过锚定计费块 fp3 校验（拒绝 cch=00000）、官方 system、官方工具白名单与克隆排除；非桌面/SDK 入口或计费块缺失时还需非零 user_id。'
                 : '已关：只认直连 Claude Code，中转流量按第三方处理。'
             }
           >
@@ -125,7 +124,7 @@ export function ProtocolPane({
             label='官方 Claude Code 家族透传'
             desc={
               compat.official_cc_passthrough === true
-                ? '开：直连和被识别为中转的官方家族保留入站 system，不套用当前提示词档。'
+                ? '开：通过严格官方校验的直连与中转请求保留入站 system，不套用当前提示词档；含外来 system 块或非官方工具时不透传。'
                 : '关：官方家族也套用协议里的 system 档。打开后才透传。'
             }
           >
@@ -179,23 +178,17 @@ export function ProtocolPane({
             />
           </SettingRow>
         </div>
-        <div
-          className={cn(
-            'space-y-3 pt-3 transition-opacity duration-200',
-            !strict && 'opacity-55'
-          )}
-        >
+        <div className='space-y-3 pt-3'>
           <p className='text-xs text-muted-foreground'>
-            {strict ? '直连放行须同时满足' : '开启后直连放行须同时满足'}
+            {strict
+              ? '官方流量判定、官方透传与「仅允许 Claude Code」共用同一套严格校验，直连须同时满足'
+              : '官方流量判定与官方透传始终执行严格校验（开启「仅允许 Claude Code」后同样适用），直连须同时满足'}
           </p>
           <ul className='grid gap-x-4 gap-y-1.5 sm:grid-cols-2'>
             {CLAUDE_CODE_FINGERPRINT.map(([name, value]) => (
               <li key={name} className='flex min-w-0 items-start gap-2 text-xs'>
                 <Check
-                  className={cn(
-                    'mt-0.5 size-3.5 shrink-0',
-                    strict ? 'text-primary' : 'text-muted-foreground'
-                  )}
+                  className='mt-0.5 size-3.5 shrink-0 text-primary'
                   aria-hidden
                 />
                 <span className='min-w-0'>
@@ -208,8 +201,10 @@ export function ProtocolPane({
             ))}
           </ul>
           <p className='text-xs leading-5 text-muted-foreground'>
-            OpenAI 格式入口与健康探测一律拒绝。count_tokens 只验请求头；CLI
-            自身的 quota 探测须是固定原样。面板测试与内部探测不受影响。
+            未通过校验的伪装请求按第三方处理（system 搬移、工具名加 mcp__
+            前缀，开启「仅允许 Claude Code」时直接 403）。OpenAI
+            格式入口与健康探测不判官方；count_tokens 与 CLI quota
+            探测须符合固定官方形态。面板测试与内部探测不受影响。
           </p>
         </div>
       </PaneSection>
@@ -284,7 +279,7 @@ export function ProtocolPane({
           />
         </SettingRow>
         <SettingRow
-          label='CRAG print 丢弃外来 thinking'
+          label='CRAG 丢弃外来 thinking'
           desc={
             cragDropForeignThinkingFromCompat(compat) === 'all'
               ? '全部：不是本账号签发的块都丢（含签名无记录的）。签名记录不完整时（清库、记录开始前的老会话）会误丢本账号 thinking 并让提示缓存失效。'
@@ -294,7 +289,7 @@ export function ProtocolPane({
           }
         >
           <ChipGroup
-            label='CRAG print 丢弃外来 thinking'
+            label='CRAG 丢弃外来 thinking'
             value={cragDropForeignThinkingFromCompat(compat)}
             options={[
               ['off', '关'],

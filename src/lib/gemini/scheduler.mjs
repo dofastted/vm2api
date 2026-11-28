@@ -204,6 +204,19 @@ const CONTENT_OUTPUT_EVENTS = new Set([
 ])
 
 const SHORT_RATE_LIMIT_MAX_MS = 5_000
+const MAX_LOCAL_BRIDGE_DISCONNECT_ATTEMPTS = 2
+
+function isLocalBridgeDisconnectFailure(failure, failureCode, attemptUpstreamStatus) {
+  if (failure?.bridgeDisconnected === true) return true
+  if (
+    failureCode === 'gemini_inference_failed' &&
+    (attemptUpstreamStatus == null || attemptUpstreamStatus === 502) &&
+    /native bridge disconnected/i.test(String(failure?.message || ''))
+  ) {
+    return true
+  }
+  return false
+}
 const WORKER_SESSION_CONFLICT_CODES = new Set(['tool_continuation_aborted', 'gemini_session_conflict'])
 
 function resolveInferFailureCode(errBody, statusCode) {
@@ -326,6 +339,8 @@ function known(error) {
     if (error.retryAfter != null) out.retryAfter = error.retryAfter
     if (typeof error.upstreamReason === 'string' && error.upstreamReason) out.upstreamReason = error.upstreamReason
     if (error.contentRejected === true) out.contentRejected = true
+    if (typeof error.workerCode === 'string' && error.workerCode) out.workerCode = error.workerCode
+    if (error.bridgeDisconnected === true) out.bridgeDisconnected = true
     if (error.timing) out.timing = error.timing
     if (error.usage) out.usage = error.usage
     if (error.details) out.details = error.details
@@ -1115,6 +1130,7 @@ export function createGeminiScheduler({
       let sessionConflictRetried = false
       let pendingRestartResume = null
       let accountSwitches = 0
+      let localBridgeDisconnects = 0
       let legacyRun = null
       let activeInfer = null
       let activeLeaseId = null
@@ -1524,11 +1540,15 @@ export function createGeminiScheduler({
                   } else {
                     const quotaMeta = parseUpstreamQuotaMeta(errBody)
                     const errCode = resolveInferFailureCode(errBody, res.statusCode)
-                    const err = fail(
-                      res.statusCode || FAILURES[errCode][0],
-                      errCode,
-                      errBody?.message || FAILURES[errCode][1],
-                    )
+                    const errMsg =
+                      (typeof errBody?.message === 'string' && errBody.message) ||
+                      (typeof errBody?.error === 'string' && errBody.error) ||
+                      FAILURES[errCode][1]
+                    const err = fail(res.statusCode || FAILURES[errCode][0], errCode, errMsg)
+                    if (typeof errBody?.code === 'string' && errBody.code) err.workerCode = errBody.code
+                    if (errBody?.code === 'bridge_disconnected' && errBody?.upstream_status == null) {
+                      err.bridgeDisconnected = true
+                    }
                     if (Number.isInteger(res.statusCode)) err.upstreamStatus = res.statusCode
                     if (quotaMeta.upstreamReason) err.upstreamReason = quotaMeta.upstreamReason
                     if (quotaMeta.contentRejected || errCode === 'gemini_content_rejected') err.contentRejected = true
@@ -1842,8 +1862,11 @@ export function createGeminiScheduler({
               (attemptUpstreamStatus === 503 &&
                 failureCode !== 'gemini_operation_busy' &&
                 failureCode !== 'gemini_native_worker_unavailable')
+            const isLocalBridgeDisconnect = isLocalBridgeDisconnectFailure(failure, failureCode, attemptUpstreamStatus)
+            if (isLocalBridgeDisconnect) localBridgeDisconnects += 1
             const isUpstream502 =
               !isUpstream503 &&
+              !isLocalBridgeDisconnect &&
               (attemptUpstreamStatus === 502 ||
                 failureCode === 'gemini_proxy_error' ||
                 (failureCode === 'gemini_inference_failed' &&
@@ -1870,7 +1893,7 @@ export function createGeminiScheduler({
                 },
               ])
               invalidateCatalogCache()
-            } else if (NON_CIRCUIT_FAILURES.has(failureCode) || isUpstream503) {
+            } else if (NON_CIRCUIT_FAILURES.has(failureCode) || isUpstream503 || isLocalBridgeDisconnect) {
               poolScheduler?.unitCircuit?.releaseProbe?.(accountKey)
             } else {
               poolScheduler?.unitCircuit?.recordFailure?.(accountKey)
@@ -1996,6 +2019,7 @@ export function createGeminiScheduler({
               !emittedOutput &&
               failure?.contentRejected !== true &&
               FAILOVER_ERRORS.has(failureCode) &&
+              (!isLocalBridgeDisconnect || localBridgeDisconnects < MAX_LOCAL_BRIDGE_DISCONNECT_ATTEMPTS) &&
               excludedNodeKeys.size < dispatchAccounts.length &&
               accountSwitches < maxAccountSwitches &&
               attempts < maxAttempts

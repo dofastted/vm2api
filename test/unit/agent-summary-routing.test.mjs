@@ -11,7 +11,16 @@ import { PoolScheduler } from '../../src/lib/pool/pool-scheduler.mjs'
 import { StickyRouter } from '../../src/lib/pool/sticky-router.mjs'
 import { ThinkingOwnerStore } from '../../src/lib/pool/thinking-owner.mjs'
 import { extractCallerSession, sessionIdFromOutboundBody } from '../../src/lib/identity/identity-rewrite.mjs'
-import { agentBody } from '../fixtures/agent-summary.mjs'
+import { agentBody as rawAgentBody } from '../fixtures/agent-summary.mjs'
+
+const OFFICIAL_AGENT_DEVICE = 'a'.repeat(64)
+const OFFICIAL_AGENT_SESSION = '11111111-2222-4333-8444-555555555555'
+const agentBody = (opts) => ({
+  ...rawAgentBody(opts),
+  metadata: {
+    user_id: JSON.stringify({ device_id: OFFICIAL_AGENT_DEVICE, session_id: OFFICIAL_AGENT_SESSION }),
+  },
+})
 import { createAnthropicSseErrorRemapper } from '../../src/lib/protocol/stream-truncation.mjs'
 import { responsesSseToAnthropicEvents } from '../../src/lib/protocol/codex-convert.mjs'
 import { clearRustHealthCache, rememberRustHealth } from '../../src/lib/transport/kernel-router.mjs'
@@ -293,6 +302,19 @@ function harness({
   })
   const headers = {
     'user-agent': 'claude-cli/2.1.306 (external, cli)',
+    'x-app': 'cli',
+    'anthropic-version': '2023-06-01',
+    'anthropic-beta': 'claude-code-20250219',
+    'anthropic-dangerous-direct-browser-access': 'true',
+    'x-claude-code-session-id': OFFICIAL_AGENT_SESSION,
+    'x-stainless-lang': 'js',
+    'x-stainless-package-version': '0.128.0',
+    'x-stainless-os': 'Linux',
+    'x-stainless-arch': 'x64',
+    'x-stainless-runtime': 'node',
+    'x-stainless-runtime-version': 'v26.12.1',
+    'x-stainless-retry-count': '0',
+    'x-stainless-timeout': '600',
     ...(agentId ? { 'x-claude-code-agent-id': agentId } : {}),
   }
   const parentSession = extractCallerSession({ inbound: agentBody(), headers })

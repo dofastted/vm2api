@@ -21,8 +21,19 @@ describe('persona drafts payload', () => {
       official_full: [],
       zero: [],
       custom: [],
-      official_303: [],
     })
+  })
+
+  it('canonicalizes legacy official_303 templates into official_full on read', () => {
+    const legacyBlocks = [
+      { id: 'custom_303', type: 'text', text: 'legacy-303' },
+    ]
+    const drafts = seedPersonaDrafts({
+      persona_preset: 'official_303',
+      persona_templates: { official_303: legacyBlocks },
+    })
+    expect(drafts.official_full).toBe(stringifyPersonaTemplate(legacyBlocks))
+    expect(personaTemplatesPayload(drafts).official_full).toEqual(legacyBlocks)
   })
 
   it('only materializes the scheme that actually changed', () => {

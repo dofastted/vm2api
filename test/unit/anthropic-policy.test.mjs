@@ -959,7 +959,28 @@ test('third-party tool additions and removals follow the declared tool name', ()
     body.messages[1].content.map((block) => block.tool.name),
     ['lookup_doc', 'lookup_doc'],
   )
-  assert.deepEqual(toStandardAnthropicBody(body, { official: true }).body.messages[1], body.messages[1])
+  // V5: non-official tool names are STILL rewritten even when official: true.
+  const officialNonCc = toStandardAnthropicBody(body, { official: true }).body
+  assert.equal(officialNonCc.tools[0].name, 'mcp__lookup_doc')
+  assert.deepEqual(
+    officialNonCc.messages[1].content.map((block) => block.tool.name),
+    ['mcp__lookup_doc', 'mcp__lookup_doc'],
+  )
+  // Verified official PascalCase CC built-ins stay untouched when official: true.
+  const officialBody = {
+    tools: [{ name: 'Read', input_schema: { type: 'object' } }],
+    messages: [
+      { role: 'user', content: 'read' },
+      {
+        role: 'system',
+        content: ['tool_addition', 'tool_removal'].map((type) => ({
+          type,
+          tool: { type: 'tool_reference', name: 'Read' },
+        })),
+      },
+    ],
+  }
+  assert.deepEqual(toStandardAnthropicBody(officialBody, { official: true }).body.messages[1], officialBody.messages[1])
 })
 
 test('#953 client-supplied mcp__ names in tool_reference stay unchanged', () => {

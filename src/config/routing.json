@@ -176,7 +176,6 @@
 
   "compatibility": {
     "persona_preset": "official_full",
-    "crag_persona_preset": "official_full",
     "craggemini_persona_preset": "official_full",
     "overlay_preset": "off",
     "persona_park": false,
@@ -216,18 +215,55 @@
     "intercept_warmup": true,
     "fail_closed": true,
     "run_on_start": true,
-    "real": {
-      "model": "claude-haiku-4-5",
+    "anthropic": {
+      "enabled": false,
+      "interval_sec": 600,
+      "cache_ttl_sec": 900,
+      "all_models": false,
+      "models": ["claude-haiku-4-5"],
+      "probe_all_slots": false,
       "prompt": "hello",
       "max_tokens": 64,
       "timeout_ms": 60000,
       "outbound_mode": "official",
       "vm_ids": []
     },
-    "gemini": {
-      "enabled": true,
+    "openai": {
+      "enabled": false,
+      "interval_sec": 600,
+      "cache_ttl_sec": 900,
+      "all_models": false,
+      "models": [],
+      "probe_all_slots": false,
+      "prompt": "hello",
+      "max_tokens": 64,
+      "timeout_ms": 60000,
+      "vm_ids": []
+    },
+    "google": {
+      "enabled": false,
       "interval_sec": 3600,
       "cache_ttl_sec": 5400,
+      "all_models": false,
+      "models": [],
+      "prompt": "hello",
+      "timeout_ms": 60000
+    },
+    "real": {
+      "model": "claude-haiku-4-5",
+      "prompt": "hello",
+      "max_tokens": 64,
+      "timeout_ms": 60000,
+      "outbound_mode": "official",
+      "vm_ids": [],
+      "openai_model": ""
+    },
+    "gemini": {
+      "enabled": false,
+      "interval_sec": 3600,
+      "cache_ttl_sec": 5400,
+      "all_models": false,
+      "models": [],
       "model": "",
       "prompt": "hello",
       "timeout_ms": 60000

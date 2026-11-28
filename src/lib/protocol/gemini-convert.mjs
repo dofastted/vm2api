@@ -777,6 +777,63 @@ function lowerOpenApiTypes(node) {
   return out
 }
 
+/**
+ * Check whether a JSON Schema `pattern` regex stays within the RE2-compatible
+ * subset accepted by CRAGGemini / agy (no lookarounds, backreferences, atomic
+ * groups, conditionals, or possessive quantifiers). Character classes and
+ * backslash escapes are tracked so literal sequences inside `[...]` or escaped
+ * parentheses do not trigger false positives (#1985).
+ */
+export function isRe2CompatibleRegex(pattern) {
+  if (typeof pattern !== 'string' || !pattern) return false
+  let inClass = false
+  let classStart = -1
+  let escaped = false
+  for (let i = 0; i < pattern.length; i += 1) {
+    const ch = pattern[i]
+    if (escaped) {
+      if (!inClass) {
+        if (ch >= '1' && ch <= '9') return false
+        if (ch === 'k' && pattern[i + 1] === '<') return false
+      }
+      escaped = false
+      continue
+    }
+    if (ch === '\\') {
+      escaped = true
+      continue
+    }
+    if (inClass) {
+      if (ch === ']' && i > classStart) {
+        inClass = false
+        classStart = -1
+      }
+      continue
+    }
+    if (ch === '[') {
+      inClass = true
+      classStart = i + 1
+      if (pattern[classStart] === '^') classStart += 1
+      continue
+    }
+    if (ch === '(' && pattern[i + 1] === '?') {
+      const next = pattern[i + 2]
+      if (next === '=' || next === '!' || next === '>' || next === '(') return false
+      if (next === '<' && (pattern[i + 3] === '=' || pattern[i + 3] === '!')) return false
+    }
+    if (ch === '+' && i > 0) {
+      const prev = pattern[i - 1]
+      if (prev === '*' || prev === '+' || prev === '?' || prev === '}') {
+        // Count preceding backslashes to distinguish escaped literal `\+` / `\*` / `\?` / `\}`.
+        let slashes = 0
+        for (let j = i - 2; j >= 0 && pattern[j] === '\\'; j -= 1) slashes += 1
+        if (slashes % 2 === 0) return false
+      }
+    }
+  }
+  return true
+}
+
 function shapeJsonSchemaForGemini(node, isSchema = true) {
   if (isSchema && typeof node === 'boolean') return node ? {} : undefined
   if (!isPlainObject(node) || !isSchema) return node
@@ -797,6 +854,8 @@ function shapeJsonSchemaForGemini(node, isSchema = true) {
     } else if (SCHEMA_LIST.has(key) && Array.isArray(val)) {
       const list = val.map((item) => shapeJsonSchemaForGemini(item, true)).filter((item) => item !== undefined)
       if (list.length) out[key] = list
+    } else if (key === 'pattern') {
+      if (isRe2CompatibleRegex(val)) out[key] = val
     } else {
       out[key] = val
     }
@@ -1100,6 +1159,7 @@ export function sanitizeGeminiSchema(raw, { plain = false } = {}) {
     const out = {}
     for (const [k, v] of Object.entries(value)) {
       if (PLAIN_SCHEMA_KEEP.has(k)) {
+        if (k === 'pattern' && !isRe2CompatibleRegex(v)) continue
         out[k] = v
       } else if ((k === 'exclusiveMinimum' || k === 'exclusiveMaximum') && typeof v === 'number') {
         const bound = k === 'exclusiveMinimum' ? 'minimum' : 'maximum'
@@ -3205,11 +3265,15 @@ function modelSupportsGeminiDefaultThinking(model) {
   return false
 }
 
+function supportsGeminiXhighThinkingLevel(model) {
+  return /(?:hydrogen|neon)/i.test(String(model || ''))
+}
+
 function mapGemini3ThinkingLevel(effort, model) {
   if (effort === 'minimal') return /flash/i.test(model) ? 'minimal' : 'low'
   if (effort === 'low') return 'low'
   if (effort === 'medium') return 'medium'
-  if ((effort === 'xhigh' || effort === 'max') && /hydrogen/i.test(model)) return 'xhigh'
+  if ((effort === 'xhigh' || effort === 'max') && supportsGeminiXhighThinkingLevel(model)) return 'xhigh'
   return 'high'
 }
 

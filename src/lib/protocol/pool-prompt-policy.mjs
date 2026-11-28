@@ -11,7 +11,7 @@
  * - Precedence: explicit Anthropic pool policy (`mode !== 'inherit_global'`)
  *   strictly overrides global `routing.compatibility`.
  */
-import { normalizeCragPersonaPreset } from './crag-print-prompt.mjs'
+import { resolveGlobalUnifiedPreset } from '../identity/system-prompt-spec.mjs'
 
 export const POOL_SYSTEM_PROMPT_MODES = Object.freeze([
   'official',
@@ -72,17 +72,11 @@ export function requestedPoolIdFromHeaders(headers = {}) {
 }
 
 /**
- * Global zero-inject compatibility check matching legacy `handle-protocol.mjs`
- * and `user-count-tokens.mjs` semantics.
+ * Global zero-inject compatibility check using unified system prompt SSOT.
  */
 export function resolveGlobalZeroInject(routing = null) {
-  const inject = String(routing?.compatibility?.persona_inject || '')
-    .trim()
-    .toLowerCase()
-  const preset = String(routing?.compatibility?.persona_preset || '')
-    .trim()
-    .toLowerCase()
-  return inject === 'zero' || preset === 'zero'
+  if (!routing || typeof routing !== 'object') return false
+  return resolveGlobalUnifiedPreset(routing) === 'zero'
 }
 
 /**
@@ -169,8 +163,9 @@ export function resolvePoolSystemPromptPolicy(
     })
   }
 
-  const globalZero = resolveGlobalZeroInject(routing)
-  const globalCragPreset = normalizeCragPersonaPreset(routing?.compatibility?.crag_persona_preset)
+  const globalPreset = resolveGlobalUnifiedPreset(routing)
+  const globalZero = globalPreset === 'zero'
+  const globalCragPreset = globalPreset
 
   if (!effectivePool || typeof effectivePool !== 'object') {
     return Object.freeze({
@@ -206,15 +201,16 @@ export function resolvePoolSystemPromptPolicy(
   }
 
   const preset = normalizePoolPromptPreset(effectivePool.system_prompt_preset, 'official_full')
+  const canonicalPreset = preset === 'official' ? 'official' : 'official_full'
   const text = typeof effectivePool.system_prompt_text === 'string' ? effectivePool.system_prompt_text : ''
   const clientSystemPolicy = normalizeClientSystemPolicy(effectivePool.client_system_policy, 'prepend_pool')
 
   if (mode === 'official') {
     return Object.freeze({
       mode: 'official',
-      preset,
-      cragPreset: 'official_full',
-      cliPreset: preset,
+      preset: canonicalPreset,
+      cragPreset: canonicalPreset,
+      cliPreset: canonicalPreset,
       apiBodyPolicy: 'persona',
       text: '',
       clientSystemPolicy: 'prepend_pool',
@@ -260,9 +256,9 @@ export function resolvePoolSystemPromptPolicy(
   if (mode === 'append') {
     return Object.freeze({
       mode: 'append',
-      preset,
-      cragPreset: 'official_full',
-      cliPreset: preset,
+      preset: canonicalPreset,
+      cragPreset: canonicalPreset,
+      cliPreset: canonicalPreset,
       apiBodyPolicy: 'persona',
       text,
       clientSystemPolicy: 'append_pool',
