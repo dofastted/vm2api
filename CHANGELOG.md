@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.4.263 — 2026-11-28 · 修复无参工具调用被误判为 `502 native_handoff_invalid`
+
+- **无参工具调用的空 `input_json_delta` 不再残留 `_inputJson`（#2101）**：Anthropic 在流式返回无参工具（如 `CronList`、`ListAgents`）时，会在 `content_block_start`（`input: {}`）与 `content_block_stop` 之间发一条空的 `input_json_delta`（`partial_json: ""`）。`src/lib/protocol/convert.mjs` 的 `applyClaudeSSELineToMessage` 在收尾时用 `if (block._inputJson)` 判断，空串为假值导致整段被跳过、`_inputJson` 没有删除；下游 `native-handoff.mjs` 看到 `Object.hasOwn(block, '_inputJson')` 就把这个合法的无参调用判成 `502 native_handoff_invalid: Native tool batch has invalid identity or arguments`，并让 `issued-tool-replay` 跳过记录。
+  - 现在 `content_block_stop` 只要 `_inputJson` 是字符串就收尾并删除；非空串仍走 `JSON.parse`，空串保证 `input` 为对象（`{}`）
+  - 安全边界不变：未收到 `content_block_stop` 的截断流仍保留 `_inputJson`，`native-handoff.mjs` 对此的校验没有放宽；非法 JSON 的行为也不变
+- 部署说明：本次改动零数据库迁移、零 Rust 变更、零 `deploy/payload.json` 变更；升级后重启控制面即可生效。
+
 ## 1.4.262 — 2026-11-28 · 上游 HTTP 400 按类别清洗，对会话相关的 400 封禁该会话 10 分钟
 
 - **终态上游 400 的分类与 10 分钟会话封禁（#2081）**：请求经过 failover / 修复重试后仍以真实上游 400 结束时，网关统一经 `classifyUpstream400`（`src/lib/core/refusal-guard.mjs`）分类，并只封当前租户下的该会话 10 分钟（不封设备、不降级已有的永久封禁、保留 `hit_count`）。封禁期内同一会话的请求在前置拦截处收到不可重试的 400（`x-should-retry: false`），不再继续冲击上游。
