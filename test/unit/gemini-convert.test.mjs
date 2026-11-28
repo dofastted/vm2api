@@ -1,3 +1,6 @@
+import { buildDirectEnvelope } from '../../src/lib/gemini/direct-client.mjs'
+import { normalizeGeminiOutboundPrompt } from '../../src/lib/gemini/prompt-normalizer.mjs'
+import { resolveUpstreamModel } from '../../src/lib/gemini/model-catalog.mjs'
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
@@ -2142,4 +2145,75 @@ test('makeWireToolName caps wire names at 55 chars so mcp_crag_<wireName> stays 
 
   const restoredNames = collector.result().toolCalls.map((c) => c.name)
   assert.deepEqual(restoredNames, toolNames)
+})
+
+test('gemini-4-neon preserves xhigh thinkingLevel alongside gemini-4-neon-xhigh variant (#1975)', () => {
+  const available = ['gemini-4-neon-low', 'gemini-4-neon-medium', 'gemini-4-neon-high', 'gemini-4-neon-xhigh']
+  const cases = [
+    { effort: 'low', model: 'gemini-4-neon-low', thinkingLevel: 'low' },
+    { effort: 'medium', model: 'gemini-4-neon-medium', thinkingLevel: 'medium' },
+    { effort: 'high', model: 'gemini-4-neon-high', thinkingLevel: 'high' },
+    { effort: 'xhigh', model: 'gemini-4-neon-xhigh', thinkingLevel: 'xhigh' },
+    { effort: 'max', model: 'gemini-4-neon-xhigh', thinkingLevel: 'xhigh' },
+  ]
+  for (const c of cases) {
+    const inbound = {
+      model: 'gemini-4-neon',
+      max_tokens: 64,
+      stream: false,
+      output_config: { effort: c.effort },
+      messages: [{ role: 'user', content: 'Reply with exactly OK.' }],
+    }
+    const parsed = parseInboundToGemini('anthropic', inbound)
+    const selected = resolveUpstreamModel(parsed.model, available, { requestedEffort: parsed.thinking.effort })
+    const nativeRequest = buildGeminiRequest(
+      { ...parsed, model: selected.upstreamModel, requestedModel: inbound.model },
+      { target: 'antigravity', defaultEffort: 'medium', includeThinkingConfig: true },
+    )
+    const { body } = normalizeGeminiOutboundPrompt(nativeRequest, { target: 'antigravity' })
+    const envelope = buildDirectEnvelope({ model: selected.upstreamModel, requestId: 'req-neon-xhigh', bodyObj: body })
+    assert.equal(envelope.body.model, c.model)
+    assert.equal(envelope.body.generationConfig.thinkingConfig.thinkingLevel, c.thinkingLevel)
+  }
+
+  // Untiered catalog preserves gemini-4-neon-xhigh while still clamping non-xhigh families (e.g. carbon).
+  const untieredNeon = resolveUpstreamModel('gemini-4-neon-xhigh[1m]', ['gemini-4-neon'])
+  assert.equal(untieredNeon.upstreamModel, 'gemini-4-neon')
+  assert.equal(untieredNeon.publicId, 'gemini-4-neon-xhigh')
+
+  const untieredNeonBare = resolveUpstreamModel('gemini-4-neon', ['gemini-4-neon'], { requestedEffort: 'xhigh' })
+  assert.equal(untieredNeonBare.upstreamModel, 'gemini-4-neon')
+  const untieredNeonReq = buildGeminiRequest(
+    {
+      ...parseInboundToGemini('anthropic', {
+        model: 'gemini-4-neon',
+        max_tokens: 64,
+        stream: false,
+        output_config: { effort: 'xhigh' },
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+      model: untieredNeonBare.upstreamModel,
+      requestedModel: 'gemini-4-neon',
+    },
+    { target: 'antigravity', defaultEffort: 'medium', includeThinkingConfig: true },
+  )
+  assert.equal(untieredNeonReq.generationConfig.thinkingConfig.thinkingLevel, 'xhigh')
+
+  const untieredCarbon = resolveUpstreamModel('gemini-4-carbon-xhigh[1m]', ['gemini-4-carbon'])
+  assert.equal(untieredCarbon.upstreamModel, 'gemini-4-carbon')
+  assert.equal(untieredCarbon.publicId, 'gemini-4-carbon-high')
+
+  const carbonIr = parseInboundToGemini('anthropic', {
+    model: 'gemini-4-carbon',
+    max_tokens: 64,
+    stream: false,
+    output_config: { effort: 'xhigh' },
+    messages: [{ role: 'user', content: 'hi' }],
+  })
+  const carbonReq = buildGeminiRequest(carbonIr, {
+    target: 'antigravity',
+    defaultEffort: 'medium',
+    includeThinkingConfig: true,
+  })
+  assert.equal(carbonReq.generationConfig.thinkingConfig.thinkingLevel, 'high')
 })
