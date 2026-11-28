@@ -1009,3 +1009,129 @@ test('StickyRouter PG mode runs resolve/bind/clear/purgeExpired via Redis + asyn
   assert.equal(syncRepoCalls, 0, 'PG purgeExpiredAsync must never call sync StickyRepo')
   router.db?.close?.()
 })
+
+test('StickyRouter PG mode statsAsync() & cached stats() eliminate sync DELETE and full-table repo.all()', async () => {
+  const dir = tmpDir('kin-sticky-pg-stats-')
+  const now = Date.now()
+  const pgRows = new Map([
+    [
+      'sess:a',
+      {
+        key: 'sess:a',
+        account_id: 'acc-1',
+        vm_id: 'vm-1',
+        session_id: 'out-a',
+        device_id: 'dev-1',
+        bound_at: now - 1000,
+        expires_at: now + 60_000,
+        hits: 7,
+        generation: 1,
+        slot_index: 0,
+      },
+    ],
+    [
+      'sess:b',
+      {
+        key: 'sess:b',
+        account_id: 'acc-2',
+        vm_id: 'vm-2',
+        session_id: 'out-b',
+        device_id: 'dev-2',
+        bound_at: now - 500,
+        expires_at: now + 60_000,
+        hits: 3,
+        generation: 1,
+        slot_index: 1,
+      },
+    ],
+    [
+      'sess:expired',
+      {
+        key: 'sess:expired',
+        account_id: 'acc-3',
+        vm_id: 'vm-3',
+        session_id: 'out-x',
+        device_id: null,
+        bound_at: 100,
+        expires_at: 200,
+        hits: 99,
+        generation: 1,
+        slot_index: null,
+      },
+    ],
+  ])
+
+  let aggQueries = 0
+  let rowQueries = 0
+  const mockPgPool = {
+    async query(sql, params = []) {
+      if (/DELETE FROM sticky_sessions/i.test(sql)) return { rows: [], rowCount: 0 }
+      if (/SELECT COUNT\(\*\)::bigint AS active_sessions/i.test(sql)) {
+        aggQueries += 1
+        const cutoff = Number(params[0]) || 0
+        let count = 0
+        let hits = 0
+        for (const r of pgRows.values()) {
+          if (r.expires_at == null || r.expires_at >= cutoff) {
+            count += 1
+            hits += Number(r.hits) || 0
+          }
+        }
+        return { rows: [{ active_sessions: String(count), total_hits: String(hits) }] }
+      }
+      if (/SELECT \*[\s\S]*FROM sticky_sessions[\s\S]*LIMIT \$2/i.test(sql)) {
+        rowQueries += 1
+        const cutoff = Number(params[0]) || 0
+        const limit = Number(params[1]) || 500
+        const rows = [...pgRows.values()].filter((r) => r.expires_at == null || r.expires_at >= cutoff).slice(0, limit)
+        return { rows }
+      }
+      return { rows: [], rowCount: 0 }
+    },
+  }
+
+  const router = new StickyRouter({
+    dataDir: dir,
+    config: { sticky: { enabled: true, ttl_seconds: 3600 } },
+    pgPool: mockPgPool,
+  })
+  await router.flushPendingWrites()
+
+  let syncAllCalls = 0
+  let syncPurgeCalls = 0
+  router.repo.all = () => {
+    syncAllCalls += 1
+    throw new Error('sync repo.all() must never run in PG mode')
+  }
+  router.repo.purgeExpired = () => {
+    syncPurgeCalls += 1
+    throw new Error('sync repo.purgeExpired() must never run in PG mode')
+  }
+
+  // 1. statsAsync({ includeSessions: false }) runs 1 aggregate COUNT/SUM query, 0 row scans, 0 sync calls
+  const s1 = await router.statsAsync({ includeSessions: false })
+  assert.equal(s1.active_sessions, 2)
+  assert.equal(s1.total_hits, 10)
+  assert.deepEqual(s1.sessions, {})
+  assert.equal(aggQueries, 1)
+  assert.equal(rowQueries, 0)
+  assert.equal(syncAllCalls, 0)
+  assert.equal(syncPurgeCalls, 0)
+
+  // 2. Repeated statsAsync() and sync stats() within 5s hit L1 cache with 0 PG queries & 0 sync calls
+  const s2 = await router.statsAsync({ includeSessions: false })
+  const s3 = router.stats({ includeSessions: false })
+  assert.equal(s2.active_sessions, 2)
+  assert.equal(s3.active_sessions, 2)
+  assert.equal(aggQueries, 1)
+  assert.equal(syncAllCalls, 0)
+
+  // 3. includeSessions: true fetches bounded session map without touching sync repo.all()
+  const full = await router.statsAsync({ includeSessions: true, bypass: true })
+  assert.equal(full.active_sessions, 2)
+  assert.equal(Object.keys(full.sessions).length, 2)
+  assert.equal(full.sessions['sess:a'].vm_id, 'vm-1')
+  assert.equal(rowQueries, 1)
+  assert.equal(syncAllCalls, 0)
+  router.db?.close?.()
+})

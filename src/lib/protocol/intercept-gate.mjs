@@ -73,9 +73,263 @@ const NEGATED_REWRITE =
 const REWRITE_LEAD_TAIL = /[.!?:;,，。、！？；"'([#>*-]\s*$/u
 const REWRITE_LEAD_PREFIX = new RegExp(`^${REWRITE_LEAD}`, 'iu')
 
+export const LARGE_BODY_MESSAGE_THRESHOLD = 12
+export const LARGE_BODY_ESTIMATED_CHARS = 32_768
+const TAIL_WINDOW_MESSAGES = 8
+const TAIL_WINDOW_MIN_USER_TURNS = 4
+const TAIL_WINDOW_MAX_CHARS = 32_768
+const TAIL_SYSTEM_MAX_CHARS = 8_192
+const TAIL_BLOCK_MAX_CHARS = 12_288
+const SYSTEM_REWRITE_SCAN_CAP = 65_536
+
+const SKIP_WINDOW_BLOCK_TYPES = new Set([
+  'tool_result',
+  'tool_use',
+  'thinking',
+  'redacted_thinking',
+  'reasoning',
+  'function_call',
+  'function_call_output',
+  'functionCall',
+  'functionResponse',
+])
+
+function clipHeadTail(text, maxChars) {
+  const str = String(text || '')
+  if (str.length <= maxChars) return str
+  if (maxChars <= 64) return str.slice(-maxChars)
+  const headLen = Math.min(4096, Math.floor(maxChars * 0.25))
+  const tailLen = Math.max(0, maxChars - headLen - 1)
+  return `${str.slice(0, headLen)}\n${str.slice(str.length - tailLen)}`
+}
+
+function estimateContentChars(value, budget, depth = 0) {
+  if (budget <= 0 || value == null || depth > 5) return 0
+  if (typeof value === 'string') return value.length
+  if (Array.isArray(value)) {
+    let total = 0
+    for (let i = 0; i < value.length; i += 1) {
+      total += estimateContentChars(value[i], budget - total, depth + 1)
+      if (total > budget) return total
+    }
+    return total
+  }
+  if (typeof value !== 'object') return 0
+  let total = 0
+  if (typeof value.text === 'string') total += value.text.length
+  if (total > budget) return total
+  if (typeof value.content === 'string') total += value.content.length
+  else if (Array.isArray(value.content)) total += estimateContentChars(value.content, budget - total, depth + 1)
+  if (total > budget) return total
+  if (Array.isArray(value.parts)) total += estimateContentChars(value.parts, budget - total, depth + 1)
+  if (total > budget) return total
+  if (typeof value.data === 'string') total += value.data.length
+  if (typeof value.input === 'string') total += value.input.length
+  return total
+}
+
+function isOversizedInterceptBody(body) {
+  if (!body || typeof body !== 'object') return false
+  const msgs = Array.isArray(body.messages) ? body.messages : null
+  if (msgs && msgs.length > LARGE_BODY_MESSAGE_THRESHOLD) return true
+  const inputs = Array.isArray(body.input) ? body.input : null
+  if (inputs && inputs.length > LARGE_BODY_MESSAGE_THRESHOLD) return true
+  const contents = Array.isArray(body.contents) ? body.contents : null
+  if (contents && contents.length > LARGE_BODY_MESSAGE_THRESHOLD) return true
+
+  let chars = 0
+  const cap = LARGE_BODY_ESTIMATED_CHARS
+  if (typeof body.prompt === 'string') chars += body.prompt.length
+  if (chars > cap) return true
+  if (body.system != null) chars += estimateContentChars(body.system, cap - chars)
+  if (chars > cap) return true
+  if (body.instructions != null) chars += estimateContentChars(body.instructions, cap - chars)
+  if (chars > cap) return true
+  const sysInstr = body.systemInstruction ?? body.system_instruction
+  if (sysInstr != null) chars += estimateContentChars(sysInstr, cap - chars)
+  if (chars > cap) return true
+  if (msgs) chars += estimateContentChars(msgs, cap - chars)
+  if (chars > cap) return true
+  if (inputs) chars += estimateContentChars(inputs, cap - chars)
+  else if (typeof body.input === 'string') chars += body.input.length
+  if (chars > cap) return true
+  if (contents) chars += estimateContentChars(contents, cap - chars)
+  return chars > cap
+}
+
+function messageHasUserText(msg) {
+  if (!msg || typeof msg !== 'object') return false
+  const role = String(msg.role || '').toLowerCase()
+  if (role && role !== 'user') return false
+  const c = msg.content ?? msg.parts ?? msg.text
+  if (typeof c === 'string') return c.trim().length > 0
+  if (!Array.isArray(c)) return false
+  for (let i = 0; i < c.length; i += 1) {
+    const part = c[i]
+    if (typeof part === 'string' && part.trim()) return true
+    if (!part || typeof part !== 'object') continue
+    if (SKIP_WINDOW_BLOCK_TYPES.has(part.type)) continue
+    if (typeof part.text === 'string' && part.text.trim()) return true
+    if (typeof part.content === 'string' && part.content.trim()) return true
+  }
+  return false
+}
+
+function trimMessageContent(content, budgetRef) {
+  if (budgetRef.remaining <= 0) return ''
+  if (typeof content === 'string') {
+    const limit = Math.min(TAIL_BLOCK_MAX_CHARS, budgetRef.remaining)
+    const clipped = content.length > limit ? clipHeadTail(content, limit) : content
+    budgetRef.remaining -= clipped.length
+    return clipped
+  }
+  if (!Array.isArray(content)) return content
+  const kept = []
+  for (let i = content.length - 1; i >= 0 && budgetRef.remaining > 0; i -= 1) {
+    const part = content[i]
+    if (typeof part === 'string') {
+      const limit = Math.min(TAIL_BLOCK_MAX_CHARS, budgetRef.remaining)
+      const clipped = part.length > limit ? clipHeadTail(part, limit) : part
+      budgetRef.remaining -= clipped.length
+      kept.push(clipped)
+      continue
+    }
+    if (!part || typeof part !== 'object') continue
+    if (SKIP_WINDOW_BLOCK_TYPES.has(part.type)) continue
+    if (typeof part.text === 'string') {
+      const limit = Math.min(TAIL_BLOCK_MAX_CHARS, budgetRef.remaining)
+      const clipped = part.text.length > limit ? clipHeadTail(part.text, limit) : part.text
+      budgetRef.remaining -= clipped.length
+      kept.push(clipped === part.text ? part : { ...part, text: clipped })
+      continue
+    }
+    if (typeof part.content === 'string') {
+      const limit = Math.min(TAIL_BLOCK_MAX_CHARS, budgetRef.remaining)
+      const clipped = part.content.length > limit ? clipHeadTail(part.content, limit) : part.content
+      budgetRef.remaining -= clipped.length
+      kept.push(clipped === part.content ? part : { ...part, content: clipped })
+      continue
+    }
+    if (Array.isArray(part.content)) {
+      const nested = trimMessageContent(part.content, budgetRef)
+      if (nested.length) kept.push({ ...part, content: nested })
+      continue
+    }
+    kept.push(part)
+  }
+  kept.reverse()
+  return kept
+}
+
+function windowMessageArray(items) {
+  if (!Array.isArray(items) || !items.length) return items
+  const pickedIndexes = new Set()
+  const tailStart = Math.max(0, items.length - TAIL_WINDOW_MESSAGES)
+  let userCount = 0
+  for (let i = items.length - 1; i >= tailStart; i -= 1) {
+    pickedIndexes.add(i)
+    if (messageHasUserText(items[i])) userCount += 1
+  }
+  for (let i = tailStart - 1; i >= 0 && userCount < TAIL_WINDOW_MIN_USER_TURNS; i -= 1) {
+    if (messageHasUserText(items[i])) {
+      pickedIndexes.add(i)
+      userCount += 1
+    }
+  }
+  const ordered = [...pickedIndexes].sort((a, b) => a - b)
+  const budgetRef = { remaining: TAIL_WINDOW_MAX_CHARS }
+  const windowedRev = []
+  for (let i = ordered.length - 1; i >= 0 && budgetRef.remaining > 0; i -= 1) {
+    const item = items[ordered[i]]
+    if (typeof item === 'string') {
+      const limit = Math.min(TAIL_BLOCK_MAX_CHARS, budgetRef.remaining)
+      const clipped = item.length > limit ? clipHeadTail(item, limit) : item
+      budgetRef.remaining -= clipped.length
+      windowedRev.push(clipped)
+      continue
+    }
+    if (!item || typeof item !== 'object') continue
+    if (item.content !== undefined) {
+      windowedRev.push({ ...item, content: trimMessageContent(item.content, budgetRef) })
+    } else if (Array.isArray(item.parts)) {
+      windowedRev.push({ ...item, parts: trimMessageContent(item.parts, budgetRef) })
+    } else if (typeof item.text === 'string') {
+      const limit = Math.min(TAIL_BLOCK_MAX_CHARS, budgetRef.remaining)
+      const clipped = item.text.length > limit ? clipHeadTail(item.text, limit) : item.text
+      budgetRef.remaining -= clipped.length
+      windowedRev.push(clipped === item.text ? item : { ...item, text: clipped })
+    } else {
+      windowedRev.push(item)
+    }
+  }
+  windowedRev.reverse()
+  return windowedRev
+}
+
+function windowSystemField(value) {
+  if (value == null) return value
+  const budgetRef = { remaining: TAIL_SYSTEM_MAX_CHARS }
+  if (typeof value === 'string') {
+    return value.length > TAIL_SYSTEM_MAX_CHARS ? clipHeadTail(value, TAIL_SYSTEM_MAX_CHARS) : value
+  }
+  if (Array.isArray(value)) {
+    const out = []
+    for (let i = 0; i < value.length && budgetRef.remaining > 0; i += 1) {
+      const item = value[i]
+      if (typeof item === 'string') {
+        const clipped = item.length > budgetRef.remaining ? clipHeadTail(item, budgetRef.remaining) : item
+        budgetRef.remaining -= clipped.length
+        out.push(clipped)
+      } else if (item && typeof item === 'object' && typeof item.text === 'string') {
+        const clipped =
+          item.text.length > budgetRef.remaining ? clipHeadTail(item.text, budgetRef.remaining) : item.text
+        budgetRef.remaining -= clipped.length
+        out.push(clipped === item.text ? item : { ...item, text: clipped })
+      } else if (item != null) {
+        out.push(item)
+      }
+    }
+    return out
+  }
+  if (typeof value === 'object' && Array.isArray(value.parts)) {
+    return { ...value, parts: windowSystemField(value.parts) }
+  }
+  return value
+}
+
+/**
+ * Tail-window projection for oversized (~100K-context) request bodies during
+ * pre-dispatch risk scanning. Small bodies (<=12 messages and <=32KB estimated)
+ * are returned untouched (zero-copy). Large bodies retain bounded system text
+ * plus the trailing conversation window (latest messages and recent user asks),
+ * bounding main-thread CPU & GC for refusal/regex/JEV extraction.
+ */
+export function windowBodyForIntercept(src) {
+  if (!src || typeof src !== 'object' || !isOversizedInterceptBody(src)) {
+    return { body: src, oversized: false }
+  }
+  const out = { ...src }
+  if (Array.isArray(src.messages)) out.messages = windowMessageArray(src.messages)
+  if (Array.isArray(src.input)) out.input = windowMessageArray(src.input)
+  else if (typeof src.input === 'string' && src.input.length > TAIL_WINDOW_MAX_CHARS) {
+    out.input = clipHeadTail(src.input, TAIL_WINDOW_MAX_CHARS)
+  }
+  if (Array.isArray(src.contents)) out.contents = windowMessageArray(src.contents)
+  if (typeof src.prompt === 'string' && src.prompt.length > TAIL_WINDOW_MAX_CHARS) {
+    out.prompt = clipHeadTail(src.prompt, TAIL_WINDOW_MAX_CHARS)
+  }
+  if (src.system != null) out.system = windowSystemField(src.system)
+  if (src.instructions != null) out.instructions = windowSystemField(src.instructions)
+  if (src.systemInstruction != null) out.systemInstruction = windowSystemField(src.systemInstruction)
+  if (src.system_instruction != null) out.system_instruction = windowSystemField(src.system_instruction)
+  return { body: out, oversized: true }
+}
+
 /** Exported for tests. Returns the matched order, or '' when none. */
 export function systemRewrite(document) {
-  const text = String(document || '').normalize('NFKC')
+  const raw = String(document || '')
+  const bounded = raw.length > SYSTEM_REWRITE_SCAN_CAP ? clipHeadTail(raw, SYSTEM_REWRITE_SCAN_CAP) : raw
+  const text = bounded.normalize('NFKC')
   for (const rule of SYSTEM_REWRITE) {
     for (const match of text.matchAll(rule)) {
       const lead = match[0].length - match[0].replace(REWRITE_LEAD_PREFIX, '').length
@@ -523,7 +777,11 @@ export function observeUpstreamRisk({
   }
   if (logBag._jevPassState) logBag.jev_state ||= logBag._jevPassState
   const minScore = minJevScore(logBag._jevPassScores)
-  const fingerprint = reason === 'upstream:flagged_session' ? null : refusalFingerprint(body, inbound)
+  const scanInboundProj = windowBodyForIntercept(inbound)
+  const scanBodyProj = body === inbound ? scanInboundProj : windowBodyForIntercept(body)
+  const scanInbound = scanInboundProj.body
+  const scanBody = scanBodyProj.body
+  const fingerprint = reason === 'upstream:flagged_session' ? null : refusalFingerprint(scanBody, scanInbound)
   const alreadyKnown = !!(fingerprint && repo?.get?.(fingerprint))
   // Dual-track anti-over-refusal guard: if JEV scored every question >= 0.85 and
   // this exact prompt has not failed before, cache the exact fingerprint only
@@ -547,8 +805,8 @@ export function observeUpstreamRisk({
         model: body?.model || inbound?.model || '',
         requestId,
         errorMessage: message || reason,
-        preview: refusalPreview(body, inbound),
-        signature: suspectOverRefusal ? null : refusalPromptSignature(inbound, body),
+        preview: refusalPreview(scanBody, scanInbound),
+        signature: suspectOverRefusal ? null : refusalPromptSignature(scanInbound, scanBody),
       })
   } catch {
     console.warn('[risk-audit] failed to persist upstream refusal')
@@ -758,6 +1016,20 @@ export async function evaluateProtocolIntercept({
   const rootSessionId = effectiveIdentity.sessionId || ''
   const reject = (fields) => block({ deviceId: effectiveIdentity.deviceId, identity: effectiveIdentity, ...fields })
   const interceptOpts = { interceptSession, ctx: bodyCtx }
+  let scanPair = null
+  const getScanPair = () => {
+    if (scanPair) return scanPair
+    const inProj = windowBodyForIntercept(inbound)
+    const bodyProj = body === inbound ? inProj : windowBodyForIntercept(body)
+    const oversized = inProj.oversized || bodyProj.oversized
+    scanPair = {
+      inbound: inProj.body,
+      body: bodyProj.body,
+      oversized,
+      opts: oversized ? { interceptSession: null, ctx: null } : interceptOpts,
+    }
+    return scanPair
+  }
   let rawDocument
   if (!skipMandatory) {
     // A session the provider already refused never hops again: before every
@@ -822,7 +1094,8 @@ export async function evaluateProtocolIntercept({
       })
     }
     if (audit?.block_system_prompt_rewrite !== false) {
-      rawDocument = jevDocument(inbound, body, { ...interceptOpts, keepPromptReminders: true })
+      const scan = getScanPair()
+      rawDocument = jevDocument(scan.inbound, scan.body, { ...scan.opts, keepPromptReminders: true })
       const scanned = prepareInterceptText(rawDocument, { stripReminders: false, stripEnvironment: false })
       const system = systemRewrite(scanned)
       if (system) {
@@ -875,8 +1148,11 @@ export async function evaluateProtocolIntercept({
   const hardEnabled = !mandatoryOnly && !outside
   let scanned = false
   if (hardEnabled) {
+    const scan = getScanPair()
     const distill =
-      openaiPlatform || skipDistill ? null : detectDistill({ inbound, body, official, zeroInject }, distillRules)
+      openaiPlatform || skipDistill
+        ? null
+        : detectDistill({ inbound: scan.inbound, body: scan.body, official, zeroInject }, distillRules)
     if (distill?.action === 'block') {
       const evidence = (distill.hits || [])
         .map((item) => item.evidence || item.rule)
@@ -894,7 +1170,7 @@ export async function evaluateProtocolIntercept({
       })
     }
 
-    const document = prepareInterceptText(rawDocument ?? jevDocument(inbound, body, interceptOpts), {
+    const document = prepareInterceptText(rawDocument ?? jevDocument(scan.inbound, scan.body, scan.opts), {
       stripReminders: jev?.strip_reminders !== false,
       expandBase64: jev?.expand_base64 !== false,
     })
@@ -952,9 +1228,10 @@ export async function evaluateProtocolIntercept({
   }
 
   if (!skipMandatory && policy?.enabled && repo && typeof repo.get === 'function') {
+    const scan = getScanPair()
     let match = matchStoredRefusal({
-      inbound,
-      body: inbound ?? body,
+      inbound: scan.inbound,
+      body: scan.inbound ?? scan.body,
       headers,
       repo,
       devices: devices?.findBan ? null : devices,
@@ -985,7 +1262,8 @@ export async function evaluateProtocolIntercept({
   if (mandatoryOnly || outside) return pass(outside || 'unchecked')
 
   if (jev?.enabled) {
-    const modelDocument = jevModelDocument(inbound, body, interceptOpts)
+    const scan = getScanPair()
+    const modelDocument = jevModelDocument(scan.inbound, scan.body, scan.opts)
     const verdict = await classifyJev(modelDocument, { ...jev, policy_request_id: requestId }, fetchImpl, now)
     if (verdict.action === 'block') {
       const unavailable = verdict.reason === 'unavailable'

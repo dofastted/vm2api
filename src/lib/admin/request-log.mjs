@@ -19,12 +19,21 @@ import path from 'node:path'
 import crypto from 'node:crypto'
 import { redactSecrets } from '../core/security.mjs'
 import { sanitizeErrorDetailsForLog, sanitizeErrorToken } from '../core/errors.mjs'
-import { getDb, getPgPool, isDbOpen, resolveStoreDb, withSavepoint } from '../db/database.mjs'
+import { DB_INSTANCE_ID, getDb, getPgPool, isDbOpen, resolveStoreDb, withSavepoint } from '../db/database.mjs'
+import { usagePoolEnabled, usageRead } from '../db/sqlite-pool.mjs'
 import { enqueueWrite, writeBehindArmed } from '../db/write-behind.mjs'
 import { getPgLogWriter, runRetentionCleanupAsync } from '../db/pg/pg-log-writer.mjs'
 import { getCacheRuntime } from '../cache/index.mjs'
 import { UsageLogsRepo } from '../db/repos/usage-logs-repo.mjs'
-import { classifyRequestError, resolveMutedErrorClasses } from './error-class.mjs'
+import {
+  ERROR_PRED,
+  PROMPT_TOKENS_SQL,
+  SLA_ERROR_PRED,
+  SLA_SUCCESS_PRED,
+  TOTAL_TOKENS_SQL,
+} from '../db/repos/usage-log-preds.mjs'
+import { cacheHitStats } from './cache-metrics.mjs'
+import { classifyRequestError, collectErrors, ingressAuthSql, resolveMutedErrorClasses } from './error-class.mjs'
 import { advisorUsageFromIterations, costColumnsFromUsage, normalizeUsage } from './pricing.mjs'
 import { disjointOpenaiUsage } from '../protocol/openai-usage.mjs'
 import { REASONING_EFFORTS, modelMismatch, sessionIdForLog } from '../protocol/log-fields.mjs'
@@ -50,7 +59,26 @@ const CLEANUP_INTERVAL_MS = 10 * 60 * 1000
 const PG_TOTAL_ROWS_CACHE_TTL_MS = 30_000
 const SQLITE_TOTAL_ROWS_CACHE_TTL_MS = 5_000
 const INFLIGHT_COUNT_CACHE_TTL_MS = 2_000
-const CLEANUP_INVALIDATE_NAMESPACES = ['stats', 'overview', 'panel', 'filter-options', 'active-sessions']
+const TOTALS_SWR_FRESH_TTL_MS = 15_000
+const TOTALS_SWR_HARD_TTL_MS = 60_000
+const WINDOW_STATS_SWR_FRESH_TTL_MS = 5_000
+const WINDOW_STATS_SWR_HARD_TTL_MS = 15_000
+const WINDOW_STATS_BUCKET_MS = 10_000
+const SUMMARIZE_MAX_ROLES = 256
+const SUMMARIZE_TOOLS_MAX_NODES = 4096
+const SUMMARIZE_TOOLS_EXACT_BYTES_MAX_NODES = 256
+const SUMMARIZE_TOOLS_EXACT_BYTES_MAX_TOP = 128
+const PG_PROMPT_TOKENS_SQL = PROMPT_TOKENS_SQL.replaceAll('IFNULL(', 'COALESCE(')
+const PG_TOTAL_TOKENS_SQL = TOTAL_TOKENS_SQL.replaceAll('IFNULL(', 'COALESCE(')
+const CLEANUP_INVALIDATE_NAMESPACES = [
+  'stats',
+  'overview',
+  'panel',
+  'panel-totals',
+  'ops-window',
+  'filter-options',
+  'active-sessions',
+]
 
 function loggingValidationError(message) {
   const error = new TypeError(message)
@@ -147,6 +175,31 @@ function safeIp(req) {
   return String(raw).slice(0, 45)
 }
 
+function estimateToolJsonBytes(value, depth = 0) {
+  if (value == null || depth > 5) return 4
+  if (typeof value === 'string') return value.length + 2
+  if (typeof value === 'number' || typeof value === 'boolean') return 6
+  if (Array.isArray(value)) {
+    let n = 2
+    const limit = Math.min(value.length, 64)
+    for (let i = 0; i < limit; i += 1) n += estimateToolJsonBytes(value[i], depth + 1) + 1
+    if (value.length > limit) n = Math.round((n / limit) * value.length)
+    return n
+  }
+  if (typeof value === 'object') {
+    let n = 2
+    let keys = 0
+    for (const k in value) {
+      if (!Object.hasOwn(value, k)) continue
+      keys += 1
+      if (keys > 32) break
+      n += k.length + 4 + estimateToolJsonBytes(value[k], depth + 1)
+    }
+    return n
+  }
+  return 0
+}
+
 /**
  * Catalog size as the model sees it. `tools.length` alone cannot tell four
  * top-level entries from the ~1400 callable functions a namespaced plugin
@@ -161,15 +214,19 @@ function summarizeTools(tools) {
   let functions = 0
   let deferred = 0
   let search = false
+  let visited = 0
   const visit = (tool) => {
-    if (!tool || typeof tool !== 'object') return
+    if (!tool || typeof tool !== 'object' || visited >= SUMMARIZE_TOOLS_MAX_NODES) return
+    visited += 1
     const type = typeof tool.type === 'string' ? tool.type.trim() : ''
     if (type.startsWith('tool_search')) search = true
     if (tool.defer_loading === true || tool.custom?.defer_loading === true) deferred += 1
     const members = Array.isArray(tool.tools) ? tool.tools : null
     if (members) {
       // A namespace is a container; only its members are callable.
-      for (const member of members) visit(member)
+      for (let i = 0; i < members.length && visited < SUMMARIZE_TOOLS_MAX_NODES; i += 1) {
+        visit(members[i])
+      }
       return
     }
     const geminiDecls = Array.isArray(tool.functionDeclarations)
@@ -183,12 +240,19 @@ function summarizeTools(tools) {
     }
     if (type === 'function' || type === 'custom' || (!type && typeof tool.name === 'string')) functions += 1
   }
-  for (const tool of tools) visit(tool)
+  for (let i = 0; i < tools.length && visited < SUMMARIZE_TOOLS_MAX_NODES; i += 1) {
+    visit(tools[i])
+  }
   let bytes = 0
-  try {
-    bytes = Buffer.byteLength(JSON.stringify(tools))
-  } catch {
-    // An unserializable catalog still reports its counts.
+  if (tools.length <= SUMMARIZE_TOOLS_EXACT_BYTES_MAX_TOP && visited <= SUMMARIZE_TOOLS_EXACT_BYTES_MAX_NODES) {
+    try {
+      bytes = Buffer.byteLength(JSON.stringify(tools))
+    } catch {
+      // An unserializable catalog still reports its counts.
+    }
+  } else {
+    // Bounded byte estimate for massive tool catalogs so main-thread JSON.stringify never stalls.
+    bytes = estimateToolJsonBytes(tools)
   }
   return { count: tools.length, functions, bytes, deferred, search }
 }
@@ -196,18 +260,50 @@ function summarizeTools(tools) {
 function systemInstructionLen(value) {
   if (typeof value === 'string') return value.length
   if (Array.isArray(value)) {
-    return value.reduce((n, b) => n + (typeof b === 'string' ? b.length : (b?.text || '').length), 0)
+    let n = 0
+    for (let i = 0; i < value.length; i += 1) {
+      const b = value[i]
+      n += typeof b === 'string' ? b.length : (b?.text || '').length
+    }
+    return n
   }
   if (value && typeof value === 'object' && Array.isArray(value.parts)) {
-    return value.parts.reduce((n, p) => n + (typeof p?.text === 'string' ? p.text.length : 0), 0)
+    let n = 0
+    for (let i = 0; i < value.parts.length; i += 1) {
+      const p = value.parts[i]
+      if (typeof p?.text === 'string') n += p.text.length
+    }
+    return n
   }
   return 0
+}
+
+function summarizeRolesBounded(messages) {
+  if (!Array.isArray(messages) || !messages.length) return []
+  const roles = []
+  if (messages.length <= SUMMARIZE_MAX_ROLES) {
+    for (let i = 0; i < messages.length; i += 1) {
+      const r = messages[i]?.role
+      if (r) roles.push(r)
+    }
+    return roles
+  }
+  const half = SUMMARIZE_MAX_ROLES >> 1
+  for (let i = 0; i < half; i += 1) {
+    const r = messages[i]?.role
+    if (r) roles.push(r)
+  }
+  for (let i = messages.length - half; i < messages.length; i += 1) {
+    const r = messages[i]?.role
+    if (r) roles.push(r)
+  }
+  return roles
 }
 
 function summarizeBody(body) {
   if (!body || typeof body !== 'object') return { empty: true }
   const messages = Array.isArray(body.messages) ? body.messages : Array.isArray(body.contents) ? body.contents : null
-  const roles = messages ? messages.map((m) => m?.role).filter(Boolean) : []
+  const roles = summarizeRolesBounded(messages)
   const toolStats = summarizeTools(body.tools)
   const gc = body.generationConfig ?? body.generation_config
   const systemLen =
@@ -644,11 +740,69 @@ export class RequestLogStore {
     } catch {}
   }
 
+  _isHighConcurrency() {
+    const liveLogs = this._getCache()?.liveLogs
+    if (!liveLogs) return false
+    if (typeof liveLogs.isHighConcurrency === 'function') return Boolean(liveLogs.isHighConcurrency())
+    if (typeof liveLogs.isHighConcurrencyMode === 'function') return Boolean(liveLogs.isHighConcurrencyMode())
+    return liveLogs.highConcurrencyMode === true
+  }
+
   _buildDebugRecord(ctx, summary, extra) {
+    const highConc = this._isHighConcurrency()
+    const inboundSummary =
+      extra.inbound_summary || (extra.inbound_body != null ? summarizeBody(extra.inbound_body) : null)
+    if (highConc) {
+      return {
+        ...summary,
+        headers: ctx.headers,
+        inbound_summary: inboundSummary,
+        request_body_snapshot:
+          !extra.classifier && extra.inbound_body != null
+            ? sanitizeRequestBodySnapshot(extra.inbound_body, {
+                maxStringChars: 48,
+                maxArrayItems: 6,
+                maxDepth: 3,
+                maxTotalChars: 2048,
+              })
+            : null,
+        inbound_body: !extra.classifier && extra.inbound_body != null ? { _omitted: 'high_concurrency' } : null,
+        hop_meta: extra.hop_meta || null,
+        batch_member: extra.batch_member || null,
+        via: extra.via || extra.hop_meta?.via || null,
+        outbound_summary: extra.outbound_summary || null,
+        cache_prefix: extra.cache_prefix || null,
+        cache_continuity: extra.cache_continuity || null,
+        classifier: extra.classifier || null,
+        outbound_headers:
+          ctx.capture_outbound && extra.outbound_headers != null ? redactHeaders(extra.outbound_headers) : null,
+        outbound_headers_source: ctx.capture_outbound ? extra.outbound_headers_source || null : null,
+        worker_envelope_headers:
+          ctx.capture_outbound && extra.worker_envelope_headers != null
+            ? redactHeaders(extra.worker_envelope_headers)
+            : null,
+        outbound_body:
+          ctx.capture_outbound && !extra.classifier && extra.outbound_body != null
+            ? { _omitted: 'high_concurrency' }
+            : null,
+        outbound_body_source: ctx.capture_outbound ? extra.outbound_body_source || null : null,
+        outbound_body_truncated: ctx.capture_outbound ? true : false,
+        response: ctx.response
+          ? {
+              status: ctx.response.status ?? null,
+              headers: ctx.response.headers || null,
+              body: null,
+              bytes: ctx.response.bytes || 0,
+              truncated: true,
+              _omitted: 'high_concurrency',
+            }
+          : null,
+      }
+    }
     return {
       ...summary,
       headers: ctx.headers,
-      inbound_summary: extra.inbound_summary || summarizeBody(extra.inbound_body),
+      inbound_summary: inboundSummary,
       request_body_snapshot:
         !extra.classifier && extra.inbound_body != null ? sanitizeRequestBodySnapshot(extra.inbound_body) : null,
       inbound_body:
@@ -1241,13 +1395,15 @@ export class RequestLogStore {
     }
 
     const pgWriter = this._activePgLogWriter()
+    const debugRec = ctx.mode === 'debug' ? this._buildDebugRecord(ctx, summary, extra) : null
     if (pgWriter) {
-      const debugRec = ctx.mode === 'debug' ? this._buildDebugRecord(ctx, summary, extra) : null
       pgWriter.enqueueUsageLog(summary, debugRec)
       if (this.jsonlMirror) this._appendJsonl(summary)
       return summary
     }
 
+    // Do not close over `extra` or `ctx` inside write-behind callbacks so large
+    // request/response payloads are released immediately once normal finish runs.
     const persist = () => {
       try {
         withSavepoint(this.repo.db, 'reqlog_sum', () => {
@@ -1255,8 +1411,7 @@ export class RequestLogStore {
         })
       } catch {}
       if (this.jsonlMirror) this._appendJsonl(summary)
-      if (ctx.mode !== 'debug') return
-      const debugRec = this._buildDebugRecord(ctx, summary, extra)
+      if (!debugRec) return
       try {
         withSavepoint(this.repo.db, 'reqlog_dbg', () => {
           this.repo.insertDebug(summary.request_id || summary.id, summary.ts, debugRec)
@@ -1319,8 +1474,84 @@ export class RequestLogStore {
     return this.repo.aggregate(opts)
   }
 
+  _canUseSharedDashboardCache() {
+    if (this._hasExplicitCache) return true
+    if (this.db?.engine === 'postgres') return true
+    return isDbOpen() && this.db === getDb()
+  }
+
+  _dashboardCacheScope() {
+    if (this.db?.engine === 'postgres') return 'pg'
+    if (isDbOpen() && this.db === getDb()) return 'sqlite'
+    return String(this.db?.[DB_INSTANCE_ID] || 'isolated')
+  }
+
+  _canUseReadPool() {
+    return usagePoolEnabled() && isDbOpen() && this.db === getDb()
+  }
+
   totals() {
     return this.repo.totals()
+  }
+
+  /**
+   * Async grand totals with short SWR cache (15s fresh / 60s hard TTL).
+   * Runs directly on native async `pgPool` in PostgreSQL mode (0 `Atomics.wait`),
+   * or off-main-thread `usageRead` when read pool is active.
+   */
+  async totalsAsync({ bypass = false } = {}) {
+    const load = async () => {
+      const pool = this._resolvePgPool()
+      if (this.db?.engine === 'postgres' && pool && typeof pool.query === 'function') {
+        const res = await pool.query(`
+          SELECT COUNT(*)::bigint AS requests,
+                 COALESCE(SUM(CASE WHEN ${ERROR_PRED} THEN 1 ELSE 0 END), 0)::bigint AS errors,
+                 COALESCE(SUM(input_tokens), 0)::bigint AS input_tokens,
+                 COALESCE(SUM(output_tokens), 0)::bigint AS output_tokens,
+                 COALESCE(SUM(cache_read_tokens), 0)::bigint AS cache_read_tokens,
+                 COALESCE(SUM(cache_creation_tokens), 0)::bigint AS cache_creation_tokens,
+                 COALESCE(SUM(${PG_PROMPT_TOKENS_SQL}), 0)::bigint AS prompt_tokens,
+                 COALESCE(SUM(input_cost), 0)::double precision AS input_cost,
+                 COALESCE(SUM(output_cost), 0)::double precision AS output_cost,
+                 COALESCE(SUM(cache_read_cost), 0)::double precision AS cache_read_cost,
+                 COALESCE(SUM(cache_creation_cost), 0)::double precision AS cache_creation_cost,
+                 COALESCE(SUM(total_cost), 0)::double precision AS total_cost
+          FROM usage_logs
+        `)
+        const r = res?.rows?.[0] || {}
+        const row = {
+          requests: Number(r.requests || 0),
+          errors: Number(r.errors || 0),
+          input_tokens: Number(r.input_tokens || 0),
+          output_tokens: Number(r.output_tokens || 0),
+          cache_read_tokens: Number(r.cache_read_tokens || 0),
+          cache_creation_tokens: Number(r.cache_creation_tokens || 0),
+          prompt_tokens: Number(r.prompt_tokens || 0),
+          input_cost: Number(r.input_cost || 0),
+          output_cost: Number(r.output_cost || 0),
+          cache_read_cost: Number(r.cache_read_cost || 0),
+          cache_creation_cost: Number(r.cache_creation_cost || 0),
+          total_cost: Number(r.total_cost || 0),
+        }
+        return { ...row, ...cacheHitStats(row) }
+      }
+      if (this._canUseReadPool()) {
+        try {
+          return await usageRead({ kind: 'repo', method: 'totals' })
+        } catch {}
+      }
+      return this.repo.totals()
+    }
+
+    const dashboard = this._canUseSharedDashboardCache() ? this._getCache()?.dashboard : null
+    if (dashboard && typeof dashboard.getOrSetSWR === 'function') {
+      return dashboard.getOrSetSWR('panel-totals', { scope: this._dashboardCacheScope() }, load, {
+        freshTtlMs: TOTALS_SWR_FRESH_TTL_MS,
+        ttlMs: TOTALS_SWR_HARD_TTL_MS,
+        bypass,
+      })
+    }
+    return load()
   }
 
   hasSuccessfulRequest(opts = {}) {
@@ -1362,6 +1593,294 @@ export class RequestLogStore {
   /** Windowed SLA / QPS / TTFT snapshot for overview + log analysis. */
   windowStats(opts = {}) {
     return this.repo.windowStats(opts)
+  }
+
+  async _windowStatsPgAsync(pool, { since = null, until = null } = {}) {
+    const condParts = []
+    const params = []
+    const sinceIso = since ? new Date(since).toISOString() : null
+    const untilIso = until ? new Date(until).toISOString() : null
+    if (sinceIso) {
+      params.push(sinceIso)
+      condParts.push(`created_at >= $${params.length}`)
+    }
+    if (untilIso) {
+      params.push(untilIso)
+      condParts.push(`created_at <= $${params.length}`)
+    }
+    const where = condParts.length ? `WHERE ${condParts.join(' AND ')}` : ''
+    const errWhere = condParts.length ? `WHERE ${condParts.join(' AND ')} AND ${ERROR_PRED}` : `WHERE ${ERROR_PRED}`
+    const authWhere = condParts.length
+      ? `WHERE ${condParts.join(' AND ')} AND ${ingressAuthSql()}`
+      : `WHERE ${ingressAuthSql()}`
+
+    const attConds = []
+    const attParams = []
+    if (sinceIso) {
+      attParams.push(sinceIso)
+      attConds.push(`started_at >= $${attParams.length}`)
+    }
+    if (untilIso) {
+      attParams.push(untilIso)
+      attConds.push(`started_at <= $${attParams.length}`)
+    }
+    const attWhere = attConds.length ? `WHERE ${attConds.join(' AND ')}` : ''
+
+    const [countsRes, minuteRes, byModelRes, stickyRes, errorRowsRes, ingressRes] = await Promise.all([
+      pool.query(
+        `SELECT
+          COUNT(*)::bigint AS requests,
+          COALESCE(SUM(CASE WHEN ${SLA_SUCCESS_PRED} THEN 1 ELSE 0 END), 0)::bigint AS success,
+          COALESCE(SUM(CASE WHEN ${SLA_ERROR_PRED} THEN 1 ELSE 0 END), 0)::bigint AS errors,
+          COALESCE(SUM(CASE WHEN status = 429 THEN 1 ELSE 0 END), 0)::bigint AS status_429,
+          COALESCE(SUM(CASE WHEN status = 529 THEN 1 ELSE 0 END), 0)::bigint AS status_529,
+          COALESCE(SUM(CASE WHEN status = 503 THEN 1 ELSE 0 END), 0)::bigint AS status_503,
+          COALESCE(SUM(CASE WHEN stream = 1 THEN 1 ELSE 0 END), 0)::bigint AS stream_requests,
+          COALESCE(SUM(CASE WHEN first_token_ms IS NOT NULL THEN 1 ELSE 0 END), 0)::bigint AS ttft_samples,
+          COALESCE(SUM(input_tokens), 0)::bigint AS input_tokens,
+          COALESCE(SUM(output_tokens), 0)::bigint AS output_tokens,
+          COALESCE(SUM(cache_read_tokens), 0)::bigint AS cache_read_tokens,
+          COALESCE(SUM(cache_creation_tokens), 0)::bigint AS cache_creation_tokens,
+          COALESCE(SUM(${PG_PROMPT_TOKENS_SQL}), 0)::bigint AS prompt_tokens,
+          COALESCE(SUM(total_cost), 0)::double precision AS total_cost,
+          COUNT(duration_ms)::bigint AS dur_samples,
+          AVG(duration_ms) AS dur_avg,
+          MAX(duration_ms) AS dur_max,
+          PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY duration_ms) FILTER (WHERE duration_ms IS NOT NULL) AS dur_p50,
+          PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY duration_ms) FILTER (WHERE duration_ms IS NOT NULL) AS dur_p90,
+          PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY duration_ms) FILTER (WHERE duration_ms IS NOT NULL) AS dur_p95,
+          PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY duration_ms) FILTER (WHERE duration_ms IS NOT NULL) AS dur_p99,
+          COUNT(first_token_ms)::bigint AS ttft_count,
+          AVG(first_token_ms) AS ttft_avg,
+          MAX(first_token_ms) AS ttft_max,
+          PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY first_token_ms) FILTER (WHERE first_token_ms IS NOT NULL) AS ttft_p50,
+          PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY first_token_ms) FILTER (WHERE first_token_ms IS NOT NULL) AS ttft_p90,
+          PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY first_token_ms) FILTER (WHERE first_token_ms IS NOT NULL) AS ttft_p95,
+          PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY first_token_ms) FILTER (WHERE first_token_ms IS NOT NULL) AS ttft_p99
+        FROM usage_logs ${where}`,
+        params,
+      ),
+      pool.query(
+        `SELECT SUBSTR(created_at, 1, 16) AS minute,
+                COUNT(*)::bigint AS requests,
+                COALESCE(SUM(${PG_TOTAL_TOKENS_SQL}), 0)::bigint AS tokens
+         FROM usage_logs ${where}
+         GROUP BY 1
+         ORDER BY 1 ASC`,
+        params,
+      ),
+      pool.query(
+        `SELECT COALESCE(NULLIF(upstream_model, ''), NULLIF(model, ''), '—') AS model,
+                COUNT(*)::bigint AS requests,
+                COALESCE(SUM(CASE WHEN ${SLA_ERROR_PRED} THEN 1 ELSE 0 END), 0)::bigint AS errors,
+                COALESCE(SUM(CASE WHEN first_token_ms IS NOT NULL THEN 1 ELSE 0 END), 0)::bigint AS ttft_samples,
+                CAST(AVG(first_token_ms) AS INTEGER) AS avg_first_token_ms,
+                CAST(AVG(duration_ms) AS INTEGER) AS avg_duration_ms
+         FROM usage_logs ${where}
+         GROUP BY 1
+         ORDER BY requests DESC
+         LIMIT 12`,
+        params,
+      ),
+      pool
+        .query(`SELECT selection_reason, COUNT(*)::bigint AS n FROM request_attempts ${attWhere} GROUP BY 1`, attParams)
+        .catch(() => ({ rows: [] })),
+      pool
+        .query(
+          `SELECT created_at AS ts, request_id, status, error_code, error_message, model, upstream_model, vm_id, ip_address AS ip, api_key_presented
+           FROM usage_logs ${errWhere}
+           ORDER BY created_at DESC, id DESC
+           LIMIT 2000`,
+          params,
+        )
+        .catch(() => ({ rows: [] })),
+      pool
+        .query(
+          `SELECT COALESCE(api_key_presented, '') AS api_key_presented,
+                  COALESCE(ip_address, '') AS ip,
+                  COUNT(*)::bigint AS count,
+                  MAX(created_at) AS last_ts,
+                  MAX(error_code) AS error_code
+           FROM usage_logs ${authWhere}
+           GROUP BY 1, 2
+           ORDER BY count DESC
+           LIMIT 40`,
+          params,
+        )
+        .catch(() => ({ rows: [] })),
+    ])
+
+    const counts = countsRes?.rows?.[0] || {}
+    const requests = Number(counts.requests || 0)
+    const success = Number(counts.success || 0)
+    const errors = Number(counts.errors || 0)
+    const inputTokens = Number(counts.input_tokens || 0)
+    const outputTokens = Number(counts.output_tokens || 0)
+    const cacheRead = Number(counts.cache_read_tokens || 0)
+    const cacheWrite = Number(counts.cache_creation_tokens || 0)
+    const cache = cacheHitStats({
+      input_tokens: inputTokens,
+      cache_read_tokens: cacheRead,
+      cache_creation_tokens: cacheWrite,
+      prompt_tokens: Number(counts.prompt_tokens || 0),
+    })
+    const tokens = inputTokens + outputTokens + cacheRead + cacheWrite
+
+    const startMs = sinceIso ? Date.parse(sinceIso) : null
+    const endMs = untilIso ? Date.parse(untilIso) : Date.now()
+    const windowSeconds =
+      Number.isFinite(startMs) && Number.isFinite(endMs) ? Math.max(1, (endMs - startMs) / 1000) : Math.max(1, requests)
+
+    const minuteRows = minuteRes?.rows || []
+    let peakReq = 0
+    let peakTok = 0
+    for (const r of minuteRows) {
+      const rq = Number(r.requests || 0)
+      const tk = Number(r.tokens || 0)
+      if (rq > peakReq) peakReq = rq
+      if (tk > peakTok) peakTok = tk
+    }
+    const lastMinute = minuteRows.length ? minuteRows[minuteRows.length - 1] : null
+
+    const roundOrNull = (v) => (v == null || !Number.isFinite(Number(v)) ? null : Math.round(Number(v)))
+    const buildLatency = (samples, avg, max, p50, p90, p95, p99) => {
+      const n = Number(samples || 0)
+      if (!n) return { samples: 0, p50_ms: null, p90_ms: null, p95_ms: null, p99_ms: null, avg_ms: null, max_ms: null }
+      return {
+        samples: n,
+        p50_ms: roundOrNull(p50),
+        p90_ms: roundOrNull(p90),
+        p95_ms: roundOrNull(p95),
+        p99_ms: roundOrNull(p99),
+        avg_ms: roundOrNull(avg),
+        max_ms: roundOrNull(max),
+      }
+    }
+
+    let selections = 0
+    let hits = 0
+    for (const row of stickyRes?.rows || []) {
+      const n = Number(row.n || 0)
+      selections += n
+      if (String(row.selection_reason || '') === 'sticky') hits += n
+    }
+
+    const ingressHits = (ingressRes?.rows || []).map((row) => ({
+      api_key_presented: row.api_key_presented || '',
+      ip: row.ip || '',
+      count: Number(row.count || 0),
+      last_ts: row.last_ts || null,
+      error_code: row.error_code || null,
+    }))
+
+    return {
+      since: sinceIso,
+      until: untilIso || new Date().toISOString(),
+      window_seconds: Math.round(windowSeconds),
+      requests,
+      success,
+      errors,
+      sla: requests ? success / requests : 1,
+      error_rate: requests ? errors / requests : 0,
+      status_429: Number(counts.status_429 || 0),
+      status_529: Number(counts.status_529 || 0),
+      status_503: Number(counts.status_503 || 0),
+      stream_requests: Number(counts.stream_requests || 0),
+      input_tokens: inputTokens,
+      output_tokens: outputTokens,
+      cache_read_tokens: cacheRead,
+      cache_creation_tokens: cacheWrite,
+      prompt_tokens: cache.prompt_tokens,
+      cache_hit_rate: cache.cache_hit_rate,
+      sticky: { selections, hits, rate: selections > 0 ? hits / selections : null },
+      total_cost: Number(counts.total_cost || 0),
+      qps: {
+        current: lastMinute ? Number(lastMinute.requests || 0) / 60 : 0,
+        peak: peakReq / 60,
+        avg: requests / windowSeconds,
+      },
+      tps: {
+        current: lastMinute ? Number(lastMinute.tokens || 0) / 60 : 0,
+        peak: peakTok / 60,
+        avg: tokens / windowSeconds,
+      },
+      duration: buildLatency(
+        counts.dur_samples,
+        counts.dur_avg,
+        counts.dur_max,
+        counts.dur_p50,
+        counts.dur_p90,
+        counts.dur_p95,
+        counts.dur_p99,
+      ),
+      ttft: buildLatency(
+        counts.ttft_count,
+        counts.ttft_avg,
+        counts.ttft_max,
+        counts.ttft_p50,
+        counts.ttft_p90,
+        counts.ttft_p95,
+        counts.ttft_p99,
+      ),
+      by_model: (byModelRes?.rows || []).map((r) => ({
+        model: r.model,
+        requests: Number(r.requests || 0),
+        errors: Number(r.errors || 0),
+        ttft_samples: Number(r.ttft_samples || 0),
+        avg_first_token_ms: r.avg_first_token_ms == null ? null : Number(r.avg_first_token_ms),
+        avg_duration_ms: r.avg_duration_ms == null ? null : Number(r.avg_duration_ms),
+      })),
+      error_collection: {
+        ...collectErrors(errorRowsRes?.rows || []),
+        ingress_hits: ingressHits,
+      },
+    }
+  }
+
+  /**
+   * Async windowed operational stats backed by short SWR (5s fresh / 15s hard TTL,
+   * 10s aligned time buckets). Runs natively async via `pgPool` (in-DB percentiles)
+   * on PostgreSQL or via off-main-thread `usageRead` on SQLite.
+   */
+  async windowStatsAsync({ since = null, until = null, owner_user_id = null, bypass = false } = {}) {
+    const queryOpts = { since, until, owner_user_id }
+    const load = async () => {
+      const pool = this._resolvePgPool()
+      if (!owner_user_id && this.db?.engine === 'postgres' && pool && typeof pool.query === 'function') {
+        return this._windowStatsPgAsync(pool, { since, until })
+      }
+      if (this._canUseReadPool()) {
+        try {
+          return await usageRead({ kind: 'repo', method: 'windowStats', args: [queryOpts] })
+        } catch {}
+      }
+      return this.repo.windowStats(queryOpts)
+    }
+
+    const dashboard = this._canUseSharedDashboardCache() ? this._getCache()?.dashboard : null
+    if (dashboard && typeof dashboard.getOrSetSWR === 'function') {
+      const bucketOf = (iso) => {
+        if (!iso) return 'none'
+        const ms = Date.parse(iso)
+        return Number.isFinite(ms) ? String(Math.floor(ms / WINDOW_STATS_BUCKET_MS)) : String(iso)
+      }
+      return dashboard.getOrSetSWR(
+        'ops-window',
+        {
+          scope: this._dashboardCacheScope(),
+          owner: owner_user_id ? String(owner_user_id).trim() : '__all__',
+          since: bucketOf(since),
+          until: bucketOf(until),
+        },
+        load,
+        {
+          freshTtlMs: WINDOW_STATS_SWR_FRESH_TTL_MS,
+          ttlMs: WINDOW_STATS_SWR_HARD_TTL_MS,
+          bypass,
+        },
+      )
+    }
+    return load()
   }
 
   protocolEntryStats(opts = {}) {
