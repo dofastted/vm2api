@@ -337,14 +337,19 @@ function fingerprint(root) {
   visit(root)
   return JSON.stringify(rows)
 }
-function verifiedPackage(root, arch = cragV2Arch()) {
-  const key = `${root}\0${arch}`
+function verifiedPackage(root, arch = cragV2Arch(), extraVerifyOpts = null) {
+  const allowUnbundled = extraVerifyOpts?.allowUnbundledStore === true
+  const storeRoot = allowUnbundled ? String(extraVerifyOpts?.sharedClaudeStoreRoot || '') : ''
+  const key = `${root}\0${arch}\0${allowUnbundled ? '1' : '0'}\0${storeRoot}`
   try {
     const before = fingerprint(root)
     const cached = verificationCache.get(key)
     if (cached?.fingerprint === before) return cached.result
     verificationCache.delete(key)
-    const result = verifyCragV2Tree(root, { arch })
+    const result = verifyCragV2Tree(root, {
+      arch,
+      ...(allowUnbundled ? { allowUnbundledStore: true, sharedClaudeStoreRoot: storeRoot } : {}),
+    })
     if (result.ok && fingerprint(root) === before) {
       verificationCache.set(key, { fingerprint: before, result })
       if (verificationCache.size > 8) verificationCache.delete(verificationCache.keys().next().value)
@@ -448,7 +453,9 @@ export function describeKernelCatalog(projectRoot, runtimeOptions) {
   try {
     const cragArch = archFor(projectRoot, 'crag', runtimeOptions)
     const root = cragV2PackageRoot(projectRoot, cragArch)
-    const verified = root ? verifiedPackage(root, cragArch) : { ok: false, code: 'crag_v2_package_missing' }
+    const verified = root
+      ? verifiedPackage(root, cragArch, runtimeOptions)
+      : { ok: false, code: 'crag_v2_package_missing' }
     const release = root ? selectedReleaseInfo(projectRoot, 'crag', root, cragArch) : {}
     if (verified.ok && !release.payload_tag) {
       const manifestSha256 = crypto
