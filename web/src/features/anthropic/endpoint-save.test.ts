@@ -4,8 +4,10 @@ import {
   API_DEFAULTS,
   DIRECT,
   draftFromStored,
+  endpointBodyPolicyRequest,
   endpointModelRequest,
   endpointSaveRequest,
+  patchCachedApiEndpoint,
 } from './endpoint-save'
 
 const stored = draftFromStored({
@@ -163,22 +165,64 @@ describe('anthropic console endpoint save', () => {
   })
 
   it('saves body policy on creation and sends only changed stored values', () => {
-    const row = draftFromStored({ id: 'policy', body_policy: 'caller' })
-    expect(row.bodyPolicy).toBe('caller')
+    const row = draftFromStored({ id: 'policy', body_policy: 'persona' })
+    expect(row.bodyPolicy).toBe('persona')
     expect(endpointSaveRequest(row, 'm').body).not.toHaveProperty('body_policy')
     expect(
-      endpointSaveRequest({ ...row, bodyPolicy: 'persona' }, 'm').body
-    ).toMatchObject({ body_policy: 'persona' })
-    expect(
-      endpointSaveRequest({ ...stored, bodyPolicy: 'caller' }, 'm').body
+      endpointSaveRequest({ ...row, bodyPolicy: 'caller' }, 'm').body
     ).toMatchObject({ body_policy: 'caller' })
     expect(
-      endpointSaveRequest({ ...row, storedId: undefined }, 'm').body
+      endpointSaveRequest({ ...stored, bodyPolicy: 'persona' }, 'm').body
+    ).toMatchObject({ body_policy: 'persona' })
+    expect(endpointSaveRequest(stored, 'm').body).not.toHaveProperty(
+      'body_policy'
+    )
+    expect(
+      endpointSaveRequest({ ...stored, storedId: undefined }, 'm').body
     ).toMatchObject({ body_policy: 'caller' })
   })
 
-  it('defaults body policy to persona and keeps OpenAI endpoints out of it', () => {
-    expect(draftFromStored({ id: 'plain' }).bodyPolicy).toBe('persona')
+  it('defaults body policy to caller, builds single-field toggle PATCH, and keeps OpenAI endpoints out of it', () => {
+    expect(draftFromStored({ id: 'plain' }).bodyPolicy).toBe('caller')
+    expect(endpointBodyPolicyRequest('ep_1', 'persona')).toEqual({
+      method: 'PATCH',
+      path: '/api/panel/api-endpoints/ep_1',
+      body: { body_policy: 'persona' },
+    })
+    expect(endpointBodyPolicyRequest('ep 1', 'caller')).toEqual({
+      method: 'PATCH',
+      path: '/api/panel/api-endpoints/ep%201',
+      body: { body_policy: 'caller' },
+    })
+    expect(
+      patchCachedApiEndpoint(
+        {
+          items: [
+            { id: 'ep_1', body_policy: 'caller' },
+            { id: 'ep_2', body_policy: 'persona' },
+          ],
+          presets: [],
+        },
+        { id: 'ep_1', body_policy: 'persona' }
+      )
+    ).toEqual({
+      items: [
+        { id: 'ep_1', body_policy: 'persona' },
+        { id: 'ep_2', body_policy: 'persona' },
+      ],
+      presets: [],
+    })
+    expect(
+      patchCachedApiEndpoint(
+        { items: [{ id: 'ep_1', body_policy: 'caller' }] },
+        { id: 'ep_new', body_policy: 'caller' }
+      )
+    ).toEqual({
+      items: [
+        { id: 'ep_1', body_policy: 'caller' },
+        { id: 'ep_new', body_policy: 'caller' },
+      ],
+    })
     const oai = draftFromStored({
       id: 'oai',
       protocol: 'openai',
