@@ -442,6 +442,7 @@ export class PoolScheduler extends EventEmitter {
     this.schedulerRuntime = schedulerRuntime || null
     this._explicitPgPool = pgPool || null
     this._pgRuntimeStateCache = new Map() // accountId -> merged runtime state (PG async cache)
+    this._vmAuthCooldownActive = new Set() // vmIds with an active in-process auth cooldown marker
     // Observability gauges only (panel live stream & graceful drain check).
     this.inflight = new Map()
     this.vmInflight = new Map()
@@ -1437,6 +1438,43 @@ export class PoolScheduler extends EventEmitter {
     })
   }
 
+  _vmNeedsAuthCooldownClear(candidate, prevState = null) {
+    const vmId = candidate?.vmId
+    if (!vmId) return false
+    if (this._vmAuthCooldownActive.has(vmId)) return true
+    if (isAuthCooldownReason(prevState?.cooldown_reason) || isAuthCooldownReason(candidate?.state?.cooldown_reason)) {
+      return true
+    }
+    let vm = candidate?.vm || null
+    if (!vm) {
+      try {
+        const peek = getCacheRuntime()?.scheduler?.peekSchedulingSnapshot?.()
+        vm = peek?.snapshot?.byVmId?.get?.(vmId) || null
+      } catch {}
+    }
+    if (!vm && this.projectRoot) {
+      try {
+        vm = getVm(this.projectRoot, vmId)
+      } catch {
+        vm = null
+      }
+    }
+    if (!vm || typeof vm !== 'object') return false
+    const claude = vm.claude
+    const reason = claude?.temp_unschedulable_reason || vm.temp_unschedulable_reason
+    if (reason && isQuotaWindowReason(reason) && !isAuthCooldownReason(reason)) {
+      return Boolean(vm.unschedulable)
+    }
+    return Boolean(
+      claude?.temp_unschedulable_until ||
+        claude?.temp_unschedulable_reason ||
+        claude?.oauth_401_generation ||
+        vm.temp_unschedulable_until ||
+        vm.temp_unschedulable_reason ||
+        vm.unschedulable,
+    )
+  }
+
   markSuccess(candidate, { workerStatus = null, countUsage = true } = {}) {
     const now = Date.now()
     if (countUsage !== false) this.accountQuota?.noteBandSettled?.(candidate.accountId, candidate.quotaToken)
@@ -1461,9 +1499,18 @@ export class PoolScheduler extends EventEmitter {
     } else {
       this.runtimeRepo?.upsert?.(payload)
     }
-    if (this.projectRoot && candidate.vmId) {
+    if (this.projectRoot && candidate.vmId && this._vmNeedsAuthCooldownClear(candidate, prev)) {
       try {
         clearVmAuthCooldown(vmJsonPath(this.projectRoot, candidate.vmId))
+        this._vmAuthCooldownActive.delete(candidate.vmId)
+        if (candidate.vm?.claude) {
+          const r = candidate.vm.claude.temp_unschedulable_reason || candidate.vm.temp_unschedulable_reason
+          if (!r || !isQuotaWindowReason(r)) {
+            delete candidate.vm.claude.temp_unschedulable_until
+            delete candidate.vm.claude.temp_unschedulable_reason
+            delete candidate.vm.claude.oauth_401_generation
+          }
+        }
       } catch {}
     }
   }
@@ -1522,6 +1569,7 @@ export class PoolScheduler extends EventEmitter {
             candidate.vm?.claude?.expires_at ??
             null,
         })
+        this._vmAuthCooldownActive.add(candidate.vmId)
       } catch {}
     } else if (!model && isAccountRestrictionReason(reason) && this.projectRoot && candidate.vmId) {
       try {
@@ -1682,7 +1730,13 @@ export class PoolScheduler extends EventEmitter {
         })
       }
     }
-    const next = clearVmQuotaRestriction(file)
+    const hasVmQuotaField = Boolean(
+      vm.claude?.temp_unschedulable_reason ||
+        vm.temp_unschedulable_reason ||
+        vm.claude?.temp_unschedulable_until ||
+        vm.temp_unschedulable_until,
+    )
+    const next = hasVmQuotaField ? clearVmQuotaRestriction(file) : null
     if (next) {
       vm.claude = next.claude || vm.claude
       delete vm.temp_unschedulable_until

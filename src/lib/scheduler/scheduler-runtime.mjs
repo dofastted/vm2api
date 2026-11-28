@@ -39,7 +39,7 @@ import {
   vmOwnerId,
 } from '../admin/resource-owner.mjs'
 import { HOST_PRESSURE_CRITICAL, hostMemoryLevelForVm } from '../cluster/host-memory-pressure.mjs'
-import { getCacheRuntime } from '../cache/index.mjs'
+import { getCacheRuntime, registerLocalCacheClearer } from '../cache/index.mjs'
 import { SchedulerSnapshotCache } from '../cache/scheduler-cache.mjs'
 import { getDb, getPgPool, isDbOpen, withTransaction } from '../db/database.mjs'
 import { listAllSnapshotsAsync, listAllVmsAsync } from '../db/repos/account-runtime-repo.mjs'
@@ -100,6 +100,11 @@ export const VIRTUAL_POOL_IDS = Object.freeze({
 
 export const DEFAULT_TELEMETRY_INTERVAL_MS = 2_000
 const PERMANENT_PENALTY_THRESHOLD_MS = 8e15
+const DEFAULT_AUX_CACHE_TTL_MS = 10_000
+const DEFAULT_GEMINI_ENVS_TTL_MS = 5_000
+const AUX_CACHE_PREFIX = 'sched:aux:'
+const AUX_ENDPOINTS_KEY = `${AUX_CACHE_PREFIX}api_endpoints`
+const AUX_GEMINI_OWNERS_KEY = `${AUX_CACHE_PREFIX}gemini_owners`
 
 const VIRTUAL_POOL_SET = new Set(Object.values(VIRTUAL_POOL_IDS))
 
@@ -1054,6 +1059,8 @@ export class SchedulerRuntime {
   #pgPool
   #schedulerCache
   #localSnapshotCache
+  #auxCacheTtlMs
+  #auxCacheExplicit
 
   #configVersion = 0
   #lastSnapshot = null
@@ -1068,11 +1075,21 @@ export class SchedulerRuntime {
   #penaltyRepo = null
   #penaltyRepoDb = null
   #started = false
+  #apiEndpointsCache = null
+  #geminiOwnerMapCache = null
+  #geminiEnvsCache = null
+  #apiEndpointsInflight = null
+  #geminiOwnersInflight = null
+  #unsubAuxInvalidate = null
+  #unsubLocalClearer = null
 
   constructor(options = {}) {
     this.#cfg = options.cfg || {}
     this.#pgPool = options.pgPool || null
     this.#schedulerCache = options.schedulerCache || null
+    this.#auxCacheExplicit = options.auxCacheTtlMs !== undefined
+    this.#auxCacheTtlMs =
+      options.auxCacheTtlMs !== undefined ? Math.max(0, Number(options.auxCacheTtlMs) || 0) : DEFAULT_AUX_CACHE_TTL_MS
     this.#localSnapshotCache = new SchedulerSnapshotCache(null, {
       freshTtlMs: options.snapshotFreshTtlMs ?? 2_000,
       staleTtlMs: options.snapshotStaleTtlMs ?? 10_000,
@@ -1140,6 +1157,47 @@ export class SchedulerRuntime {
           this.#onError?.(err, info)
         },
       })
+    }
+
+    try {
+      const cacheClient = getCacheRuntime()?.client
+      if (cacheClient?.onInvalidate) {
+        this.#unsubAuxInvalidate = cacheClient.onInvalidate((payload) => {
+          const prefixes = Array.isArray(payload?.prefixes) ? payload.prefixes : []
+          const keys = Array.isArray(payload?.keys) ? payload.keys : []
+          if (
+            prefixes.some(
+              (p) => p === AUX_CACHE_PREFIX || p === 'sched:' || p === 'entity:' || p.startsWith('dash:'),
+            ) ||
+            keys.some((k) => k === AUX_ENDPOINTS_KEY || k === AUX_GEMINI_OWNERS_KEY)
+          ) {
+            this.invalidateAuxiliaryCaches()
+          }
+        })
+      }
+      this.#unsubLocalClearer = registerLocalCacheClearer(() => this.invalidateAuxiliaryCaches())
+    } catch {}
+  }
+
+  /** Clear short-TTL L1 auxiliary caches (`api_endpoints`, `gemini_environment_owners`, `gemini_envs`). */
+  invalidateAuxiliaryCaches({ tables = null, broadcast = false } = {}) {
+    const set = Array.isArray(tables) && tables.length ? new Set(tables.map((t) => String(t).toLowerCase())) : null
+    if (!set || set.has('api_endpoints') || set.has('api_endpoint_keys') || set.has('api_endpoint_models')) {
+      this.#apiEndpointsCache = null
+      this.#apiEndpointsInflight = null
+    }
+    if (!set || set.has('gemini_environment_owners')) {
+      this.#geminiOwnerMapCache = null
+      this.#geminiOwnersInflight = null
+    }
+    if (!set || set.has('gemini_envs') || set.has('gemini_environment_owners')) {
+      this.#geminiEnvsCache = null
+    }
+    if (broadcast) {
+      try {
+        const client = getCacheRuntime()?.client
+        client?.invalidate?.({ prefixes: [AUX_CACHE_PREFIX], broadcast: true })?.catch?.(() => {})
+      } catch {}
     }
   }
 
@@ -1377,32 +1435,290 @@ export class SchedulerRuntime {
     })
   }
 
-  #loadGeminiEnvs() {
+  #shouldCacheEndpoints(pgPool = this.#resolvePgPool()) {
+    if (this.#auxCacheTtlMs <= 0) return false
+    if (this.#auxCacheExplicit) return true
+    return Boolean(pgPool || this.#apiEndpointStore?.db || this.#apiEndpointStore?.repo?.db)
+  }
+
+  #shouldCacheGeminiOwners(pgPool = this.#resolvePgPool()) {
+    if (this.#auxCacheTtlMs <= 0) return false
+    if (this.#auxCacheExplicit) return true
+    return Boolean(pgPool || this.#geminiOwnersRepo?.db || (this.#resolveDb() && isDbOpen()))
+  }
+
+  #shouldCacheGeminiEnvs(pgPool = this.#resolvePgPool()) {
+    if (this.#auxCacheTtlMs <= 0) return false
+    if (this.#auxCacheExplicit) return true
+    return Boolean(pgPool)
+  }
+
+  #loadGeminiEnvs({ forceRefresh = false, now = Date.now() } = {}) {
     const gSched = this.#resolveGeminiScheduler()
     if (!gSched) return []
+    const cacheable = this.#shouldCacheGeminiEnvs()
+    const ttlMs = Math.min(this.#auxCacheTtlMs, DEFAULT_GEMINI_ENVS_TTL_MS)
+    if (cacheable && !forceRefresh && this.#geminiEnvsCache && now - this.#geminiEnvsCache.loadedAt < ttlMs) {
+      return this.#geminiEnvsCache.value
+    }
     try {
       const list = gSched.listEnvironments?.() || gSched.snapshot?.()?.accounts || []
-      return Array.isArray(list) ? list : []
+      const result = Array.isArray(list) ? list : []
+      if (cacheable) this.#geminiEnvsCache = { value: result, loadedAt: now }
+      return result
     } catch {
       return []
     }
   }
 
-  #loadGeminiOwnerMap() {
+  #loadGeminiOwnerMap({ forceRefresh = false, now = Date.now() } = {}) {
+    if (!this.#geminiOwnersRepo) return null
+    const cacheable = this.#shouldCacheGeminiOwners()
+    if (
+      cacheable &&
+      !forceRefresh &&
+      this.#geminiOwnerMapCache &&
+      now - this.#geminiOwnerMapCache.loadedAt < this.#auxCacheTtlMs
+    ) {
+      return this.#geminiOwnerMapCache.value
+    }
     try {
-      return this.#geminiOwnersRepo?.ownerMap?.() || null
+      const map = this.#geminiOwnersRepo?.ownerMap?.() || null
+      if (cacheable) this.#geminiOwnerMapCache = { value: map, loadedAt: now }
+      return map
     } catch {
       return null
     }
   }
 
-  #loadApiEndpoints() {
+  #loadApiEndpoints({ forceRefresh = false, now = Date.now() } = {}) {
+    if (!this.#apiEndpointStore) return []
+    const cacheable = this.#shouldCacheEndpoints()
+    if (
+      cacheable &&
+      !forceRefresh &&
+      this.#apiEndpointsCache &&
+      now - this.#apiEndpointsCache.loadedAt < this.#auxCacheTtlMs
+    ) {
+      return this.#apiEndpointsCache.value
+    }
     try {
       const list = this.#apiEndpointStore?.listRaw?.() ?? this.#apiEndpointStore?.list?.() ?? []
-      return Array.isArray(list) ? list : []
+      const result = Array.isArray(list) ? list : []
+      if (cacheable) this.#apiEndpointsCache = { value: result, loadedAt: now }
+      return result
     } catch {
       return []
     }
+  }
+
+  async #queryApiEndpointsPgAsync(pgPool) {
+    const epRes = await pgPool.query(
+      `SELECT id, name, disabled, prefix, base_url, headers_json, disable_cooling,
+              priority, kind, protocol, risk_review_enabled, body_policy,
+              owner_user_id, created_at, updated_at
+       FROM api_endpoints
+       ORDER BY priority DESC, created_at, id`,
+    )
+    const epRows = epRes?.rows || []
+    if (!epRows.length) return []
+    const epIds = epRows.map((r) => String(r.id))
+    const [keysRes, modelsRes] = await Promise.all([
+      pgPool.query(
+        `SELECT id, endpoint_id, proxy_url, proxy_id, disabled, cooldown_until, created_at
+         FROM api_endpoint_keys
+         WHERE endpoint_id = ANY($1::text[])
+         ORDER BY created_at, id`,
+        [epIds],
+      ),
+      pgPool.query(
+        `SELECT id, endpoint_id, sort, upstream_name, alias, image, thinking_levels_json
+         FROM api_endpoint_models
+         WHERE endpoint_id = ANY($1::text[])
+         ORDER BY sort, id`,
+        [epIds],
+      ),
+    ])
+    const keysByEp = new Map()
+    for (const k of keysRes?.rows || []) {
+      const eid = String(k.endpoint_id)
+      let list = keysByEp.get(eid)
+      if (!list) {
+        list = []
+        keysByEp.set(eid, list)
+      }
+      list.push({
+        id: k.id,
+        endpoint_id: k.endpoint_id,
+        proxy_url: k.proxy_url || '',
+        proxy_id: k.proxy_id || '',
+        disabled: Boolean(k.disabled),
+        cooldown_until: k.cooldown_until || null,
+        created_at: k.created_at,
+      })
+    }
+    const modelsByEp = new Map()
+    for (const m of modelsRes?.rows || []) {
+      const eid = String(m.endpoint_id)
+      let list = modelsByEp.get(eid)
+      if (!list) {
+        list = []
+        modelsByEp.set(eid, list)
+      }
+      let levels = null
+      try {
+        levels = m.thinking_levels_json ? JSON.parse(m.thinking_levels_json) : null
+      } catch {
+        levels = null
+      }
+      list.push({
+        id: m.id,
+        endpoint_id: m.endpoint_id,
+        sort: Number(m.sort) || 0,
+        name: m.upstream_name,
+        alias: m.alias,
+        image: Boolean(m.image),
+        thinking: levels ? { levels } : undefined,
+      })
+    }
+    return epRows.map((row) => {
+      let headers = {}
+      try {
+        headers = row.headers_json ? JSON.parse(row.headers_json) : {}
+      } catch {
+        headers = {}
+      }
+      return {
+        id: row.id,
+        name: row.name,
+        disabled: Boolean(row.disabled),
+        prefix: row.prefix || '',
+        base_url: row.base_url,
+        headers,
+        disable_cooling: Boolean(row.disable_cooling),
+        priority: Number(row.priority) || 0,
+        kind: row.kind || 'custom',
+        protocol: row.protocol || 'anthropic',
+        risk_review_enabled: Boolean(row.risk_review_enabled),
+        body_policy: row.body_policy === 'persona' ? 'persona' : 'caller',
+        owner_user_id: row.owner_user_id ? String(row.owner_user_id).trim() || null : null,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+        api_key_entries: keysByEp.get(String(row.id)) || [],
+        models: modelsByEp.get(String(row.id)) || [],
+      }
+    })
+  }
+
+  async #ensureApiEndpointsAsync(pgPool, { forceRefresh = false, now = Date.now() } = {}) {
+    if (!this.#apiEndpointStore) return []
+    if (!pgPool || typeof pgPool.query !== 'function') {
+      return this.#loadApiEndpoints({ forceRefresh, now })
+    }
+    // Preserve custom non-DB test mocks (e.g. `{ listRaw: () => fx.endpoints }`)
+    const storeDb = this.#apiEndpointStore?.db || this.#apiEndpointStore?.repo?.db || null
+    if (!storeDb && !this.#auxCacheExplicit) {
+      return this.#loadApiEndpoints({ forceRefresh, now })
+    }
+    if (
+      !forceRefresh &&
+      this.#auxCacheTtlMs > 0 &&
+      this.#apiEndpointsCache &&
+      now - this.#apiEndpointsCache.loadedAt < this.#auxCacheTtlMs
+    ) {
+      return this.#apiEndpointsCache.value
+    }
+    if (!forceRefresh && this.#apiEndpointsInflight) return this.#apiEndpointsInflight
+
+    const p = (async () => {
+      const client = getCacheRuntime()?.client
+      if (!forceRefresh && this.#auxCacheTtlMs > 0 && client?.enabled && client.hasRedis) {
+        try {
+          const hit = await client.get(AUX_ENDPOINTS_KEY, {
+            useL2: true,
+            prefixes: [AUX_CACHE_PREFIX],
+            maxL1TtlMs: this.#auxCacheTtlMs,
+          })
+          if (hit?.hit && Array.isArray(hit.value)) {
+            this.#apiEndpointsCache = { value: hit.value, loadedAt: Date.now() }
+            return hit.value
+          }
+        } catch {}
+      }
+      const list = await this.#queryApiEndpointsPgAsync(pgPool)
+      const loadedAt = Date.now()
+      this.#apiEndpointsCache = { value: list, loadedAt }
+      if (this.#auxCacheTtlMs > 0 && client?.enabled && client.hasRedis) {
+        client
+          .set(AUX_ENDPOINTS_KEY, list, {
+            ttlMs: this.#auxCacheTtlMs,
+            l1TtlMs: this.#auxCacheTtlMs,
+            prefixes: [AUX_CACHE_PREFIX],
+          })
+          .catch(() => {})
+      }
+      return list
+    })().finally(() => {
+      if (this.#apiEndpointsInflight === p) this.#apiEndpointsInflight = null
+    })
+    this.#apiEndpointsInflight = p
+    return p
+  }
+
+  async #ensureGeminiOwnerMapAsync(pgPool, { forceRefresh = false, now = Date.now() } = {}) {
+    if (!this.#geminiOwnersRepo) return null
+    if (!pgPool || typeof pgPool.query !== 'function') {
+      return this.#loadGeminiOwnerMap({ forceRefresh, now })
+    }
+    if (
+      !forceRefresh &&
+      this.#auxCacheTtlMs > 0 &&
+      this.#geminiOwnerMapCache &&
+      now - this.#geminiOwnerMapCache.loadedAt < this.#auxCacheTtlMs
+    ) {
+      return this.#geminiOwnerMapCache.value
+    }
+    if (!forceRefresh && this.#geminiOwnersInflight) return this.#geminiOwnersInflight
+
+    const p = (async () => {
+      const client = getCacheRuntime()?.client
+      if (!forceRefresh && this.#auxCacheTtlMs > 0 && client?.enabled && client.hasRedis) {
+        try {
+          const hit = await client.get(AUX_GEMINI_OWNERS_KEY, {
+            useL2: true,
+            prefixes: [AUX_CACHE_PREFIX],
+            maxL1TtlMs: this.#auxCacheTtlMs,
+          })
+          if (hit?.hit && Array.isArray(hit.value)) {
+            const restored = new Map(hit.value)
+            this.#geminiOwnerMapCache = { value: restored, loadedAt: Date.now() }
+            return restored
+          }
+        } catch {}
+      }
+      const res = await pgPool.query('SELECT env_id, owner_user_id FROM gemini_environment_owners')
+      const out = new Map()
+      for (const row of res?.rows || []) {
+        const envId = String(row?.env_id || '').trim()
+        const owner = String(row?.owner_user_id || '').trim()
+        if (envId && owner) out.set(envId, owner)
+      }
+      this.#geminiOwnerMapCache = { value: out, loadedAt: Date.now() }
+      if (this.#auxCacheTtlMs > 0 && client?.enabled && client.hasRedis) {
+        client
+          .set(AUX_GEMINI_OWNERS_KEY, [...out.entries()], {
+            ttlMs: this.#auxCacheTtlMs,
+            l1TtlMs: this.#auxCacheTtlMs,
+            prefixes: [AUX_CACHE_PREFIX],
+          })
+          .catch(() => {})
+      }
+      return out
+    })().finally(() => {
+      if (this.#geminiOwnersInflight === p) this.#geminiOwnersInflight = null
+    })
+    this.#geminiOwnersInflight = p
+    return p
   }
 
   /**
@@ -2240,6 +2556,14 @@ export class SchedulerRuntime {
   async shutdown({ drain = true, stopProcess = true, timeoutMs = 2_000 } = {}) {
     this.#stopTelemetryLoop()
     this.#started = false
+    try {
+      this.#unsubAuxInvalidate?.()
+    } catch {}
+    this.#unsubAuxInvalidate = null
+    try {
+      this.#unsubLocalClearer?.()
+    } catch {}
+    this.#unsubLocalClearer = null
     if (this.#ownsClient) {
       return this.#client.shutdown({ drain: drain && !this.isStandby, stopProcess, timeoutMs })
     }
@@ -2257,11 +2581,23 @@ export class SchedulerRuntime {
       this.#syncPending = true
       return this.#syncInFlight
     }
+    const forceAux = /endpoint|gemini|restore|manual|panel|pool/i.test(String(reason || ''))
     const run = async () => {
       let lastRes = { ok: true, applied: false, config_version: this.#configVersion }
       do {
         this.#syncPending = false
         this.#configVersion += 1
+        const db = this.#resolveDb()
+        const pgPool = this.#resolvePgPool(db)
+        if (pgPool && typeof pgPool.query === 'function') {
+          if (forceAux) this.#geminiEnvsCache = null
+          await Promise.all([
+            this.#ensureApiEndpointsAsync(pgPool, { forceRefresh: forceAux }).catch(() => null),
+            this.#ensureGeminiOwnerMapAsync(pgPool, { forceRefresh: forceAux }).catch(() => null),
+          ])
+        } else if (forceAux) {
+          this.invalidateAuxiliaryCaches()
+        }
         const snapshot = this.buildConfigSnapshot({ configVersion: this.#configVersion })
         lastRes = await this.#client.syncConfig({
           config_version: snapshot.config_version,
@@ -2297,10 +2633,13 @@ export class SchedulerRuntime {
     if (!Array.isArray(batch)) {
       const db = this.#resolveDb()
       const pgPool = this.#resolvePgPool(db)
-      const snapshot =
-        pgPool && typeof pgPool.query === 'function'
-          ? await this.#ensureSchedulingSnapshotAsync().catch(() => null)
-          : null
+      let snapshot = null
+      if (pgPool && typeof pgPool.query === 'function') {
+        ;[snapshot] = await Promise.all([
+          this.#ensureSchedulingSnapshotAsync().catch(() => null),
+          this.#ensureApiEndpointsAsync(pgPool).catch(() => null),
+        ])
+      }
       batch = this.buildTelemetryBatch({ snapshot })
     }
     if (!batch.length) return { ok: true, updated: 0 }
