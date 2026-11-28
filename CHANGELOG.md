@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.4.261 — 2026-11-28 · 文档：vm2api 与 CRAG V4 的协议边界；内核目录标注历史 V4 载荷的升级建议
+
+- **`vm2api` ↔ CRAG 协议与整流边界文档与内核目录 label（#2093）**：
+  - `docs/PROTOCOL.md`：「CRAG native V2 部署边界」更新为「CRAG Native V4 部署与协议边界」；新增「`vm2api` ↔ CRAG 协议与整流边界（Claude Code `2.1.321`）」，写明网关入口的协议转译、第三方 `system` / `role=system|developer` 文本搬迁、CRAG 最终出口 `2.1.321` 结构整流（`src/lib/protocol/crag-321-rectifier.mjs`）与槽内 CRAG 的职责划分；新增「历史 CRAG V4 载荷升级策略（`3.1.26`–`3.1.30` → `3.1.31`）」
+  - `src/lib/admin/kernel-catalog.mjs`：仅更新 `CRAG_PINNED_RELEASES` 中 `3.1.31`（标注「推荐」）与 `3.1.30` / `3.1.29` / `3.1.27` / `3.1.26`（标注「历史·建议改用 3.1.31」）的展示 `label`；所有 `tag` / `size` / `sha256` / `manifestSha256` 保持不变，不覆写历史 Release 的不可变附件
+- 部署说明：本次改动零数据库迁移、零 Rust 变更、零 `deploy/payload.json` 变更、零协议行为变更；仅文档与面板内核列表中的展示文字，升级后重启控制面即可。
+
 ## 1.4.260 — 2026-11-28 · CRAG 出口新增 Claude Code 2.1.321 结构整流器
 
 - **CRAG 最终出口统一执行 2.1.321 结构整流（#2089）**：新增 `src/lib/protocol/crag-321-rectifier.mjs` 作为单一真值，在 `prepareCragRequest`（严格官方透传与非严格/第三方两条分支）以及 `count_tokens`（`user-count-tokens.mjs`、`go-worker-client.mjs` 的 `countTokensViaKernel`）出口调用，把不合法或版本漂移的结构改写成 2.1.321 的合法等价形态，而不是放行到上游触发 400。
