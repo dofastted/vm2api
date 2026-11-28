@@ -32,6 +32,7 @@ import {
   POLICY_BLOCK_MESSAGE,
   classifyJev,
   isPolicyBlockMemory,
+  isThinkingLeakHardRule,
   jevDocument,
   jevAccountInScope,
   jevModelDocument,
@@ -341,8 +342,15 @@ export function systemRewrite(document) {
   return ''
 }
 
+const DISTILL_SESSION_BLOCK_MS = 10 * 60_000
+const DISTILL_THINKING_LEAK_REASON = 'distill:thinking_leak'
+
 function isJevReason(reason) {
   return typeof reason === 'string' && reason.startsWith('jev:') && reason !== 'jev:unavailable'
+}
+
+function isDistillSessionBanReason(reason) {
+  return reason === DISTILL_THINKING_LEAK_REASON
 }
 
 function retryAfterFromExpiry(expiresAt, now, fallbackSec = 600) {
@@ -352,7 +360,7 @@ function retryAfterFromExpiry(expiresAt, now, fallbackSec = 600) {
 }
 
 function enforcesBan(policy, row) {
-  if (isJevReason(row?.reason) || isUpstream400Reason(row?.reason)) {
+  if (isJevReason(row?.reason) || isUpstream400Reason(row?.reason) || isDistillSessionBanReason(row?.reason)) {
     if (row?.subject_kind === 'session' && policy?.session_block_enabled === false) return false
     return true
   }
@@ -885,6 +893,23 @@ export function commitProtocolBlock(decision, { repo, devices, sessions, policy,
       console.warn('[risk-audit] failed to record refusal cache hit')
     }
   }
+  if (decision.banSession && Number(decision.sessionBlockMs) > 0 && !decision.banDevice) {
+    if (policy?.session_block_enabled === false) return
+    try {
+      const ban =
+        devices?.blockSession?.(decision.identity, {
+          requestId,
+          fingerprint: decision.fingerprint || null,
+          reason: decision.sessionBlockReason || decision.reason || 'jev:distill',
+          ttlMs: Number(decision.sessionBlockMs),
+          now,
+        }) || null
+      if (ban) invalidateRiskBanCache({ kind: 'device', db: devices?.db || null })
+    } catch {
+      console.warn('[risk-audit] failed to persist session block')
+    }
+    return
+  }
   // JEV session bans are persisted tenant-scoped via devices.recordViolation
   // (keyed by sha256(principal, 'session', rootSessionId)) instead of the
   // unscoped global refusal_session_blocks table, preventing cross-tenant DoS.
@@ -1184,6 +1209,7 @@ export async function evaluateProtocolIntercept({
       if (hard?.category === 'distill') {
         const keyword = hard.keyword || hard.category
         const error = distillBlockError(distillRules, requestId)
+        const sessionOnly = isThinkingLeakHardRule(hard)
         return reject({
           kind: 'distill',
           via: 'distill-detect',
@@ -1191,8 +1217,15 @@ export async function evaluateProtocolIntercept({
           error,
           errorMessage: distillEvidenceMessage(error.body?.error?.message, keyword),
           intercept: gateVerdict({ kind: 'block', by: 'distill', keyword: keyword.slice(0, 40) }),
-          banDevice: true,
-          reason: 'distill',
+          banDevice: !sessionOnly,
+          banSession: sessionOnly,
+          ...(sessionOnly
+            ? {
+                sessionBlockMs: DISTILL_SESSION_BLOCK_MS,
+                sessionBlockReason: DISTILL_THINKING_LEAK_REASON,
+              }
+            : {}),
+          reason: sessionOnly ? DISTILL_THINKING_LEAK_REASON : 'distill',
         })
       }
       if (hard) {
@@ -1300,6 +1333,9 @@ export async function evaluateProtocolIntercept({
         })
       }
       const category = verdict.category || 'safety'
+      const categories =
+        Array.isArray(verdict.categories) && verdict.categories.length ? verdict.categories : category ? [category] : []
+      const distillOnlyJev = categories.length > 0 && categories.every((item) => item === 'distill')
       if (profile === 'downgrade_only') {
         const downgradeRoute = buildDowngradeRoute(audit, backend, verdict.score ?? null)
         if (downgradeRoute) {
@@ -1310,6 +1346,39 @@ export async function evaluateProtocolIntercept({
             downgradeReason: `jev:${category}`,
           })
         }
+      }
+      if (distillOnlyJev) {
+        const retryAfterSec = Math.round(DISTILL_SESSION_BLOCK_MS / 1000)
+        const error = makePolicyOverloadError({ requestId, retryAfterSec })
+        return reject({
+          kind: 'jev',
+          via: 'jev',
+          final_state: 'policy_blocked',
+          error,
+          logErrorCode: 'policy_blocked',
+          errorDetails: {
+            reason: 'jev:distill',
+            session_block_ms: DISTILL_SESSION_BLOCK_MS,
+            ...jevScoreDetails(verdict.scores),
+          },
+          errorMessage: `${POLICY_BLOCK_MESSAGE}: distill（已封锁当前会话 10 分钟）`,
+          intercept: gateVerdict({
+            kind: 'block',
+            by: 'jev',
+            keyword: 'distill',
+          }),
+          jevState: verdict.state || '',
+          category: 'distill',
+          sessionId: rootSessionId,
+          model: body?.model || inbound?.model || '',
+          preview: refusalPreview(body, inbound),
+          banSession: true,
+          banDevice: false,
+          forceDeviceBan: false,
+          sessionBlockMs: DISTILL_SESSION_BLOCK_MS,
+          sessionBlockReason: 'jev:distill',
+          reason: 'jev:distill',
+        })
       }
       const escalateBan = shouldEscalateJevBan(verdict, jev)
       const steps = policy?.risk_audit?.ban_steps || DEFAULT_BAN_STEPS
