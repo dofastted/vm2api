@@ -17,6 +17,7 @@ import {
   cragV2PackageRoot,
   installedCragV2Root,
   materializeCragV2,
+  resolveSharedStoreCragCurrentDir,
   verifyCragV2Tree,
 } from '../vm/wrap-cli-runtime.mjs'
 
@@ -89,9 +90,10 @@ function isUnbundledCragManifest(dir) {
 function resolveSharedCragTreeDir(projectRoot, vm, storeRoot, slotArch) {
   const installed = installedCragV2Root(projectRoot, vm)
   if (installed && fs.existsSync(path.join(installed, 'manifest.json'))) return installed
-  for (const candidate of [path.join(storeRoot, 'crag', 'current'), path.join(storeRoot, 'crag')]) {
-    if (fs.existsSync(path.join(candidate, 'manifest.json'))) return candidate
-  }
+  const storeCurrent = resolveSharedStoreCragCurrentDir(storeRoot)
+  if (storeCurrent && fs.existsSync(path.join(storeCurrent, 'manifest.json'))) return storeCurrent
+  const legacyStoreCrag = path.join(storeRoot, 'crag')
+  if (fs.existsSync(path.join(legacyStoreCrag, 'manifest.json'))) return legacyStoreCrag
   try {
     const packaged = cragV2PackageRoot(projectRoot, slotArch)
     if (packaged && isUnbundledCragManifest(packaged)) return packaged
