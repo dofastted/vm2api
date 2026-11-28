@@ -1,7 +1,7 @@
 {
   "repo": "dofastted/vm2api",
   "release": "payload-2026.11.28-system-prompt",
-  "crag_release": "payload-2026.11.28-crag-3.1.30",
+  "crag_release": "payload-2026.11.28-crag-3.1.31",
   "crag_debian13_release": {
     "tag": "payload-2026.11.28-crag-debian13-1.1.0",
     "dest_dir": "share/os/crag-debian13",
@@ -175,15 +175,15 @@
     },
     {
       "path": "share/crag/kernels/v2/amd64/crag-v2",
-      "asset": "crag-v2-amd64-v3.1.30-crag-v2",
+      "asset": "crag-v2-amd64-v3.1.31-crag-v2",
       "size": 930752,
-      "sha256": "07636459c92328b090dc9a3bbf474a57602ad831894519b91fa56eb96ac8e554"
+      "sha256": "9f8c1e38e9f2f7ddefa8d97e31fa6775a063672b9b41ced5e2f42998cfbf0cf0"
     },
     {
       "path": "share/crag/kernels/v2/amd64/crag-v2.payload.enc",
-      "asset": "crag-v2-amd64-v3.1.30-crag-v2.payload.enc",
-      "size": 11089220,
-      "sha256": "08d024979baa28405a8d6b331cbab82c58f6f66fe208279692c0cf97d1d24373"
+      "asset": "crag-v2-amd64-v3.1.31-crag-v2.payload.enc",
+      "size": 11106644,
+      "sha256": "98a50e2eef70b89807f3453050278f1eef98d8eb363d5d2caf089eb307c5c2e8"
     },
     {
       "path": "share/crag/kernels/v2/amd64/kernel.json.example",
@@ -193,9 +193,9 @@
     },
     {
       "path": "share/crag/kernels/v2/amd64/manifest.json",
-      "asset": "crag-v2-amd64-v3.1.30-manifest.json",
+      "asset": "crag-v2-amd64-v3.1.31-manifest.json",
       "size": 3046,
-      "sha256": "129dde38496b20ea8d9d8582551a0138ffaa02bba3f751e9c4de360388bbd33c"
+      "sha256": "270fcd28e6e61e597d5425f861c4c7dcda532b7991c31fabcf35ffb552c81cd0"
     },
     {
       "path": "share/crag/kernels/v2/amd64/unpack-note.md",
@@ -206,8 +206,8 @@
     {
       "path": "dist/crag-v2-licensed-amd64.tar.gz",
       "asset": "crag-v2-licensed-amd64.tar.gz",
-      "size": 168939626,
-      "sha256": "46d3fced7991064275770f9143475e6d5c28d449e7579e5698c463b84a15c1bd"
+      "size": 168956657,
+      "sha256": "58ef8c34d2a8d13451ad221113b7eb17288dfa3600f6fd740e41601c843c51a9"
     }
   ]
 }
