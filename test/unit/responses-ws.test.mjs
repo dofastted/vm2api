@@ -1307,3 +1307,194 @@ test('WebSocket upgrade handshake preserves Retry-After headers set before json(
     await live.close()
   }
 })
+
+test('responses-ws sets _responsesWsReplay while retaining full input across turns', async () => {
+  const seen = []
+  const live = await listen({
+    routing: ENABLED,
+    requireAuth: allowAuth,
+    async handleProtocol(req, res) {
+      const body = await readJson(req)
+      const turn = seen.length + 1
+      seen.push({
+        input: body.input,
+        replay: req._responsesWsReplay,
+      })
+      res.writeHead(200, { 'content-type': 'text/event-stream' })
+      const item = {
+        type: 'message',
+        role: 'assistant',
+        status: 'completed',
+        content: [{ type: 'output_text', text: `reply-${turn}` }],
+      }
+      res.write(
+        `data: ${JSON.stringify({ type: 'response.created', response: { id: `resp_r_${turn}`, output: [] } })}\n\n`,
+      )
+      res.write(
+        `data: ${JSON.stringify({
+          type: 'response.completed',
+          response: { id: `resp_r_${turn}`, status: 'completed', output: [item] },
+        })}\n\n`,
+      )
+      res.end()
+    },
+  })
+  const opened = await openWs(live.url, { authorization: 'Bearer sk-test' })
+  try {
+    const d1 = nextFrame(opened.ws, (f) => f.type === 'response.completed')
+    opened.ws.send(
+      JSON.stringify({
+        type: 'response.create',
+        model: 'gpt-5.4',
+        input: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'first' }] }],
+      }),
+    )
+    await d1
+
+    const d2 = nextFrame(opened.ws, (f) => f.type === 'response.completed')
+    opened.ws.send(
+      JSON.stringify({
+        type: 'response.create',
+        model: 'gpt-5.4',
+        previous_response_id: 'resp_r_1',
+        input: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'second' }] }],
+      }),
+    )
+    await d2
+
+    assert.deepEqual(seen[0].replay, {})
+    assert.equal(seen[0].input.length, 1)
+    assert.deepEqual(seen[1].replay, { previous_response_id: 'resp_r_1' })
+    assert.equal(seen[1].input.length, 3)
+  } finally {
+    opened.ws.close()
+    await live.close()
+  }
+})
+
+test('live x-tap-interrupt websocket mode forwards interrupt (204/409) without aborting and caches interrupted replay', async () => {
+  const interruptCalls = []
+  let abortedCount = 0
+  let releaseTurn1 = null
+  let interruptStatus = 204
+  const capturedInputs = []
+
+  const live = await listen({
+    routing: ENABLED,
+    requireAuth: allowAuth,
+    async handleProtocol(req, res) {
+      const body = await readJson(req)
+      const turn = capturedInputs.length + 1
+      capturedInputs.push(body.input)
+      req.once('aborted', () => {
+        abortedCount++
+      })
+      req._onCodexInterruptReady?.({
+        requestId: `kreq-ws-${turn}`,
+        interruptMode: 'websocket',
+        interrupt: async (responseId) => {
+          interruptCalls.push({ turn, responseId, status: interruptStatus })
+          if (interruptStatus === 204 && releaseTurn1) releaseTurn1()
+          return { ok: interruptStatus === 204, status: interruptStatus }
+        },
+      })
+      res.writeHead(200, { 'content-type': 'text/event-stream' })
+      if (turn === 1) {
+        const partial = {
+          type: 'message',
+          role: 'assistant',
+          status: 'incomplete',
+          content: [{ type: 'output_text', text: 'half-answer' }],
+        }
+        res.write(
+          `data: ${JSON.stringify({ type: 'response.created', response: { id: 'resp_live_1', output: [] } })}\n\n`,
+        )
+        await new Promise((resolve) => {
+          releaseTurn1 = resolve
+        })
+        res.write(
+          `data: ${JSON.stringify({
+            type: 'response.interrupt.accepted',
+            previous_response_id: 'resp_live_1',
+            mode: 'discard_partial_items',
+          })}\n\n`,
+        )
+        res.write(
+          `data: ${JSON.stringify({
+            type: 'response.incomplete',
+            response: {
+              id: 'resp_live_1',
+              status: 'incomplete',
+              incomplete_details: { reason: 'interrupted' },
+              output: [partial],
+            },
+          })}\n\n`,
+        )
+        res.end()
+        return
+      }
+
+      if (turn === 2) {
+        const resp2 = {
+          type: 'message',
+          role: 'assistant',
+          status: 'completed',
+          content: [{ type: 'output_text', text: 'continued' }],
+        }
+        res.write(
+          `data: ${JSON.stringify({ type: 'response.created', response: { id: 'resp_live_2', output: [] } })}\n\n`,
+        )
+        await new Promise((r) => setTimeout(r, 120))
+        res.write(
+          `data: ${JSON.stringify({ type: 'response.completed', response: { id: 'resp_live_2', status: 'completed', output: [resp2] } })}\n\n`,
+        )
+        res.end()
+      }
+    },
+  })
+  const opened = await openWs(live.url, { authorization: 'Bearer sk-test' })
+  try {
+    const t1Created = nextFrame(opened.ws, (f) => f.type === 'response.created')
+    const t1Accepted = nextFrame(opened.ws, (f) => f.type === 'response.interrupt.accepted')
+    const t1Incomplete = nextFrame(opened.ws, (f) => f.type === 'response.incomplete')
+    opened.ws.send(
+      JSON.stringify({
+        type: 'response.create',
+        model: 'gpt-5.4',
+        input: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'interrupt-turn-1' }] }],
+      }),
+    )
+    await t1Created
+    opened.ws.send(JSON.stringify({ type: 'response.interrupt', previous_response_id: 'resp_live_1' }))
+    await t1Accepted
+    const incompleteFrame = await t1Incomplete
+    assert.equal(incompleteFrame.response?.incomplete_details?.reason, 'interrupted')
+    assert.equal(abortedCount, 0)
+    assert.equal(interruptCalls[0]?.status, 204)
+
+    // Turn 2 resumes from interrupted Turn 1 via previous_response_id AND receives 409 on interrupt without aborting!
+    interruptStatus = 409
+    const t2Created = nextFrame(opened.ws, (f) => f.type === 'response.created' && f.response?.id === 'resp_live_2')
+    const t2Failed = nextFrame(opened.ws, (f) => f.type === 'response.interrupt.failed')
+    const t2Done = nextFrame(opened.ws, (f) => f.type === 'response.completed' && f.response?.id === 'resp_live_2')
+    opened.ws.send(
+      JSON.stringify({
+        type: 'response.create',
+        model: 'gpt-5.4',
+        previous_response_id: 'resp_live_1',
+        input: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'resume-turn-2' }] }],
+      }),
+    )
+    await t2Created
+    opened.ws.send(JSON.stringify({ type: 'response.interrupt', previous_response_id: 'resp_live_2' }))
+    const failedFrame = await t2Failed
+    const completedFrame = await t2Done
+    assert.equal(failedFrame.previous_response_id, 'resp_live_2')
+    assert.equal(completedFrame.response?.status, 'completed')
+    assert.equal(abortedCount, 0)
+    assert.equal(capturedInputs[1].length, 3)
+  } finally {
+    opened.ws.close()
+    await live.close()
+  }
+})

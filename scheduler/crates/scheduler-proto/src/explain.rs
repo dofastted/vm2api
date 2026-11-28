@@ -10,6 +10,9 @@ pub enum AffinityWhy {
     SessionSpillBusy,
     SessionNodeUnavailable,
     SubagentFollowParent,
+    /// Summary fork / seatless probe placed on its session's (or parent's) pinned
+    /// node without touching any stick (238 summary + seatless reconcileSticky).
+    EphemeralFollowSession,
     MachineHomeHit,
     MachineHomeCapacitySpill,
     MachineHomeUnavailable,
@@ -43,6 +46,9 @@ pub enum ExcludeReason {
     SubagentLimitExceeded,
     CrossPromptFallbackBlocked,
     CapabilityMismatch,
+    /// Node takes only conversations already pinned to it (quota guard band,
+    /// host memory pressure).
+    NewSessionBlocked,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
