@@ -141,6 +141,22 @@ export function resolveSlotTier(vm, account = null) {
   ).key
 }
 
+/** `routing.pool.fable_requires_max`, read the same way by dispatch and the panel. */
+export function fableRequiresMaxEnabled(routing) {
+  return routing?.pool?.fable_requires_max === true
+}
+
+/**
+ * The one `fable_requires_max` predicate: with the switch on, a Claude slot
+ * whose plan is not Max never receives a Fable model. Dispatch
+ * (`slotAllowsModel`) and the panel's per-slot badge both call this, so the
+ * badge cannot drift from what the scheduler does.
+ */
+export function slotDeniesFableForPlan({ vm, account = null, fableRequiresMax = false } = {}) {
+  if (!fableRequiresMax || !vm || isCodexVm(vm)) return false
+  return resolveSlotTier(vm, account) !== 'max'
+}
+
 export function slotAllowsModel({ vm, account = null, model, fableRequiresMax = false } = {}) {
   const requestedModel = String(model || '').trim()
   const fast = resolveGptFastAlias(requestedModel)
@@ -155,7 +171,7 @@ export function slotAllowsModel({ vm, account = null, model, fableRequiresMax = 
   const canonical = resolvePolicyModelId(modelKey) || modelKey
   // Before the per-account denial: a Pro slot is out for the plan, which is
   // what the caller should hear, whatever else was recorded on it.
-  if (fableRequiresMax && isFableModel(modelKey) && resolveSlotTier(vm, account) !== 'max') {
+  if (isFableModel(modelKey) && slotDeniesFableForPlan({ vm, account, fableRequiresMax })) {
     return { ok: false, reason: 'fable_requires_max' }
   }
   const deniedUntil = Number(account?.unified?.model_denied_until?.[canonical]) || 0

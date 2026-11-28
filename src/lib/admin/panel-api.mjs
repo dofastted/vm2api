@@ -59,6 +59,7 @@ import { mergeBatchGroupConfig } from '../pool/batch-group.mjs'
 import { applyVmQuotaConfig, applyVmQuotaPolicy, vmQuotaOverrideOf, vmQuotaView } from '../pool/vm-quota-override.mjs'
 import { GATE_OPEN, gatePolicyFields, gateZone, quotaGateOf } from '../pool/quota-gate.mjs'
 import { guardUsageTier, inferClaudeTier } from '../pool/claude-tier.mjs'
+import { fableRequiresMaxEnabled, slotDeniesFableForPlan } from '../pool/slot-model-gate.mjs'
 import { listQuotaFromHeaders, isOfficialWindowLimited } from '../pool/quota-window.mjs'
 import { lastClosedWindow } from '../pool/window-history.mjs'
 import { hardBlockOf } from '../pool/rate-limit-service.mjs'
@@ -2361,7 +2362,12 @@ function enrichVm(v, accountQuota, active, extras = {}) {
     usage_has_fable: isCodex ? null : q.usage_has_fable,
     fable_credits_required: isCodex ? null : q.fable_credits_required || null,
     // pool.fable_requires_max: this slot never gets Fable because it is not Max.
-    fable_requires_max: !isCodex && extras.routingConfig?.pool?.fable_requires_max === true && tierKey !== 'max',
+    // Same predicate dispatch uses (scheduler-runtime -> slotAllowsModel).
+    fable_requires_max: slotDeniesFableForPlan({
+      vm: v,
+      account: acc,
+      fableRequiresMax: fableRequiresMaxEnabled(extras.routingConfig),
+    }),
     availability,
     cred_status: credStatusFromAvailability(availability),
     cooldown_until: Number(restrictionUntil) > Date.now() ? Number(restrictionUntil) : null,
