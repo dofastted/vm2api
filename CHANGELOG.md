@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.4.255 — 2026-11-28 · 虚拟机面板透出 Rust 调度器 `node_cooldown`，测试链接给出准确原因
+
+- **面板显示与调度器一致：`node_cooldown` 不再被当成「可用」（#2069，Fixes #2057）**：Rust `kin-scheduler` 在连续上游拒答（如 `content_filter_refusal`）等情形下会让槽位进入节点级冷却并将其排除出派发，状态落在 `scheduler_node_penalties`，但面板此前只读 JS 侧的运行时冷却，于是该槽仍显示「可用 / 正在接单」、`diagnose` 全绿。
+  - `src/lib/scheduler/scheduler-runtime.mjs` 新增只读的 `activeNodePenalties()`，`src/lib/pool/pool-scheduler.mjs` 暴露为 `nodePenalties()`：仅取 `claude_vm`、节点级（`model_scope='*'`）、有时限的惩罚，模型级与永久惩罚不计入冷却
+  - `src/lib/admin/panel-api.mjs` 的 `enrichVm` 将其并入 `cooldown_until` / `cooldown_reason`（`node_cooldown:<原因>`），槽位在 `/#/vms` 归入受限区并显示「冷却中」，「清冷却」入口随之可用（既有的 `cooldown/clear` 会同步解除 Rust 节点冷却）；列表与详情新增 `node_cooldown: { until, reason, left_ms }`；Codex 槽不受影响
+  - `src/lib/admin/vm-test-chat.mjs`：测试链接的 pin 请求被调度器拒绝且该槽确在冷却时，返回 `code: node_cooldown` 与剩余分秒，调度器原文保留在 `upstream_message`，不再显示笼统的 `pinned node ... is busy · upstream_overloaded`
+- 部署说明：本次改动零数据库迁移、零 Rust 变更、零前端改动（前端已按 `availability` / `cooldown_until` 分区）；升级后重启控制面即可生效。
+
 ## 1.4.254 — 2026-11-28 · 热修：`role: "system"` `tool_addition`/`tool_removal` 400、内联工具改写与 CRAG `3.1.30` beta 兼容性修复
 
 - **修复中转/第三方流量触发 `400 messages.*.content: 'tool_addition'/'tool_removal' blocks are only permitted within role: "system" messages` 及重构兼容性回归**：

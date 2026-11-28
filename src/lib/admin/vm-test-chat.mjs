@@ -1308,6 +1308,16 @@ export async function runVmTestChat(opts = {}) {
       code: 'apikey_invalid',
       message: `${errObj.message}。Console Key 入站已去掉 oauth beta；上游仍 401 表示密钥无效。`,
     }
+  } else if (errObj && opts.nodePenalty && /pinned node \S+ is busy/i.test(errObj.message)) {
+    // Rust reports every refused pin as NodeBusy; the slot is really in a scheduler cooldown.
+    const leftSec = Math.max(1, Math.ceil((Number(opts.nodePenalty.until) - Date.now()) / 1000))
+    errObj = {
+      ...errObj,
+      type: 'api_error',
+      code: 'node_cooldown',
+      message: `该槽位处于调度冷却（node_cooldown，原因 ${opts.nodePenalty.reason}），剩余约 ${Math.floor(leftSec / 60)} 分 ${leftSec % 60} 秒；不是并发泄漏或上游过载。可在槽位详情清除限制后重试。`,
+      upstream_message: errObj.message,
+    }
   } else if (errObj && credMode === 'codex' && looksLikeCodexUnauthorized(result)) {
     const refreshFailed = log.some((row) => /OAuth 刷新失败/.test(String(row.message || '')))
     errObj = {
