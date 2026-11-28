@@ -3,8 +3,9 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import pg from 'pg'
 
-import { createDatabase } from '../../src/lib/db/database.mjs'
+import { closeDatabaseAsync, createDatabase, getPgPool, openDatabaseAsync } from '../../src/lib/db/database.mjs'
 import { armWriteBehind, flushWrites, pendingWrites } from '../../src/lib/db/write-behind.mjs'
 import {
   closeCacheRuntime,
@@ -382,13 +383,196 @@ test('ApiKeyStore Dirty-Set Write-Behind batches usage, enforces Safety Floor on
   const failedRes = await pgStore.flushPendingUsage()
   assert.equal(failedRes.flushed, 0)
   assert.equal(failedRes.failed, 2)
+  assert.match(failedRes.error, /transient pg error/)
+  assert.equal(pgStore.usageFlushStats().failures, 1)
+  assert.match(pgStore.usageFlushStats().lastError, /transient pg error/)
   assert.equal(getCacheRuntime().billing.pendingLocalDirtyCount(), 2, 'failed batch must re-add entries to dirty set')
 
   const okRes = await pgStore.flushPendingUsage()
   assert.equal(okRes.flushed, 2)
   assert.equal(okRes.failed, 0)
-  assert.match(pgQueries[1].sql, /UPDATE api_keys AS k[\s\S]*FROM \(VALUES/)
+  const batchSql = pgQueries[1].sql
+  assert.match(batchSql, /UPDATE api_keys AS k[\s\S]*FROM \(VALUES/)
+  assert.match(batchSql, /\(\$1::text\)::timestamptz/)
+  assert.match(batchSql, /NULLIF\(k\.window_5h_start, ''\)::timestamptz/)
+  assert.match(batchSql, /NULLIF\(k\.window_1d_start, ''\)::timestamptz/)
+  assert.match(batchSql, /NULLIF\(k\.window_7d_start, ''\)::timestamptz/)
+  assert.match(batchSql, /THEN \$1::text/)
+  assert.match(batchSql, /updated_at = \$1::text/)
+  assert.doesNotMatch(batchSql, /[^)]\$1::timestamptz/, 'must never cast raw $1 directly to timestamptz')
+  assert.doesNotMatch(batchSql, /k\.window_(?:5h|1d|7d)_start::timestamptz/, 'must guard empty string with NULLIF')
   await pgStore.close()
+})
+
+test('ApiKeyStore usage flusher drains multiple batches per tick, logs throttled errors on failure, and persists cleanly on real PG 18', async (t) => {
+  const { dir, db } = makeTmpDb('kin-billing-tick-')
+  t.after(async () => {
+    await closeCacheRuntime()
+    try {
+      db.close()
+    } catch {}
+    fs.rmSync(dir, { recursive: true, force: true })
+  })
+
+  await closeCacheRuntime()
+  await initCacheRuntime({ redisConfig: null })
+
+  // 1. Multi-batch tick draining (>200 dirty keys drained in one tick, not capped at 1 batch)
+  const seenBatches = []
+  const batchPgPool = {
+    query: async (_sql, params) => {
+      seenBatches.push((params.length - 1) / 9)
+      return { rows: [] }
+    },
+  }
+  const tickStore = new ApiKeyStore({ db, writeBehindUsage: true, usageFlushIntervalMs: 60_000, pgPool: batchPgPool })
+  const billing = getCacheRuntime().billing
+  for (let i = 0; i < 250; i += 1) {
+    await billing.accumulateKeyUsage(`key_tick_${i}`, {
+      requests: 1,
+      quota_requests_used: 1,
+      tokens_in: 10,
+      tokens_out: 5,
+      cost: 0.01,
+    })
+  }
+  const drained = await tickStore._drainUsageTick()
+  assert.equal(drained, 250, 'single tick must drain across multiple 200-key batches until empty')
+  assert.deepEqual(seenBatches, [200, 50])
+  await tickStore.close()
+
+  // 2. Throttled console.error observability on repeated flush failures (without swallowing errors)
+  const errorLogs = []
+  const origConsoleError = console.error
+  console.error = (...args) => errorLogs.push(args.join(' '))
+  try {
+    const failingPool = {
+      query: async () => {
+        throw new Error('PG18 synthetic failure')
+      },
+    }
+    const errStore = new ApiKeyStore({ db, writeBehindUsage: true, usageFlushIntervalMs: 60_000, pgPool: failingPool })
+    await billing.accumulateKeyUsage('key_err_1', { requests: 1, cost: 0.02 })
+    const r1 = await errStore.flushPendingUsage()
+    const r2 = await errStore.flushPendingUsage()
+    assert.equal(r1.failed, 1)
+    assert.equal(r2.failed, 1)
+    assert.equal(errStore.usageFlushStats().failures, 2)
+    assert.match(errStore.usageFlushStats().lastError, /PG18 synthetic failure/)
+    assert.equal(errorLogs.length, 1, 'consecutive failures within throttle window must emit 1 console.error alert')
+    assert.match(errorLogs[0], /PG18 synthetic failure/)
+    // Clean up re-added dirty entry so subsequent tests start clean
+    await billing.popDirtyKeyUsage(10)
+    await errStore.close()
+  } finally {
+    console.error = origConsoleError
+  }
+
+  // 3. Real PG 18 execution branch (when VM2API_TEST_PG_URL is configured)
+  const pgUrl = process.env.VM2API_TEST_PG_URL || ''
+  if (pgUrl) {
+    const schema = `vm2api_usage_pg18_${Date.now()}_${Math.floor(Math.random() * 1e6)}`
+    const admin = new pg.Client({ connectionString: pgUrl })
+    await admin.connect()
+    await admin.query(`CREATE SCHEMA "${schema}"`)
+    await admin.end()
+
+    const u = new URL(pgUrl)
+    u.searchParams.set('options', `-c search_path=${schema}`)
+    const pgDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-pg18-usage-'))
+    try {
+      const pgDb = await openDatabaseAsync({
+        dataDir: pgDir,
+        driver: 'postgres',
+        connectionString: u.toString(),
+        pooled: true,
+        enableAggregator: false,
+      })
+      const pool = getPgPool()
+      const liveStore = new ApiKeyStore({
+        db: pgDb,
+        writeBehindUsage: true,
+        usageFlushIntervalMs: 60_000,
+        pgPool: pool,
+      })
+      const kNull = liveStore.create({ name: 'pg18-null-win' })
+      const kEmpty = liveStore.create({ name: 'pg18-empty-win' })
+      const kActive = liveStore.create({ name: 'pg18-active-win' })
+
+      const activeWinStart = new Date(Date.now() - 60_000).toISOString()
+      await pool.query(
+        "UPDATE api_keys SET window_5h_start = '', window_1d_start = '', window_7d_start = '' WHERE id = $1",
+        [kEmpty.id],
+      )
+      await pool.query(
+        'UPDATE api_keys SET window_5h_start = $2, usage_5h = 0.25, window_1d_start = $2, usage_1d = 0.25, window_7d_start = $2, usage_7d = 0.25 WHERE id = $1',
+        [kActive.id, activeWinStart],
+      )
+
+      const nowIso = new Date().toISOString()
+      const updatedRows = await liveStore._applyUsageBatchToPg(
+        pool,
+        [
+          {
+            keyId: kNull.id,
+            requests: 2,
+            quota_requests_used: 2,
+            tokens_in: 120,
+            tokens_out: 30,
+            cache_read_tokens: 10,
+            cache_creation_tokens: 5,
+            cost: 0.4,
+            last_used_at: nowIso,
+          },
+          {
+            keyId: kEmpty.id,
+            requests: 3,
+            quota_requests_used: 3,
+            tokens_in: 300,
+            tokens_out: 90,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            cost: 0.75,
+            last_used_at: nowIso,
+          },
+          {
+            keyId: kActive.id,
+            requests: 1,
+            quota_requests_used: 1,
+            tokens_in: 50,
+            tokens_out: 20,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            cost: 0.15,
+            last_used_at: nowIso,
+          },
+        ],
+        nowIso,
+      )
+      assert.equal(
+        updatedRows.length,
+        3,
+        'real PG 18 batch update must succeed for NULL, empty-string, and ISO windows',
+      )
+      const byId = new Map(updatedRows.map((r) => [r.id, r]))
+      assert.equal(Number(byId.get(kNull.id).requests), 2)
+      assert.equal(byId.get(kNull.id).window_5h_start, nowIso)
+      assert.equal(Number(byId.get(kEmpty.id).requests), 3)
+      assert.equal(Number(byId.get(kEmpty.id).tokens_in), 300)
+      assert.ok(Math.abs(Number(byId.get(kEmpty.id).usage_5h) - 0.75) < 1e-9)
+      assert.equal(byId.get(kEmpty.id).window_5h_start, nowIso)
+      assert.ok(Math.abs(Number(byId.get(kActive.id).usage_5h) - 0.4) < 1e-9)
+      assert.equal(byId.get(kActive.id).window_5h_start, activeWinStart)
+      await liveStore.close()
+    } finally {
+      await closeDatabaseAsync().catch(() => {})
+      const cleanup = new pg.Client({ connectionString: pgUrl })
+      await cleanup.connect()
+      await cleanup.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`).catch(() => {})
+      await cleanup.end()
+      fs.rmSync(pgDir, { recursive: true, force: true })
+    }
+  }
 })
 
 test('GroupsRepo caches rateMultiplier including 0 and invalidates on update; resource-owner reuses _authProjection and EntityCache', async (t) => {

@@ -2513,6 +2513,7 @@ export function createGeminiPublicHandler({
     if (logBag.outbound_headers_source === 'unavailable') logBag.outbound_headers_source = null
     if (ownLogCtx) {
       res._kinRequestId = ownLogCtx.request_id
+      requestLog?.bindLifecycle?.(ownLogCtx, req, res)
       // Register tapResponse before our finish listener so ctx.response has final status/headers/body.
       requestLog?.tapResponse?.(ownLogCtx, res)
     }

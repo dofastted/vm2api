@@ -7,13 +7,13 @@
  * `get()` and `nearest()` never full-scan `refusal_guards` on the request hot path.
  */
 import { decodeSignature, REFUSAL_SIMILARITY, signatureSimilarity } from '../../core/refusal-similarity.mjs'
-import { getCacheRuntime } from '../../cache/index.mjs'
+import { getCacheRuntime, registerLocalCacheClearer } from '../../cache/index.mjs'
 import { getDb, isDbOpen } from '../database.mjs'
 
 const GUARD_CACHE_PREFIX = 'risk:guards:'
 const SNAPSHOT_TTL_MS = 60_000
 
-const dbSnapshots = new WeakMap() // db -> { revision, loadedAt, byFingerprint, signatures }
+let dbSnapshots = new WeakMap() // db -> { revision, loadedAt, byFingerprint, signatures }
 const hookedClients = new WeakSet()
 
 function ensureGuardInvalidationHook(cache) {
@@ -25,8 +25,8 @@ function ensureGuardInvalidationHook(cache) {
     const matchPrefix =
       Array.isArray(payload.prefixes) &&
       payload.prefixes.some((p) => p === GUARD_CACHE_PREFIX || GUARD_CACHE_PREFIX.startsWith(p))
-    if (matchPrefix && isDbOpen()) {
-      dbSnapshots.delete(getDb())
+    if (matchPrefix) {
+      invalidateRefusalGuardsSnapshot()
     }
   })
 }
@@ -34,10 +34,14 @@ function ensureGuardInvalidationHook(cache) {
 export function invalidateRefusalGuardsSnapshot(db = null) {
   if (db) {
     dbSnapshots.delete(db)
-  } else if (isDbOpen()) {
-    dbSnapshots.delete(getDb())
+  } else {
+    dbSnapshots = new WeakMap()
   }
 }
+
+registerLocalCacheClearer(({ db = null } = {}) => {
+  invalidateRefusalGuardsSnapshot(db)
+})
 
 function rowToRec(row) {
   if (!row) return null

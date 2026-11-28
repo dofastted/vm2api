@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.4.266 — 2026-11-28 · 修复 PG 18 账单批写类型冲突、恢复清全缓存与断连在飞孤儿，新增 20K 回放基准套件
+
+- **修复 PostgreSQL 18 + Redis 8 真实闭环验证暴露的 3 项缺陷（#2119）**：承接 `1.4.264`（#2102）后的真库端到端与压测验证，根治以下 3 个问题：
+  - **`api_keys` 批写 PG 18 参数类型冲突与空串强转**：`ApiKeyStore._applyUsageBatchToPg` 统一将 `$1` 绑定为 `$1::text`，仅在 `EXTRACT(EPOCH FROM ...)` 中使用 `($1::text)::timestamptz` 与 `NULLIF(k.window_*_start, '')::timestamptz`，避免 PG 18 类型冲突及空串强转报错导致账单清零；`flushPendingUsage()` 保留 `readdDirtyKeyUsage` 防丢语义并补充失败计数/最近错误（`usageFlushStats()`）与 30s 节流 `console.error`；`startUsageFlusher()` 改为单 tick 最多排干 16 批（每批 200 keys，防重入）
+  - **备份恢复清全缓存与本地快照**：在 `src/lib/cache/index.mjs` 新增并导出 SSOT 方法 `invalidateAllCaches()`（覆盖 `apikey:`、`billing:`、`sched:`、`dash:`、`entity:`、`risk:`、`live:` 全部 7 前缀，清理 `dashboard.snapshotCache`、`liveLogs`、`apiKeys.negCache`、`scheduler.snapshots`，并通过 `registerLocalCacheClearer` 联动清除 `RefusalGuardsRepo` 进程内快照）；`BackupService.restoreBackup()` 在 PG 与 SQLite 恢复分支统一调用，根治恢复后读出旧脏用户
+  - **`vm2api:live:inflight` 断连孤儿清理**：`RequestLogStore` 新增幂等 `bindLifecycle()` / `abort()`（监听 `req` `aborted`、`req` `close` 仅 `!req.complete`、`res` `close` 仅 `!res.writableFinished` 并预检已断开请求），`handleProtocol` / `handleSearch` / `handleImages` 增加 `try/finally` 退出兜底并保持 `res.on('finish')` 兼容，确保超时断连或异常早退时 `vm2api:live:inflight` 与 `vm2api:live:sess:conc:*` 零孤儿残留
+- **新增 20K RPM × 100K 上下文脱敏回放基准套件与 Phase 0 基线报告（#2116）**：新增 `scripts/bench-20k/` 隔离压测与闭环零丢/零漂移校验脚本、合并单测 `test/unit/bench-20k.test.mjs`（20 用例）与 `docs/performance/phase0-baseline-20k-replay.md`，固化后续性能迭代标尺；离线脱敏语料置于 `.local/bench-20k/` 不入库。
+- 部署说明：本次改动相对 `1.4.265` 零数据库迁移、零 Rust 变更、零 `deploy/payload.json` 变更（若从 `1.4.263` 及更早版本跨版升级，控制面启动时会自动幂等应用 `1.4.264` 的 PG 迁移 `011`）；升级后重启控制面即可生效。
 ## 1.4.265 — 2026-11-28 · 账号预热面板可见性：阶段汇总、徽章与手动启停（外部贡献）
 
 - **面板显示账号预热进度并支持手动操作（#2048，外部贡献 `grain-lu`）**：账号预热爬坡引擎（`1.4.246` 引入，默认关闭 `enabled: false`）此前在面板上没有任何可见状态。
