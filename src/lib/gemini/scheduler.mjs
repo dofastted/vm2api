@@ -337,9 +337,9 @@ function known(error) {
     const out = fail(Number.isInteger(error.status) ? error.status : status, code, error.message || message)
     if (Number.isInteger(error.upstreamStatus)) out.upstreamStatus = error.upstreamStatus
     if (Number.isFinite(error.retryAfterMs) && error.retryAfterMs > 0) out.retryAfterMs = error.retryAfterMs
+    if (error.explain) out.explain = error.explain
     if (error.retryAfter != null) out.retryAfter = error.retryAfter
     if (typeof error.upstreamReason === 'string' && error.upstreamReason) out.upstreamReason = error.upstreamReason
-    if (error.explain) out.explain = error.explain
     if (error.contentRejected === true) out.contentRejected = true
     if (typeof error.workerCode === 'string' && error.workerCode) out.workerCode = error.workerCode
     if (error.bridgeDisconnected === true) out.bridgeDisconnected = true

@@ -45,9 +45,9 @@ import {
   defaultSystemPromptModeForProvider,
   normalizeProviderScope,
 } from '../db/repos/scheduler-pools-repo.mjs'
+import { evaluateGeminiQuota, quotaRetryAfter } from '../gemini/quota-admission.mjs'
 import { SettingsRepo } from '../db/repos/settings-repo.mjs'
 import { indexAccountModelCatalog, resolveUpstreamModel, stripAntigravityPrefix } from '../gemini/model-catalog.mjs'
-import { evaluateGeminiQuota, quotaRetryAfter } from '../gemini/quota-admission.mjs'
 import { isGeminiSeriesId, resolveGeminiDefaultEffort } from '../protocol/gemini-model-policy.mjs'
 import { OFFICIAL_303_PRESET, normalizePersonaPreset } from '../identity/persona-template.mjs'
 import { activeHoursOf, evaluateActiveHours } from '../pool/active-hours.mjs'
