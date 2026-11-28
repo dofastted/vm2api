@@ -186,7 +186,6 @@ const DEFAULTS = {
   max_total_attempts: 12,
   max_accounts_per_request: 0,
   total_retry_deadline_ms: 120000,
-  session_queue_timeout_ms: 900_000,
   poison_request_threshold: 2,
   poison_request_window_ms: 30 * 60_000,
   poison_request_quarantine_ms: 10 * 60_000,
