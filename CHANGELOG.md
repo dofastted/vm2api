@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.4.270 — 2026-11-29 · Gemini 基础别名与显式推理档位不再被 M3 准入误判为池耗尽（外部贡献）
+
+- **M3 准入与模型解析使用同一套默认/请求推理档位（#2108，外部贡献 `DNAlec`）**：此前 Gemini 请求解析与 M3 兼容性闸门各自取默认/请求档位，基础别名（如 `gemini-4-hydrogen`）即使默认变体存在也可能被当作池耗尽拒绝；显式指定的非默认档位同样会被误拒。
+  - `src/lib/gemini/scheduler.mjs`、`src/lib/scheduler/scheduler-runtime.mjs`：把请求的推理档位传给 M3，并复用现有模型解析器、默认档位策略与账号目录判定兼容性；模型、属主、API 密钥与允许节点的限制保持不变，**不改变配额准入**。
+  - 测试 `test/unit/scheduler-gemini-alias-regression.test.mjs`（真实调度器回归）覆盖：基础别名、仅 high 账号的显式 high 档位、缺失默认变体、不存在的模型，以及属主/密钥/节点范围隔离。
+- 部署说明：本次改动零数据库迁移、零 Rust 变更、零 `deploy/payload.json` 变更；升级后重启控制面即可生效。
+
 ## 1.4.269 — 2026-11-28 · Stage 1 10K RPM 热路径与 PG/Redis I/O 优化（含 PG 迁移 `012`）
 
 - **Stage 1 高并发热路径与 PG/Redis I/O 深度优化（#2129）**：针对 Phase 0 真 PostgreSQL 18.6 + Redis 8 20K 回放基准归因的 Top 5 主线程 `Atomics.wait` 阻塞与日志写放大瓶颈，完成三路并行重构（100% 兼容 SQLite 与无 Redis 降级）：
