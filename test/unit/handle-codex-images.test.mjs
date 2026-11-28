@@ -1,18 +1,80 @@
-import { test, beforeEach, afterEach } from 'node:test'
+import { test, before, after, beforeEach, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { Readable } from 'node:stream'
 import { handleCodexImages } from '../../src/lib/protocol/handle-codex.mjs'
 import { CODEX_IMAGE_EDITS_URL, CODEX_IMAGE_GENERATIONS_URL } from '../../src/lib/protocol/codex-models.mjs'
 import { openDatabase, closeDatabase } from '../../src/lib/db/database.mjs'
 import { loadGptModelPolicy, saveGptModelPolicy } from '../../src/lib/protocol/gpt-model-policy.mjs'
 import { resetOpenAIAccountRuntime } from '../../src/lib/pool/openai-account-runtime.mjs'
-import { StickyRouter } from '../../src/lib/pool/sticky-router.mjs'
 import { readBody } from '../../src/lib/http/respond.mjs'
 import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs'
 import { gatewayModelCatalog } from '../../src/lib/protocol/models.mjs'
+import { listVms } from '../../src/lib/vm/vm-registry.mjs'
+import { createSchedulerRuntime, formatNodeKey } from '../../src/lib/scheduler/scheduler-runtime.mjs'
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
+const REPO_ROOT = path.resolve(__dirname, '../..')
+
+function resolveSchedulerBin() {
+  for (const candidate of [
+    process.env.KIN_SCHEDULER_BIN,
+    path.join(REPO_ROOT, 'bin', process.platform === 'win32' ? 'kin-scheduler.exe' : 'kin-scheduler'),
+    '/tmp/vm2api-sched-m3-target/release/kin-scheduler',
+    '/tmp/vm2api-sched-target/release/kin-scheduler',
+  ]) {
+    if (candidate && fs.existsSync(candidate)) return candidate
+  }
+  return null
+}
+
+let sharedSchedRoot = null
+let sharedSchedulerRuntime = null
+let imgReqSeq = 0
+
+async function syncProjectVms() {
+  await sharedSchedulerRuntime.syncConfigNow('codex_images_test')
+  await sharedSchedulerRuntime.pushTelemetryNow()
+  if (root) {
+    for (const vm of listVms(root)) {
+      await sharedSchedulerRuntime.unrestNode(formatNodeKey('codex_vm', vm.id)).catch(() => {})
+    }
+  }
+}
+
+before(async () => {
+  const binPath = resolveSchedulerBin()
+  assert.ok(binPath, 'kin-scheduler binary must exist for handle-codex-images tests (set KIN_SCHEDULER_BIN)')
+  sharedSchedRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-images-rust-sched-'))
+  sharedSchedulerRuntime = createSchedulerRuntime({
+    cfg: { paths: { data: sharedSchedRoot, project: sharedSchedRoot } },
+    getVms: () => (root && fs.existsSync(root) ? listVms(root) : []),
+    getRoutingConfig: () => ({}),
+    telemetryIntervalMs: 0,
+    clientOptions: {
+      binPath,
+      socketPath: path.join(sharedSchedRoot, 'run', 'scheduler.sock'),
+      tokenPath: path.join(sharedSchedRoot, 'run', 'scheduler.token'),
+      capFile: path.join(sharedSchedRoot, 'run', 'scheduler.cap.json'),
+      manageProcess: true,
+    },
+  })
+  await sharedSchedulerRuntime.start({ waitMs: 5_000, startLoops: false })
+})
+
+after(async () => {
+  if (sharedSchedulerRuntime) {
+    await sharedSchedulerRuntime.shutdown({ drain: false, stopProcess: true })
+    sharedSchedulerRuntime = null
+  }
+  if (sharedSchedRoot) {
+    fs.rmSync(sharedSchedRoot, { recursive: true, force: true })
+    sharedSchedRoot = null
+  }
+})
 
 const USAGE = {
   input_tokens: 300,
@@ -42,7 +104,8 @@ function upstream(status, payload, { raw = null } = {}) {
   return { status, headers: new Map(), text: async () => raw ?? JSON.stringify(payload) }
 }
 
-async function images({ kind = 'generations', body, headers = {}, ops = {}, stickyRouter = null } = {}) {
+async function images({ kind = 'generations', body, headers = {}, ops = {} } = {}) {
+  await syncProjectVms()
   const res = { statusCode: 0, body: null, setHeader() {} }
   const logBag = {}
   const stats = { errors: 0, requests: 0, by_route: {} }
@@ -60,8 +123,8 @@ async function images({ kind = 'generations', body, headers = {}, ops = {}, stic
     },
     routing: {},
     projectRoot: root,
-    stickyRouter,
     ops,
+    schedulerRuntime: sharedSchedulerRuntime,
   })
   return { res, logBag, stats }
 }
@@ -241,11 +304,10 @@ test('a 401 refreshes the token once and retries on the same slot', async () => 
 test('x-codex-image-turn-id keeps an edit turn on the slot that served it', async () => {
   writeGptVm('vm-a')
   writeGptVm('vm-b')
-  const stickyRouter = new StickyRouter({ dataDir: path.join(root, 'data'), config: { sticky: { enabled: true } } })
   const seen = []
   const fetchImpl = async (_url, init) => (seen.push(init.headers['chatgpt-account-id']), upstream(200, { data: [] }))
   const headers = { 'x-codex-image-turn-id': 'img-turn-7' }
-  for (let i = 0; i < 4; i++) await images({ headers, stickyRouter, ops: { fetchImpl } })
+  for (let i = 0; i < 4; i++) await images({ headers, ops: { fetchImpl } })
   assert.equal(new Set(seen).size, 1)
 })
 
@@ -275,10 +337,11 @@ function protocolHarness(rows, { apiKeyStore = null } = {}) {
       req.apiKeyKind = 'managed'
       return true
     },
-    requestLog: { start: () => ({ request_id: 'req-img' }), finish: (_ctx, row) => rows.push(row) },
+    requestLog: { start: () => ({ request_id: `req-img-${++imgReqSeq}` }), finish: (_ctx, row) => rows.push(row) },
     stats: { errors: 0, requests: 0, by_route: {} },
     groupsRepo: { rateMultiplier: () => 1 },
     routingConfig: {},
+    schedulerRuntime: sharedSchedulerRuntime,
   })
 }
 
@@ -296,6 +359,7 @@ function fakeRes() {
 
 test('the images route converts a multipart edit and logs without base64', async () => {
   writeGptVm('vm-a') // no SOCKS5 bound: the hop stops at proxy_required after conversion
+  await syncProjectVms()
   const rows = []
   const { handleImages } = protocolHarness(rows)
   const form = new FormData()
@@ -335,6 +399,7 @@ test('the images route picks slots by the key owner role, like search', async ()
   writeGptVm('vm-tenant')
   const file = path.join(root, 'vms', 'vm-tenant.json')
   fs.writeFileSync(file, JSON.stringify({ ...JSON.parse(fs.readFileSync(file, 'utf8')), owner_user_id: 'u1' }))
+  await syncProjectVms()
   const roles = { a1: 'admin', u1: 'user' }
   const apiKeyStore = {
     users: { getById: (id) => ({ id, role: roles[id] }) },
@@ -358,6 +423,7 @@ test('the images route picks slots by the key owner role, like search', async ()
 
 test('the images route reads JSON generations', async () => {
   writeGptVm('vm-a')
+  await syncProjectVms()
   const rows = []
   const { handleImages } = protocolHarness(rows)
   const req = Readable.from([Buffer.from('{"model":"gpt-image-2.5-flare","prompt":"x"}')])

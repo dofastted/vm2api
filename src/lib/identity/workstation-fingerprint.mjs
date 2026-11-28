@@ -6,6 +6,7 @@ import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import { US_TIMEZONES, validTimezone } from '../core/timezone.mjs'
+import { isValidSlotUsername } from '../vm/slot-identity.mjs'
 import { workstationFamily, workstationKernel, workstationSkuId } from './workstation-profile.mjs'
 
 export const HOSTNAME_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/
@@ -31,14 +32,16 @@ export function takenFingerprintKeys(vms, { exceptId } = {}) {
   const hostname = new Set()
   const device_id = new Set()
   const guest_machine_id = new Set()
+  const username = new Set()
   for (const vm of vms || []) {
     if (exceptId && vm.id === exceptId) continue
     const fp = vm.fingerprint || {}
     if (fp.hostname) hostname.add(String(fp.hostname))
     if (fp.device_id) device_id.add(String(fp.device_id))
     if (fp.guest_machine_id) guest_machine_id.add(String(fp.guest_machine_id))
+    if (fp.username) username.add(String(fp.username).trim())
   }
-  return { hostname, device_id, guest_machine_id }
+  return { hostname, device_id, guest_machine_id, username }
 }
 
 function hex(n) {
@@ -97,6 +100,9 @@ export function applyGeneratedFingerprint(prev = {}, generated = {}) {
     generated_at: generated.generated_at,
     reset_at: generated.reset_at || generated.generated_at,
   }
+  if (isValidSlotUsername(generated.username)) next.username = generated.username
+  if (Number.isInteger(generated.guest_uid) && generated.guest_uid > 0) next.guest_uid = generated.guest_uid
+  if (Number.isInteger(generated.guest_gid) && generated.guest_gid > 0) next.guest_gid = generated.guest_gid
   delete next.official_machine_id
   delete next.official_user_id
   delete next.identity_source

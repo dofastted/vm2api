@@ -331,6 +331,7 @@ export function sanitizeAnthropicBody(
     out.system = (list ? out.system : [out.system]).map((value, index) => {
       const source = canonicalSystemBlock(value, list ? `system[${index}]` : 'system')
       const block = { type: 'text', text: source.text }
+      if (source.citations !== undefined) block.citations = source.citations
       if (source.cache_control) block.cache_control = source.cache_control
       onSystemBlock?.(block, index)
       return block

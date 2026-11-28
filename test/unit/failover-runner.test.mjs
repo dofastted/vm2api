@@ -1,6 +1,11 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { FailoverRunner, opaque429Tracker, sessionCircuitDedupe } from '../../src/lib/pool/failover-runner.mjs'
+import {
+  FailoverRunner as RawFailoverRunner,
+  opaque429Tracker,
+  sessionCircuitDedupe,
+} from '../../src/lib/pool/failover-runner.mjs'
+import { SchedulerApiError } from '../../src/lib/transport/scheduler-client.mjs'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -8,7 +13,265 @@ import { StickyRouter } from '../../src/lib/pool/sticky-router.mjs'
 import { UnitCircuit } from '../../src/lib/pool/unit-circuit.mjs'
 import { resolveOutboundSessionId } from '../../src/lib/identity/identity-rewrite.mjs'
 import { prepareCragPrintBody } from '../../src/lib/protocol/crag-print-prompt.mjs'
-import { dispatchCallInference } from '../../src/lib/transport/kernel-router.mjs'
+
+function makeMockFailoverRuntime({ scheduler, config = {} } = {}) {
+  let leaseSeq = 0
+  const leases = new Map()
+  const sessionLocks = new Map()
+
+  const acquireSessionLock = async (sessionKey, timeoutMs, signal) => {
+    if (!sessionKey) return () => {}
+    if (signal?.aborted) throw Object.assign(new Error('aborted'), { name: 'AbortError' })
+    let state = sessionLocks.get(sessionKey)
+    if (!state) {
+      state = { held: false, waiters: [] }
+      sessionLocks.set(sessionKey, state)
+    }
+    const release = () => {
+      const next = state.waiters.shift()
+      if (next) {
+        next.grant()
+      } else {
+        state.held = false
+        if (sessionLocks.get(sessionKey) === state) sessionLocks.delete(sessionKey)
+      }
+    }
+    if (!state.held) {
+      state.held = true
+      return release
+    }
+    await new Promise((resolve, reject) => {
+      let settled = false
+      const waiter = {
+        grant() {
+          if (settled) return
+          settled = true
+          clearTimeout(timer)
+          signal?.removeEventListener?.('abort', onAbort)
+          resolve()
+        },
+      }
+      const removeWaiter = () => {
+        const idx = state.waiters.indexOf(waiter)
+        if (idx >= 0) state.waiters.splice(idx, 1)
+      }
+      const onAbort = () => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        removeWaiter()
+        reject(Object.assign(new Error('aborted'), { name: 'AbortError' }))
+      }
+      const timer = setTimeout(
+        () => {
+          if (settled) return
+          settled = true
+          signal?.removeEventListener?.('abort', onAbort)
+          removeWaiter()
+          reject(
+            new SchedulerApiError({
+              status: 529,
+              code: 'pool_overloaded',
+              message: '号池负载过高，稍后再试',
+              retryAfterSec: 1,
+              explain: { reason: 'session_queue_timeout' },
+            }),
+          )
+        },
+        Math.max(1, Number(timeoutMs) || 900_000),
+      )
+      signal?.addEventListener?.('abort', onAbort, { once: true })
+      state.waiters.push(waiter)
+    })
+    return release
+  }
+
+  const buildExcludedSet = (excludeNodes = []) => {
+    const excluded = new Set()
+    for (const key of excludeNodes || []) {
+      const raw = String(key || '')
+      excluded.add(raw)
+      const id = raw.includes(':') ? raw.split(':').slice(1).join(':') : raw
+      excluded.add(id)
+      const match = (scheduler?.candidates || []).find((c) => c.vmId === id || c.accountId === id)
+      if (match) {
+        if (match.vmId) excluded.add(match.vmId)
+        if (match.accountId) excluded.add(match.accountId)
+      }
+    }
+    return excluded
+  }
+
+  const selectCandidate = async (params) => {
+    if (!scheduler || typeof scheduler.selectAndReserve !== 'function') {
+      throw new SchedulerApiError({
+        status: 503,
+        code: 'account_pool_exhausted',
+        message: 'No eligible Claude accounts remain',
+      })
+    }
+    const excluded = buildExcludedSet(params.excludeNodes)
+    const pinVmId = params.pinNodeKey ? String(params.pinNodeKey).split(':').slice(1).join(':') : null
+    let selected
+    try {
+      selected = await scheduler.selectAndReserve({
+        excluded,
+        model: params.model,
+        pinVmId,
+        skipSessionSlot: params.isEphemeralProbe === true,
+        allowWait: params.noQueue !== true,
+      })
+    } catch (err) {
+      if (err?.code === 'pool_wait_queue_full') {
+        throw new SchedulerApiError({
+          status: 529,
+          code: 'pool_overloaded',
+          message: '号池负载过高，稍后再试',
+          retryAfterSec: 1,
+          explain: { reason: 'pool_wait_queue_full' },
+        })
+      }
+      throw err
+    }
+    if (!selected || !selected.ok) {
+      const reason = selected?.reason || 'no_eligible_accounts'
+      const retryMs = Number(selected?.retry_after_ms ?? selected?.soonest_available_ms)
+      const retryAfterSec = Number.isFinite(retryMs) && retryMs > 0 ? Math.max(1, Math.ceil(retryMs / 1000)) : undefined
+      if (reason === 'fable_requires_max') {
+        throw new SchedulerApiError({
+          status: 429,
+          code: 'fable_requires_max',
+          message: 'Fable requires a Max account',
+          retryAfterSec: retryAfterSec ?? 1,
+        })
+      }
+      if (reason === 'pool_rate_limited') {
+        throw new SchedulerApiError({
+          status: 429,
+          code: 'pool_rate_limited',
+          message: 'All accounts are rate limited',
+          retryAfterSec: retryAfterSec ?? 1,
+        })
+      }
+      if (reason === 'all_accounts_busy' || reason === 'pool_queue_timeout' || reason === 'pool_overload_cooldown') {
+        throw new SchedulerApiError({
+          status: 529,
+          code: 'pool_overloaded',
+          message: '号池负载过高，稍后再试',
+          retryAfterSec: retryAfterSec ?? 1,
+          explain: { reason, ...selected },
+        })
+      }
+      throw new SchedulerApiError({
+        status: 503,
+        code: reason === 'pool_resting' ? 'pool_unavailable' : 'account_pool_exhausted',
+        message: 'No eligible Claude accounts remain',
+        retryAfterSec,
+        explain: {
+          reason,
+          wait_ms: selected?.waitMs ?? 0,
+          sticky_cleared: Boolean(selected?.sticky_cleared),
+          ...selected,
+        },
+      })
+    }
+    return selected
+  }
+
+  return {
+    candidateForLease(leaseId) {
+      return leases.get(leaseId)?.candidate || null
+    },
+    async acquireNode(params, { signal } = {}) {
+      const lockKey = params.isEphemeralProbe ? '' : String(params.sessionId || '')
+      const releaseLock = await acquireSessionLock(lockKey, config.session_queue_timeout_ms, signal)
+      try {
+        const selected = await selectCandidate(params)
+        const leaseId = `mock-lease-${++leaseSeq}`
+        leases.set(leaseId, { candidate: selected, releaseLock })
+        return {
+          lease_id: leaseId,
+          lease_ttl_ms: 30_000,
+          resolved_pool_id: params.originPoolId || '__default_claude__',
+          selected_node: {
+            node_type: 'claude_vm',
+            node_id: selected.vmId,
+            node_key: `claude_vm:${selected.vmId}`,
+          },
+          explain: { affinity: { why: selected.selectionReason || 'balanced' } },
+        }
+      } catch (err) {
+        releaseLock()
+        throw err
+      }
+    },
+    async switchNode(body, { signal } = {}) {
+      const prev = leases.get(body.release_lease_id)
+      leases.delete(body.release_lease_id)
+      const releaseLock = prev?.releaseLock || (() => {})
+      try {
+        prev?.candidate?.release?.()
+      } catch {}
+      if (signal?.aborted) {
+        releaseLock()
+        throw Object.assign(new Error('aborted'), { name: 'AbortError' })
+      }
+      try {
+        const selected = await selectCandidate(body.next_attempt || {})
+        const leaseId = `mock-lease-${++leaseSeq}`
+        leases.set(leaseId, { candidate: selected, releaseLock })
+        return {
+          lease_id: leaseId,
+          lease_ttl_ms: 30_000,
+          resolved_pool_id: body.next_attempt?.originPoolId || '__default_claude__',
+          selected_node: {
+            node_type: 'claude_vm',
+            node_id: selected.vmId,
+            node_key: `claude_vm:${selected.vmId}`,
+          },
+          explain: { affinity: { why: selected.selectionReason || 'balanced' } },
+        }
+      } catch (err) {
+        releaseLock()
+        throw err
+      }
+    },
+    async commitLease() {},
+    async releaseLease(leaseId) {
+      const rec = leases.get(leaseId)
+      if (!rec) return
+      leases.delete(leaseId)
+      try {
+        rec.candidate?.release?.()
+      } catch {}
+      rec.releaseLock()
+    },
+  }
+}
+
+class FailoverRunner extends RawFailoverRunner {
+  constructor(opts = {}) {
+    const scheduler = opts.scheduler || null
+    const runtime =
+      opts.schedulerRuntime ||
+      makeMockFailoverRuntime({
+        scheduler,
+        config: opts.config || {},
+      })
+    if (scheduler && typeof scheduler.resolveCandidateForNode !== 'function') {
+      scheduler.resolveCandidateForNode = (_node, meta) => {
+        const cand = runtime.candidateForLease(meta?.leaseId)
+        if (!cand) return null
+        return {
+          ...cand,
+          nodeKey: cand.nodeKey || `claude_vm:${cand.vmId}`,
+          leaseId: meta?.leaseId || null,
+        }
+      }
+    }
+    super({ ...opts, schedulerRuntime: runtime })
+  }
+}
 
 class Scheduler {
   constructor(candidates) {
@@ -281,13 +544,9 @@ test('unsupported CRAG provider tool reports its field without execution or acco
 test('account1 quota exhausted rotates to account2 and commits final sticky', async () => {
   const scheduler = new Scheduler([candidate(1), candidate(2)])
   const attempts = new Attempts()
-  const bindings = []
   const runner = new FailoverRunner({
     scheduler,
     attemptsRepo: attempts,
-    stickyRouter: {
-      bind: (key, value, opts) => bindings.push({ key, value, opts }),
-    },
   })
   const seen = []
   const result = await runner.run({
@@ -323,15 +582,6 @@ test('account1 quota exhausted rotates to account2 and commits final sticky', as
   assert.equal(scheduler.cooldowns.length, 1)
   assert.equal(scheduler.cooldowns[0].candidate.accountId, 'account-1')
   assert.deepEqual(scheduler.releasedAccounts, [{ accountId: 'account-1', vmId: 'vm-01' }])
-  const commits = bindings.filter((b) => b.opts?.countHit !== false)
-  assert.ok(bindings.some((b) => b.value.accountId === 'account-1' && b.opts?.countHit === false))
-  assert.deepEqual(commits, [
-    {
-      key: 'conversation-1',
-      value: { accountId: 'account-2', vmId: 'vm-02' },
-      opts: undefined,
-    },
-  ])
   assert.equal(attempts.items.length, 2)
   assert.equal(attempts.items[1].terminalState, 'verified')
 })
@@ -402,72 +652,6 @@ test('slot_busy spill serves the turn elsewhere but keeps the session pinned', a
   })
 })
 
-test('with session_affinity_first a slot_busy spill moves the pin to the unit that served the turn', async (t) => {
-  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-slot-busy-follow-'))
-  const sticky = new StickyRouter({ dataDir, config: { sticky: { enabled: true } } })
-  t.after(() => {
-    sticky.db.close()
-    fs.rmSync(dataDir, { recursive: true, force: true })
-  })
-  const callerSession = 'slot-busy-follow'
-  const stickyKey = sticky.canonicalSessionKey(callerSession)
-  sticky.bind(stickyKey, { accountId: 'account-1', vmId: 'vm-01', sessionId: 'stored-home' }, { countHit: false })
-  const selections = [1, 2].map((n) => ({
-    ok: true,
-    accountId: `account-${n}`,
-    vmId: `vm-0${n}`,
-    seatKey: `seat:sess:${callerSession}`,
-    release() {},
-  }))
-  let index = 0
-  const scheduler = {
-    config: { session_affinity_first: true },
-    async selectAndReserve() {
-      return selections[Math.min(index++, selections.length - 1)]
-    },
-    markSuccess() {},
-    markCooldown() {},
-    releaseAccountSessions() {
-      assert.fail('capacity spill must not unbind')
-    },
-  }
-  const runner = new FailoverRunner({ scheduler, stickyRouter: sticky, config: { same_account_retry_delay_ms: 0 } })
-  let clock = 1_000
-  const result = await runner.run({
-    requestId: 'req-spill-follow',
-    canonicalBody: { model: 'claude-opus-test' },
-    model: 'claude-opus-test',
-    stickyKey,
-    seatKey: `seat:sess:${callerSession}`,
-    applyAttempt: (body, selected, extra) => ({
-      body,
-      meta: {
-        sessionId: resolveOutboundSessionId(callerSession, {
-          boundSessionId: extra.stickyBound?.sessionId,
-          boundVmId: extra.stickyBound?.vmId,
-          vmId: selected.vmId,
-          epoch: `${clock++}:${selected.vmId}`,
-        }),
-      },
-    }),
-    callAttempt: ({ candidate: selected }) =>
-      selected.accountId === 'account-1'
-        ? {
-            ok: false,
-            status: 503,
-            terminalState: 'rejected',
-            body: { error: { type: 'api_error', code: 'slot_busy', message: 'no free slot' } },
-          }
-        : success(),
-  })
-  assert.equal(result.ok, true)
-  assert.equal(result.accountId, 'account-2')
-  const bound = sticky.resolve(stickyKey)
-  assert.equal(bound.accountId, 'account-2')
-  assert.equal(bound.vmId, 'vm-02')
-  assert.notEqual(bound.sessionId, 'stored-home')
-})
-
 test('a late device-affinity hop does not overwrite a newer cross-account session pin', async (t) => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-device-move-race-'))
   const sticky = new StickyRouter({ dataDir, config: { sticky: { enabled: true } } })
@@ -531,45 +715,51 @@ test('#A20: a late completion never writes back a pin another request released',
   assert.equal(pins.has('conversation-1'), false)
 })
 
-test('verified hop binds family and session sticky keys to the same account', async () => {
+test('verified hop forwards session and parent identity to Rust scheduler runtime', async () => {
   const scheduler = new Scheduler([candidate(1)])
-  const bindings = []
-  const runner = new FailoverRunner({
-    scheduler,
-    stickyRouter: {
-      bind: (key, value, opts) => bindings.push({ key, value, opts }),
+  const acquireCalls = []
+  const baseRt = makeMockFailoverRuntime({ scheduler })
+  const schedulerRuntime = {
+    ...baseRt,
+    async acquireNode(params, opts) {
+      acquireCalls.push(params)
+      return baseRt.acquireNode(params, opts)
     },
-  })
+  }
+  const runner = new FailoverRunner({ scheduler, schedulerRuntime })
   const result = await runner.run({
     requestId: 'req-family',
     canonicalBody: { model: 'claude-opus-test' },
     model: 'claude-opus-test',
-    stickyKey: 'dev:aabbcc',
-    stickyKeys: ['dev:aabbcc', 'child-sess'],
+    stickyKey: 'child-sess',
+    rootSessionId: 'root-sess',
+    deviceKey: 'dev:aabbcc',
     callAttempt: () => success(),
   })
   assert.equal(result.ok, true)
-  const commits = bindings.filter((b) => b.opts?.countHit !== false)
-  assert.deepEqual(commits.map((b) => b.key).sort(), ['child-sess', 'dev:aabbcc'])
-  assert.ok(commits.every((b) => b.value.accountId === 'account-1' && b.value.vmId === 'vm-01'))
+  assert.equal(acquireCalls.length, 1)
+  assert.equal(acquireCalls[0].sessionId, 'child-sess')
+  assert.equal(acquireCalls[0].parentSessionId, 'root-sess')
+  assert.equal(acquireCalls[0].machineId, 'dev:aabbcc')
 })
 
-test('probe hop passes skipSessionSeat and only updates device affinity', async () => {
+test('probe hop passes isEphemeralProbe and machineId without writing legacy Node session pins', async () => {
   const scheduler = new Scheduler([candidate(1)])
-  const selectCalls = []
-  const select = scheduler.selectAndReserve.bind(scheduler)
-  scheduler.selectAndReserve = async (opts) => {
-    selectCalls.push(opts)
-    return select(opts)
+  const acquireCalls = []
+  const baseRt = makeMockFailoverRuntime({ scheduler })
+  const schedulerRuntime = {
+    ...baseRt,
+    async acquireNode(params, opts) {
+      acquireCalls.push(params)
+      return baseRt.acquireNode(params, opts)
+    },
   }
   const sessionBindings = []
-  const deviceBindings = []
   const runner = new FailoverRunner({
     scheduler,
+    schedulerRuntime,
     stickyRouter: {
-      resolve: (key) => (key === 'dev2:device-1' ? { vmId: 'vm-01', accountId: 'account-1' } : null),
       bind: (key, value, opts) => sessionBindings.push({ key, value, opts }),
-      bindDeviceAffinity: (key, value, opts) => deviceBindings.push({ key, value, opts }),
     },
   })
   const result = await runner.run({
@@ -584,45 +774,10 @@ test('probe hop passes skipSessionSeat and only updates device affinity', async 
     callAttempt: () => success(),
   })
   assert.equal(result.ok, true)
-  assert.equal(selectCalls.length, 1)
-  assert.equal(selectCalls[0].skipSessionSlot, true)
-  assert.equal(selectCalls[0].stickyKey, null)
-  assert.deepEqual(selectCalls[0].stickyKeys, [])
-  assert.equal(selectCalls[0].deviceVmId, 'vm-01')
+  assert.equal(acquireCalls.length, 1)
+  assert.equal(acquireCalls[0].isEphemeralProbe, true)
+  assert.equal(acquireCalls[0].machineId, 'device-1')
   assert.deepEqual(sessionBindings, [])
-  assert.equal(deviceBindings.length, 2)
-  assert.ok(deviceBindings.every((binding) => binding.key === 'dev2:device-1'))
-})
-
-test('verified hop stores the outbound session on every sticky alias', async () => {
-  const scheduler = new Scheduler([candidate(1)])
-  const bindings = []
-  const runner = new FailoverRunner({
-    scheduler,
-    stickyRouter: {
-      bind: (key, value, opts) => bindings.push({ key, value, opts }),
-    },
-  })
-  const result = await runner.run({
-    requestId: 'req-stable-session',
-    canonicalBody: { model: 'claude-opus-test' },
-    model: 'claude-opus-test',
-    stickyKey: 'dev:aabbcc',
-    stickyKeys: ['dev:aabbcc', 'ch:first'],
-    applyAttempt: () => ({
-      body: { model: 'claude-opus-test' },
-      meta: { sessionId: '11111111-1111-4111-8111-111111111111', toolNames: {} },
-    }),
-    callAttempt: () => success(),
-  })
-  assert.equal(result.ok, true)
-  const stored = bindings.filter((b) => b.value.sessionId)
-  assert.deepEqual(
-    stored.map((b) => b.key).sort(),
-    ['ch:first', 'dev:aabbcc', 'ch:first', 'dev:aabbcc', 'ch:first', 'dev:aabbcc'].sort(),
-  )
-  assert.ok(stored.every((b) => b.value.sessionId === '11111111-1111-4111-8111-111111111111'))
-  assert.ok(stored.every((b) => b.value.accountId === 'account-1'))
 })
 
 test('request-scoped entitlement error does not walk the pool', async () => {
@@ -1366,199 +1521,6 @@ test('aborted signal stops before another account is tried', async () => {
   assert.equal(scheduler.cooldowns.length, 0)
 })
 
-for (const cancellation of ['result', 'throw']) {
-  test(`client cancellation via ${cancellation} preserves outbound session beyond fifty turns`, async (t) => {
-    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-cancel-session-'))
-    const sticky = new StickyRouter({ dataDir, config: { sticky: { enabled: true } } })
-    t.after(() => {
-      sticky.db.close()
-      fs.rmSync(dataDir, { recursive: true, force: true })
-    })
-    const scheduler = new Scheduler([{ ...candidate(1), slotIndex: 3 }])
-    const runner = new FailoverRunner({ scheduler, stickyRouter: sticky })
-    const callerSession = 'cancelled-caller'
-    const stickyKey = sticky.canonicalSessionKey(callerSession)
-    let originalSession
-    for (let turn = 0; turn < 53; turn++) {
-      const controller = new AbortController()
-      const result = await runner.run({
-        requestId: `req-cancel-${cancellation}-${turn}`,
-        canonicalBody: { model: 'claude-opus-test' },
-        model: 'claude-opus-test',
-        stickyKey,
-        signal: controller.signal,
-        applyAttempt: (body, selected, extra) => {
-          const bound = extra.stickyBound
-          const sessionId = resolveOutboundSessionId(callerSession, {
-            boundSessionId: bound?.sessionId,
-            boundVmId: bound?.vmId,
-            vmId: selected.vmId,
-            epoch: `turn:${turn}`,
-          })
-          originalSession ??= sessionId
-          assert.equal(sessionId, originalSession, `outbound session changed at turn ${turn}`)
-          return { body, meta: { sessionId } }
-        },
-        callAttempt: () => {
-          if (turn !== 50) return success()
-          if (cancellation === 'throw') {
-            controller.abort()
-            throw Object.assign(new Error('Client closed the connection'), { code: 'request_cancelled' })
-          }
-          return { ok: false, status: 499, clientCancelled: true, terminalState: 'cancelled' }
-        },
-      })
-      assert.equal(result.status, turn === 50 ? 499 : 200)
-      if (turn === 50) assert.equal(result.body.error.code, 'client_cancelled')
-      const bound = sticky.resolve(stickyKey)
-      assert.equal(bound.sessionId, originalSession, `persisted session changed at turn ${turn}`)
-      assert.equal(bound.vmId, 'vm-01', `dialog forgot the VM at turn ${turn}`)
-      assert.equal(bound.slotIndex, null, `ended dialog kept the slot at turn ${turn}`)
-    }
-    assert.notEqual(originalSession, callerSession)
-    assert.deepEqual(scheduler.releasedAccounts, [])
-    assert.deepEqual(scheduler.cooldowns, [])
-  })
-}
-
-test('failed hops before a cross-account VM move persist that VM outbound session', async (t) => {
-  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-failed-move-'))
-  const sticky = new StickyRouter({ dataDir, config: { sticky: { enabled: true } } })
-  t.after(() => {
-    sticky.db.close()
-    fs.rmSync(dataDir, { recursive: true, force: true })
-  })
-  const callerSession = 'failed-hop-caller'
-  const stickyKey = sticky.canonicalSessionKey(callerSession)
-  sticky.bind(stickyKey, { accountId: 'account-old', vmId: 'vm-old', sessionId: 'stored-old' }, { countHit: false })
-  const selections = [
-    { ok: true, vmId: 'vm-old', accountId: 'account-old', release() {} },
-    { ok: true, vmId: 'vm-mid', accountId: 'account-mid', release() {} },
-    { ok: true, vmId: 'vm-home', accountId: 'account-home', release() {} },
-  ]
-  let index = 0
-  const scheduler = {
-    async selectAndReserve() {
-      return selections[Math.min(index++, selections.length - 1)]
-    },
-    markSuccess() {},
-    markCooldown() {},
-    releaseAccountSessions() {},
-  }
-  const runner = new FailoverRunner({ scheduler, stickyRouter: sticky, config: { same_account_retry_delay_ms: 0 } })
-  const seen = []
-  let clock = 1_000
-  const applyAttempt = (body, selected, extra) => {
-    const bound = extra.stickyBound
-    const sessionId = resolveOutboundSessionId(callerSession, {
-      boundSessionId: bound?.sessionId,
-      boundVmId: bound?.vmId,
-      vmId: selected.vmId,
-      epoch: `${clock}:${selected.vmId}`,
-    })
-    clock += 10
-    seen.push({ vm: selected.vmId, sessionId })
-    return { body, meta: { sessionId } }
-  }
-  const responses = [
-    {
-      ok: false,
-      status: 503,
-      terminalState: 'rejected',
-      body: { type: 'error', error: { type: 'api_error', message: 'worker unavailable' } },
-    },
-    {
-      ok: false,
-      status: 401,
-      terminalState: 'error',
-      body: { type: 'error', error: { type: 'authentication_error', message: 'authentication_error' } },
-    },
-    success(),
-  ]
-  let responseIndex = 0
-  await runner.run({
-    requestId: 'req-move',
-    canonicalBody: { model: 'claude-opus-test' },
-    model: 'claude-opus-test',
-    stickyKey,
-    applyAttempt,
-    callAttempt: () => responses[responseIndex++],
-  })
-  await runner.run({
-    requestId: 'req-home',
-    canonicalBody: { model: 'claude-opus-test' },
-    model: 'claude-opus-test',
-    stickyKey,
-    applyAttempt,
-    callAttempt: () => success(),
-  })
-  const stored = sticky.resolve(stickyKey)
-  assert.equal(stored.vmId, 'vm-home')
-  assert.equal(stored.accountId, 'account-home')
-  assert.equal(stored.sessionId, seen[2].sessionId)
-  assert.equal(seen[3].sessionId, seen[2].sessionId)
-  assert.notEqual(seen[2].sessionId, seen[1].sessionId)
-})
-
-for (const cancellation of ['result', 'throw']) {
-  test(`first cancelled turn via ${cancellation} keeps the sent outbound session`, async (t) => {
-    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-first-cancel-'))
-    const sticky = new StickyRouter({ dataDir, config: { sticky: { enabled: true } } })
-    t.after(() => {
-      sticky.db.close()
-      fs.rmSync(dataDir, { recursive: true, force: true })
-    })
-    const callerSession = `first-cancel-${cancellation}`
-    const stickyKey = sticky.canonicalSessionKey(callerSession)
-    const runner = new FailoverRunner({
-      scheduler: {
-        async selectAndReserve() {
-          return { ok: true, vmId: 'vm-home', accountId: 'home', release() {} }
-        },
-        markSuccess() {},
-      },
-      stickyRouter: sticky,
-    })
-    const seen = []
-    let clock = 1_000
-    const applyAttempt = (body, selected, extra) => {
-      const sessionId = resolveOutboundSessionId(callerSession, {
-        boundSessionId: extra.stickyBound?.sessionId,
-        boundVmId: extra.stickyBound?.vmId,
-        vmId: selected.vmId,
-        epoch: `${clock}:${selected.vmId}`,
-      })
-      clock += 10
-      seen.push(sessionId)
-      return { body, meta: { sessionId } }
-    }
-    const first = runner.run({
-      requestId: `req-first-${cancellation}`,
-      canonicalBody: { model: 'claude-opus-test' },
-      model: 'claude-opus-test',
-      stickyKey,
-      applyAttempt,
-      callAttempt: () => {
-        if (cancellation === 'throw') throw Object.assign(new Error('cancelled'), { code: 'request_cancelled' })
-        return { ok: false, status: 499, clientCancelled: true, terminalState: 'cancelled' }
-      },
-    })
-    assert.equal((await first).status, 499)
-    const second = await runner.run({
-      requestId: `req-second-${cancellation}`,
-      canonicalBody: { model: 'claude-opus-test' },
-      model: 'claude-opus-test',
-      stickyKey,
-      applyAttempt,
-      callAttempt: () => success(),
-    })
-    assert.equal(second.status, 200)
-    assert.equal(second.finalState, 'verified')
-    assert.equal(seen.length, 2)
-    assert.equal(seen[1], seen[0])
-  })
-}
-
 test('streamed plan limit writes the hard block and rotates to another account', async () => {
   const scheduler = new Scheduler([candidate(1), candidate(2)])
   const blocks = []
@@ -1618,7 +1580,7 @@ test('fast 502 retries the same account once without cooldown', async () => {
   assert.equal(result.ok, false)
   assert.equal(result.status, 502)
   assert.equal(result.body.error.code, 'upstream_transport_error')
-  assert.equal(result.via, 'pool-failover')
+  assert.equal(result.via, 'rust-scheduler')
   assert.notEqual(result.body.error.code, 'server_overloaded')
   assert.deepEqual(seen, ['account-1', 'account-1'])
   assert.equal(scheduler.cooldowns.length, 0)
@@ -1872,9 +1834,11 @@ test('empty pool without a prior hop stays account_pool_exhausted', async () => 
   assert.equal(result.status, 503)
   assert.equal(result.body.error.code, 'account_pool_exhausted')
   assert.equal(result.body.error.message, 'No eligible Claude accounts remain')
-  assert.equal(result.body.error.details.reason, 'no_eligible_accounts')
-  assert.equal(result.body.error.details.wait_ms, 0)
-  assert.equal(result.body.error.details.sticky_cleared, false)
+  assert.equal(result.body.error.explain, undefined)
+  assert.equal(result.body.error.details, undefined)
+  assert.equal(result.explain.reason, 'no_eligible_accounts')
+  assert.equal(result.explain.wait_ms, 0)
+  assert.equal(result.explain.sticky_cleared, false)
 })
 
 test('fable without an eligible Max account returns a dedicated HTTP 429', async () => {
@@ -1928,11 +1892,13 @@ test('pool exhaustion details include the scheduler snapshot', async () => {
   assert.equal(result.body.error.message, '号池负载过高，稍后再试')
   assert.equal(result.retryAfterSec, 10_064)
   assert.equal(result.attemptCount, 0)
-  assert.equal(result.body.error.details.reason, 'all_accounts_busy')
-  assert.equal(result.body.error.details.soonest_available_ms, 10_064_000)
-  assert.equal(result.body.error.details.sticky_cleared, true)
-  assert.equal(result.body.error.details.eligible, 2)
-  assert.deepEqual(result.body.error.details.wait_reasons, ['account_cooldown'])
+  assert.equal(result.body.error.explain, undefined)
+  assert.equal(result.body.error.details, undefined)
+  assert.equal(result.explain.reason, 'all_accounts_busy')
+  assert.equal(result.explain.soonest_available_ms, 10_064_000)
+  assert.equal(result.explain.sticky_cleared, true)
+  assert.equal(result.explain.eligible, 2)
+  assert.deepEqual(result.explain.wait_reasons, ['account_cooldown'])
 })
 
 test('a seat queue timeout is a 529 overloaded_error with the planner retry-after', async () => {
@@ -1953,7 +1919,9 @@ test('a seat queue timeout is a 529 overloaded_error with the planner retry-afte
   assert.equal(result.status, 529)
   assert.equal(result.body.error.type, 'overloaded_error')
   assert.equal(result.body.error.code, 'pool_overloaded')
-  assert.equal(result.body.error.details.reason, 'pool_queue_timeout')
+  assert.equal(result.body.error.explain, undefined)
+  assert.equal(result.body.error.details, undefined)
+  assert.equal(result.explain.reason, 'pool_queue_timeout')
   assert.equal(result.retryAfterSec, 3)
 })
 
@@ -2000,7 +1968,9 @@ test('a full pool queue answers 529 immediately with retry-after >= 1s', async (
   })
   assert.equal(result.status, 529)
   assert.equal(result.body.error.type, 'overloaded_error')
-  assert.equal(result.body.error.details.reason, 'pool_wait_queue_full')
+  assert.equal(result.body.error.explain, undefined)
+  assert.equal(result.body.error.details, undefined)
+  assert.equal(result.explain.reason, 'pool_wait_queue_full')
   assert.equal(result.retryAfterSec, 1)
 })
 
@@ -2221,7 +2191,9 @@ test('a same-session waiter times out without starting or overlapping the holder
   assert.equal(waiter.status, 529)
   assert.equal(waiter.body.error.type, 'overloaded_error')
   assert.equal(waiter.body.error.code, 'pool_overloaded')
-  assert.equal(waiter.body.error.details.reason, 'session_queue_timeout')
+  assert.equal(waiter.body.error.explain, undefined)
+  assert.equal(waiter.body.error.details, undefined)
+  assert.equal(waiter.explain.reason, 'session_queue_timeout')
   assert.equal(waiterCalls, 0)
   assert.equal(holderCalls, 1)
   let followerEntered = false
@@ -2705,284 +2677,6 @@ test('when every account answers 429 the caller gets that 429, not a generic 502
   assert.equal(result.status, 429)
   assert.equal(result.body.error.type, 'rate_limit_error')
   assert.equal(result.headers['retry-after'], '30')
-})
-
-function pinnedStickyRouter(accountId = 'account-1', vmId = 'vm-01') {
-  return {
-    resolve: (key) => (key === 'sess:home' ? { accountId, vmId, generation: 1 } : null),
-    bind() {},
-    unbind() {},
-  }
-}
-
-test('keep_session_home: a continuing session retries its account and never replays elsewhere', async () => {
-  const scheduler = new Scheduler([candidate(1), candidate(2)])
-  const runner = new FailoverRunner({
-    scheduler,
-    stickyRouter: pinnedStickyRouter(),
-    config: { same_account_retry_delay_ms: 0, keep_session_home: true },
-  })
-  const seen = []
-  const result = await runner.run({
-    requestId: 'req-home-502',
-    canonicalBody: { model: 'claude-sonnet-test' },
-    model: 'claude-sonnet-test',
-    stickyKey: 'sess:home',
-    callAttempt: ({ candidate: selected }) => {
-      seen.push(selected.accountId)
-      return badGateway()
-    },
-  })
-  assert.equal(result.ok, false)
-  assert.equal(result.status, 502)
-  assert.equal(result.session_home_kept, true)
-  assert.deepEqual(seen, ['account-1', 'account-1'])
-})
-
-test('keep_session_home: a same-account retry goes straight back home and can recover there', async () => {
-  const scheduler = new Scheduler([candidate(1), candidate(2)])
-  const runner = new FailoverRunner({
-    scheduler,
-    stickyRouter: pinnedStickyRouter(),
-    config: { same_account_retry_delay_ms: 0, keep_session_home: true },
-  })
-  const seen = []
-  const result = await runner.run({
-    requestId: 'req-home-recover',
-    canonicalBody: { model: 'claude-sonnet-test' },
-    model: 'claude-sonnet-test',
-    stickyKey: 'sess:home',
-    callAttempt: ({ candidate: selected }) => {
-      seen.push(selected.accountId)
-      return seen.length === 1 ? badGateway() : success('home')
-    },
-  })
-  assert.equal(result.ok, true)
-  assert.equal(result.accountId, 'account-1')
-  assert.deepEqual(seen, ['account-1', 'account-1'])
-})
-
-test('keep_session_home: an account-scope failure returns instead of moving the conversation', async () => {
-  const scheduler = new Scheduler([candidate(1), candidate(2)])
-  const runner = new FailoverRunner({
-    scheduler,
-    stickyRouter: pinnedStickyRouter(),
-    config: { same_account_retry_delay_ms: 0, keep_session_home: true },
-  })
-  const seen = []
-  const result = await runner.run({
-    requestId: 'req-home-quota',
-    canonicalBody: { model: 'claude-sonnet-test' },
-    model: 'claude-sonnet-test',
-    stickyKey: 'sess:home',
-    callAttempt: ({ candidate: selected }) => {
-      seen.push(selected.accountId)
-      return {
-        ok: false,
-        status: 429,
-        headers: {
-          'anthropic-ratelimit-unified-status': 'rejected',
-          'anthropic-ratelimit-unified-reset': '9999999999',
-        },
-        body: { type: 'error', error: { type: 'rate_limit_error', message: 'rate limited' } },
-      }
-    },
-  })
-  assert.equal(result.ok, false)
-  assert.equal(result.session_home_kept, true)
-  assert.deepEqual(seen, ['account-1'])
-})
-
-test('keep_session_home: a session without a pin still fails over', async () => {
-  const scheduler = new Scheduler([candidate(1), candidate(2)])
-  const runner = new FailoverRunner({
-    scheduler,
-    stickyRouter: pinnedStickyRouter(),
-    config: { same_account_retry_delay_ms: 0, keep_session_home: true },
-  })
-  const seen = []
-  const result = await runner.run({
-    requestId: 'req-home-new',
-    canonicalBody: { model: 'claude-sonnet-test' },
-    model: 'claude-sonnet-test',
-    stickyKey: 'sess:new',
-    callAttempt: ({ candidate: selected }) => {
-      seen.push(selected.accountId)
-      return selected.accountId === 'account-1' ? badGateway() : success('moved')
-    },
-  })
-  assert.equal(result.ok, true)
-  assert.deepEqual(seen, ['account-1', 'account-2'])
-})
-
-test('keep_session_home off: a pinned session fails over as before', async () => {
-  const scheduler = new Scheduler([candidate(1), candidate(2)])
-  const runner = new FailoverRunner({
-    scheduler,
-    stickyRouter: pinnedStickyRouter(),
-    config: { same_account_retry_delay_ms: 0 },
-  })
-  const seen = []
-  const result = await runner.run({
-    requestId: 'req-home-off',
-    canonicalBody: { model: 'claude-sonnet-test' },
-    model: 'claude-sonnet-test',
-    stickyKey: 'sess:home',
-    callAttempt: ({ candidate: selected }) => {
-      seen.push(selected.accountId)
-      return selected.accountId === 'account-1' ? badGateway() : success('moved')
-    },
-  })
-  assert.equal(result.ok, true)
-  assert.deepEqual(seen, ['account-1', 'account-2'])
-})
-
-test('keep_session_home: a home kernel with no free slot is retried instead of spilling the transcript', async () => {
-  const scheduler = new Scheduler([candidate(1), candidate(2)])
-  const runner = new FailoverRunner({
-    scheduler,
-    stickyRouter: pinnedStickyRouter(),
-    config: { same_account_retry_delay_ms: 0, home_slot_busy_retry_ms: 0, keep_session_home: true },
-  })
-  const seen = []
-  const result = await runner.run({
-    requestId: 'req-home-slot-busy',
-    canonicalBody: { model: 'claude-sonnet-test' },
-    model: 'claude-sonnet-test',
-    stickyKey: 'sess:home',
-    callAttempt: ({ candidate: selected }) => {
-      seen.push(selected.accountId)
-      if (seen.length < 3) {
-        return {
-          ok: false,
-          status: 503,
-          upstreamExecutions: 0,
-          body: { error: { type: 'api_error', code: 'slot_busy', message: 'no free slot' } },
-        }
-      }
-      return success('home')
-    },
-  })
-  assert.equal(result.ok, true)
-  assert.equal(result.accountId, 'account-1')
-  assert.deepEqual(seen, ['account-1', 'account-1', 'account-1'])
-})
-
-test('keep_session_home with allowQueue:false: a home kernel with no free slot answers 529 at once', async () => {
-  const scheduler = new Scheduler([candidate(1), candidate(2)])
-  const runner = new FailoverRunner({
-    scheduler,
-    stickyRouter: pinnedStickyRouter(),
-    // A real wait would show up as a slow test; the old path slept and retried home.
-    config: { same_account_retry_delay_ms: 0, home_slot_busy_retry_ms: 60000, keep_session_home: true },
-  })
-  const seen = []
-  const startedAt = Date.now()
-  const result = await runner.run({
-    requestId: 'req-home-slot-busy-no-queue',
-    canonicalBody: { model: 'claude-sonnet-test' },
-    model: 'claude-sonnet-test',
-    stickyKey: 'sess:home',
-    allowQueue: false,
-    callAttempt: ({ candidate: selected }) => {
-      seen.push(selected.accountId)
-      return {
-        ok: false,
-        status: 503,
-        upstreamExecutions: 0,
-        body: { error: { type: 'api_error', code: 'slot_busy', message: 'no free slot' } },
-      }
-    },
-  })
-  assert.deepEqual(seen, ['account-1'], 'neither retried home nor spilled the transcript')
-  assert.ok(Date.now() - startedAt < 5000)
-  assert.equal(result.status, 529)
-  assert.equal(result.body.error.code, 'pool_overloaded')
-  assert.equal(result.body.error.details.reason, 'session_home_slot_busy')
-  assert.equal(result.accountId, 'account-1')
-})
-
-test('keep_session_home: home_slot_busy_max_wait_ms bounds the home retry with 529', async () => {
-  const scheduler = new Scheduler([candidate(1), candidate(2)])
-  const noted = []
-  scheduler.noteKernelSlotBusy = (unit) => noted.push(unit.accountId)
-  const runner = new FailoverRunner({
-    scheduler,
-    stickyRouter: pinnedStickyRouter(),
-    config: {
-      same_account_retry_delay_ms: 0,
-      home_slot_busy_retry_ms: 20,
-      home_slot_busy_max_wait_ms: 120,
-      keep_session_home: true,
-    },
-  })
-  const seen = []
-  const startedAt = Date.now()
-  const result = await runner.run({
-    requestId: 'req-home-slot-busy-bounded',
-    canonicalBody: { model: 'claude-sonnet-test' },
-    model: 'claude-sonnet-test',
-    stickyKey: 'sess:home',
-    callAttempt: ({ candidate: selected }) => {
-      seen.push(selected.accountId)
-      return {
-        ok: false,
-        status: 503,
-        upstreamExecutions: 0,
-        body: { error: { type: 'api_error', code: 'slot_busy', message: 'no free slot' } },
-      }
-    },
-  })
-  const elapsed = Date.now() - startedAt
-  assert.ok(seen.length >= 2, 'retried home before giving up')
-  assert.ok(
-    seen.every((id) => id === 'account-1'),
-    'never spilled the transcript',
-  )
-  assert.ok(elapsed >= 120 && elapsed < 2000, `bounded wait (${elapsed}ms)`)
-  assert.equal(result.status, 529)
-  assert.equal(result.body.error.details.reason, 'session_home_slot_busy')
-  assert.equal(noted.length, seen.length, 'every kernel slot_busy reaches the lease ledger')
-})
-
-test('keep_session_home with allowQueue:false: pre-hop kernel slot_busy stamps zero attemptCount and zero hops', async () => {
-  const previous = process.env.KIN_KERNEL_BIN
-  process.env.KIN_KERNEL_BIN = process.execPath
-  const home = { ...candidate(1), vmId: 'vm-home-01', exec: { vmId: 'vm-home-01', vm: { id: 'vm-home-01' } } }
-  const scheduler = new Scheduler([home, candidate(2)])
-  const runner = new FailoverRunner({
-    scheduler,
-    stickyRouter: pinnedStickyRouter('account-1', 'vm-home-01'),
-    config: { same_account_retry_delay_ms: 0, home_slot_busy_retry_ms: 60000, keep_session_home: true },
-  })
-  try {
-    const result = await runner.run({
-      requestId: 'req-home-prehop-slot-busy-zero-attempts',
-      canonicalBody: { model: 'claude-sonnet-test' },
-      model: 'claude-sonnet-test',
-      stickyKey: 'sess:home',
-      allowQueue: false,
-      callAttempt: ({ candidate: selected, body }) =>
-        dispatchCallInference({
-          exec: selected.exec,
-          body,
-          routing: { inference: { engine: 'rust', health_ttl_ms: 0 } },
-          ensureRust: async () => ({ ok: false, reason: 'slot_busy', error: 'rust kernel has no free slot' }),
-        }),
-    })
-    assert.equal(scheduler.selectCalls, 1)
-    assert.equal(result.ok, false)
-    assert.equal(result.status, 529)
-    assert.equal(result.body.error.code, 'pool_overloaded')
-    assert.equal(result.body.error.details.reason, 'session_home_slot_busy')
-    assert.equal(result.body.error.details.attempt_count, 0)
-    assert.equal(result.attemptCount, 0)
-    assert.equal(result.accountId, 'account-1')
-    assert.equal(result.vmId, 'vm-home-01')
-  } finally {
-    if (previous == null) delete process.env.KIN_KERNEL_BIN
-    else process.env.KIN_KERNEL_BIN = previous
-  }
 })
 
 test('keep_pin_on_model_gate: a borrowed account never takes the session, family or device pin', async () => {
@@ -3875,4 +3569,54 @@ test('#3 an upstream 400 with the same code is not treated as a capability misma
   assert.equal(seen.length, 1)
   assert.equal(result.status, 400)
   assert.deepEqual(sticky.unbound, [])
+})
+
+test('terminal switchNode errors (422 poison_abort, 403 pool_forbidden, 429 session_*) never fall back to same-unit acquireNode', async () => {
+  const cases = [
+    { status: 422, code: 'poison_abort', message: 'Poison request aborted' },
+    { status: 403, code: 'pool_forbidden', message: 'Pool forbidden' },
+    { status: 429, code: 'session_in_flight', message: 'Session already in flight' },
+    { status: 429, code: 'session_queue_full', message: 'Session queue full' },
+    { status: 429, code: 'session_queue_timeout', message: 'Session queue timed out' },
+    { status: 429, code: 'session_node_busy', message: 'Session node busy' },
+  ]
+  for (const tc of cases) {
+    const scheduler = new Scheduler([candidate(1)])
+    let acquireCalls = 0
+    let switchCalls = 0
+    const baseRt = makeMockFailoverRuntime({ scheduler })
+    const schedulerRuntime = {
+      ...baseRt,
+      async acquireNode(params, opts) {
+        acquireCalls += 1
+        return baseRt.acquireNode(params, opts)
+      },
+      async switchNode() {
+        switchCalls += 1
+        throw new SchedulerApiError({
+          status: tc.status,
+          code: tc.code,
+          message: tc.message,
+          retryAfterSec: tc.status === 429 ? 1 : undefined,
+        })
+      },
+    }
+    const runner = new FailoverRunner({
+      scheduler,
+      schedulerRuntime,
+      config: { same_account_retry_delay_ms: 0, max_same_account_retries: 2 },
+    })
+    const result = await runner.run({
+      requestId: `req-terminal-switch-${tc.code}`,
+      canonicalBody: { model: 'claude-sonnet-test' },
+      model: 'claude-sonnet-test',
+      // Fast 502 keeps canSameUnit === true, verifying terminal switch errors are NOT swallowed.
+      callAttempt: () => badGateway(),
+    })
+    assert.equal(acquireCalls, 1, `${tc.code} must not trigger same-unit acquireNode retry`)
+    assert.equal(switchCalls, 1, `${tc.code} must call switchNode once`)
+    assert.equal(result.ok, false, tc.code)
+    assert.equal(result.status, tc.status, tc.code)
+    assert.equal(result.body.error.code, tc.code, tc.code)
+  }
 })

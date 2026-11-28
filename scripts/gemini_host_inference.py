@@ -48,7 +48,10 @@ _ERROR_MESSAGES = {
     "gemini_models_empty": "Gemini returned no available models.",
     "gemini_model_unavailable": "The selected model is unavailable.",
     "gemini_oauth_required": "Sign in to Gemini again to run this diagnostic.",
-    "gemini_location_unsupported": "Google reports that Antigravity is unavailable in the current account location.",
+    "gemini_location_unsupported": (
+        "Google rejected Antigravity access (403). The egress region may be unsupported or the account may be "
+        "disabled; eligibility checks can still look normal—confirm with an actual conversation."
+    ),
     "gemini_api_key_invalid": "The Gemini API key was rejected.",
     "gemini_proxy_error": "Gemini could not be reached through the configured proxy.",
     "gemini_quota_exhausted": "The Gemini quota or rate limit was reached.",

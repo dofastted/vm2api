@@ -123,6 +123,7 @@ import {
   assertVmScope,
   keyTierPolicyFromRecord,
   normalizeGroupType,
+  normalizeKeyPoolBindingInput,
   normalizeKeyScope,
   normalizeMultiTierKeyConfig,
 } from './key-scope.mjs'
@@ -134,6 +135,12 @@ import {
   vmPoolHttpStatus,
   vmPoolsFor,
 } from './vm-pools.mjs'
+import { SchedulerPoolsRepo } from '../db/repos/scheduler-pools-repo.mjs'
+import {
+  createSchedulerPoolsHandler,
+  enrichApiKeyViewsWithPools,
+  syncVmPoolToSchedulerPool,
+} from './scheduler-pools-routes.mjs'
 import { publicEndpointView, fetchUpstreamModels, API_ENDPOINT_PRESETS } from './api-endpoints.mjs'
 import { runAnthropicConsole, resolveConsoleProxyUrl, savedEndpointKey } from './anthropic-console.mjs'
 import { publicUserView } from './panel-users.mjs'
@@ -276,12 +283,14 @@ import { DEFAULT_MAX_REQUEST_BYTES, reloadActiveVm } from '../core/config.mjs'
 import {
   OS_CATALOG,
   kernelForIndex,
+  normalizeOsKernel,
   normalizeTimezone,
   nextNumericIndex,
   padVm,
   discardSlotContainer,
   STANDARD_LOCALE,
 } from '../vm/vm-runtime.mjs'
+import { isCragDebian13Kernel } from '../vm/custom-os-runtime.mjs'
 import {
   startSlotReady,
   reloadSlotReady,
@@ -329,7 +338,12 @@ import {
   takenFingerprintKeys,
   writeGuestMachineIdFile,
 } from '../identity/workstation-fingerprint.mjs'
-import { assignComputerFingerprint } from '../identity/slot-computer.mjs'
+import {
+  assignComputerFingerprint,
+  fingerprintDir,
+  pushLiveSlotTimezoneSync,
+  syncSlotIdentityTimezoneAndPreset,
+} from '../identity/slot-computer.mjs'
 import { runFleetUpdate, fleetStatus } from '../vm/fleet-update.mjs'
 import {
   captureWrapSample,
@@ -351,9 +365,12 @@ import { readRawBody as defaultReadRawBody } from '../http/respond.mjs'
 import { corsHeadersForRequest } from '../http/cors.mjs'
 import {
   createCragShopHandler,
+  createGeminiCragShopHandler,
   cragShopRoute,
+  geminiCragShopRoute,
   isCragDeviceShopPath,
   isCragShopPath,
+  isGeminiCragShopPath,
   sameOriginPost,
 } from './crag-shop.mjs'
 import { createCragSubscriptionHandler, cragSubscriptionRoute } from './crag-subscription-routes.mjs'
@@ -379,7 +396,7 @@ import {
 } from '../vm/crag-license.mjs'
 import { applyNativeTelemetry } from '../vm/fleet-update.mjs'
 import { codexKernelHealth } from '../transport/codex-kernel-client.mjs'
-import { normalizeHealthProbeConfig } from './health-probe.mjs'
+import { listPlatformCatalogModels, normalizeHealthProbeConfig } from './health-probe.mjs'
 import { normalizeUsageProbeConfig } from '../oauth/usage-probe-monitor.mjs'
 import {
   isNotifyChannel,
@@ -808,6 +825,7 @@ export function createPanelHandler(ctx) {
     panelUsers: ctx.panelUsers || null,
     requestLog: ctx.requestLog || null,
     billingReady: Boolean(ctx.requestLog),
+    publicBaseUrl: ctx.cfg?.base_url || null,
   })
   // A checkout can change under a live Node process; report its boot version.
   const runningVersion = readLocalVersion(ctx.cfg?.paths?.project)
@@ -830,16 +848,28 @@ export function createPanelHandler(ctx) {
   const refreshCluster = ctx.refreshClusterSlotPayloads || refreshClusterSlotPayloads
   const requireAuth = (...args) => ctx.requireAuth(...args)
   const cfg = ctx.cfg
+  const isShopCurrentAdmin = (req) => {
+    const record = ctx.panelUsers.getByUsername(req.panelUser)
+    if (record) return record.enabled && record.role === 'admin' && req.panelBuyerOwner === `panel:${record.id}`
+    return req.panelBuyerOwner === `configured-admin:${req.panelUser}`
+  }
   const handleCragShop =
     ctx.handleCragShop ??
     createCragShopHandler({
       getDb: ctx.getDb,
       subscription: ctx.cragSubscription,
-      isCurrentAdmin: (req) => {
-        const record = ctx.panelUsers.getByUsername(req.panelUser)
-        if (record) return record.enabled && record.role === 'admin' && req.panelBuyerOwner === `panel:${record.id}`
-        return req.panelBuyerOwner === `configured-admin:${req.panelUser}`
-      },
+      isCurrentAdmin: isShopCurrentAdmin,
+      dataDir: cfg?.paths?.data,
+      publicBaseUrl: cfg?.base_url,
+      json,
+      readRawBody,
+    })
+  const handleGeminiCragShop =
+    ctx.handleGeminiCragShop ??
+    createGeminiCragShopHandler({
+      getDb: ctx.getDb,
+      subscription: ctx.geminiCragSubscription,
+      isCurrentAdmin: isShopCurrentAdmin,
       dataDir: cfg?.paths?.data,
       publicBaseUrl: cfg?.base_url,
       json,
@@ -851,6 +881,30 @@ export function createPanelHandler(ctx) {
     publicBaseUrl: cfg?.base_url,
     json,
     readRawBody,
+  })
+  const resolveSchedulerRuntime = () => {
+    if (typeof ctx.getSchedulerRuntime === 'function') return ctx.getSchedulerRuntime()
+    return typeof ctx.schedulerRuntime === 'function' ? ctx.schedulerRuntime() : ctx.schedulerRuntime || null
+  }
+  const notifySchedulerConfigChanged = (reason) => {
+    const rt = resolveSchedulerRuntime()
+    if (!rt || typeof rt.syncConfigNow !== 'function') return
+    void rt.syncConfigNow(reason).catch(() => {})
+  }
+  const handleSchedulerPools = createSchedulerPoolsHandler({
+    getDb: () => apiKeyStore?.db || ctx.getDb?.() || getDb(),
+    cfg,
+    apiKeyStore: ctx.apiKeyStore,
+    apiEndpointStore: ctx.apiEndpointStore,
+    accountQuota: ctx.accountQuota,
+    poolScheduler: () => ctx.poolScheduler,
+    geminiScheduler: () => ctx.geminiScheduler,
+    geminiSlotPrefs: ctx.geminiSlotPrefs || null,
+    geminiOwnersRepo: ctx.geminiOwnersRepo || null,
+    schedulerRuntime: resolveSchedulerRuntime,
+    writeSSEHeaders: ctx.writeSSEHeaders || null,
+    json,
+    readBody,
   })
   const routingConfigPath = ctx.routingConfigPath
   const stickyRouter = ctx.stickyRouter
@@ -959,7 +1013,10 @@ export function createPanelHandler(ctx) {
     if (!hasBoundExit(vm.proxy)) {
       startError = 'no_exit'
     } else {
-      const boot = await startSlotReady(vm, cfg.paths.project, { routing: ctx.routingConfig, bindSubscription })
+      const boot = await (ctx.startSlotReady || startSlotReady)(vm, cfg.paths.project, {
+        routing: ctx.routingConfig,
+        bindSubscription,
+      })
       vm = getVm(cfg.paths.project, id) || vm
       if (!boot?.ok) {
         startError = boot?.error || boot?.reason || 'runtime start failed'
@@ -1435,6 +1492,14 @@ export function createPanelHandler(ctx) {
       targetDataplane !== 'crag' &&
       !isCodexVm(desired) &&
       typeof ctx.cragSubscription?.releaseStoppedBinding === 'function'
+    if (!isCodexVm(desired) && isCragDebian13Kernel(desired.kernel) && targetDataplane !== 'crag') {
+      return {
+        ok: false,
+        id,
+        code: 'crag_debian13_crag_only',
+        error: 'crag-debian13 槽位仅支持 CRAG 推理数据面，不能切换为 cli-node/wrap',
+      }
+    }
     if (kernelSwitch && targetDataplane === 'crag' && targetVersion === 'v2') {
       if (isNativeNodeVm(desired)) {
         return { ok: false, id, code: 'native_crag_unsupported', error: 'crag 数据面暂不支持 macOS 原生节点' }
@@ -1730,6 +1795,7 @@ export function createPanelHandler(ctx) {
     ctx.routingConfig = previous
     ctx.healthMonitor?.setConfig(ctx.routingConfig.health_probe)
     ctx.usageProbeMonitor?.setConfig(ctx.routingConfig.usage_probe)
+    ctx.cragZombieGuard?.setConfig(ctx.routingConfig.crag_zombie_guard)
     ctx.notifyMonitor?.setConfig(ctx.routingConfig.notify)
     if (ctx.routingConfig.logging) {
       requestLog.setConfig({
@@ -1800,7 +1866,25 @@ export function createPanelHandler(ctx) {
     }
   }
 
-  return async function handlePanel(req, res, url) {
+  const shouldSyncSchedulerOnMutation = (method, pathname) => {
+    if (method === 'GET' || method === 'HEAD' || method === 'OPTIONS') return false
+    return (
+      pathname === '/admin/routing' ||
+      pathname === '/api/panel/routing' ||
+      pathname === '/api/panel/api-keys' ||
+      pathname.startsWith('/api/panel/api-keys/') ||
+      pathname === '/api/panel/api-endpoints' ||
+      pathname.startsWith('/api/panel/api-endpoints/') ||
+      pathname === '/api/panel/vms' ||
+      pathname.startsWith('/api/panel/vms/') ||
+      pathname === '/api/panel/refusal-guards' ||
+      pathname.startsWith('/api/panel/refusal-guards/') ||
+      pathname === '/api/panel/jev-intercept' ||
+      pathname.startsWith('/api/panel/jev-intercept/')
+    )
+  }
+
+  async function handlePanelInner(req, res, url) {
     const p = url.pathname
     if (!p.startsWith('/admin') && !p.startsWith('/api/panel')) return false
 
@@ -2063,6 +2147,21 @@ export function createPanelHandler(ctx) {
       return handleCragShop(req, res, url, route)
     }
 
+    if (isGeminiCragShopPath(p)) {
+      res.setHeader('Cache-Control', 'no-store')
+      const route = geminiCragShopRoute(req.method, p)
+      if (route === 'plans') {
+        requireAuth(req, res, { buyer: true, optionalBuyer: true })
+        if (res.headersSent) return true
+        return handleGeminiCragShop(req, res, url, route)
+      }
+      if (!requireAuth(req, res, { buyer: true })) return true
+      if (route && !authorizePanelRoute(req.method, p, panelIdentity(req).role).ok) {
+        return json(res, 403, { ok: false, error: { code: 'forbidden', message: 'Forbidden' } })
+      }
+      return handleGeminiCragShop(req, res, url, route)
+    }
+
     if (p.startsWith('/api/panel')) {
       const delegated = req[INTEGRATION_DELEGATED] === true
       if (delegated) {
@@ -2158,7 +2257,17 @@ export function createPanelHandler(ctx) {
           }).body,
         )
       }
-      if (isGeminiPanelPath(p)) return geminiPanel(req, res, p)
+      if (isGeminiPanelPath(p)) {
+        const out = await geminiPanel(req, res, p)
+        if (req.method !== 'GET' && req.method !== 'HEAD' && (res.statusCode || 200) < 400) {
+          notifySchedulerConfigChanged(`gemini:${req.method}:${p}`)
+        }
+        return out
+      }
+      if (p === '/api/panel/pools' || p.startsWith('/api/panel/pools/') || p.startsWith('/api/panel/scheduler/')) {
+        const handled = await handleSchedulerPools(req, res, p, url)
+        if (handled !== false) return
+      }
       if (!delegated && p.startsWith('/api/panel/integration')) {
         const handled = await handleIntegrationAdminRoute(req, res, p, {
           tokenStore: integrationTokenStore,
@@ -2242,6 +2351,14 @@ export function createPanelHandler(ctx) {
           return json(res, 400, {
             ok: false,
             error: { code: 'kernel_switch_unsupported', message: '当前槽位不支持切换 Claude 内核' },
+          })
+        if (isCragDebian13Kernel(vm.kernel) && body.dataplane !== 'crag')
+          return json(res, 400, {
+            ok: false,
+            error: {
+              code: 'crag_debian13_crag_only',
+              message: 'crag-debian13 槽位仅支持 CRAG 推理数据面，不能切换为 cli-node/wrap',
+            },
           })
         // readBody yielded: reserve only after checking the latest admission state.
         if (kernelSwitchJobs.get(id)?.status === 'running')
@@ -2454,7 +2571,10 @@ export function createPanelHandler(ctx) {
       if (req.method === 'POST' && p === '/api/panel/vm-pools') {
         const body = await readBody(req, 64 * 1024).catch(() => ({}))
         try {
-          const pool = createVmPool(vmPoolsFor(apiKeyStore.db), body || {}, listVms(cfg.paths.project))
+          const allVms = listVms(cfg.paths.project)
+          const pool = createVmPool(vmPoolsFor(apiKeyStore.db), body || {}, allVms)
+          syncVmPoolToSchedulerPool(apiKeyStore.db, 'upsert', pool, allVms)
+          notifySchedulerConfigChanged('panel_vm_pool_create')
           return json(res, 201, panel.ok({ pool }))
         } catch (e) {
           return json(res, vmPoolHttpStatus(e.code), {
@@ -2467,8 +2587,11 @@ export function createPanelHandler(ctx) {
         const id = decodeURIComponent(p.split('/').pop())
         const body = await readBody(req, 64 * 1024).catch(() => ({}))
         try {
-          const pool = updateVmPool(vmPoolsFor(apiKeyStore.db), id, body || {}, listVms(cfg.paths.project))
+          const allVms = listVms(cfg.paths.project)
+          const pool = updateVmPool(vmPoolsFor(apiKeyStore.db), id, body || {}, allVms)
           if (!pool) return json(res, 404, { ok: false, error: { message: '账号池不存在', code: 'vm_pool_not_found' } })
+          syncVmPoolToSchedulerPool(apiKeyStore.db, 'upsert', pool, allVms)
+          notifySchedulerConfigChanged('panel_vm_pool_update')
           return json(res, 200, panel.ok({ pool }))
         } catch (e) {
           return json(res, vmPoolHttpStatus(e.code), {
@@ -2490,6 +2613,8 @@ export function createPanelHandler(ctx) {
             },
           })
         }
+        syncVmPoolToSchedulerPool(apiKeyStore.db, 'delete', { id })
+        notifySchedulerConfigChanged('panel_vm_pool_delete')
         return json(res, 200, { ok: true, deleted: id })
       }
       if (req.method === 'GET' && p === '/api/panel/api-keys') {
@@ -2499,11 +2624,13 @@ export function createPanelHandler(ctx) {
         const mine = (snap.keys || []).filter(
           (key) => panelOwnsKey(req, key) && (!filterOwner || normalizeOwnerId(key.owner_id) === filterOwner),
         )
+        const rawById = new Map((apiKeyStore.repo?.list?.() || []).map((r) => [r.id, r]))
+        const enrichedKeys = enrichApiKeyViewsWithPools(apiKeyStore.db, mine, rawById)
         return json(res, 200, {
           ok: true,
-          total: mine.length,
-          active: mine.filter((k) => k.status === 'active').length,
-          keys: mine,
+          total: enrichedKeys.length,
+          active: enrichedKeys.filter((k) => k.status === 'active').length,
+          keys: enrichedKeys,
         })
       }
       if (req.method === 'GET' && /^\/api\/panel\/api-keys\/[^/]+\/stats$/.test(p)) {
@@ -2512,7 +2639,12 @@ export function createPanelHandler(ctx) {
         const rec = apiKeyStore.getById(id)
         if (!rec) return json(res, 404, { ok: false, error: { message: 'api key not found' } })
         const usage_stats = requestLog?.keyUsageStats?.({ apiKeyId: id, days: 30 }) || null
-        return json(res, 200, { ok: true, item: publicKeyView(rec, { reveal: false }), usage_stats })
+        const [item] = enrichApiKeyViewsWithPools(
+          apiKeyStore.db,
+          [publicKeyView(rec, { reveal: false })],
+          new Map([[rec.id, rec]]),
+        )
+        return json(res, 200, { ok: true, item, usage_stats })
       }
       if (req.method === 'POST' && p === '/api/panel/api-keys') {
         const body = await readBody(req, API_KEY_BODY_MAX).catch(() => ({}))
@@ -2523,7 +2655,12 @@ export function createPanelHandler(ctx) {
             error: { code: 'gemini_key_forbidden', message: '只有管理员可以生成 Gemini 密钥' },
           })
         }
-        if (ident.role !== 'admin' && body?.vm_pool_id != null && String(body.vm_pool_id).trim() !== '') {
+        const hasAdminPoolFields =
+          (body?.vm_pool_id != null && String(body.vm_pool_id).trim() !== '') ||
+          (body?.default_pool_id != null && String(body.default_pool_id).trim() !== '') ||
+          (Array.isArray(body?.allowed_pool_ids) && body.allowed_pool_ids.length > 0) ||
+          body?.pool_binding_mode === 'strict_pool'
+        if (ident.role !== 'admin' && hasAdminPoolFields) {
           return json(res, 403, {
             ok: false,
             error: { code: 'key_pool_forbidden', message: '只有管理员可以设置账号池' },
@@ -2543,6 +2680,15 @@ export function createPanelHandler(ctx) {
           })
         }
         try {
+          const schedPoolsRepo = new SchedulerPoolsRepo(apiKeyStore.db)
+          const hasUnifiedPoolFields =
+            Object.hasOwn(body || {}, 'pool_binding_mode') ||
+            Object.hasOwn(body || {}, 'default_pool_id') ||
+            Object.hasOwn(body || {}, 'allowed_pool_ids')
+          const poolBinding =
+            ident.role === 'admin' && hasUnifiedPoolFields
+              ? normalizeKeyPoolBindingInput(body || {}, { partial: false, poolsRepo: schedPoolsRepo })
+              : null
           const tierCfg =
             ident.role === 'admin'
               ? normalizeMultiTierKeyConfig({ ...body, user_id: input.user_id }, { partial: false })
@@ -2555,22 +2701,34 @@ export function createPanelHandler(ctx) {
                 }
           const isApi = isApiCategory(tierCfg.category)
           const allowsEndpoint = isMixedOrApiCategory(tierCfg.category)
+          const reqGroupType = normalizeGroupType(body?.group_type)
           const scopeInput = {
-            group_type: body?.group_type,
-            allowed_vms: body?.allowed_vms,
+            group_type:
+              poolBinding?.pool_binding_mode === 'strict_pool' && reqGroupType !== 'gemini' ? 'all' : body?.group_type,
+            allowed_vms: poolBinding?.pool_binding_mode === 'strict_pool' ? [] : body?.allowed_vms,
             category: tierCfg.category,
             permission_tier: tierCfg.permission_tier,
             owner_id: tierCfg.owner_id,
           }
-          if (ident.role === 'admin' && Object.prototype.hasOwnProperty.call(body || {}, 'vm_pool_id')) {
+          if (ident.role === 'admin' && poolBinding) {
+            scopeInput.vm_pool_id =
+              reqGroupType !== 'gemini' &&
+              poolBinding.default_pool_id &&
+              /^pool_[a-f0-9]{8}$/.test(poolBinding.default_pool_id)
+                ? poolBinding.default_pool_id
+                : null
+          } else if (ident.role === 'admin' && Object.prototype.hasOwnProperty.call(body || {}, 'vm_pool_id')) {
             scopeInput.vm_pool_id = body.vm_pool_id
           }
           const scope = normalizeKeyScope(scopeInput, { isApi })
           const pools = vmPoolsFor(apiKeyStore.db)
           const validEndpointId = validateKeyEndpoint(input.api_endpoint_id, allowsEndpoint)
           if (!isApi) {
-            if (scope.vm_pool_id) assertVmPoolExists(pools, scope.vm_pool_id)
-            else assertVmScope(keyScopeVms(req), scope)
+            if (scope.vm_pool_id && !schedPoolsRepo.get(scope.vm_pool_id)) {
+              assertVmPoolExists(pools, scope.vm_pool_id)
+            } else if (!scope.vm_pool_id && !poolBinding?.default_pool_id) {
+              assertVmScope(keyScopeVms(req), scope)
+            }
           }
           const enforceMultiTierOwnership =
             req[INTEGRATION_DELEGATED] === true ||
@@ -2599,7 +2757,11 @@ export function createPanelHandler(ctx) {
               vms: listVms(cfg.paths.project),
               endpoints: apiEndpointStore?.listRaw?.() || [],
               geminiOwnerMap: ctx.geminiOwnersRepo?.ownerMap?.() || null,
-              policy,
+              policy: {
+                ...policy,
+                default_pool_id: poolBinding?.default_pool_id ?? null,
+                allowed_pool_ids: poolBinding?.allowed_pool_ids ?? [],
+              },
               ownerScope: keyOwnerScope,
             })
           }
@@ -2637,9 +2799,25 @@ export function createPanelHandler(ctx) {
                 ? new Date(Date.now() + Number(body.expires_in_days) * 86400_000).toISOString()
                 : null),
           })
+          if (ident.role === 'admin' && poolBinding) {
+            schedPoolsRepo.setKeyBindings(rec.id, poolBinding.allowed_pool_ids, {
+              defaultPoolId: poolBinding.default_pool_id,
+              bindingMode: poolBinding.pool_binding_mode,
+            })
+            apiKeyStore.reload()
+          } else if (ident.role === 'admin' && scope.vm_pool_id && schedPoolsRepo.get(scope.vm_pool_id)) {
+            schedPoolsRepo.setKeyBindings(rec.id, [scope.vm_pool_id], {
+              defaultPoolId: scope.vm_pool_id,
+              bindingMode: 'legacy_scope',
+            })
+            apiKeyStore.reload()
+          }
+          const latestRec = apiKeyStore.getById(rec.id) || rec
+          const baseView = publicKeyView({ ...latestRec, _plain_key: rec._plain_key }, { reveal: true })
+          const [item] = enrichApiKeyViewsWithPools(apiKeyStore.db, [baseView], new Map([[latestRec.id, latestRec]]))
           return json(res, 201, {
             ok: true,
-            item: publicKeyView(rec, { reveal: true }),
+            item,
             note: 'plaintext stays recoverable via POST /api/panel/api-keys/:id/reveal',
           })
         } catch (e) {
@@ -2665,7 +2843,16 @@ export function createPanelHandler(ctx) {
             error: { code: 'gemini_key_forbidden', message: '只有管理员可以修改 Gemini 密钥' },
           })
         }
-        if (ident.role !== 'admin' && body?.vm_pool_id != null && String(body.vm_pool_id).trim() !== '') {
+        const hasAdminPoolPatch =
+          (body?.vm_pool_id != null && String(body.vm_pool_id).trim() !== '') ||
+          (body?.default_pool_id != null && String(body.default_pool_id).trim() !== '') ||
+          (Array.isArray(body?.allowed_pool_ids) && body.allowed_pool_ids.length > 0) ||
+          body?.pool_binding_mode === 'strict_pool' ||
+          (currentRec?.pool_binding_mode === 'strict_pool' &&
+            (Object.hasOwn(body || {}, 'pool_binding_mode') ||
+              Object.hasOwn(body || {}, 'default_pool_id') ||
+              Object.hasOwn(body || {}, 'allowed_pool_ids')))
+        if (ident.role !== 'admin' && hasAdminPoolPatch) {
           return json(res, 403, {
             ok: false,
             error: { code: 'key_pool_forbidden', message: '只有管理员可以设置账号池' },
@@ -2678,6 +2865,19 @@ export function createPanelHandler(ctx) {
           })
         }
         try {
+          const schedPoolsRepo = new SchedulerPoolsRepo(apiKeyStore.db)
+          const hasUnifiedPoolPatch =
+            Object.hasOwn(body || {}, 'pool_binding_mode') ||
+            Object.hasOwn(body || {}, 'default_pool_id') ||
+            Object.hasOwn(body || {}, 'allowed_pool_ids')
+          const poolBinding =
+            ident.role === 'admin' && hasUnifiedPoolPatch
+              ? normalizeKeyPoolBindingInput(body || {}, {
+                  current: currentRec,
+                  partial: true,
+                  poolsRepo: schedPoolsRepo,
+                })
+              : null
           const input = normalizePanelApiKeyInput(body || {}, req)
           const tierCfg =
             ident.role === 'admin'
@@ -2696,13 +2896,22 @@ export function createPanelHandler(ctx) {
               currentRec?.api_endpoint_id,
             )
           }
+          const reqGroupType = normalizeGroupType(body?.group_type ?? currentRec?.group_type)
           const scopeInput = {
-            group_type: body?.group_type,
-            allowed_vms: body?.allowed_vms,
+            group_type:
+              poolBinding?.pool_binding_mode === 'strict_pool' && reqGroupType !== 'gemini' ? 'all' : body?.group_type,
+            allowed_vms: poolBinding?.pool_binding_mode === 'strict_pool' ? [] : body?.allowed_vms,
             category: effectiveCategory || 'oauth',
             ...(tierCfg ? { permission_tier: tierCfg.permission_tier, owner_id: tierCfg.owner_id } : {}),
           }
-          if (ident.role === 'admin' && Object.prototype.hasOwnProperty.call(body || {}, 'vm_pool_id')) {
+          if (ident.role === 'admin' && poolBinding) {
+            scopeInput.vm_pool_id =
+              reqGroupType !== 'gemini' &&
+              poolBinding.default_pool_id &&
+              /^pool_[a-f0-9]{8}$/.test(poolBinding.default_pool_id)
+                ? poolBinding.default_pool_id
+                : null
+          } else if (ident.role === 'admin' && Object.prototype.hasOwnProperty.call(body || {}, 'vm_pool_id')) {
             scopeInput.vm_pool_id = body.vm_pool_id
           }
           const scope = normalizeKeyScope(scopeInput, { partial: true, current: currentRec, isApi })
@@ -2712,8 +2921,11 @@ export function createPanelHandler(ctx) {
             }
             const pools = vmPoolsFor(apiKeyStore.db)
             if (!isApi) {
-              if (scope.vm_pool_id) assertVmPoolExists(pools, scope.vm_pool_id)
-              else assertVmScope(keyScopeVms(req), scope)
+              if (scope.vm_pool_id && !schedPoolsRepo.get(scope.vm_pool_id)) {
+                assertVmPoolExists(pools, scope.vm_pool_id)
+              } else if (!scope.vm_pool_id && !poolBinding?.default_pool_id) {
+                assertVmScope(keyScopeVms(req), scope)
+              }
             }
             input.group_type = scope.group_type
             input.allowed_vms = scope.allowed_vms
@@ -2753,7 +2965,11 @@ export function createPanelHandler(ctx) {
                 vms: listVms(cfg.paths.project),
                 endpoints: apiEndpointStore?.listRaw?.() || [],
                 geminiOwnerMap: ctx.geminiOwnersRepo?.ownerMap?.() || null,
-                policy,
+                policy: {
+                  ...policy,
+                  default_pool_id: poolBinding?.default_pool_id ?? currentRec?.default_pool_id ?? null,
+                  allowed_pool_ids: poolBinding?.allowed_pool_ids ?? [],
+                },
                 ownerScope: keyOwnerScope,
               })
             }
@@ -2762,7 +2978,35 @@ export function createPanelHandler(ctx) {
           if (!rec) {
             return json(res, 404, { ok: false, error: { message: 'api key not found' } })
           }
-          return json(res, 200, { ok: true, item: publicKeyView(rec, { reveal: false }) })
+          if (ident.role === 'admin' && poolBinding) {
+            schedPoolsRepo.setKeyBindings(rec.id, poolBinding.allowed_pool_ids, {
+              defaultPoolId: poolBinding.default_pool_id,
+              bindingMode: poolBinding.pool_binding_mode,
+            })
+            apiKeyStore.reload()
+          } else if (ident.role === 'admin' && Object.hasOwn(body || {}, 'vm_pool_id')) {
+            const legacyId = scope?.vm_pool_id ?? null
+            if (legacyId && schedPoolsRepo.get(legacyId)) {
+              schedPoolsRepo.setKeyBindings(rec.id, [legacyId], {
+                defaultPoolId: legacyId,
+                bindingMode: currentRec?.pool_binding_mode || 'legacy_scope',
+              })
+              apiKeyStore.reload()
+            } else if (!legacyId) {
+              schedPoolsRepo.setKeyBindings(rec.id, [], {
+                defaultPoolId: null,
+                bindingMode: currentRec?.pool_binding_mode === 'strict_pool' ? 'strict_pool' : 'legacy_scope',
+              })
+              apiKeyStore.reload()
+            }
+          }
+          const latestRec = apiKeyStore.getById(rec.id) || rec
+          const [item] = enrichApiKeyViewsWithPools(
+            apiKeyStore.db,
+            [publicKeyView(latestRec, { reveal: false })],
+            new Map([[latestRec.id, latestRec]]),
+          )
+          return json(res, 200, { ok: true, item })
         } catch (e) {
           const status = Number.isInteger(e.status) ? e.status : vmPoolHttpStatus(e.code)
           return json(res, status, {
@@ -2810,6 +3054,9 @@ export function createPanelHandler(ctx) {
         if (denyIfUserMissesKey(req, res, { apiKeyStore, json, keyId: id })) return true
         const ok = apiKeyStore.remove(id)
         if (!ok) return json(res, 404, { ok: false, error: { message: 'api key not found' } })
+        try {
+          new SchedulerPoolsRepo(apiKeyStore.db).deleteBindingsForKey(id)
+        } catch {}
         return json(res, 200, { ok: true, deleted: id })
       }
 
@@ -4604,6 +4851,18 @@ export function createPanelHandler(ctx) {
           if (hasAuthScheme) {
             const vm = persistSlotAuthScheme(cfg.paths.project, id, body.auth_scheme || body.authScheme)
             if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+            try {
+              const host = slotHost(vm)
+              await (host.syncCredentials || host.onImport)?.(vm, path.join(cfg.paths.project, 'vms', id))
+            } catch (error) {
+              return json(res, 502, {
+                ok: false,
+                error: {
+                  code: 'credential_sync_failed',
+                  message: String(error?.message || 'failed to sync auth_scheme to slot'),
+                },
+              })
+            }
           }
           let slotPolicyResult = null
           if (hasSlotPolicy) {
@@ -4621,7 +4880,8 @@ export function createPanelHandler(ctx) {
                   ? 404
                   : slotPolicyResult.code?.startsWith('license_')
                     ? 403
-                    : slotPolicyResult.code === 'gpt_engine_forbidden'
+                    : slotPolicyResult.code === 'gpt_engine_forbidden' ||
+                        slotPolicyResult.code === 'crag_debian13_crag_only'
                       ? 400
                       : 503
               return json(res, status, {
@@ -4642,17 +4902,30 @@ export function createPanelHandler(ctx) {
             if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
           }
           if (hasTimezone) {
+            const prevZone = currentVm.timezone || ''
             const vm = persistVmTimezone(cfg.paths.project, id, timezoneSync.timezone, { source: 'manual' })
             if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
             const kernel = projectSlotKernelConfig(vm)
             timezoneSync.applied = true
             timezoneSync.kernel_hot = kernel?.changed === true
+            const freshVm = getVm(cfg.paths.project, id)
+            if (freshVm?.status === 'running') {
+              if (freshVm.runtime?.type === 'kvm') {
+                await pushLiveSlotTimezoneSync(cfg.paths.project, freshVm).catch(() => null)
+              } else if (prevZone !== timezoneSync.timezone) {
+                timezoneSync.restart_recommended_for_tz = true
+              }
+            }
           } else if (followProxyTz) {
             const synced = await syncVmTimezoneFromProxy(cfg.paths.project, proxyPool, id, { force: true })
             timezoneSync = { applied: synced.applied, timezone: synced.timezone, source: 'proxy_geo' }
             if (synced.applied) {
               const kernel = projectSlotKernelConfig({ id })
               timezoneSync.kernel_hot = kernel?.changed === true
+              const freshVm = getVm(cfg.paths.project, id)
+              if (freshVm?.status === 'running' && freshVm.runtime?.type !== 'kvm') {
+                timezoneSync.restart_recommended_for_tz = true
+              }
             }
           }
           if (nextName != null && nextName !== String(currentVm.name || '')) {
@@ -5511,6 +5784,18 @@ export function createPanelHandler(ctx) {
           vm.seed_policy = next
           vm.updated_at = new Date().toISOString()
           atomicWriteJson(vmPath, vm, { mode: 0o600 })
+          if (fs.existsSync(fingerprintDir(cfg.paths.project, id))) {
+            try {
+              const tzSync = syncSlotIdentityTimezoneAndPreset(cfg.paths.project, vm, {
+                timezone: vm.timezone,
+                locale: vm.locale,
+                telemetryEnabled: isTelemetryEnabled(next),
+              })
+              if (tzSync?.ok && vm.status === 'running' && vm.runtime?.type === 'kvm') {
+                await pushLiveSlotTimezoneSync(cfg.paths.project, vm, tzSync).catch(() => null)
+              }
+            } catch {}
+          }
           let service
           if (unsupported) {
             service = await withVmLock(`seed-publication:${vmPath}`, async () => {
@@ -5822,18 +6107,26 @@ export function createPanelHandler(ctx) {
           }
         }
         const startNow = body.start !== false && body.status !== 'stopped'
-        const wantKernel = body.kernel && OS_CATALOG[body.kernel] ? body.kernel : kernelForIndex(idx)
+        const wantKernel = normalizeOsKernel(body.kernel) || kernelForIndex(idx)
+        const cragDebian13Create = isCragDebian13Kernel(wantKernel)
         let nodeId = body.node_id ? String(body.node_id) : null
         const kindProbe = {}
         stampVmKind(kindProbe, body)
         const codexCreate = isCodexVm(kindProbe)
+        if (codexCreate && cragDebian13Create) {
+          return json(res, 400, {
+            ok: false,
+            error: { code: 'invalid_create_dataplane', message: 'crag-debian13 仅支持 Anthropic CRAG 槽位' },
+          })
+        }
         if (Object.hasOwn(body, 'dataplane') && (codexCreate || !['wrap', 'crag'].includes(body.dataplane))) {
           return json(res, 400, {
             ok: false,
             error: { code: 'invalid_create_dataplane', message: '仅 Anthropic 支持选择 cli-node 或 CRAG 推理内核' },
           })
         }
-        const selectedCrag = body.dataplane === 'crag'
+        const effectiveDataplane = !codexCreate ? (cragDebian13Create ? 'crag' : (body.dataplane ?? 'wrap')) : undefined
+        const selectedCrag = !codexCreate && effectiveDataplane === 'crag'
         const unsupportedCrag = () =>
           json(res, 409, {
             ok: false,
@@ -6094,7 +6387,7 @@ export function createPanelHandler(ctx) {
         }
         if (nodeId) vm.node_id = nodeId
         stampVmKind(vm, body)
-        if (!codexCreate) vm.dataplane = body.dataplane ?? 'wrap'
+        if (!codexCreate) vm.dataplane = effectiveDataplane
         if (selectedCrag) {
           vm.crag_kernel_version = 'v2'
           // Do not publish a running record before the selected CRAG has passed licensing.
@@ -6230,7 +6523,7 @@ export function createPanelHandler(ctx) {
         if (!startError && startNow && hasExit(vm)) {
           let boot
           try {
-            boot = await startSlotReady(vm, cfg.paths.project, {
+            boot = await (ctx.startSlotReady || startSlotReady)(vm, cfg.paths.project, {
               routing: ctx.routingConfig,
               bindSubscription: createBindSubscription,
             })
@@ -7039,6 +7332,17 @@ export function createPanelHandler(ctx) {
         return json(res, 200, result)
       }
       if (req.method === 'GET' && p === '/api/panel/health-probe') {
+        let geminiCatalog = null
+        try {
+          if (typeof ctx.geminiScheduler?.catalog === 'function') {
+            geminiCatalog = await ctx.geminiScheduler.catalog()
+          }
+        } catch {}
+        const catalog = {
+          anthropic: listPlatformCatalogModels('anthropic'),
+          openai: listPlatformCatalogModels('openai'),
+          google: listPlatformCatalogModels('google', { geminiCatalog }),
+        }
         return json(
           res,
           200,
@@ -7046,6 +7350,7 @@ export function createPanelHandler(ctx) {
             config: ctx.healthMonitor?.getConfig?.() || ctx.routingConfig.health_probe,
             snapshot: ctx.healthMonitor?.getSnapshot?.() || null,
             snapshots: ctx.healthMonitor?.getSnapshots?.() || null,
+            catalog,
           }),
         )
       }
@@ -7053,7 +7358,19 @@ export function createPanelHandler(ctx) {
         const body = await readBody(req, 4096).catch(() => ({}))
         const platform =
           typeof body?.platform === 'string' && body.platform.trim() ? body.platform.trim().toLowerCase() : 'all'
-        const snapshot = await ctx.healthMonitor.runRealProbe({ platform })
+        const model = typeof body?.model === 'string' ? body.model.trim() : ''
+        const snapshot = await ctx.healthMonitor.runRealProbe({ platform, ...(model ? { model } : {}) })
+        let geminiCatalog = null
+        try {
+          if (typeof ctx.geminiScheduler?.catalog === 'function') {
+            geminiCatalog = await ctx.geminiScheduler.catalog()
+          }
+        } catch {}
+        const catalog = {
+          anthropic: listPlatformCatalogModels('anthropic'),
+          openai: listPlatformCatalogModels('openai'),
+          google: listPlatformCatalogModels('google', { geminiCatalog }),
+        }
         return json(
           res,
           200,
@@ -7061,6 +7378,7 @@ export function createPanelHandler(ctx) {
             config: ctx.healthMonitor.getConfig(),
             snapshot,
             snapshots: ctx.healthMonitor.getSnapshots?.() || null,
+            catalog,
           }),
         )
       }
@@ -8269,6 +8587,14 @@ export function createPanelHandler(ctx) {
     }
 
     return false
+  }
+
+  return async function handlePanel(req, res, url) {
+    const out = await handlePanelInner(req, res, url)
+    if (out !== false && shouldSyncSchedulerOnMutation(req.method, url.pathname) && (res.statusCode || 200) < 400) {
+      notifySchedulerConfigChanged(`${req.method}:${url.pathname}`)
+    }
+    return out
   }
 }
 

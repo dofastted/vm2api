@@ -33,6 +33,7 @@ import { vmQuotaOverrideOf } from '../pool/vm-quota-override.mjs'
 import { activeHoursOf, parseActiveHoursInput } from '../pool/active-hours.mjs'
 import { rollWindowHistory } from '../pool/window-history.mjs'
 import { normalizeOwnerId, vmOriginOf, vmOwnerId, VM_ORIGIN } from '../admin/resource-owner.mjs'
+import { fingerprintDir, syncSlotIdentityTimezoneAndPreset } from '../identity/slot-computer.mjs'
 import { isCodexVm, normalizeVmKind } from './vm-kind.mjs'
 import { canClaudeResetCredits } from '../oauth/credential-mode.mjs'
 import { validTimezone } from '../core/timezone.mjs'
@@ -958,6 +959,11 @@ export function persistVmTimezone(projectRoot, id, timezone, { source = 'manual'
   if (vm.fingerprint && typeof vm.fingerprint === 'object') vm.fingerprint.timezone = zone
   vm.updated_at = new Date().toISOString()
   atomicWriteJson(file, vm)
+  if (fs.existsSync(fingerprintDir(projectRoot, id))) {
+    try {
+      syncSlotIdentityTimezoneAndPreset(projectRoot, vm, { timezone: zone, locale: vm.locale })
+    } catch {}
+  }
   return summarizeVm(vm)
 }
 

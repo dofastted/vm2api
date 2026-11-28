@@ -7,9 +7,26 @@
  */
 import fs from 'node:fs'
 import path from 'node:path'
-import { normalizeCragKernelVersion, normalizeKernelDataplane, normalizeSlotPersonaPreset } from '../vm/slot-engine.mjs'
+import {
+  isHeadlessBridgeCaps,
+  normalizeCragKernelVersion,
+  normalizeKernelDataplane,
+  normalizeSlotPersonaPreset,
+} from '../vm/slot-engine.mjs'
+import { CRS_OFFICIAL_CLI_SYSTEM, renderCragCustomSystemBlocks } from '../identity/crs-persona.mjs'
+import { canonicalPersonaCompat, templatePresetFor } from '../identity/persona-template.mjs'
+import {
+  CLI_IDENTITY,
+  cragEnvFromSpec,
+  isOfficialIdentityText,
+  isPromptSpecV1Caps,
+  normalizeUnifiedPreset,
+  resolveGlobalUnifiedPreset,
+  resolveSystemPromptSpec,
+  sanitizePromptSpec,
+} from '../identity/system-prompt-spec.mjs'
 import { materializeAutomaticCache } from './cache-ttl.mjs'
-import { isOnlyOfficialCliIdentitySystem, sanitizeSafeguardsForCrag } from './crag-whitelist.mjs'
+import { isOnlyOfficialCliIdentitySystem, sanitizeCragEnv, sanitizeSafeguardsForCrag } from './crag-whitelist.mjs'
 import { normalizeImageContentBlocks } from './images.mjs'
 import { needsCragProviderCompatibility } from './kernel-request.mjs'
 import { isEmptyEffortValue } from './log-fields.mjs'
@@ -68,26 +85,86 @@ export function cragConsumesModelDirective(health) {
 
 export const CRAG_PRINT_PROMPT_MAX_BYTES = 64 * 1024
 const BILLING_LINE = /^x-anthropic-billing-header:/i
+const EMPTY_REPLACE_CAPS = Object.freeze(['prompt_replace_empty', 'prompt_replace_empty_v3'])
+
+/**
+ * Check whether the CRAG worker advertises explicit empty `replace:""` support
+ * (CRAG 3.1.25+ `prompt_replace_empty` / `prompt_replace_empty_v3`).
+ */
+export function cragSupportsEmptyReplace(capabilities, health = null) {
+  if (Array.isArray(capabilities) && capabilities.some((cap) => EMPTY_REPLACE_CAPS.includes(cap))) {
+    return true
+  }
+  if (Array.isArray(health?.capabilities) && health.capabilities.some((cap) => EMPTY_REPLACE_CAPS.includes(cap))) {
+    return true
+  }
+  return false
+}
+
+export function cragEmptyReplaceUnsupportedError() {
+  const message =
+    'CRAG worker lacks prompt_replace_empty capability and is not statically configured as zero persona; refusing to silently fall back to official prompt'
+  const error = new Error(message)
+  error.status = 503
+  error.code = 'crag_prompt_replace_empty_unsupported'
+  error.body = {
+    type: 'error',
+    error: {
+      type: 'overloaded_error',
+      code: 'crag_prompt_replace_empty_unsupported',
+      message,
+      details: { retryable: false },
+    },
+  }
+  return error
+}
 
 export function normalizeCragPersonaPreset(value) {
-  const raw = String(value ?? '')
-    .trim()
-    .toLowerCase()
-    .replaceAll('_', '-')
-  if (raw === 'zero' || raw === '0' || raw === '0-inject') return 'zero'
-  return 'official_full'
+  return normalizeUnifiedPreset(value, 'official_full')
 }
 
 /**
- * Slot zero stays replace. Any other explicit slot preset is append-only:
- * official (identity-only), official_303 and custom templates have no print flag.
- * Empty slot inherits compatibility.crag_persona_preset, not persona_preset.
+ * Unified SSOT preset resolver for CRAG (matches `resolveSlotPersonaPreset`):
+ * slot `vm.persona_preset` > global `compatibility.persona_preset` > legacy fallback.
  */
 export function resolveCragPrintPersona(vm, routing = {}) {
   const slot = normalizeSlotPersonaPreset(vm?.persona_preset, { inherit: true })
-  if (slot === 'zero') return 'zero'
-  if (slot) return 'official_full'
-  return normalizeCragPersonaPreset(routing?.compatibility?.crag_persona_preset)
+  if (slot) return normalizeUnifiedPreset(slot, 'official_full')
+  return resolveGlobalUnifiedPreset(routing)
+}
+
+function explicitSlotTemplatePreset(vm) {
+  const raw = String(vm?.persona_preset ?? '')
+    .trim()
+    .toLowerCase()
+  if (!raw || raw === 'inherit' || raw === 'global' || raw === 'default') return ''
+  if (raw === 'custom' || raw === 'diy' || raw === 'manual') return 'custom'
+  const slot = normalizeSlotPersonaPreset(vm?.persona_preset, { inherit: true })
+  return slot ? templatePresetFor(slot) : ''
+}
+
+/**
+ * Resolve an explicit panel custom template override for `headless_claude_bridge_v1`.
+ * Returns `{ preset, blocks }` only when a non-empty `persona_templates[key]` is
+ * configured for the active slot/routing preset; returns `null` to use unified
+ * preset compilation (`official`, `official_full`, `zero`).
+ */
+export function resolveCragCustomTemplate(vm, routing = {}, preset = null) {
+  if (!routing || typeof routing !== 'object') return null
+  const compat = canonicalPersonaCompat(routing?.compatibility || {})
+  const templates = compat?.persona_templates
+  if (!templates || typeof templates !== 'object' || Array.isArray(templates)) return null
+  const has = (key) => Array.isArray(templates[key]) && templates[key].length > 0
+  const slotPreset = explicitSlotTemplatePreset(vm)
+  if (slotPreset) {
+    return has(slotPreset) ? { preset: slotPreset, blocks: templates[slotPreset] } : null
+  }
+  if (preset != null) {
+    const explicit = normalizeUnifiedPreset(preset, 'official_full')
+    if (has(explicit)) return { preset: explicit, blocks: templates[explicit] }
+  }
+  const globalPreset = resolveGlobalUnifiedPreset(routing)
+  return has(globalPreset) ? { preset: globalPreset, blocks: templates[globalPreset] } : null
 }
 
 function textOf(block) {
@@ -196,8 +273,49 @@ export function callerSystemTail(system) {
     .join('\n\n')
 }
 
+function stripBillingAndOfficialIdentityForZero(system) {
+  if (system == null) return undefined
+  if (typeof system === 'string') {
+    const cleaned = system
+      .split('\n')
+      .filter((line) => !BILLING_LINE.test(line.trim()))
+      .join('\n')
+    if (!cleaned.trim() || isOfficialIdentityText(cleaned)) return undefined
+    return cleaned
+  }
+  if (!Array.isArray(system)) return system
+  const kept = []
+  for (const block of system) {
+    if (typeof block === 'string') {
+      const cleaned = block
+        .split('\n')
+        .filter((line) => !BILLING_LINE.test(line.trim()))
+        .join('\n')
+      if (!cleaned.trim() || isOfficialIdentityText(cleaned)) continue
+      kept.push(cleaned)
+      continue
+    }
+    if (block && typeof block === 'object' && typeof block.text === 'string') {
+      const cleaned = block.text
+        .split('\n')
+        .filter((line) => !BILLING_LINE.test(line.trim()))
+        .join('\n')
+      if (!cleaned.trim() || isOfficialIdentityText(cleaned)) continue
+      kept.push(cleaned === block.text ? block : { ...block, text: cleaned })
+      continue
+    }
+    if (block != null) kept.push(block)
+  }
+  return kept.length ? kept : undefined
+}
+
 function stripCallerPromptAlias(body) {
   delete body.crag_prompt
+  delete body.crag_prompt_spec
+  delete body.prompt_spec
+  delete body.crag_persona_preset
+  delete body.crag_prompt_version
+  delete body.crag_env
   if (!body.crag_options || typeof body.crag_options !== 'object' || Array.isArray(body.crag_options)) return
   const { prompt: _prompt, ...rest } = body.crag_options
   if (Object.keys(rest).length) body.crag_options = rest
@@ -312,6 +430,11 @@ function invertsCacheTtl(moved, passed) {
   return long && passed.some((block) => block?.cache_control != null && block.cache_control.ttl !== '1h')
 }
 
+function hasCacheControl(message) {
+  if (message?.cache_control != null) return true
+  return contentBlocks(message?.content).some((block) => block?.cache_control != null)
+}
+
 function hasOutputConfig(message) {
   return message?.output_config != null && typeof message.output_config === 'object'
 }
@@ -387,7 +510,12 @@ function foldSystemTurns(messages) {
     }
     if (pendingSource.length) {
       const content = contentBlocks(message?.content)
-      if (message?.role === 'user' && !invertsCacheTtl(pending, content.slice(0, leadingToolResults(content)))) {
+      const toolResults = leadingToolResults(content)
+      // A post-assistant system turn carrying cache_control was emitted as a trailing
+      // system turn on the previous request; folding it forward into a subsequent plain
+      // user turn would mutate that cached message's role from system -> user (#2007).
+      const keepsCachedPrefix = toolResults === 0 && pendingSource.some(hasCacheControl)
+      if (message?.role === 'user' && !keepsCachedPrefix && !invertsCacheTtl(pending, content.slice(0, toolResults))) {
         out.push({
           ...message,
           content: prependAfterToolResults(content, pending),
@@ -434,24 +562,97 @@ function foldSummarySystemTurns(messages) {
   return { messages: [...folded.messages, ...tail], outputConfig }
 }
 
+function applyPoolSystemForCrag(callerSystem, promptPolicy, officialPassthrough) {
+  if (!promptPolicy?.applies) return callerSystem
+  const poolText = typeof promptPolicy.text === 'string' ? promptPolicy.text : ''
+  const poolBlocks = poolText ? [{ type: 'text', text: poolText }] : []
+  if (promptPolicy.mode === 'append') {
+    const baseCaller = !officialPassthrough && isOnlyOfficialCliIdentitySystem(callerSystem) ? undefined : callerSystem
+    if (!poolBlocks.length) return baseCaller
+    if (officialPassthrough) return poolBlocks
+    const clientBlocks = systemBlocks(baseCaller)
+      .map((b) =>
+        typeof b === 'string' ? (b ? { type: 'text', text: b } : null) : b && typeof b === 'object' ? { ...b } : null,
+      )
+      .filter(Boolean)
+    return [...clientBlocks, ...poolBlocks]
+  }
+  if (promptPolicy.mode === 'override') {
+    const policy = String(promptPolicy.clientSystemPolicy || 'prepend_pool')
+      .trim()
+      .toLowerCase()
+    if (policy === 'replace_client') return poolBlocks
+    const clientBlocks = systemBlocks(callerSystem)
+      .map((b) =>
+        typeof b === 'string' ? (b ? { type: 'text', text: b } : null) : b && typeof b === 'object' ? { ...b } : null,
+      )
+      .filter(Boolean)
+    if (policy === 'append_pool') return [...clientBlocks, ...poolBlocks]
+    return [...poolBlocks, ...clientBlocks]
+  }
+  return callerSystem
+}
+
+function toSpecCustomBlocks(action, blocks) {
+  return {
+    action,
+    blocks: (Array.isArray(blocks) ? blocks : [])
+      .filter((b) => b && typeof b === 'object' && typeof b.text === 'string')
+      .map((b) => ({
+        type: 'text',
+        text: b.text,
+        cache_control: b.cache_control && typeof b.cache_control === 'object' ? { ...b.cache_control } : null,
+      })),
+  }
+}
+
 /**
  * @param {object} body caller body, before cli-node persona injection
- * @param {{ preset?: 'official_full' | 'zero', officialPassthrough?: boolean, capabilities?: string[], agentSummary?: boolean, foldSystemMessages?: boolean }} [options]
+ * @param {{ preset?: 'official' | 'official_full' | 'zero' | 'custom', promptSpec?: object | null, officialPassthrough?: boolean, capabilities?: string[], health?: object | null, promptPolicy?: object | null, agentSummary?: boolean, foldSystemMessages?: boolean }} [options]
  */
 export function prepareCragPrintBody(
   body,
   {
     preset = 'official_full',
+    promptSpec = null,
     officialPassthrough = false,
+    strictPassthrough = false,
     capabilities,
+    health = null,
+    promptPolicy = null,
     agentSummary = false,
     foldSystemMessages = true,
+    routing = null,
+    vm = null,
+    identity = null,
+    sessionId = '',
+    entrypoint = 'cli',
+    cacheTtl = null,
   } = {},
 ) {
+  if (strictPassthrough) {
+    const out = { ...(body || {}) }
+    stripCallerPromptAlias(out)
+    if (isHeadlessBridgeCaps(capabilities) && isPromptSpecV1Caps(capabilities, health)) {
+      const cleanSpec =
+        sanitizePromptSpec(promptSpec) ||
+        resolveSystemPromptSpec({
+          routing: routing || {},
+          slot: vm,
+          poolPolicy: promptPolicy?.applies ? promptPolicy : null,
+          identity,
+          officialPassthrough: true,
+          strictPassthrough: true,
+          relocateCallerSystem: false,
+        })
+      if (cleanSpec) out.crag_prompt_spec = { ...cleanSpec, passthrough: true }
+    }
+    return out
+  }
   // The CRAG kernel reads block markers only and 400s on a top-level
   // cache_control. Convert it here, before any early return, so every path out
   // of this function hands the kernel the standard shape.
-  const out = materializeAutomaticCache({ ...(body || {}) })
+  const out = body?.cache_control != null ? materializeAutomaticCache({ ...(body || {}) }) : { ...(body || {}) }
   if (out.safeguards !== undefined) {
     const sg = sanitizeSafeguardsForCrag(out.safeguards, capabilities)
     if (sg.value === undefined) delete out.safeguards
@@ -465,7 +666,253 @@ export function prepareCragPrintBody(
     })
   }
   if (agentSummary) out.messages = readOnlySummaryResults(out.messages)
+  const poolApplied = Boolean(promptPolicy?.applies)
+  const headlessBridge = isHeadlessBridgeCaps(capabilities)
+  const promptSpecV1 = isPromptSpecV1Caps(capabilities, health)
+  const effectivePreset = normalizeCragPersonaPreset(preset)
+  if (headlessBridge) {
+    // Still enforce fail-closed provider-managed tool capability checks.
+    const providerCompat = needsCragProviderCompatibility(out, capabilities)
+    stripCallerPromptAlias(out)
+    const spec =
+      sanitizePromptSpec(promptSpec) ||
+      resolveSystemPromptSpec({
+        routing: routing || {},
+        slot: vm,
+        poolPolicy: poolApplied ? promptPolicy : null,
+        identity,
+        officialPassthrough,
+        strictPassthrough: false,
+        modeOverride: poolApplied ? null : effectivePreset,
+      })
+    const attachSpecEnv = (targetSpec) => {
+      const env = sanitizeCragEnv(cragEnvFromSpec(targetSpec))
+      if (env) out.crag_env = env
+    }
+    const attachPromptSpec = (targetSpec) => {
+      if (!promptSpecV1) return
+      const clean = sanitizePromptSpec(targetSpec)
+      if (clean) out.crag_prompt_spec = clean
+    }
+
+    // Explicit pool prompt policy takes precedence over legacy persona presets.
+    if (poolApplied && promptPolicy.mode !== 'official') {
+      if (promptPolicy.mode === 'passthrough') {
+        attachPromptSpec({ ...spec, passthrough: true })
+        return out
+      }
+      if (promptPolicy.mode === 'zero_inject') {
+        const cleanedZeroSystem = stripBillingAndOfficialIdentityForZero(out.system)
+        if (cleanedZeroSystem === undefined) delete out.system
+        else out.system = cleanedZeroSystem
+        out.crag_persona_preset = 'zero'
+        out.crag_prompt_version = CLI_IDENTITY
+        attachPromptSpec(spec)
+        return out
+      }
+      if (promptPolicy.mode === 'override') {
+        const cleanedCallerSystem = stripBillingAndOfficialIdentityForZero(body?.system)
+        const poolBlocks = applyPoolSystemForCrag(cleanedCallerSystem, promptPolicy, false)
+        const normalizedBlocks = Array.isArray(poolBlocks) ? poolBlocks : []
+        if (providerCompat) {
+          if (normalizedBlocks.length) out.system = normalizedBlocks
+          else delete out.system
+        } else {
+          delete out.system
+          out.crag_prompt = normalizedBlocks.length
+            ? { mode: 'replace', blocks: normalizedBlocks }
+            : { mode: 'replace', text: '' }
+        }
+        // CRAG 3.1.26+ runtime requires zero persona so the official template is not prepended.
+        out.crag_persona_preset = 'zero'
+        out.crag_prompt_version = CLI_IDENTITY
+        attachPromptSpec({ ...spec, custom_blocks: toSpecCustomBlocks('replace', normalizedBlocks) })
+        return out
+      }
+      if (promptPolicy.mode === 'append') {
+        if (officialPassthrough) {
+          const appendedBlocks = applyPoolSystemForCrag(body?.system, promptPolicy, true)
+          if (Array.isArray(appendedBlocks) && appendedBlocks.length) {
+            out.system = appendedBlocks
+          }
+          attachPromptSpec({ ...spec, passthrough: true })
+          return out
+        }
+        const customTemplate = resolveCragCustomTemplate(vm, routing, spec.mode)
+        if (customTemplate) {
+          const appendedBlocks = applyPoolSystemForCrag(body?.system, promptPolicy, false)
+          if (Array.isArray(appendedBlocks) && appendedBlocks.length) {
+            out.system = appendedBlocks
+          } else if (isOnlyOfficialCliIdentitySystem(out.system)) {
+            delete out.system
+          }
+          const {
+            blocks,
+            promptVersion,
+            messages: renderedMessages,
+          } = renderCragCustomSystemBlocks(out, {
+            preset: customTemplate.preset,
+            routing,
+            identity,
+            sessionId,
+            entrypoint,
+            cacheTtl,
+          })
+          if (Array.isArray(renderedMessages)) out.messages = renderedMessages
+          if (providerCompat) {
+            if (blocks.length) out.system = blocks
+            else delete out.system
+          } else {
+            delete out.system
+            out.crag_prompt = { mode: 'replace', blocks }
+          }
+          if (promptVersion) out.crag_prompt_version = promptVersion
+          attachPromptSpec({ ...spec, custom_blocks: toSpecCustomBlocks('replace', blocks) })
+          return out
+        }
+        if (promptSpecV1) {
+          // CRAG V4 prompt_spec_v1: keep out.system free of promptPolicy.text (still stripping
+          // relocated [CLI_IDENTITY] placeholder) and let crag_prompt_spec.custom_blocks carry it once.
+          if (isOnlyOfficialCliIdentitySystem(out.system)) delete out.system
+          const appendCustom =
+            spec.custom_blocks ||
+            (typeof promptPolicy.text === 'string' && promptPolicy.text
+              ? toSpecCustomBlocks('append', [{ type: 'text', text: promptPolicy.text }])
+              : null)
+          const finalSpec = { ...spec, custom_blocks: appendCustom }
+          out.crag_persona_preset = spec.mode === 'official' ? 'official' : 'official_full'
+          attachPromptSpec(finalSpec)
+          attachSpecEnv(finalSpec)
+          return out
+        }
+        if (spec.mode === 'official') {
+          // Legacy CRAG fallback without prompt_spec_v1: render Mode 1 minimal blocks from pre-pool
+          // body (without promptPolicy.text mixed into out.system), then append promptPolicy.text once.
+          if (isOnlyOfficialCliIdentitySystem(out.system)) delete out.system
+          const { blocks, messages: renderedMessages } = renderCragCustomSystemBlocks(out, {
+            preset: 'official',
+            routing,
+            identity,
+            sessionId,
+            entrypoint,
+            cacheTtl,
+          })
+          if (Array.isArray(renderedMessages)) out.messages = renderedMessages
+          const finalBlocks =
+            typeof promptPolicy.text === 'string' && promptPolicy.text
+              ? [...blocks, { type: 'text', text: promptPolicy.text }]
+              : blocks
+          if (providerCompat) {
+            if (finalBlocks.length) out.system = finalBlocks
+            else delete out.system
+          } else {
+            delete out.system
+            out.crag_prompt = { mode: 'replace', blocks: finalBlocks }
+          }
+          attachSpecEnv(spec)
+          return out
+        }
+        // Legacy CRAG (headless_claude_bridge_v1 without prompt_spec_v1) official_full:
+        // pass appendedBlocks via out.system since legacy CRAG does not read crag_prompt_spec.
+        const appendedBlocks = applyPoolSystemForCrag(body?.system, promptPolicy, false)
+        if (Array.isArray(appendedBlocks) && appendedBlocks.length) {
+          out.system = appendedBlocks
+        } else if (isOnlyOfficialCliIdentitySystem(out.system)) {
+          delete out.system
+        }
+        out.crag_persona_preset = 'official_full'
+        attachSpecEnv(spec)
+        return out
+      }
+    }
+    // Priority 1: Native CC passthrough never touches system[] or injects persona/prompt/env controls.
+    // Headless bridge also never folds mid-conversation role:"system" turns.
+    if (officialPassthrough || spec.passthrough) {
+      attachPromptSpec({ ...spec, passthrough: true })
+      return out
+    }
+    // Priority 2: Explicit panel custom template override or Mode `custom` -> direct replace blocks.
+    const customTemplate = resolveCragCustomTemplate(vm, routing, spec.mode)
+    if (customTemplate || spec.mode === 'custom') {
+      const targetPreset = customTemplate ? customTemplate.preset : 'custom'
+      const {
+        blocks,
+        promptVersion,
+        messages: renderedMessages,
+      } = renderCragCustomSystemBlocks(out, {
+        preset: targetPreset,
+        routing,
+        identity,
+        sessionId,
+        entrypoint,
+        cacheTtl,
+      })
+      if (Array.isArray(renderedMessages)) out.messages = renderedMessages
+      if (providerCompat) {
+        if (blocks.length) out.system = blocks
+        else delete out.system
+      } else {
+        delete out.system
+        out.crag_prompt = { mode: 'replace', blocks }
+      }
+      if (promptVersion) out.crag_prompt_version = promptVersion
+      if (promptSpecV1 && spec.mode === 'custom') out.crag_persona_preset = 'custom'
+      attachPromptSpec({ ...spec, custom_blocks: toSpecCustomBlocks('replace', blocks) })
+      return out
+    }
+    // Priority 3: Mode 3 (`zero`, no custom template) -> 0-inject with prompt_version = CLI_IDENTITY.
+    // Strip billing lines and all official identity blocks while preserving caller business system verbatim.
+    if (spec.mode === 'zero') {
+      const cleanedZeroSystem = stripBillingAndOfficialIdentityForZero(out.system)
+      if (cleanedZeroSystem === undefined) delete out.system
+      else out.system = cleanedZeroSystem
+      out.crag_persona_preset = 'zero'
+      out.crag_prompt_version = CLI_IDENTITY
+      attachPromptSpec(spec)
+      return out
+    }
+    // Priority 4: Mode 1 (`official` — identity-only by default, toggles for core/guidance/env).
+    if (spec.mode === 'official') {
+      if (promptSpecV1) {
+        if (isOnlyOfficialCliIdentitySystem(out.system)) delete out.system
+        out.crag_persona_preset = 'official'
+        attachPromptSpec(spec)
+        attachSpecEnv(spec)
+        return out
+      }
+      // Legacy CRAG V4 fallback (no prompt_spec_v1): compile Mode 1 blocks directly via crag_prompt replace.
+      const { blocks, messages: renderedMessages } = renderCragCustomSystemBlocks(out, {
+        preset: 'official',
+        routing,
+        identity,
+        sessionId,
+        entrypoint,
+        cacheTtl,
+      })
+      if (Array.isArray(renderedMessages)) out.messages = renderedMessages
+      if (providerCompat) {
+        if (blocks.length) out.system = blocks
+        else delete out.system
+      } else {
+        delete out.system
+        out.crag_prompt = { mode: 'replace', blocks }
+      }
+      attachSpecEnv(spec)
+      return out
+    }
+    // Priority 5: Mode 2 (`official_full`, no custom template) -> CRAG prepends probed official template.
+    // Strip the 1-line placeholder left by relocateThirdPartySystem so CRAG V4 wire.rs
+    // (`!caller_starts_with_official_identity`) actually prepends tui_system_template.
+    if (isOnlyOfficialCliIdentitySystem(out.system)) delete out.system
+    out.crag_persona_preset = 'official_full'
+    attachPromptSpec(spec)
+    attachSpecEnv(spec)
+    return out
+  }
   if (needsCragProviderCompatibility(out, capabilities)) {
+    if (poolApplied && (promptPolicy.mode === 'override' || promptPolicy.mode === 'append')) {
+      out.system = applyPoolSystemForCrag(body?.system, promptPolicy, officialPassthrough)
+    }
     stripCallerPromptAlias(out)
     return out
   }
@@ -478,17 +925,45 @@ export function prepareCragPrintBody(
         ...folded.outputConfig,
       }
   }
-  const mode = preset === 'zero' ? 'replace' : 'append'
+  if (poolApplied && promptPolicy.mode === 'passthrough') {
+    stripCallerPromptAlias(out)
+    return out
+  }
+  const mode = poolApplied
+    ? promptPolicy.mode === 'zero_inject' || promptPolicy.mode === 'override'
+      ? 'replace'
+      : 'append'
+    : preset === 'zero'
+      ? 'replace'
+      : 'append'
+  const effectiveOfficialPassthrough = poolApplied
+    ? promptPolicy.mode === 'official'
+      ? officialPassthrough
+      : false
+    : officialPassthrough
+  const effectiveSystem = poolApplied
+    ? applyPoolSystemForCrag(body?.system, promptPolicy, officialPassthrough)
+    : body?.system
+  const healthPreset = String(health?.persona_preset || '')
+    .trim()
+    .toLowerCase()
+  const staticZeroHealth = healthPreset === 'zero'
+  const staticNonZeroHealth = Boolean(healthPreset && healthPreset !== 'zero')
+
   delete out.system
   stripCallerPromptAlias(out)
-  if (capabilities !== undefined && (!Array.isArray(capabilities) || !capabilities.includes(`prompt_${mode}`)))
+  if (capabilities !== undefined && (!Array.isArray(capabilities) || !capabilities.includes(`prompt_${mode}`))) {
+    if (mode === 'replace' && poolApplied && !staticZeroHealth) {
+      throw cragEmptyReplaceUnsupportedError()
+    }
     return out
+  }
   const textCache = nativeV3 && capabilities.includes('system_text_cache_v3')
   if (
     nativeV3 &&
-    !officialPassthrough &&
-    Array.isArray(body?.system) &&
-    body.system.some(
+    !effectiveOfficialPassthrough &&
+    Array.isArray(effectiveSystem) &&
+    effectiveSystem.some(
       (block) =>
         typeof block !== 'string' &&
         (!block ||
@@ -513,11 +988,35 @@ export function prepareCragPrintBody(
       },
     })
   }
-  const skipRelocatedPlaceholder = !officialPassthrough && isOnlyOfficialCliIdentitySystem(body?.system)
-  const tail = officialPassthrough || skipRelocatedPlaceholder ? '' : callerSystemTail(body?.system)
-  if (!tail) return out
+  const skipRelocatedPlaceholder =
+    !effectiveOfficialPassthrough &&
+    (!poolApplied || promptPolicy.mode === 'official' || promptPolicy.mode === 'append') &&
+    isOnlyOfficialCliIdentitySystem(effectiveSystem)
+  const tail = effectiveOfficialPassthrough || skipRelocatedPlaceholder ? '' : callerSystemTail(effectiveSystem)
+  if (!tail) {
+    if (!effectiveOfficialPassthrough && mode === 'replace') {
+      if (cragSupportsEmptyReplace(capabilities, health)) {
+        out.crag_prompt = { mode: 'replace', text: '' }
+        return out
+      }
+      if (skipRelocatedPlaceholder || staticZeroHealth) {
+        return out
+      }
+      // Fail-Closed whenever an explicit pool policy requires zero/replace OR
+      // worker health advertises a non-zero static persona, so we never
+      // silently fall back to the official prompt.
+      if (poolApplied || staticNonZeroHealth) {
+        throw cragEmptyReplaceUnsupportedError()
+      }
+    }
+    return out
+  }
+  if (!nativeV3 && poolApplied && (promptPolicy.mode === 'override' || promptPolicy.mode === 'append')) {
+    const poolBytes = Buffer.byteLength(String(promptPolicy.text || ''), 'utf8')
+    if (poolBytes > CRAG_PRINT_PROMPT_MAX_BYTES) throw cragPromptTooLarge(poolBytes)
+  }
   if (textCache && mode === 'append') {
-    out.system = body.system
+    out.system = effectiveSystem
     return out
   }
   if (!nativeV3 && mode === 'replace' && Buffer.byteLength(tail, 'utf8') > CRAG_PRINT_PROMPT_MAX_BYTES) {
@@ -525,7 +1024,7 @@ export function prepareCragPrintBody(
   }
   out.crag_prompt = { mode, text: tail }
   if (textCache) {
-    const blocks = callerSystemBlocks(body?.system)
+    const blocks = callerSystemBlocks(effectiveSystem)
     if (blocks.some((block) => block.cache_control != null)) out.crag_prompt.blocks = blocks
   }
   return out

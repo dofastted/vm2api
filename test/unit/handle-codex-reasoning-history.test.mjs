@@ -9,6 +9,7 @@ import {
   handleCodexProtocol,
 } from '../../src/lib/protocol/handle-codex.mjs'
 import { resetOpenAIAccountRuntime } from '../../src/lib/pool/openai-account-runtime.mjs'
+import { createMockSchedulerRuntime } from '../helpers/mock-scheduler-runtime.mjs'
 
 const LIMIT = 128 * 1024
 const KEEP_BUDGET = 120 * 1024
@@ -355,6 +356,7 @@ test('handleCodexProtocol counts the extra attempt on the same slot and records 
     writeSSEHeaders() {},
     routing: { pool: { fallback_wait_timeout_ms: 5000 } },
     projectRoot: root,
+    schedulerRuntime: createMockSchedulerRuntime({ projectRoot: root }),
     captureOutbound: true,
     ops: {
       writeCodexKernelConfig() {},

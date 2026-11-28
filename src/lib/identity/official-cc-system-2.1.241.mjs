@@ -6,6 +6,7 @@
  */
 import { createRequire } from 'node:module'
 import { validTimezone } from '../core/timezone.mjs'
+import { DEFAULT_SLOT_HOME, slotHome } from '../vm/slot-identity.mjs'
 
 const require = createRequire(import.meta.url)
 const FIXTURE = require('./official-cc-system-2.1.241.json')
@@ -13,8 +14,12 @@ const FIXTURE = require('./official-cc-system-2.1.241.json')
 export const CRS_OFFICIAL_AGENT_IDENTITY = FIXTURE.identity
 export const CRS_OFFICIAL_AGENT_PROMPT = FIXTURE.agent_prompt
 export const CRS_OFFICIAL_CONTINUATION = FIXTURE.continuation
-export const OFFICIAL_SLOT_CWD = '/home/kincli'
+export const OFFICIAL_SLOT_CWD = DEFAULT_SLOT_HOME
 export const MAX_INBOUND_CWD_LEN = 512
+
+export function officialSlotCwd(vm = null) {
+  return vm ? slotHome(vm) : OFFICIAL_SLOT_CWD
+}
 
 /** Official 2.1.296 `DXt`. Must be its own system block for cli-node `mpo` to lift it. */
 export const CRS_REPORTING_OUTCOMES = `# Reporting outcomes
@@ -304,8 +309,8 @@ export function buildOfficialEnvironmentSection(env = {}, { sourceTexts = [], co
   return `${envBlock}\n\n${OFFICIAL_CONTEXT_MANAGEMENT}`
 }
 
-export function buildOfficialContinuationText(env = {}, sourceTexts = [], { overwrite = false } = {}) {
-  const cwd = sanitizeInboundCwd(env.cwd)
+export function buildOfficialContinuationText(env = {}, sourceTexts = [], { overwrite = false, vm = null } = {}) {
+  const cwd = sanitizeInboundCwd(env.cwd) || (vm ? slotHome(vm) : '')
   let body = String(CRS_OFFICIAL_CONTINUATION || '')
   const slug = officialProjectSlug(cwd)
   if (cwd && slug) {

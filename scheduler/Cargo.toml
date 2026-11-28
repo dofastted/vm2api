@@ -1,0 +1,46 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/scheduler-proto",
+    "crates/scheduler-core",
+    "crates/scheduler-daemon",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.86"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+scheduler-proto = { path = "crates/scheduler-proto" }
+scheduler-core = { path = "crates/scheduler-core" }
+
+arc-swap = "1.7"
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
+bytes = "1"
+compact_str = { version = "0.9", features = ["serde"] }
+dashmap = "6.1"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+hex = "0.4"
+http = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1", "server"] }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "server", "tokio"] }
+parking_lot = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+smallvec = "1.15"
+subtle = "2.6"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }
+tower = { version = "0.5", default-features = false, features = ["util"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "std"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

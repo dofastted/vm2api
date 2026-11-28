@@ -4,6 +4,7 @@ import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
+import { createFailoverMockSchedulerRuntime } from '../helpers/mock-scheduler-runtime.mjs'
 import { validateCacheBreakpoints } from '../../src/lib/protocol/cache-ttl.mjs'
 import { withRequestProtocolBetas } from '../../src/lib/protocol/claude-code-betas.mjs'
 import { applyClaudeSSELineToMessage, createClaudeMessageAssembler } from '../../src/lib/protocol/convert.mjs'
@@ -199,10 +200,10 @@ test('CRAG whitelist fails closed 400 on unknown top-level and unrepresentable f
   }
 })
 
-test('CRAG whitelist strictly rebuilds cache_control, strips scope/evict_on_complete and thinking markers, and enforces budget/TTL order', () => {
+test('CRAG whitelist preserves valid 2.1.321 cache_control scope/evict_on_complete while stripping unknown keys and thinking markers, and enforces budget/TTL order', () => {
   assert.deepEqual(
     sanitizeCragCacheControl({ type: 'ephemeral', ttl: '1h', scope: 'org', evict_on_complete: true, foo: 'bar' }),
-    { type: 'ephemeral', ttl: '1h' },
+    { type: 'ephemeral', ttl: '1h', scope: 'org', evict_on_complete: true },
   )
   const cleaned = prepareCragRequest(
     {
@@ -257,7 +258,11 @@ test('CRAG whitelist strictly rebuilds cache_control, strips scope/evict_on_comp
   )
 
   assert.deepEqual(cleaned.system, [
-    { type: 'text', text: 'Be concise.', cache_control: { type: 'ephemeral', ttl: '1h' } },
+    {
+      type: 'text',
+      text: 'Be concise.',
+      cache_control: { type: 'ephemeral', ttl: '1h', scope: 'global', evict_on_complete: true },
+    },
   ])
   assert.deepEqual(cleaned.tools, [
     {
@@ -265,7 +270,7 @@ test('CRAG whitelist strictly rebuilds cache_control, strips scope/evict_on_comp
       description: 'Read file',
       input_schema: { type: 'object', properties: { path: { type: 'string' } } },
       defer_loading: true,
-      cache_control: { type: 'ephemeral', ttl: '1h' },
+      cache_control: { type: 'ephemeral', ttl: '1h', scope: 'org' },
     },
   ])
   assert.deepEqual(cleaned.messages[0].content, [{ type: 'text', text: 'Read README' }])
@@ -276,7 +281,7 @@ test('CRAG whitelist strictly rebuilds cache_control, strips scope/evict_on_comp
     type: 'tool_result',
     tool_use_id: 'toolu_1',
     content: [{ type: 'text', text: '# ok' }],
-    cache_control: { type: 'ephemeral', ttl: '5m' },
+    cache_control: { type: 'ephemeral', ttl: '5m', scope: 'org' },
   })
 
   // Inverted TTL (5m before 1h) auto-repairs by downgrading trailing 1h to 5m instead of 400ing
@@ -369,7 +374,11 @@ test('CRAG whitelist strictly rebuilds cache_control, strips scope/evict_on_comp
     { capabilities: V3_CAPS },
   )
   assert.doesNotThrow(() => validateCacheBreakpoints(zeroPromptBudget))
-  assert.deepEqual(zeroPromptBudget.crag_prompt.blocks[0].cache_control, { type: 'ephemeral', ttl: '5m' })
+  assert.deepEqual(zeroPromptBudget.crag_prompt.blocks[0].cache_control, {
+    type: 'ephemeral',
+    ttl: '5m',
+    scope: 'global',
+  })
   assert.deepEqual(zeroPromptBudget.crag_prompt.blocks[1].cache_control, { type: 'ephemeral', ttl: '5m' })
   assert.equal(zeroPromptBudget.messages[0].content[0].cache_control, undefined)
   assert.deepEqual(zeroPromptBudget.messages[0].content[2].cache_control, { type: 'ephemeral', ttl: '5m' })
@@ -845,15 +854,17 @@ test('handleProtocol CRAG V3 path skips pre-slot persona bloat and fake metadata
       workerStatus: health,
     }
     rememberRustHealth(exec, { ok: true, health })
-    const runner = new FailoverRunner({
-      scheduler: {
-        async selectAndReserve() {
-          return { ok: true, vmId: vm.id, accountId: vm.id, vm, exec, release() { } }
-        },
-        markSuccess() { },
-        markCooldown() { },
-        releaseAccountSessions() { },
+    const scheduler = {
+      async selectAndReserve() {
+        return { ok: true, vmId: vm.id, accountId: vm.id, vm, exec, release() {} }
       },
+      markSuccess() {},
+      markCooldown() {},
+      releaseAccountSessions() {},
+    }
+    const runner = new FailoverRunner({
+      scheduler,
+      schedulerRuntime: createFailoverMockSchedulerRuntime({ scheduler }),
       config: { max_same_account_retries: 0 },
     })
     const logs = []
@@ -867,9 +878,9 @@ test('handleProtocol CRAG V3 path skips pre-slot persona bloat and fake metadata
       once(ev, fn) {
         if (ev === 'finish') finishListeners.push(fn)
       },
-      off() { },
-      write() { },
-      end() { },
+      off() {},
+      write() {},
+      end() {},
     }
     const handler = createHandleProtocol({
       json(_res, status, body) {
@@ -879,7 +890,7 @@ test('handleProtocol CRAG V3 path skips pre-slot persona bloat and fake metadata
         for (const fn of finishListeners) fn()
         return body
       },
-      writeSSEHeaders() { },
+      writeSSEHeaders() {},
       readBody: async () => structuredClone(incoming),
       requireAuth: () => true,
       cfg: {
@@ -894,8 +905,8 @@ test('handleProtocol CRAG V3 path skips pre-slot persona bloat and fake metadata
         finish: (bag, second) => logs.push(second || bag),
       },
       stickyRouter: { extractPoolKey: () => null, collectPoolKeys: () => [] },
-      accountQuota: { ingestHeaders() { } },
-      apiKeyStore: { acquire: () => ({ ok: true }), release() { }, recordUsage() { } },
+      accountQuota: { ingestHeaders() {} },
+      apiKeyStore: { acquire: () => ({ ok: true }), release() {}, recordUsage() {} },
       apiScheduler: {},
       apiEndpointStore: {},
       stats: { errors: 0, requests: 0, by_route: {}, passthrough: 0, rewrite: 0, convert: 0 },
@@ -938,8 +949,8 @@ test('handleProtocol CRAG V3 path skips pre-slot persona bloat and fake metadata
         },
         apiKeyKind: 'managed',
         apiKeyRecord: { id: 'fixture' },
-        once() { },
-        off() { },
+        once() {},
+        off() {},
       },
       response,
       'anthropic.messages',

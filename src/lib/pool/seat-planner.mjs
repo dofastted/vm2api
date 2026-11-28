@@ -5,7 +5,7 @@
  * concurrent request of that session rides the same seat and shares the VM's
  * concurrency; a session is never split across VMs. Two sessions on the same
  * device are two seats. Seat capacity is the VM's `session_slots`;
- * concurrency and RPM stay with PoolScheduler.reserve().
+ * concurrency and RPM are managed by the Rust scheduler.
  *
  * The live seat frees when its last request and any queued follow-up finish.
  * Sticky VM memory and persisted restart holds have their own lifetimes.

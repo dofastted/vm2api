@@ -1,0 +1,21 @@
+# Read-only minimal sshd config for Custom Debian 13 EROFS KVM slots.
+# Per-slot host key and authorized_keys live exclusively on /var/lib/kin-slot/ssh (ext4 state disk).
+Port 22
+AddressFamily inet
+ListenAddress 0.0.0.0
+HostKey /var/lib/kin-slot/ssh/ssh_host_ed25519_key
+PidFile /run/sshd.pid
+PermitRootLogin prohibit-password
+PubkeyAuthentication yes
+AuthorizedKeysFile /var/lib/kin-slot/ssh/authorized_keys
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+UsePAM no
+StrictModes yes
+AllowTcpForwarding no
+X11Forwarding no
+PrintMotd no
+PrintLastLog no
+UseDNS no
+Subsystem sftp internal-sftp
+AcceptEnv LANG LC_* COLORTERM

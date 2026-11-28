@@ -269,6 +269,7 @@ function detailScore(usage) {
   if (usage.output_tokens_details) score++
   if (usage.completion_tokens_details) score++
   if (usage.cache_creation && typeof usage.cache_creation === 'object') score++
+  if (Array.isArray(usage.iterations) && usage.iterations.length > 0) score++
   if (usage.cached_tokens != null || usage.cache_read_input_tokens != null || usage.cache_read_tokens != null) score++
   if (
     usage.cache_write_tokens != null ||

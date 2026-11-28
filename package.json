@@ -18,6 +18,7 @@
     "build:egress": "mkdir -p bin && cd worker && CGO_ENABLED=0 go build -trimpath -o ../bin/kin-egress ./cmd/kin-egress",
     "build:gate": "mkdir -p bin && cd worker && CGO_ENABLED=0 go build -trimpath -o ../bin/kin-slot-gate ./cmd/kin-slot-gate",
     "build:proto-front": "mkdir -p bin && cd protofront && CGO_ENABLED=0 go build -trimpath -o ../bin/kin-proto-front ./cmd/kin-proto-front",
+    "build:scheduler": "mkdir -p bin && cd scheduler && cargo build --release --locked --bin kin-scheduler && cp \"${CARGO_TARGET_DIR:-target}/release/kin-scheduler\" ../bin/kin-scheduler.new && chmod 755 ../bin/kin-scheduler.new && mv -f ../bin/kin-scheduler.new ../bin/kin-scheduler",
     "build:web": "pnpm -C web build",
     "fetch:payload": "node scripts/fetch-payload.mjs",
     "test:web": "pnpm -C web test",

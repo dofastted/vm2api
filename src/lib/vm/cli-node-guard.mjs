@@ -14,6 +14,7 @@ import { execDetached } from '../cluster/docker-remote.mjs'
 import { NODE_CLAUDE_SETUP_PY, slotContainerName } from '../transport/rust-kernel-supervisor.mjs'
 import { isCodexVm } from './vm-kind.mjs'
 import { isKvmRuntime } from './runtime-kind.mjs'
+import { resolveKernelDataplane } from './slot-engine.mjs'
 import { slotExecCmd } from './slot-exec.mjs'
 import { slotHost } from './slot-host.mjs'
 
@@ -27,8 +28,16 @@ export const NODE_SETUP_INTERVAL_MS = 60_000
 // would only log `No such container` / `is not running`.
 const HARD_DOWN = new Set(['stopped', 'dead', 'error', 'disabled'])
 
-export function isCliNodeGuardTarget(vm) {
+function isCragV2Slot(vm, routing = null) {
+  if (!vm) return false
+  if (vm.kernel_installation?.kernel === 'crag') return true
+  if (vm.runtime?.runtime_variant === 'crag-v2') return true
+  return resolveKernelDataplane(vm, routing || {}) === 'crag'
+}
+
+export function isCliNodeGuardTarget(vm, routing = null) {
   if (!vm?.id || isCodexVm(vm)) return false
+  if (isCragV2Slot(vm, routing)) return false
   return !HARD_DOWN.has(String(vm.status || '').toLowerCase())
 }
 
@@ -75,6 +84,7 @@ exit 0
 export function createCliNodeGuard({
   listTargets,
   liveTokens = () => [],
+  getRouting = () => null,
   exec = execDetached,
   intervalMs = CLI_NODE_GUARD_INTERVAL_MS,
   logger = console,
@@ -89,7 +99,8 @@ export function createCliNodeGuard({
     inTick = true
     try {
       const tokens = liveTokens().filter(Boolean)
-      const vms = (listTargets?.() || []).filter(isCliNodeGuardTarget)
+      const routing = getRouting?.() || null
+      const vms = (listTargets?.() || []).filter((vm) => isCliNodeGuardTarget(vm, routing))
       for (const vm of vms) {
         try {
           const host = hostFor(vm)

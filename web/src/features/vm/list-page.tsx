@@ -40,6 +40,8 @@ import {
   geminiResource,
 } from '@/features/import/gemini-operations'
 import { usageQueryOptions } from '@/features/overview/queries'
+import { buildNodePoolsIndex } from '@/features/pools/node-pool-badges'
+import { schedulerPoolsQueryOptions } from '@/features/pools/queries'
 import { proxiesQueryOptions } from '@/features/proxies/queries'
 import { GeminiMaintenanceLink } from '@/features/settings/gemini-maintenance-link'
 import { planDeleteActiveVm } from '@/features/vm/active-vm'
@@ -133,6 +135,11 @@ export function VmListPage() {
   const isAdmin = me.data?.role === 'admin'
   const gemini = useQuery({ ...geminiInventoryOptions(), enabled: isAdmin })
   const proxies = useQuery({ ...proxiesQueryOptions(), enabled: isAdmin })
+  const schedulerPools = useQuery({
+    ...schedulerPoolsQueryOptions(),
+    enabled: isAdmin,
+    retry: false,
+  })
   usePoolSeatStream()
   const usage = useQuery({
     ...usageQueryOptions(5000),
@@ -242,7 +249,10 @@ export function VmListPage() {
       (!geminiInventory.available ||
         !!geminiPayloadIssue(geminiInventory) ||
         !!geminiInventory.oauth_runtime_issue))
-  const slots = geminiInventory?.available
+  const poolsByNode = buildNodePoolsIndex(
+    isAdmin ? schedulerPools.data : undefined
+  )
+  const rawSlots = geminiInventory?.available
     ? [
         ...vms,
         ...geminiInventory.environments.map((environment) =>
@@ -250,6 +260,12 @@ export function VmListPage() {
         ),
       ]
     : vms
+  const slots = poolsByNode.size
+    ? rawSlots.map((slot) => {
+        const pools = poolsByNode.get(slot.id)
+        return pools?.length ? { ...slot, pools } : slot
+      })
+    : rawSlots
   const poolQueue = vmsQ.data?.pool_queue
   const accounts = usage.data?.accounts
   const canCreate =

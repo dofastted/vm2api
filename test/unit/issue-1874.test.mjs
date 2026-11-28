@@ -5,15 +5,22 @@ import os from 'node:os'
 import path from 'node:path'
 import {
   mergeVmTestSchedulePreserve,
+  VM_TEST_RENEW_CLAIM_PREFIX,
   VM_TEST_SCHEDULE_PREFIX,
   VmTestScheduleRunner,
 } from '../../src/lib/admin/vm-test-schedule.mjs'
 import {
   fiveHourWindowFromCodexVm,
   preheatNextWindowEnd,
+  preheatOpenAIQuotaPolicy,
+  preheatRenewEpisodeKey,
   preheatWindowState,
+  preheatWindowStateForVm,
+  preheatWindowStateLikeServer,
   resolvePreheatFiveHourWindow,
+  truncateResetSec,
 } from '../../src/lib/admin/vm-test-preheat-window.mjs'
+import { OPENAI_QUOTA_DEFAULTS } from '../../src/lib/pool/openai-quota-policy.mjs'
 import { parseResetMs } from '../../src/lib/pool/quota-window.mjs'
 
 const FIXED_NOW = Date.parse('2026-10-01T12:00:00.000Z')
@@ -242,4 +249,178 @@ test('fiveHourWindowFromCodexVm reads vm file extra on disk', () => {
   )
   const w5 = fiveHourWindowFromCodexVm(root, { id: vmId, platform: 'openai' }, FIXED_NOW)
   assert.equal(parseResetMs(w5.reset), Date.parse(diskReset))
+})
+
+function routingWithCodexQuota(quota) {
+  return { codex: { quota: { ...OPENAI_QUOTA_DEFAULTS, ...quota } } }
+}
+
+function codexExtraVm(overrides = {}) {
+  return {
+    id: 'vm-codex',
+    platform: 'openai',
+    has_token: true,
+    schedulable: true,
+    codex: {
+      has_access: true,
+      extra: {
+        codex_secondary_used_percent: 20,
+        codex_secondary_window_minutes: 300,
+        codex_secondary_reset_at: new Date(FIXED_NOW + 3_600_000).toISOString(),
+        codex_primary_used_percent: 20,
+        codex_primary_window_minutes: 10080,
+        codex_primary_reset_at: new Date(FIXED_NOW + 7 * 24 * 3600_000).toISOString(),
+        ...overrides,
+      },
+    },
+  }
+}
+
+test('preheatRenewEpisodeKey uses whole-second reset anchors', () => {
+  const vm = codexVmWithReset(new Date(RESET_FUTURE_MS).toISOString())
+  const episode = preheatRenewEpisodeKey(vm, { projectRoot: null, now: FIXED_NOW })
+  assert.ok(episode?.key)
+  assert.equal(episode.reset5hSec, truncateResetSec(new Date(RESET_FUTURE_MS).toISOString()))
+  assert.ok(episode.reset7dSec)
+})
+
+test('preheatWindowState blocks only exhausted 5h (7d still healthy)', () => {
+  const vm = codexExtraVm({
+    codex_secondary_used_percent: 100,
+    codex_secondary_reset_at: new Date(FIXED_NOW + 3_600_000).toISOString(),
+    codex_primary_used_percent: 34,
+  })
+  const state = preheatWindowState(vm, { projectRoot: null, now: FIXED_NOW })
+  assert.equal(state.windowLive, true)
+  assert.equal(state.reason, 'quota_5h_header')
+})
+
+test('preheatWindowState blocks only exhausted 7d (5h still healthy)', () => {
+  const vm = codexExtraVm({
+    codex_primary_used_percent: 100,
+    codex_primary_reset_at: new Date(FIXED_NOW + 5 * 24 * 3600_000).toISOString(),
+    codex_secondary_used_percent: 34,
+  })
+  const state = preheatWindowState(vm, { projectRoot: null, now: FIXED_NOW })
+  assert.equal(state.windowLive, true)
+  assert.equal(state.reason, 'quota_7d_header')
+})
+
+test('preheatWindowState blocks when both 5h and 7d are capped', () => {
+  const vm = codexExtraVm({
+    codex_secondary_used_percent: 100,
+    codex_secondary_reset_at: new Date(FIXED_NOW + 3_600_000).toISOString(),
+    codex_primary_used_percent: 100,
+    codex_primary_reset_at: new Date(FIXED_NOW + 5 * 24 * 3600_000).toISOString(),
+  })
+  const state = preheatWindowState(vm, { projectRoot: null, now: FIXED_NOW })
+  assert.equal(state.windowLive, true)
+  assert.match(state.reason, /^quota_(5h|7d)_header$/)
+})
+
+test('preheatWindowStateForVm skips when 7d usage exceeds configured codex.quota limit_7d but is below hard cap', () => {
+  const vm = codexExtraVm({
+    codex_primary_used_percent: 92,
+    codex_primary_reset_at: new Date(FIXED_NOW + 5 * 24 * 3600_000).toISOString(),
+    codex_secondary_used_percent: 40,
+  })
+  const routing = routingWithCodexQuota({ limit_7d: 0.9 })
+  const state = preheatWindowStateForVm(vm, { projectRoot: null, routingConfig: routing, now: FIXED_NOW })
+  assert.equal(state.windowLive, true)
+  assert.equal(state.reason, 'quota_7d_local')
+})
+
+test('preheatWindowStateLikeServer reads live routingConfig.codex.quota without an explicit openaiQuotaPolicy', () => {
+  const vm = codexExtraVm({
+    codex_primary_used_percent: 92,
+    codex_primary_reset_at: new Date(FIXED_NOW + 5 * 24 * 3600_000).toISOString(),
+    codex_secondary_used_percent: 100,
+    codex_secondary_reset_at: new Date(FIXED_NOW - 1_000).toISOString(),
+  })
+  let routingConfig = routingWithCodexQuota({ limit_7d: 1 })
+  let state = preheatWindowStateLikeServer(vm, () => routingConfig, { projectRoot: null, now: FIXED_NOW })
+  assert.equal(state.windowLive, false)
+
+  routingConfig = routingWithCodexQuota({ limit_7d: 0.9 })
+  state = preheatWindowStateLikeServer(vm, () => routingConfig, { projectRoot: null, now: FIXED_NOW })
+  assert.equal(state.windowLive, true)
+  assert.equal(state.reason, 'quota_7d_local')
+})
+
+test('preheatWindowStateForVm skips when 5h reset elapsed but 7d still exceeds configured soft limit', () => {
+  const vm = codexExtraVm({
+    codex_secondary_used_percent: 100,
+    codex_secondary_reset_at: new Date(FIXED_NOW - 3_600_000).toISOString(),
+    codex_primary_used_percent: 91,
+    codex_primary_reset_at: new Date(FIXED_NOW + 5 * 24 * 3600_000).toISOString(),
+  })
+  const state = preheatWindowStateForVm(vm, {
+    projectRoot: null,
+    routingConfig: routingWithCodexQuota({ limit_7d: 0.9 }),
+    now: FIXED_NOW,
+  })
+  assert.equal(state.windowLive, true)
+  assert.equal(state.reason, 'quota_7d_local')
+})
+
+test('preheatOpenAIQuotaPolicy ignores vm.policy.quota on Codex (global routing only)', () => {
+  const vm = codexExtraVm()
+  vm.policy = { quota: { limit_7d: 0.5 } }
+  const global = routingWithCodexQuota({ limit_7d: 0.9 })
+  const policy = preheatOpenAIQuotaPolicy(vm, global)
+  assert.equal(policy.limit_7d, 0.9)
+  const vm2 = codexExtraVm({
+    codex_primary_used_percent: 60,
+    codex_primary_reset_at: new Date(FIXED_NOW + 5 * 24 * 3600_000).toISOString(),
+    codex_secondary_used_percent: 100,
+    codex_secondary_reset_at: new Date(FIXED_NOW - 1_000).toISOString(),
+  })
+  vm2.policy = { quota: { limit_7d: 0.5 } }
+  const blocked = preheatWindowStateForVm(vm2, { projectRoot: null, routingConfig: global, now: FIXED_NOW })
+  assert.equal(blocked.windowLive, false, 'hand-edited per-vm limits must not tighten preheat vs scheduler')
+})
+
+test('auto-renew sweep survives stop/reload without resending the same episode', async () => {
+  const expiredVm = codexVmWithReset(new Date(RESET_EXPIRED_MS).toISOString())
+  expiredVm.codex.extra.codex_secondary_used_percent = 100
+  let calls = 0
+  const settings = new MemorySettings()
+  const shared = {
+    projectRoot: '/missing',
+    settings: () => settings,
+    list: () => [expiredVm],
+    runTest: async () => {
+      calls += 1
+      return { ok: true, duration_ms: 1 }
+    },
+    windowState: () => ({ hasCredential: true, schedulable: true, windowLive: false }),
+    nextWindowEnd: () => RESET_EXPIRED_MS,
+    now: () => FIXED_NOW,
+  }
+  const schedule = new VmTestScheduleRunner(shared)
+  settings.set(`${VM_TEST_SCHEDULE_PREFIX}vm-codex`, {
+    enabled: true,
+    mode: 'preheat',
+    auto_renew: true,
+    frequency: 'daily',
+    time: '09:00',
+    timezone: 'Asia/Shanghai',
+    cron: '0 9 * * *',
+    model: 'gpt-5-codex',
+    prompt: 'ping',
+    max_tokens: null,
+    reasoning_effort: 'medium',
+  })
+  schedule.start()
+  await schedule._sweepElapsedWindows()
+  assert.equal(calls, 1)
+  const claim = settings.get(`${VM_TEST_RENEW_CLAIM_PREFIX}vm-codex`)
+  assert.ok(claim?.episode_key)
+  schedule.stop()
+
+  const restored = new VmTestScheduleRunner(shared)
+  restored.start()
+  await restored._sweepElapsedWindows()
+  assert.equal(calls, 1)
+  restored.stop()
 })

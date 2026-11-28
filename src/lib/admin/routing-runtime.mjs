@@ -64,6 +64,7 @@ import { isCodexVm } from '../vm/vm-kind.mjs'
 import { syncCodexQuotaSchedule } from '../vm/vm-registry.mjs'
 import { wakeOpenAIWaiter } from '../pool/openai-account-runtime.mjs'
 import { normalizeVmConfig } from '../vm/machine-spec.mjs'
+import { normalizeCragZombieGuardConfig } from '../vm/crag-zombie-guard.mjs'
 import { applyNativeTelemetry } from '../vm/fleet-update.mjs'
 import {
   telemetryDefaultEnabled,
@@ -85,6 +86,7 @@ export function createRoutingRuntime(ctx) {
   const getHealth = () => (typeof ctx.getHealthMonitor === 'function' ? ctx.getHealthMonitor() : ctx.healthMonitor)
   const getUsage = () => ctx.usageProbeMonitor
   const getWarmup = () => ctx.warmupMonitor
+  const getCragZombieGuard = () => ctx.cragZombieGuard
   const getNotify = () => ctx.notifyMonitor
   const setRuntimeRepo = (next) => {
     if (typeof ctx.setRuntimeRepo === 'function') ctx.setRuntimeRepo(next)
@@ -374,14 +376,69 @@ export function createRoutingRuntime(ctx) {
 
   function applyHealthProbeRoutingBody(body, previous = null) {
     if (!body || typeof body !== 'object' || body.health_probe == null) return
-    const prev = previous && typeof previous === 'object' ? previous : {}
+    const prev = normalizeHealthProbeConfig(previous && typeof previous === 'object' ? previous : {})
     const next = body.health_probe && typeof body.health_probe === 'object' ? body.health_probe : {}
     const routingConfig = getRouting()
+
+    const hasNextAnthropic = next.anthropic && typeof next.anthropic === 'object'
+    const hasNextOpenai = next.openai && typeof next.openai === 'object'
+    const hasNextGoogle = next.google && typeof next.google === 'object'
+    const hasNextReal = next.real && typeof next.real === 'object'
+    const hasNextGemini = next.gemini && typeof next.gemini === 'object'
+
+    const nextAnthropic = { ...prev.anthropic, ...(hasNextAnthropic ? next.anthropic : {}) }
+    const nextOpenai = { ...prev.openai, ...(hasNextOpenai ? next.openai : {}) }
+    const nextGoogle = { ...prev.google, ...(hasNextGoogle ? next.google : {}) }
+
+    if (!hasNextAnthropic) {
+      if (Object.prototype.hasOwnProperty.call(next, 'interval_sec')) nextAnthropic.interval_sec = next.interval_sec
+      if (Object.prototype.hasOwnProperty.call(next, 'cache_ttl_sec')) nextAnthropic.cache_ttl_sec = next.cache_ttl_sec
+      else if (Object.prototype.hasOwnProperty.call(next, 'max_stale_sec'))
+        nextAnthropic.cache_ttl_sec = next.max_stale_sec
+      if (Object.prototype.hasOwnProperty.call(next, 'probe_all_slots'))
+        nextAnthropic.probe_all_slots = next.probe_all_slots
+      if (hasNextReal) {
+        if (Object.prototype.hasOwnProperty.call(next.real, 'model')) {
+          nextAnthropic.models = next.real.model ? [next.real.model] : []
+        }
+        for (const k of ['prompt', 'max_tokens', 'timeout_ms', 'outbound_mode', 'vm_ids']) {
+          if (Object.prototype.hasOwnProperty.call(next.real, k)) nextAnthropic[k] = next.real[k]
+        }
+      }
+      if (!hasNextOpenai && !hasNextGoogle && Object.prototype.hasOwnProperty.call(next, 'enabled')) {
+        nextAnthropic.enabled = next.enabled
+      }
+    }
+
+    if (!hasNextOpenai && hasNextReal) {
+      if (Object.prototype.hasOwnProperty.call(next.real, 'openai_model')) {
+        nextOpenai.models = next.real.openai_model ? [next.real.openai_model] : []
+        if (!hasNextAnthropic && !hasNextGoogle && nextAnthropic.enabled) {
+          nextOpenai.enabled = nextOpenai.models.length > 0
+        }
+      }
+      for (const k of ['prompt', 'max_tokens', 'timeout_ms', 'vm_ids']) {
+        if (Object.prototype.hasOwnProperty.call(next.real, k)) nextOpenai[k] = next.real[k]
+      }
+    }
+
+    if (!hasNextGoogle && hasNextGemini) {
+      for (const k of ['enabled', 'interval_sec', 'cache_ttl_sec', 'all_models', 'prompt', 'timeout_ms']) {
+        if (Object.prototype.hasOwnProperty.call(next.gemini, k)) nextGoogle[k] = next.gemini[k]
+      }
+      if (Object.prototype.hasOwnProperty.call(next.gemini, 'models')) {
+        nextGoogle.models = next.gemini.models
+      } else if (Object.prototype.hasOwnProperty.call(next.gemini, 'model')) {
+        nextGoogle.models = next.gemini.model ? [next.gemini.model] : []
+      }
+    }
+
     routingConfig.health_probe = normalizeHealthProbeConfig({
       ...prev,
       ...next,
-      real: { ...(prev.real || {}), ...(next.real || {}) },
-      gemini: { ...(prev.gemini || {}), ...(next.gemini || {}) },
+      anthropic: nextAnthropic,
+      openai: nextOpenai,
+      google: nextGoogle,
       match: { ...(prev.match || {}), ...(next.match || {}) },
     })
     getHealth()?.setConfig(routingConfig.health_probe)
@@ -407,6 +464,16 @@ export function createRoutingRuntime(ctx) {
     getWarmup()?.setConfig(routingConfig.warmup)
   }
 
+  function applyCragZombieGuardRoutingBody(body, previous = null) {
+    if (!body || typeof body !== 'object' || body.crag_zombie_guard == null) return
+    const routingConfig = getRouting()
+    routingConfig.crag_zombie_guard = normalizeCragZombieGuardConfig({
+      ...(previous && typeof previous === 'object' ? previous : {}),
+      ...(body.crag_zombie_guard && typeof body.crag_zombie_guard === 'object' ? body.crag_zombie_guard : {}),
+    })
+    getCragZombieGuard()?.setConfig(routingConfig.crag_zombie_guard)
+  }
+
   function applyNotifyRoutingBody(body, previous = null) {
     if (!body || typeof body !== 'object' || body.notify == null) return
     const routingConfig = getRouting()
@@ -419,6 +486,7 @@ export function createRoutingRuntime(ctx) {
     return (
       Object.prototype.hasOwnProperty.call(compatibility, 'cache_ttl') ||
       Object.prototype.hasOwnProperty.call(compatibility, 'persona_preset') ||
+      Object.prototype.hasOwnProperty.call(compatibility, 'crag_persona_preset') ||
       Object.prototype.hasOwnProperty.call(compatibility, 'cch_enabled') ||
       Object.prototype.hasOwnProperty.call(compatibility, 'cc_entrypoint')
     )
@@ -533,6 +601,7 @@ export function createRoutingRuntime(ctx) {
     const prevHealthProbe = routingConfig.health_probe
     const prevUsageProbe = routingConfig.usage_probe
     const prevWarmup = routingConfig.warmup
+    const prevCragZombieGuard = routingConfig.crag_zombie_guard
     const prevNotify = routingConfig.notify
     const prevTiers = routingConfig.tiers
     const prevIdleMs = streamIdleTimeoutMs(routingConfig)
@@ -565,6 +634,20 @@ export function createRoutingRuntime(ctx) {
       routingConfig.compatibility = { ...(routingConfig.compatibility || {}), ...body.compatibility }
       delete routingConfig.compatibility.persona_rules
       delete routingConfig.compatibility.persona_leak_append
+      // Unified SSOT: saving persona_preset retires stale crag_persona_preset drift.
+      if (
+        Object.prototype.hasOwnProperty.call(body.compatibility, 'persona_preset') &&
+        !Object.prototype.hasOwnProperty.call(body.compatibility, 'crag_persona_preset')
+      ) {
+        delete routingConfig.compatibility.crag_persona_preset
+      } else if (
+        !Object.prototype.hasOwnProperty.call(body.compatibility, 'persona_preset') &&
+        Object.prototype.hasOwnProperty.call(body.compatibility, 'crag_persona_preset') &&
+        String(body.compatibility.crag_persona_preset || '').trim() !== ''
+      ) {
+        routingConfig.compatibility.persona_preset = body.compatibility.crag_persona_preset
+        delete routingConfig.compatibility.crag_persona_preset
+      }
       if (
         Object.prototype.hasOwnProperty.call(body.compatibility, 'cch_enabled') ||
         routingConfig.compatibility.cch_enabled == null
@@ -613,6 +696,7 @@ export function createRoutingRuntime(ctx) {
     applyHealthProbeRoutingBody(body, prevHealthProbe)
     applyUsageProbeRoutingBody(body, prevUsageProbe)
     applyWarmupRoutingBody(body, prevWarmup)
+    applyCragZombieGuardRoutingBody(body, prevCragZombieGuard)
     applyNotifyRoutingBody(body, prevNotify)
     routingConfig.tiers = normalizeTiers(
       body.tiers ? mergeTierMaps(prevTiers, body.tiers) : prevTiers,

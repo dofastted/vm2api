@@ -3,6 +3,8 @@
 ARG NODE_IMAGE=node:22-bookworm-slim@sha256:de170b39439eb0e5a3444ad7d60b015614a381e10fecae2e30ec9e735122f38d
 # The prebuilt Rust payloads require GLIBC_2.39 (Ubuntu 24.04).
 ARG AMD64_RUNTIME_IMAGE=ubuntu:24.04@sha256:f610ab94648195aa356059f5b41d6085c9d4d903c072430cdd1af7bdb646106b
+# Multi-arch OCI index digest (linux/amd64 + linux/arm64), verified against Docker Hub.
+ARG RUST_IMAGE=rust:1.86-bookworm@sha256:300ec56abce8cc9448ddea2172747d048ed902a3090e6b57babb2bf19f754081
 FROM --platform=linux/amd64 ${AMD64_RUNTIME_IMAGE} AS amd64-runtime
 
 FROM --platform=linux/arm64 golang:1.25-bookworm@sha256:3b4a11519ad929d1e1d261a12cff056f0c85b735253d7d861346b9c6f8b36437 AS helpers
@@ -23,6 +25,13 @@ RUN cd worker && go build -buildvcs=false -trimpath -ldflags="-s -w" -o /out/kin
     && CGO_ENABLED=0 GOARCH=amd64 go build -buildvcs=false -trimpath -o /out/amd64/kin-slot-gate ./cmd/kin-slot-gate \
     && cd ../api-kernel && go build -buildvcs=false -trimpath -ldflags="-s -w" -o /out/kin-api-kernel ./cmd/kin-api-kernel \
     && cd ../redact && go build -buildvcs=false -trimpath -ldflags="-s -w" -o /out/kin-redact ./cmd/kin-redact
+
+FROM --platform=linux/arm64 ${RUST_IMAGE} AS scheduler
+WORKDIR /src/scheduler
+COPY scheduler/ ./
+RUN RUSTUP_TOOLCHAIN="${RUST_VERSION}" cargo build --release --locked --bin kin-scheduler \
+    && mkdir -p /out \
+    && cp target/release/kin-scheduler /out/kin-scheduler
 
 FROM --platform=linux/arm64 ${NODE_IMAGE} AS web
 RUN npm install -g pnpm@10
@@ -90,6 +99,7 @@ RUN mkdir -p /usr/lib64 \
 COPY deploy/check-x86-deps.py ./deploy/check-x86-deps.py
 # The standard entrypoint refreshes bind-mounted helpers from image-bin on boot.
 COPY --from=helpers /out/kin-egress /out/kin-worker /out/kin-api-kernel /out/kin-redact /opt/vm2api/image-bin/
+COPY --from=scheduler /out/kin-scheduler /opt/vm2api/image-bin/kin-scheduler
 COPY scripts/docker-entrypoint.sh /usr/local/bin/vm2api-entrypoint
 RUN chmod 755 /usr/local/bin/vm2api-entrypoint /opt/vm2api/image-bin/* \
     /opt/vm2api/image-wrap-cli/cli-node \
@@ -111,6 +121,7 @@ ENV NODE_ENV=production \
     KIN_COMPUTER_BIN=/opt/vm2api/bin/kin-computer \
     KIN_API_KERNEL_BIN=/opt/vm2api/bin/kin-api-kernel \
     KIN_REDACT_BIN=/opt/vm2api/bin/kin-redact \
+    KIN_SCHEDULER_BIN=/opt/vm2api/bin/kin-scheduler \
     KIN_CLUSTER_WORKER_BIN=/opt/vm2api/cluster-bin-amd64/kin-worker \
     KIN_CLUSTER_EGRESS_BIN=/opt/vm2api/cluster-bin-amd64/kin-egress \
     KIN_CLUSTER_GATE_BIN=/opt/vm2api/cluster-bin-amd64/kin-slot-gate \

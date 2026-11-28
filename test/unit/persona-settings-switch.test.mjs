@@ -133,14 +133,12 @@ test('settings save rewrite/official_prompt/overwrite/zero/none hot-reads withou
 
     persistSettings(file, { persona_inject: 'official_prompt', persona_park: true })
     const official = applyFromSettings(file)
-    assert.equal(official.system.length, 4)
+    assert.equal(official.system.length, 2)
     assert.equal(official.system[1].text, CRS_OFFICIAL_CLI_SYSTEM)
-    assert.equal(official.system[2].text, OFFICIAL_303_HARNESS)
-    assert.equal(official.system[3].text, '__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__')
     assert.ok(!official.system.some((b) => String(b?.text || '').includes(DEFAULT_AGENT_STANDING)))
     assert.ok(!official.system.some((b) => b?.text === CRS_AGENT_EXPANSION))
     assert.equal(envTextAt(official), '')
-    assert.match(roleSystemEnv(official), /^# Environment\n/)
+    assert.equal(roleSystemEnv(official), '')
     assert.match(firstUser(official), /MANDATORY constraints for this turn/)
 
     persistSettings(file, { persona_inject: 'overwrite' })
@@ -283,11 +281,13 @@ test('zero agent aliases match settings radio values', () => {
   assert.equal(normalizePersonaAgent('required'), 'required')
 })
 
-test('official_prompt puts standing before the 303 harness and moves leftover into the first user turn', () => {
+test('official_prompt puts standing before the 303 harness when enabled and moves leftover into the first user turn', () => {
   withRouting((file) => {
     persistSettings(file, {
       persona_inject: 'official_prompt',
       persona_park: true,
+      persona_block_presets: { official: { harness: true } },
+      persona_env_presets: { official: true },
       agent_standing_presets: { official: true },
     })
     const withAgent = applyFromSettings(file, {

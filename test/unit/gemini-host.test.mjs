@@ -10,6 +10,7 @@ import { fileURLToPath } from 'node:url'
 import { authorizePanelRoute } from '../../src/lib/admin/panel-acl.mjs'
 import { PoolScheduler } from '../../src/lib/pool/pool-scheduler.mjs'
 import { createGeminiScheduler } from '../../src/lib/gemini/scheduler.mjs'
+import { createMockSchedulerRuntime } from '../helpers/mock-scheduler-runtime.mjs'
 import { dispatchGeminiNativeTurn, prepareGeminiNativeTurn } from '../../src/lib/gemini/native-turn.mjs'
 import { AGY_SHA256, installGeminiPayload, readSignedGeminiManifest } from '../../src/lib/gemini/payload.mjs'
 import {
@@ -1009,18 +1010,15 @@ test('the public scheduler completes one turn through the host socket', async ()
   })
   const previous = process.env.KIN_GEMINI_HOST_SOCKET
   process.env.KIN_GEMINI_HOST_SOCKET = socketPath
-  const reservation = { release() {} }
+  const poolStub = {
+    unitCircuit: { recordSuccess() {}, recordFailure() {}, releaseProbe() {} },
+    lastUsed: new Map(),
+  }
   const scheduler = createGeminiScheduler({
     callHost: callGeminiHost,
     resolveProxy: () => proxyUrl,
-    poolScheduler: {
-      reserveExternalCandidates: (candidates) => ({
-        selected: { ...candidates[0], accountId: `gemini:${account.id}` },
-        reservation,
-      }),
-      unitCircuit: { recordSuccess() {}, recordFailure() {}, releaseProbe() {} },
-      lastUsed: new Map(),
-    },
+    poolScheduler: poolStub,
+    schedulerRuntime: createMockSchedulerRuntime({ poolScheduler: poolStub }),
   })
   const handle = createGeminiPublicHandler({
     json: (_response, status, body) => ({ status, body }),
@@ -1070,8 +1068,10 @@ test('Gemini gateway uses shared account reservations and each selected environm
     resolveBoth = resolve
   })
   const pool = new PoolScheduler()
+  const runtime = createMockSchedulerRuntime({ poolScheduler: pool })
   const scheduler = createGeminiScheduler({
     poolScheduler: pool,
+    schedulerRuntime: runtime,
     resolveProxy: (proxyId) => `socks5h://192.0.2.${proxyId === 'px-1' ? '11' : '12'}:1080`,
     callHost: async (operation, input) => {
       if (operation === 'list') return { payload_state: 'installed', environments }
@@ -1102,10 +1102,11 @@ test('Gemini gateway uses shared account reservations and each selected environm
     ['px-1', 'socks5h://192.0.2.11:1080'],
     ['px-2', 'socks5h://192.0.2.12:1080'],
   ])
-  assert.equal(pool.inflight.size, 2)
+  assert.equal(runtime.inflightCount(), 2)
   finish = true
   const results = await Promise.all([first, second])
   assert.deepEqual(new Set(results.map((result) => result.text)), new Set(['reply one', 'reply two']))
+  assert.equal(runtime.inflightCount(), 0)
   assert.equal(pool.inflight.size, 0)
 })
 
@@ -1127,6 +1128,7 @@ test('a selected Gemini location rejection stays HTTP 403 and counts toward the 
   now = 2001
   const scheduler = createGeminiScheduler({
     poolScheduler: pool,
+    schedulerRuntime: createMockSchedulerRuntime({ poolScheduler: pool }),
     resolveProxy: () => proxyUrl,
     callHost: async (operation, input) => {
       if (operation === 'list') return { payload_state: 'installed', environments: [account] }
@@ -1181,28 +1183,25 @@ test('client disconnect cancels the Gemini run without recording a circuit failu
   const statusPolled = new Promise((resolve) => {
     resolveStatusPoll = resolve
   })
-  const scheduler = createGeminiScheduler({
-    resolveProxy: () => proxyUrl,
-    poolScheduler: {
-      reserveExternalCandidates(candidates) {
-        return {
-          selected: candidates[0],
-          reservation: {
-            release() {
-              events.reservationReleased += 1
-            },
-          },
-        }
+  const poolStub = {
+    unitCircuit: {
+      recordFailure() {
+        events.failures += 1
       },
-      unitCircuit: {
-        recordFailure() {
-          events.failures += 1
-        },
-        releaseProbe(id) {
-          events.probeAccountIds.push(id)
-        },
+      releaseProbe(id) {
+        events.probeAccountIds.push(id)
       },
     },
+  }
+  const scheduler = createGeminiScheduler({
+    resolveProxy: () => proxyUrl,
+    poolScheduler: poolStub,
+    schedulerRuntime: createMockSchedulerRuntime({
+      poolScheduler: poolStub,
+      onRelease: () => {
+        events.reservationReleased += 1
+      },
+    }),
     callHost: async (operation) => {
       if (operation === 'list') return { payload_state: 'installed', environments: [account] }
       if (operation === 'get') return account
@@ -1258,9 +1257,11 @@ test('Google API route uses shared pool reservation and returns Google response 
     models: [model],
   }
   const pool = new PoolScheduler()
+  const runtime = createMockSchedulerRuntime({ poolScheduler: pool })
   const testChat = []
   const scheduler = createGeminiScheduler({
     poolScheduler: pool,
+    schedulerRuntime: runtime,
     resolveProxy: () => proxyUrl,
     callHost: async (operation, payload) => {
       if (operation === 'list') return { payload_state: 'installed', environments: [account] }
@@ -1299,6 +1300,7 @@ test('Google API route uses shared pool reservation and returns Google response 
   assert.equal(testChat.length, 1)
   assert.equal(testChat[0].id, account.id)
   assert.equal(testChat[0].proxy_id, account.proxy_id)
+  assert.equal(runtime.inflightCount(), 0)
   assert.equal(pool.inflight.size, 0)
 })
 
@@ -1609,6 +1611,7 @@ test('Gemini scheduler allows 10 concurrent slots on acc1 with strict per-accoun
     'px-2': 'socks5h://u2:p2@192.0.2.102:1080',
   }
   const pool = new PoolScheduler()
+  const runtime = createMockSchedulerRuntime({ poolScheduler: pool, maxConcurrency: 10 })
   const inflightPayloads = []
   const releases = []
   let resolveAll10
@@ -1618,6 +1621,7 @@ test('Gemini scheduler allows 10 concurrent slots on acc1 with strict per-accoun
 
   const scheduler = createGeminiScheduler({
     poolScheduler: pool,
+    schedulerRuntime: runtime,
     resolveProxy: (pid) => proxyMap[pid],
     callHost: async (op, input) => {
       if (op === 'list') return { payload_state: 'installed', environments: [environments[0]] }
@@ -1654,10 +1658,11 @@ test('Gemini scheduler allows 10 concurrent slots on acc1 with strict per-accoun
     }),
   )
   await tenActive
-  assert.equal(pool.inflight.get('gemini:gemini-acc1'), 10)
+  assert.equal(runtime.inflightCount('gemini_env:gemini-acc1'), 10)
   for (const release of releases) release()
   const results = await Promise.all(tasks)
   assert.equal(results.length, 10)
+  assert.equal(runtime.inflightCount(), 0)
   assert.equal(pool.inflight.size, 0)
 })
 
@@ -1908,4 +1913,91 @@ test('synchronous host errors and polled test-chat runs report the same resident
     assert.equal(pollRes.body.data.error.code, code)
     assert.equal(startRes.body.error.message, pollRes.body.data.error.message)
   }
+})
+
+test('geminiProxyFor accepts HTTP and domain proxies, forwards egress_options when set, and maps 503 gemini_oauth_client_not_configured', async () => {
+  const { geminiProxyEgressOptionsFor, geminiProxyFor } = await import('../../src/lib/gemini/routes.mjs')
+  const makePool = (rows, urls) => ({
+    snapshot: () => ({ proxies: rows }),
+    getProxyByIdWithAuth: (id) => urls[id] || null,
+  })
+
+  const pool = makePool(
+    [
+      {
+        id: 'px-http',
+        enabled: true,
+        status: 'ok',
+        kind: 'http',
+        domain_forward: true,
+        dns_disable_svcb_https: true,
+        owner_user_id: null,
+      },
+      { id: 'px-dom', enabled: true, status: 'ok', kind: 'socks5', owner_user_id: null },
+      { id: 'px-http80', enabled: true, status: 'ok', kind: 'http', owner_user_id: null },
+      { id: 'px-local', enabled: true, status: 'ok', kind: 'http', owner_user_id: null },
+      { id: 'px-v6', enabled: true, status: 'ok', kind: 'socks5', owner_user_id: null },
+    ],
+    {
+      'px-http': { url: 'http://alice:pw@192.0.2.30:8080', domain_forward: true, dns_disable_svcb_https: true },
+      'px-dom': { url: 'socks5://u:p@proxy.example.com:1080' },
+      'px-http80': { url: 'http://proxy.example.com' },
+      'px-local': { url: 'http://localhost:8080' },
+      'px-v6': { url: 'socks5h://[2001:db8::1]:1080' },
+    },
+  )
+
+  assert.equal(geminiProxyFor(pool, 'px-http'), 'http://alice:pw@192.0.2.30:8080')
+  assert.equal(geminiProxyFor(pool, 'px-dom'), 'socks5h://u:p@proxy.example.com:1080')
+  assert.equal(geminiProxyFor(pool, 'px-http80'), 'http://proxy.example.com:80')
+  assert.throws(() => geminiProxyFor(pool, 'px-local'), { code: 'gemini_proxy_unavailable' })
+  assert.throws(() => geminiProxyFor(pool, 'px-v6'), { code: 'gemini_proxy_unavailable' })
+
+  assert.deepEqual(geminiProxyEgressOptionsFor(pool, 'px-http'), {
+    domain_forward: true,
+    dns_empty_types: [64, 65],
+  })
+  assert.equal(geminiProxyEgressOptionsFor(pool, 'px-dom'), null)
+
+  // Panel create forwards egress_options only when configured and maps 503 gemini_oauth_client_not_configured.
+  const calls = []
+  const response = { setHeader() {} }
+  const panel = createGeminiPanelHandler({
+    json: (_res, status, body) => ({ status, body }),
+    readBody: async (req) => req.body,
+    proxyPool: () => pool,
+    callHost: (op, payload) => {
+      calls.push([op, payload])
+      if (op === 'create' && payload.name === 'missing-oauth') {
+        throw Object.assign(new Error('gemini_oauth_client_not_configured'), {
+          code: 'gemini_oauth_client_not_configured',
+          status: 503,
+        })
+      }
+      return {
+        ...record,
+        proxy_id: payload.proxy_id,
+        account: { state: 'error', error_message: 'failed via http://alice:pw@192.0.2.30:8080' },
+      }
+    },
+  })
+  const runPanel = (method, pathname, body) => panel({ method, pathname, body }, response, pathname)
+
+  const okCreate = await runPanel('POST', '/api/panel/gemini/environments', {
+    name: 'http-env',
+    proxy_id: 'px-http',
+  })
+  assert.equal(okCreate.status, 200)
+  assert.deepEqual(calls[0][1].egress_options, { domain_forward: true, dns_empty_types: [64, 65] })
+  // HTTP proxy credentials in account error_message must be redacted.
+  assert.ok(!okCreate.body.data.account.error_message.includes('alice:pw'))
+  assert.ok(okCreate.body.data.account.error_message.includes('[redacted proxy URL]'))
+
+  const missingOAuth = await runPanel('POST', '/api/panel/gemini/environments', {
+    name: 'missing-oauth',
+    proxy_id: 'px-dom',
+  })
+  assert.equal(missingOAuth.status, 503)
+  assert.equal(missingOAuth.body.error.code, 'gemini_oauth_client_not_configured')
+  assert.equal('egress_options' in calls[1][1], false)
 })

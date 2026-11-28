@@ -1,0 +1,157 @@
+From: vm2api <dev@vm2api.org>
+Subject: [PATCH] uts: add write-once PR_KIN_SET_UTS_ONCE (0x564d3201) prctl for KVM guest identity
+
+Target kernel: Debian Trixie linux-source-6.12 (6.12.118-1)
+Allows initial-namespace root (CAP_SYS_ADMIN, GLOBAL_ROOT_UID, init_uts_ns,
+init_pid_ns) to atomically seal and set init_uts_ns.name.{release,version}
+and the /proc/version build/compiler banner segment once during early boot.
+Preserves 0444 sysctl permissions and validates all fields before sealing.
+
+--- a/include/uapi/linux/prctl.h
++++ b/include/uapi/linux/prctl.h
+@@ -328,4 +328,7 @@
+ # define PR_PPC_DEXCR_CTRL_CLEAR_ONEXEC	0x10 /* Clear the aspect on exec */
+ # define PR_PPC_DEXCR_CTRL_MASK		0x1f
+ 
++/* Write-once UTS and /proc/version identity override for isolated KVM guests */
++#define PR_KIN_SET_UTS_ONCE		0x564d3201
++
+ #endif /* _LINUX_PRCTL_H */
+--- a/include/linux/utsname.h
++++ b/include/linux/utsname.h
+@@ -89,4 +89,7 @@
+ 
+ extern struct rw_semaphore uts_sem;
+ 
++#define KIN_PROC_VERSION_MID_LEN	192
++extern char kin_proc_version_mid[KIN_PROC_VERSION_MID_LEN];
++
+ #endif /* _LINUX_UTSNAME_H */
+--- a/fs/proc/version.c
++++ b/fs/proc/version.c
+@@ -4,15 +4,26 @@
+ #include <linux/kernel.h>
+ #include <linux/proc_fs.h>
+ #include <linux/seq_file.h>
++#include <linux/rwsem.h>
+ #include <linux/utsname.h>
+ #include "internal.h"
+ 
+ static int version_proc_show(struct seq_file *m, void *v)
+ {
+-	seq_printf(m, linux_proc_banner,
+-		utsname()->sysname,
+-		utsname()->release,
+-		utsname()->version);
++	down_read(&uts_sem);
++	if (kin_proc_version_mid[0]) {
++		seq_printf(m, "%s version %s %s %s\n",
++			utsname()->sysname,
++			utsname()->release,
++			kin_proc_version_mid,
++			utsname()->version);
++	} else {
++		seq_printf(m, linux_proc_banner,
++			utsname()->sysname,
++			utsname()->release,
++			utsname()->version);
++	}
++	up_read(&uts_sem);
+ 	return 0;
+ }
+ 
+--- a/kernel/sys.c
++++ b/kernel/sys.c
+@@ -60,6 +60,7 @@
+ #include <linux/sched/mm.h>
+ #include <linux/sched/coredump.h>
+ #include <linux/sched/task.h>
++#include <linux/pid_namespace.h>
+ #include <linux/sched/cputime.h>
+ #include <linux/rcupdate.h>
+ #include <linux/uidgid.h>
+@@ -2470,6 +2471,74 @@
+ 	return sizeof(mm->saved_auxv);
+ }
+ 
++char kin_proc_version_mid[KIN_PROC_VERSION_MID_LEN];
++static atomic_t kin_uts_sealed = ATOMIC_INIT(0);
++
++struct kin_uts_override {
++	char release[__NEW_UTS_LEN + 1];
++	char version[__NEW_UTS_LEN + 1];
++	char proc_mid[KIN_PROC_VERSION_MID_LEN];
++};
++
++static bool kin_valid_uts_ascii(const char *buf, size_t buf_size, size_t min_len)
++{
++	size_t len = strnlen(buf, buf_size);
++	size_t i;
++
++	if (len >= buf_size || len < min_len)
++		return false;
++	for (i = 0; i < len; i++) {
++		unsigned char c = (unsigned char)buf[i];
++
++		if (c < 0x20 || c > 0x7e)
++			return false;
++	}
++	return true;
++}
++
++static long prctl_kin_set_uts_once(unsigned long arg2, unsigned long arg3,
++				   unsigned long arg4, unsigned long arg5)
++{
++	struct kin_uts_override req;
++
++	BUILD_BUG_ON(sizeof(req) != 322);
++	BUILD_BUG_ON(sizeof(req.release) != sizeof(init_uts_ns.name.release));
++	BUILD_BUG_ON(sizeof(req.version) != sizeof(init_uts_ns.name.version));
++
++	if (arg3 || arg4 || arg5)
++		return -EINVAL;
++	if (!capable(CAP_SYS_ADMIN) || !uid_eq(current_euid(), GLOBAL_ROOT_UID) ||
++	    !current->nsproxy || current->nsproxy->uts_ns != &init_uts_ns ||
++	    task_active_pid_ns(current) != &init_pid_ns)
++		return -EPERM;
++	if (atomic_read(&kin_uts_sealed))
++		return -EPERM;
++	if (!arg2 || copy_from_user(&req, (const void __user *)arg2, sizeof(req)))
++		return -EFAULT;
++	if (!kin_valid_uts_ascii(req.release, sizeof(req.release), 1) ||
++	    !kin_valid_uts_ascii(req.version, sizeof(req.version), 1) ||
++	    !kin_valid_uts_ascii(req.proc_mid, sizeof(req.proc_mid), 0))
++		return -EINVAL;
++
++	down_write(&uts_sem);
++	if (atomic_cmpxchg(&kin_uts_sealed, 0, 1) != 0) {
++		up_write(&uts_sem);
++		return -EPERM;
++	}
++	memset(init_uts_ns.name.release, 0, sizeof(init_uts_ns.name.release));
++	strscpy(init_uts_ns.name.release, req.release, sizeof(init_uts_ns.name.release));
++	memset(init_uts_ns.name.version, 0, sizeof(init_uts_ns.name.version));
++	strscpy(init_uts_ns.name.version, req.version, sizeof(init_uts_ns.name.version));
++	memset(kin_proc_version_mid, 0, sizeof(kin_proc_version_mid));
++	if (req.proc_mid[0])
++		strscpy(kin_proc_version_mid, req.proc_mid, sizeof(kin_proc_version_mid));
++	up_write(&uts_sem);
++
++	uts_proc_notify(UTS_PROC_OSRELEASE);
++	uts_proc_notify(UTS_PROC_VERSION);
++	return 0;
++}
++
+ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
+ 		unsigned long, arg4, unsigned long, arg5)
+ {
+@@ -2800,6 +2869,9 @@
+ 	case PR_RISCV_SET_ICACHE_FLUSH_CTX:
+ 		error = RISCV_SET_ICACHE_FLUSH_CTX(arg2, arg3);
+ 		break;
++	case PR_KIN_SET_UTS_ONCE:
++		error = prctl_kin_set_uts_once(arg2, arg3, arg4, arg5);
++		break;
+ 	default:
+ 		error = -EINVAL;
+ 		break;

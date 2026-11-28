@@ -2,6 +2,7 @@
  * /v1 protocol handler. URLs, auth, and response envelopes stay with the
  * server wiring; this factory owns convert → pool → Go/Rust hop → client.
  */
+import crypto from 'node:crypto'
 import { applyIntercept } from '../core/intercept.mjs'
 import { resolveStreamIdleTimeoutMs, inboundBodyLimit, queueKeepaliveDelayMs } from '../core/config.mjs'
 import { hashKey } from '../core/security.mjs'
@@ -21,14 +22,20 @@ import {
   refusalSessionId,
   riskPrincipal,
 } from '../core/refusal-guard.mjs'
+import { isDbOpen } from '../db/database.mjs'
 import { RefusalGuardsRepo } from '../db/repos/refusal-guards-repo.mjs'
 import { RefusalDeviceBlocksRepo } from '../db/repos/refusal-device-blocks-repo.mjs'
 import { RefusalSessionBlocksRepo } from '../db/repos/refusal-session-blocks-repo.mjs'
 import { SettingsRepo } from '../db/repos/settings-repo.mjs'
-import { findAccount } from '../admin/panel-api.mjs'
 import { makeApiKeyGateError } from '../admin/api-keys.mjs'
-import { readJevConfig, scopeAccountFromVm } from './jev-intercept.mjs'
-import { observeUpstreamRisk, runProtocolIntercept, upstreamRiskClientError } from './intercept-gate.mjs'
+import { readJevConfig } from './jev-intercept.mjs'
+import { observeUpstreamRisk, upstreamRiskClientError } from './intercept-gate.mjs'
+import {
+  clientBlockErrorOf,
+  isTrustedGateDecision,
+  projectCandidateAccounts,
+  runUnifiedPreDispatch,
+} from './unified-pre-dispatch.mjs'
 import {
   toClaudeMessages,
   isClientStream,
@@ -44,7 +51,12 @@ import {
   createClaudeMessageAssembler,
   applyClaudeSSELineToMessage,
 } from './convert.mjs'
-import { sanitizeInboundBody, defaultSeedPolicy, callerAutoCompactWindow } from './seed-policy.mjs'
+import {
+  sanitizeInboundBody,
+  sanitizeOutboundHeaders,
+  defaultSeedPolicy,
+  callerAutoCompactWindow,
+} from './seed-policy.mjs'
 import { fingerprintRequest } from './client-fingerprint.mjs'
 import { validateOfficialModel } from './models.mjs'
 import { handleCodexImages, handleCodexProtocol, handleCodexSearch } from './handle-codex.mjs'
@@ -86,11 +98,19 @@ import {
   keyAllowsVm,
   keyScopeFromRequest,
   keyTierPolicyFromRecord,
+  resolvePoolAccessForKey,
   vmGroupType,
   vmPoolDenial,
 } from '../admin/key-scope.mjs'
+import {
+  applyPoolPromptToAnthropicBody,
+  isPoolZeroInjectMode,
+  requestedPoolIdFromHeaders,
+  resolvePoolSystemPromptPolicy,
+} from './pool-prompt-policy.mjs'
 import { keyModelError } from '../admin/key-models.mjs'
 import {
+  isHeadlessBridgeCaps,
   resolveInferenceEngine,
   resolveOfficialCcInference,
   resolveSlotPersonaPreset,
@@ -100,6 +120,7 @@ import { readJsonParsedCached } from '../vm/vm-file.mjs'
 import {
   makeError,
   mapUpstreamError,
+  passthroughUpstreamError,
   rewritePoolErrorForClient,
   validateRequestBody,
   mapModelError,
@@ -125,6 +146,7 @@ import {
   prepareCragPrintBody,
   projectCallerSystem,
   readSlotKernelConfig,
+  resolveCragCustomTemplate,
   resolveCragPrintPersona,
   trackCallerSystemBlock,
 } from './crag-print-prompt.mjs'
@@ -138,6 +160,7 @@ import {
   extractFirstUserIdentity,
   outboundSessionMode,
   resolveInboundIdentity,
+  resolveSchedulerIdentity,
   resolveSeatIdentity,
   resolveOutboundSessionId,
   sessionIdFromOutboundBody,
@@ -160,6 +183,8 @@ import {
 } from '../pool/batch-group.mjs'
 import {
   applyCrsUnofficialPersona,
+  configuredTimezone,
+  cragStrictPassthroughEnabled,
   detectProxiedOfficialCcFromRoutingFile,
   billingIndexesFromMessages,
   ccEntrypointFromRouting,
@@ -173,7 +198,12 @@ import {
   standingUsageFromRoutingFile,
   personaModeFromRoutingFile,
 } from '../identity/crs-persona.mjs'
-import { presetFlagEnabled } from '../identity/persona-template.mjs'
+import { isPresetEnvEnabled } from '../identity/persona-template.mjs'
+import {
+  compileSpecForCliNode,
+  resolveGlobalUnifiedPreset,
+  resolveSystemPromptSpec,
+} from '../identity/system-prompt-spec.mjs'
 import {
   claudeCodeOnlyError,
   claudeCodeOnlyFromRouting,
@@ -219,13 +249,14 @@ import { jevInterceptSessionCache } from './jev-intercept.mjs'
 import { ensureClaudeWebSearch, shouldInjectClaudeWebSearch } from './web-search.mjs'
 import { dispatchStreamInference, prepareInferenceHop } from '../transport/kernel-router.mjs'
 import { syncClaudeKernelConfigsFromFile } from '../transport/rust-kernel-supervisor.mjs'
-import { ensureWorkerCredential } from '../transport/go-worker-client.mjs'
+import { ensureWorkerCredential, isNativeCragV3Plus } from '../transport/go-worker-client.mjs'
 import { formatPoolSelectionSummary } from '../pool/pool-scheduler.mjs'
 import { extraHeadersFromLimitError, isAccountQuotaExhausted } from '../pool/quota-window.mjs'
 import {
   cragForeignThinkingMode,
   dropForeignThinkingForCrag,
   filterThinkingForAccount,
+  inspectForeignThinking,
   recordThinkingOwners,
   thinkingOwners as defaultThinkingOwners,
 } from '../pool/thinking-owner.mjs'
@@ -245,6 +276,13 @@ import { materializeRemoteImageSources, validateImageDimensions } from './images
 import { applyMinMaxTokens } from './min-max-tokens.mjs'
 import { detectWarmupIntercept, formatWarmupSse, warmupMockMessage } from './warmup-intercept.mjs'
 import { queueAllowedByHeaders } from './queue-hint.mjs'
+import {
+  SchedulerApiError,
+  SchedulerUnavailableError,
+  VIRTUAL_POOL_IDS,
+  classifyErrorClass,
+  formatSchedulerError,
+} from '../scheduler/scheduler-runtime.mjs'
 
 /**
  * Which upstream refusals end the caller session. Claude Code's auto-mode
@@ -307,6 +345,41 @@ function authenticatedTenant(req) {
   return ''
 }
 
+/**
+ * Extract read-only scheduler identity strictly before sanitizeInboundBody /
+ * sanitizeOutboundHeaders strip client machine_id/device_id/metadata.user_id.
+ */
+export function prepareInboundProtocolContext({
+  inbound,
+  headers = {},
+  pathName = '',
+  protocol = '',
+  poolId = '',
+  apiKeyId = '',
+  seedPolicy = defaultSeedPolicy(),
+  autoCompactWindow = callerAutoCompactWindow(inbound),
+} = {}) {
+  const inboundIdentity = resolveSchedulerIdentity({
+    inbound,
+    headers,
+    poolId,
+    apiKeyId,
+  })
+  const legacyInboundIdentity = resolveInboundIdentity({
+    inbound,
+    headers,
+  })
+  const ctx = {
+    path: pathName,
+    protocol,
+    body: sanitizeInboundBody(inbound, seedPolicy),
+    headers: sanitizeOutboundHeaders(headers),
+    autoCompactWindow,
+    inboundIdentity,
+  }
+  return { ctx, inboundIdentity, legacyInboundIdentity }
+}
+
 export function createHandleProtocol(deps) {
   const issuedTools = createIssuedToolReplay()
   const json = (...args) => deps.json(...args)
@@ -332,7 +405,55 @@ export function createHandleProtocol(deps) {
     typeof deps.getHealthMonitor === 'function' ? deps.getHealthMonitor() : deps.healthMonitor
   const getFailoverRunner = () =>
     typeof deps.getFailoverRunner === 'function' ? deps.getFailoverRunner() : deps.failoverRunner
+  const getSchedulerRuntime = (req = null) =>
+    (typeof deps.getSchedulerRuntime === 'function' ? deps.getSchedulerRuntime() : deps.schedulerRuntime) ||
+    req?._schedulerRuntime ||
+    null
   const thinkingOwnerStore = deps.thinkingOwners || defaultThinkingOwners
+
+  function resolveAttemptPoolPromptPolicy(
+    rustPolicy,
+    fallbackPool,
+    routing,
+    { nodeProvider = 'anthropic', isInternalCall = false } = {},
+  ) {
+    if (isInternalCall) {
+      return resolvePoolSystemPromptPolicy(fallbackPool, routing, { nodeProvider, isInternalCall: true })
+    }
+    if (!rustPolicy || typeof rustPolicy !== 'object') {
+      return resolvePoolSystemPromptPolicy(fallbackPool, routing, { nodeProvider, isInternalCall: false })
+    }
+    if (rustPolicy.source === 'provider_exempt') {
+      return resolvePoolSystemPromptPolicy(
+        { id: rustPolicy.pool_id || fallbackPool?.id || null, provider_scope: 'openai' },
+        routing,
+        { nodeProvider, isInternalCall: false },
+      )
+    }
+    if (rustPolicy.source === 'global') {
+      return resolvePoolSystemPromptPolicy(
+        {
+          id: rustPolicy.pool_id || fallbackPool?.id || null,
+          provider_scope: 'anthropic',
+          system_prompt_mode: 'inherit_global',
+        },
+        routing,
+        { nodeProvider, isInternalCall: false },
+      )
+    }
+    return resolvePoolSystemPromptPolicy(
+      {
+        id: rustPolicy.pool_id || fallbackPool?.id || null,
+        provider_scope: 'anthropic',
+        system_prompt_mode: rustPolicy.mode || 'inherit_global',
+        system_prompt_preset: rustPolicy.preset || 'official_full',
+        system_prompt_text: rustPolicy.text || '',
+        client_system_policy: rustPolicy.client_system_policy || 'prepend_pool',
+      },
+      routing,
+      { nodeProvider, isInternalCall: false },
+    )
+  }
   function responseClosed(res) {
     return !!(res?.destroyed || res?.writableEnded || res?.closed)
   }
@@ -453,19 +574,74 @@ export function createHandleProtocol(deps) {
     }
   }
 
-  function mapProtocolClientError(result, logBag, fallbackCode) {
+  function mapProtocolClientError(result, logBag, fallbackCode, { strictPassthrough = false } = {}) {
     const opaqueCrag429 = result?.policy?.reason === 'crag_opaque_429'
     const explicitCode = opaqueCrag429 ? result.policy.reason : result?.body?.error?.code || null
     const originalMessage = result?.body?.error?.message || null
-    const details = result?.body?.error?.details || {}
+    if (explicitCode === 'scheduler_unavailable') {
+      logBag.error_code = 'scheduler_unavailable'
+      logBag.error_message = originalMessage || 'Rust scheduler sidecar is unavailable'
+      return {
+        status: 503,
+        retryAfterSec: 1,
+        body: {
+          type: 'error',
+          error: {
+            type: 'api_error',
+            code: 'scheduler_unavailable',
+            message: logBag.error_message,
+          },
+        },
+      }
+    }
+    if (explicitCode === 'poison_abort') {
+      logBag.error_code = 'poison_abort'
+      logBag.error_message = originalMessage || 'Request rejected by scheduler poison guard'
+      return {
+        status: 422,
+        body: result?.body || {
+          type: 'error',
+          error: {
+            type: 'invalid_request_error',
+            code: 'poison_abort',
+            message: logBag.error_message,
+          },
+        },
+      }
+    }
+    if (
+      explicitCode === 'session_in_flight' ||
+      explicitCode === 'session_queue_full' ||
+      explicitCode === 'session_queue_timeout' ||
+      explicitCode === 'session_node_busy' ||
+      explicitCode === 'pool_queue_full'
+    ) {
+      logBag.error_code = explicitCode
+      logBag.error_message = originalMessage || 'Scheduler queue limit reached'
+      return {
+        status: 429,
+        retryAfterSec: Math.max(1, Math.ceil(Number(result?.retryAfterSec) || 1)),
+        body: result?.body || {
+          type: 'error',
+          error: {
+            type: 'rate_limit_error',
+            code: explicitCode,
+            message: logBag.error_message,
+          },
+        },
+      }
+    }
+    const details = result?.explain || result?.body?.error?.details || {}
     const policyRefusal =
       !opaqueCrag429 && logBag.risk_upstream_reason && logBag.risk_upstream_reason !== 'upstream:billing_refusal'
     const mapped = policyRefusal
       ? upstreamRiskClientError(logBag.risk_upstream_reason, logBag.risk_request_id)
-      : rewritePoolErrorForClient(
-          mapUpstreamError(result?.status || 503, result?.body, result?.headers || {}),
-          result?.body,
-        )
+      : strictPassthrough
+        ? passthroughUpstreamError(result?.status || 503, result?.body, result?.headers || {})
+        : rewritePoolErrorForClient(
+            mapUpstreamError(result?.status || 503, result?.body, result?.headers || {}),
+            result?.body,
+          )
     if (mapped.body.error.code === ErrorCode.POOL_OVERLOADED && result?.poolReason === 'subagent_limit') {
       mapped.body.error.details = { reason: result.poolReason }
     }
@@ -509,12 +685,20 @@ export function createHandleProtocol(deps) {
     if (!policyRefusal && Number(result?.retryAfterSec) > 0) {
       mapped.retryAfterSec = Math.max(1, Math.ceil(Number(result.retryAfterSec)))
     }
+    if (!policyRefusal && result?.headers && typeof result.headers === 'object') {
+      mapped.headers = result.headers
+    }
     return mapped
   }
 
   function sendMapped(res, mapped) {
-    if (mapped.retryAfterSec) res.setHeader?.('retry-after', String(mapped.retryAfterSec))
-    return json(res, mapped.status, mapped.body)
+    const forwardHeaders = mapped.headers && typeof mapped.headers === 'object' ? { ...mapped.headers } : {}
+    const hasRetryAfter = Object.keys(forwardHeaders).some((k) => k.toLowerCase() === 'retry-after')
+    if (mapped.retryAfterSec) {
+      if (!hasRetryAfter) forwardHeaders['retry-after'] = String(mapped.retryAfterSec)
+      res.setHeader?.('retry-after', String(mapped.retryAfterSec))
+    }
+    return json(res, mapped.status, mapped.body, forwardHeaders)
   }
 
   function acceptAssistantHop(result) {
@@ -530,6 +714,45 @@ export function createHandleProtocol(deps) {
     }
   }
 
+  function applyGateDecisionToLogBag(decision, logBag, { mandatoryOnly = false } = {}) {
+    if (!decision) return
+    if (!mandatoryOnly && decision.intercept) logBag.intercept = decision.intercept
+    if (decision.action === 'downgrade' && decision.route) logBag.risk_route = decision.route
+    if (decision.action === 'downgrade' && decision.jev_downgrade_pool_id) {
+      logBag.jev_downgrade_pool_id = decision.jev_downgrade_pool_id
+    }
+    if (!mandatoryOnly) logBag.risk_wait = false
+    if (decision.jev_passed) {
+      logBag._jevPassed = true
+      if (decision.jev_state) logBag._jevPassState = decision.jev_state
+      if (decision.scores) logBag._jevPassScores = decision.scores
+    }
+  }
+
+  function writeGateBlockResponse(decision, { res, logBag }) {
+    stats.errors++
+    logBag.via = decision.via
+    logBag.attempt_count = 0
+    logBag.final_state = decision.final_state
+    logBag.error_code = decision.error_code || decision.error?.body?.error?.code || null
+    logBag.error_message = decision.message || decision.error?.body?.error?.message || null
+    if (decision.error_details) {
+      logBag.error_details = { ...(logBag.error_details || {}), ...decision.error_details }
+    }
+    logBag.intercept = decision.intercept || null
+    logBag.jev_state = decision.jev_state || null
+    const clientErr = clientBlockErrorOf(decision)
+    const errPayload = clientErr.body
+    if (res.headersSent && logBag.protocol === 'anthropic.messages') {
+      res.write(buildAnthropicSseError(errPayload.error))
+      res.end()
+    } else {
+      const retryAfter = decision.retry_after_sec || decision.error?.retryAfterSec
+      if (retryAfter) res.setHeader?.('retry-after', String(retryAfter))
+      json(res, clientErr.status, errPayload)
+    }
+  }
+
   async function applyProtocolIntercept({
     req,
     inbound,
@@ -540,6 +763,12 @@ export function createHandleProtocol(deps) {
     res,
     account = null,
     scopeMatched = false,
+    candidateAccounts = null,
+    poolJevProfile = null,
+    zeroInject = undefined,
+    channel = 'anthropic',
+    skipDistill = undefined,
+    enforceHardAndJev = undefined,
     bodyCtx = null,
     interceptSessionKey = null,
     identity,
@@ -549,18 +778,45 @@ export function createHandleProtocol(deps) {
     apiPlatform,
     riskState,
   }) {
+    // Reuse a trusted frame-level pre-dispatch verdict (e.g. Responses WebSocket)
+    // only when its evaluated backend matches the resolved inference backend and
+    // an API endpoint-level review requirement was not skipped upstream.
+    const prevDecision = req?._preDispatchDecision
+    let prevInterceptBy = ''
+    if (typeof prevDecision?.intercept === 'string' && prevDecision.intercept) {
+      try {
+        prevInterceptBy = String(JSON.parse(prevDecision.intercept)?.by || '')
+      } catch {
+        prevInterceptBy = ''
+      }
+    }
+    const canReusePreDispatch =
+      isTrustedGateDecision(prevDecision) &&
+      prevDecision.action !== 'block' &&
+      (!backend || !prevDecision.backend || prevDecision.backend === backend) &&
+      !(backend === 'api' && scopeMatched && ['scope', 'platform', 'unchecked'].includes(prevInterceptBy))
+    if (canReusePreDispatch) {
+      applyGateDecisionToLogBag(prevDecision, logBag, { mandatoryOnly })
+      return false
+    }
     const official =
       isOfficialClaudeCodeTraffic(req.headers, inbound) ||
       isOfficialClaudeClient(fp.client_class) ||
       (detectProxiedOfficialCcFromRoutingFile(routingConfigPath) && isProxiedOfficialClaudeCode(inbound, req.headers))
+    const classifier = classifyClaudeRequestPurpose(inbound, { officialTraffic: official })
     const interceptSession = interceptSessionKey ? peekInterceptSession(interceptSessionKey) : null
-    const decision = await runProtocolIntercept({
+    const decision = await runUnifiedPreDispatch({
+      req,
       inbound,
       body,
       headers: req.headers,
       identity,
       official,
-      zeroInject: isZeroInjectMode(),
+      classifier,
+      zeroInject:
+        typeof zeroInject === 'boolean'
+          ? zeroInject
+          : isZeroInjectMode(req?._poolAccess?.effectivePool || null, channel),
       distillRules: cfg.distill,
       policy: riskState.policy,
       jev: mandatoryOnly ? null : readRuntimeJev(),
@@ -570,6 +826,11 @@ export function createHandleProtocol(deps) {
       requestId,
       account,
       scopeMatched,
+      candidateAccounts,
+      poolJevProfile: poolJevProfile || req.poolJevProfile || req.apiKeyRecord?.jev_profile || null,
+      channel,
+      skipDistill,
+      enforceHardAndJev,
       bodyCtx,
       interceptSession,
       mandatoryOnly,
@@ -578,46 +839,165 @@ export function createHandleProtocol(deps) {
       openaiPlatform: apiPlatform,
     })
     if (!decision || decision.action !== 'block') {
-      if (!mandatoryOnly && decision?.intercept) logBag.intercept = decision.intercept
-      if (decision?.route) logBag.risk_route = decision.route
-      if (!mandatoryOnly) logBag.risk_wait = decision.wait === true
-      if (decision?.jevPassed) {
-        logBag._jevPassed = true
-        if (decision.jevState) logBag._jevPassState = decision.jevState
-        if (decision.jevScores) logBag._jevPassScores = decision.jevScores
-      }
+      applyGateDecisionToLogBag(decision, logBag, { mandatoryOnly })
+      if (!mandatoryOnly && req) req._preDispatchDecision = decision
       return false
     }
-    stats.errors++
-    logBag.via = decision.via
-    logBag.attempt_count = 0
-    logBag.final_state = decision.final_state
-    logBag.error_code = decision.logErrorCode || decision.error?.body?.error?.code || null
-    logBag.error_message = decision.errorMessage || decision.error?.body?.error?.message || null
-    if (decision.errorDetails) {
-      logBag.error_details = { ...(logBag.error_details || {}), ...decision.errorDetails }
-    }
-    logBag.intercept = decision.intercept || null
-    logBag.jev_state = decision.jevState || null
-    if (res.headersSent && logBag.protocol === 'anthropic.messages') {
-      res.write(buildAnthropicSseError(decision.error.body.error))
-      res.end()
-    } else {
-      if (decision.error?.retryAfterSec) res.setHeader?.('retry-after', String(decision.error.retryAfterSec))
-      json(res, decision.error.status, decision.error.body)
-    }
+    writeGateBlockResponse(decision, { res, logBag })
     return true
   }
 
-  function isZeroInjectMode() {
-    const routing = getRouting() || {}
-    const inject = String(routing?.compatibility?.persona_inject || '')
-      .trim()
-      .toLowerCase()
-    const preset = String(routing?.compatibility?.persona_preset || '')
-      .trim()
-      .toLowerCase()
-    return inject === 'zero' || preset === 'zero'
+  function isZeroInjectMode(effectivePool = null, nodeProvider = 'anthropic') {
+    return isPoolZeroInjectMode(effectivePool, getRouting() || {}, { nodeProvider })
+  }
+
+  function legacyPoolAccessResult() {
+    return {
+      ok: true,
+      status: 200,
+      code: null,
+      mode: 'legacy_scope',
+      legacy: true,
+      isDowngraded: false,
+      originPool: null,
+      effectivePool: null,
+      allowedPoolIds: [],
+      allowedMembers: null,
+      allowedVmIds: null,
+      allowedClaudeVmIds: null,
+      allowedCodexVmIds: null,
+      allowedGeminiEnvIds: null,
+      allowedEndpointIds: null,
+      allowedModels: [],
+    }
+  }
+
+  function intersectAllowedIds(existing, poolIds) {
+    const allowed = Array.isArray(poolIds) ? poolIds : []
+    if (Array.isArray(existing) && existing.length > 0) {
+      return existing.filter((id) => allowed.includes(id))
+    }
+    return [...allowed]
+  }
+
+  function loadVmInventoryForPoolAccess() {
+    if (Array.isArray(deps.vms)) return deps.vms
+    if (typeof deps.listVms === 'function') {
+      try {
+        const rows = deps.listVms()
+        if (Array.isArray(rows)) return rows
+      } catch {}
+    }
+    if (cfg?.paths?.project) {
+      try {
+        const rows = listVms(cfg.paths.project)
+        if (Array.isArray(rows)) return rows
+      } catch {}
+    }
+    return null
+  }
+
+  function loadApiEndpointInventoryForPoolAccess() {
+    if (Array.isArray(deps.apiEndpoints)) return deps.apiEndpoints
+    try {
+      const rows = apiEndpointStore?.listRaw?.() ?? apiEndpointStore?.list?.()
+      if (Array.isArray(rows)) return rows
+    } catch {}
+    return null
+  }
+
+  function loadGeminiOwnerMapForPoolAccess() {
+    if (typeof deps.geminiOwnerMap === 'function') {
+      try {
+        return deps.geminiOwnerMap()
+      } catch {}
+    }
+    return deps.geminiOwnerMap || null
+  }
+
+  function hasExplicitPoolIntent(req, { requestedPoolId = null, jevDowngradePoolId = null } = {}) {
+    if (requestedPoolId || jevDowngradePoolId) return true
+    const rec = req?.apiKeyRecord
+    if (!rec) return false
+    if (rec.pool_binding_mode === 'strict_pool') return true
+    if (rec.default_pool_id) return true
+    if (Array.isArray(rec.allowed_pool_ids) && rec.allowed_pool_ids.length > 0) return true
+    return false
+  }
+
+  function resolveRequestPoolAccess(
+    req,
+    {
+      model = null,
+      ownerScope = null,
+      jevDowngradePoolId = null,
+      isTrustedDowngrade = false,
+      trustedDowngradePoolIds = null,
+      geminiEnvs = null,
+    } = {},
+  ) {
+    const requestedPoolId = requestedPoolIdFromHeaders(req?.headers || {})
+    const explicitIntent = hasExplicitPoolIntent(req, { requestedPoolId, jevDowngradePoolId })
+    if (!deps.poolsRepo && !isDbOpen() && !explicitIntent) {
+      return legacyPoolAccessResult()
+    }
+    const resolvedGeminiEnvs = Array.isArray(geminiEnvs)
+      ? geminiEnvs
+      : Array.isArray(deps.geminiEnvs)
+        ? deps.geminiEnvs
+        : null
+    const resolvedGeminiOwnerMap = loadGeminiOwnerMapForPoolAccess()
+    const access = resolvePoolAccessForKey({
+      key: req?.apiKeyRecord || null,
+      apiKeyKind: req?.apiKeyKind || null,
+      requestedPoolId,
+      jevDowngradePoolId,
+      isTrustedDowngrade,
+      trustedDowngradePoolIds,
+      model,
+      poolsRepo: deps.poolsRepo || null,
+      vms: loadVmInventoryForPoolAccess(),
+      geminiEnvs: resolvedGeminiEnvs,
+      geminiOwnerMap: resolvedGeminiOwnerMap,
+      apiEndpoints: loadApiEndpointInventoryForPoolAccess(),
+      ownerScope,
+    })
+    return {
+      ...access,
+      _geminiOwnerMapChecked: Boolean(resolvedGeminiOwnerMap),
+      _geminiEnvsChecked: Array.isArray(resolvedGeminiEnvs),
+    }
+  }
+
+  function rejectPoolAccess(res, poolAccess, logBag, protocol = '') {
+    stats.errors++
+    const status = poolAccess?.status || 403
+    const code = poolAccess?.code || 'pool_unavailable'
+    const message = poolAccess?.message || '分组池不可用'
+    logBag.error_code = code
+    logBag.error_message = message
+    logBag.final_state = 'policy_blocked'
+    logBag.attempt_count = 0
+    if (protocol === 'google.gemini') {
+      return json(res, status, {
+        error: {
+          code: status,
+          status: status === 403 ? 'PERMISSION_DENIED' : 'FAILED_PRECONDITION',
+          message,
+          details: [{ '@type': 'type.googleapis.com/google.rpc.ErrorInfo', reason: code }],
+        },
+      })
+    }
+    return json(
+      res,
+      status,
+      makeError({
+        type: ErrorType.PERMISSION,
+        code,
+        message,
+        status,
+      }).body,
+    )
   }
 
   function refusalRepo() {
@@ -688,9 +1068,13 @@ export function createHandleProtocol(deps) {
     preserveCacheBreakpoints = false,
     cliHop = false,
     cragPrint = false,
+    promptSpec = null,
     preparedHop = null,
     callerCwd = null,
     repaired = false,
+    dropSampling = false,
+    strictPassthrough = false,
+    safeguardsSanitized = false,
     requestContext = null,
     routing = {},
     noGoFallback = false,
@@ -698,6 +1082,7 @@ export function createHandleProtocol(deps) {
     onOutboundHeaders = null,
     redactionPrincipal = '',
     redactionSession = '',
+    cancelSessionId = '',
     tenantId = '',
     gatewayRequestId = null,
   }) {
@@ -718,9 +1103,13 @@ export function createHandleProtocol(deps) {
       preserveCacheBreakpoints,
       cliHop,
       cragPrint,
+      promptSpec,
       preparedHop,
       callerCwd,
       repaired,
+      dropSampling,
+      strictPassthrough,
+      safeguardsSanitized,
       requestContext,
       slotWaitMs: candidate.slotWaitMs,
       slotWaitDeadlineMs: candidate.slotWaitDeadlineMs,
@@ -730,6 +1119,7 @@ export function createHandleProtocol(deps) {
       ensureCredential: (exec) => ensureWorkerCredential(exec),
       redactionPrincipal,
       redactionSession,
+      cancelSessionId,
       onEnvelope,
       onOutboundHeaders,
       onEvent: async (line) => {
@@ -823,10 +1213,6 @@ export function createHandleProtocol(deps) {
       return
     }
 
-    if (protocol === 'anthropic.messages' && req.apiKeyRecord?.group_type === 'gemini') {
-      return deps.handleGeminiMessages(req, res, { logBag, logCtx })
-    }
-
     let inbound
     try {
       inbound = await readBody(req, inboundBodyLimit(getRouting(), cfg.limits.max_body_bytes))
@@ -872,6 +1258,63 @@ export function createHandleProtocol(deps) {
     )
     logBag.inbound_device_id = sessionIdForLog(auditIdentity.deviceId)
     logBag.reasoning_effort = reasoningEffortOf(inbound)
+    const fp = fingerprintRequest(req, inbound)
+    const riskState = { policy: refusalPolicy(), repo: refusalRepo(), devices: deviceRepo(), sessions: sessionRepo() }
+    const gateArgs = { req, inbound, fp, logBag, requestId: logCtx.request_id, res, identity: auditIdentity, riskState }
+
+    // Bypass #3 closed: `/v1/messages` with a Gemini-scoped key must pass pool
+    // Fail-Closed authorization AND unified pre-dispatch JEV BEFORE delegating.
+    if (protocol === 'anthropic.messages' && req.apiKeyRecord?.group_type === 'gemini') {
+      const bypassOwnerScope = ownerScopeFromRequest(req, apiKeyStore?.users)
+      let bypassGeminiCatalog = null
+      if (
+        !Array.isArray(deps.geminiEnvs) &&
+        typeof deps.geminiScheduler?.catalog === 'function' &&
+        hasExplicitPoolIntent(req, { requestedPoolId: requestedPoolIdFromHeaders(req?.headers || {}) })
+      ) {
+        try {
+          bypassGeminiCatalog = await deps.geminiScheduler.catalog({ ownerScope: bypassOwnerScope })
+        } catch {}
+      }
+      const bypassPoolAccess = resolveRequestPoolAccess(req, {
+        model: inbound?.model || null,
+        ownerScope: bypassOwnerScope,
+        geminiEnvs: Array.isArray(bypassGeminiCatalog?.accounts) ? bypassGeminiCatalog.accounts : null,
+      })
+      if (!bypassPoolAccess.ok) {
+        return rejectPoolAccess(res, bypassPoolAccess, logBag, protocol)
+      }
+      req._poolAccess = bypassPoolAccess
+      if (bypassPoolAccess.effectivePool?.id) {
+        logBag.resolved_pool_id = bypassPoolAccess.effectivePool.id
+      }
+      if (bypassPoolAccess.effectivePool?.jev_profile) {
+        req.poolJevProfile = bypassPoolAccess.effectivePool.jev_profile
+      }
+      if (
+        await applyProtocolIntercept({
+          ...gateArgs,
+          body: inbound,
+          poolJevProfile: bypassPoolAccess.effectivePool?.jev_profile || req.poolJevProfile || null,
+          zeroInject: isPoolZeroInjectMode(bypassPoolAccess.effectivePool, getRouting() || {}, {
+            nodeProvider: 'google',
+          }),
+          channel: 'gemini',
+          enforceHardAndJev: true,
+          backend: 'oauth',
+          apiPlatform: false,
+        })
+      ) {
+        return
+      }
+      req.body = inbound
+      return deps.handleGeminiMessages(req, res, {
+        logBag,
+        logCtx,
+        preDispatchDecision: req._preDispatchDecision || null,
+        ...(bypassGeminiCatalog ? { catalogSnapshot: bypassGeminiCatalog } : {}),
+      })
+    }
 
     const rawInboundBackend = resolveInferenceBackend(req)
     const inboundKeyPolicy = req.apiKeyKind === 'managed' ? keyTierPolicyFromRecord(req.apiKeyRecord) : null
@@ -915,7 +1358,8 @@ export function createHandleProtocol(deps) {
             }
           }
           if (!hasOwnedGeminiEnv) {
-            const probe = apiScheduler.pick(
+            const probe = (apiScheduler.matchEndpoints || apiScheduler.pick).call(
+              apiScheduler,
               inbound?.model,
               Date.now(),
               apiScheduleScope(req, 'all', apiKeyStore?.users),
@@ -925,16 +1369,60 @@ export function createHandleProtocol(deps) {
         }
       }
       if (!preferGeminiApiChannel) {
+        // Bypass #4 closed: `all` key + Antigravity model must pass pool
+        // Fail-Closed authorization AND unified pre-dispatch JEV BEFORE delegating.
+        const bypassOwnerScope = ownerScopeFromRequest(req, apiKeyStore?.users)
+        if (
+          !preloadedGeminiCatalog &&
+          !Array.isArray(deps.geminiEnvs) &&
+          typeof deps.geminiScheduler?.catalog === 'function' &&
+          hasExplicitPoolIntent(req, { requestedPoolId: requestedPoolIdFromHeaders(req?.headers || {}) })
+        ) {
+          try {
+            preloadedGeminiCatalog = await deps.geminiScheduler.catalog({ ownerScope: bypassOwnerScope })
+          } catch {}
+        }
+        const bypassPoolAccess = resolveRequestPoolAccess(req, {
+          model: inbound?.model || null,
+          ownerScope: bypassOwnerScope,
+          geminiEnvs: Array.isArray(preloadedGeminiCatalog?.accounts) ? preloadedGeminiCatalog.accounts : null,
+        })
+        if (!bypassPoolAccess.ok) {
+          return rejectPoolAccess(res, bypassPoolAccess, logBag, protocol)
+        }
+        req._poolAccess = bypassPoolAccess
+        if (bypassPoolAccess.effectivePool?.id) {
+          logBag.resolved_pool_id = bypassPoolAccess.effectivePool.id
+        }
+        if (bypassPoolAccess.effectivePool?.jev_profile) {
+          req.poolJevProfile = bypassPoolAccess.effectivePool.jev_profile
+        }
+        if (
+          await applyProtocolIntercept({
+            ...gateArgs,
+            body: inbound,
+            poolJevProfile: bypassPoolAccess.effectivePool?.jev_profile || req.poolJevProfile || null,
+            zeroInject: isPoolZeroInjectMode(bypassPoolAccess.effectivePool, getRouting() || {}, {
+              nodeProvider: 'google',
+            }),
+            channel: 'gemini',
+            enforceHardAndJev: true,
+            backend: 'oauth',
+            apiPlatform: false,
+          })
+        ) {
+          return
+        }
         req.body = inbound
         return (deps.handleGeminiPublic || deps.handleGeminiMessages)(req, res, {
           logBag,
           logCtx,
+          preDispatchDecision: req._preDispatchDecision || null,
           ...(preloadedGeminiCatalog ? { catalogSnapshot: preloadedGeminiCatalog } : {}),
         })
       }
     }
 
-    const fp = fingerprintRequest(req, inbound)
     // Before the health probe: its synthesized or fail-closed replies would otherwise answer
     // probe-shaped third-party traffic, and with the switch on no probe is answered at all.
     // Official Claude Code only ever speaks Messages, so other inbound protocols on a Claude
@@ -972,8 +1460,6 @@ export function createHandleProtocol(deps) {
     }
     // After the Desktop sign-in probe, which runs no model.
     if (rejectKeyModel(req, res, protocol, inbound?.model, logBag)) return
-    const riskState = { policy: refusalPolicy(), repo: refusalRepo(), devices: deviceRepo(), sessions: sessionRepo() }
-    const gateArgs = { req, inbound, fp, logBag, requestId: logCtx.request_id, res, identity: auditIdentity, riskState }
     if (await applyProtocolIntercept({ ...gateArgs, body: inbound, mandatoryOnly: true })) return
     if (
       claudeCodeOnlyFromRouting(routingNow) &&
@@ -1031,6 +1517,7 @@ export function createHandleProtocol(deps) {
         logBag.via = healthDecision.via
         logBag.attempt_count = 0
         logBag.vm_id = healthDecision.snapshot?.vm_id || null
+        logBag.upstream_model = healthDecision.snapshot?.model || inbound?.model || null
         logBag.usage = healthDecision.snapshot?.body?.usage || { input_tokens: 0, output_tokens: 0 }
         logBag.stop_reason = healthDecision.snapshot?.body?.stop_reason || 'end_turn'
         logBag.final_state = healthDecision.via
@@ -1064,13 +1551,22 @@ export function createHandleProtocol(deps) {
 
     const callerEnvironment = protocol === 'anthropic.messages' ? callerCwdDeclaration(inbound?.system) : null
     const autoCompactWindow = callerAutoCompactWindow(inbound)
-    let ctx = {
-      path: pathName,
+    const { ctx: preparedCtx, legacyInboundIdentity } = prepareInboundProtocolContext({
+      inbound,
+      headers: req.headers,
+      pathName,
       protocol,
-      body: sanitizeInboundBody(inbound, defaultSeedPolicy()),
-      headers: { ...req.headers },
+      poolId:
+        requestedPoolIdFromHeaders(req.headers) ||
+        req.apiKeyRecord?.default_pool_id ||
+        req.apiKeyRecord?.vm_pool_id ||
+        '',
+      apiKeyId: req.apiKeyRecord?.id ?? '',
+      seedPolicy: defaultSeedPolicy(),
       autoCompactWindow,
-    }
+    })
+    const outboundReqHeaders = preparedCtx.headers
+    let ctx = preparedCtx
     ctx = applyIntercept(cfg.intercept.rules, 'before_convert', ctx)
     const bodyCheck = protocol === 'google.gemini' ? { ok: true } : validateRequestBody(protocol, ctx.body)
     if (!bodyCheck.ok) {
@@ -1086,8 +1582,58 @@ export function createHandleProtocol(deps) {
     if (inboundKeyPolicy) {
       keyScope = { ...keyScope, permission_tier: inboundKeyPolicy.permission_tier }
     }
+    // Step [2]: Fail-Closed pool authorization & effectivePool pre-evaluation
+    // strictly BEFORE JEV (Step [4]) and slot/endpoint admission.
+    let activePoolAccess = resolveRequestPoolAccess(req, {
+      model: ctx.body?.model || inbound?.model || null,
+      ownerScope: reqOwnerScope,
+    })
+    if (
+      !activePoolAccess.ok &&
+      activePoolAccess.reason === 'missing' &&
+      req.apiKeyRecord?.pool_binding_mode !== 'strict_pool' &&
+      !req.apiKeyRecord?.default_pool_id &&
+      !(Array.isArray(req.apiKeyRecord?.allowed_pool_ids) && req.apiKeyRecord.allowed_pool_ids.length) &&
+      !requestedPoolIdFromHeaders(req.headers) &&
+      keyScope.vm_pool_id &&
+      !keyScope.vm_pool_error
+    ) {
+      activePoolAccess = legacyPoolAccessResult()
+    }
+    if (!activePoolAccess.ok) {
+      return rejectPoolAccess(res, activePoolAccess, logBag, protocol)
+    }
+    let effectivePool = activePoolAccess.effectivePool || null
+    req._poolAccess = activePoolAccess
+    if (effectivePool) {
+      logBag.resolved_pool_id = effectivePool.id
+      if (effectivePool.jev_profile) {
+        req.poolJevProfile = effectivePool.jev_profile
+      }
+      if (!activePoolAccess.legacy) {
+        keyScope = {
+          ...keyScope,
+          vm_pool_id: effectivePool.id,
+          vm_pool_error: null,
+          allowed_vms: activePoolAccess.allowedVmIds || [],
+          ...(effectivePool.jev_profile ? { jev_profile: effectivePool.jev_profile } : {}),
+        }
+        if (effectivePool.id && !ctx.inboundIdentity?.poolId) {
+          ctx = {
+            ...ctx,
+            inboundIdentity: { ...ctx.inboundIdentity, poolId: effectivePool.id },
+          }
+        }
+      }
+    }
     let inferenceBackend = rawBackend === 'api' ? 'api' : 'oauth'
     let apiScope = rawBackend === 'api' ? apiScheduleScope(req, keyScope.group_type, apiKeyStore?.users) : null
+    if (!activePoolAccess.legacy && apiScope) {
+      apiScope = {
+        ...apiScope,
+        allowedEndpointIds: intersectAllowedIds(apiScope.allowedEndpointIds, activePoolAccess.allowedEndpointIds || []),
+      }
+    }
     if (rawBackend === 'api') {
       if (reqOwnerScope.type !== 'platform' && !apiScheduler?.hasOwnedEndpoints?.(reqOwnerScope, apiScope)) {
         stats.errors++
@@ -1102,8 +1648,24 @@ export function createHandleProtocol(deps) {
         return json(res, 403, errorResult.body)
       }
     } else if (rawBackend === 'all') {
-      const candidateApiScope = apiScheduleScope(req, keyScope.group_type, apiKeyStore?.users)
+      let candidateApiScope = apiScheduleScope(req, keyScope.group_type, apiKeyStore?.users)
+      if (!activePoolAccess.legacy) {
+        candidateApiScope = {
+          ...candidateApiScope,
+          allowedEndpointIds: intersectAllowedIds(
+            candidateApiScope.allowedEndpointIds,
+            activePoolAccess.allowedEndpointIds || [],
+          ),
+        }
+      }
       if (protocol === 'google.gemini') {
+        inferenceBackend = 'api'
+        apiScope = candidateApiScope
+      } else if (
+        !activePoolAccess.legacy &&
+        (activePoolAccess.allowedVmIds?.length || 0) === 0 &&
+        (activePoolAccess.allowedEndpointIds?.length || 0) > 0
+      ) {
         inferenceBackend = 'api'
         apiScope = candidateApiScope
       } else if (apiScheduler?.hasOwnedEndpoints?.(reqOwnerScope, candidateApiScope)) {
@@ -1158,7 +1720,24 @@ export function createHandleProtocol(deps) {
     // API endpoint protocols own routing; apply model overrides before choosing the channel.
     if (inferenceBackend === 'api') ctx = applyIntercept(cfg.intercept.rules, 'before_upstream', ctx)
     let apiInbound = inferenceBackend === 'api' ? ctx.body : null
-    let apiPicked = apiScope ? apiScheduler.pick(ctx.body?.model, Date.now(), apiScope) : null
+    // Pure read-only metadata lookup BEFORE JEV (zero slot reservation prior to JEV).
+    let apiPicked = apiScope
+      ? (apiScheduler.matchEndpoints || apiScheduler.pick).call(apiScheduler, ctx.body?.model, Date.now(), apiScope)
+      : null
+    if (
+      apiPicked &&
+      !apiPicked.ok &&
+      apiPicked.code === 'no_ready_api_key' &&
+      !activePoolAccess.legacy &&
+      effectivePool?.fallback_pool_id &&
+      !apiScope.endpointId
+    ) {
+      // Allow Stage 4 fallback_pool_id endpoints owned by the same scope when originPool keys are cooling down.
+      apiPicked = (apiScheduler.matchEndpoints || apiScheduler.pick).call(apiScheduler, ctx.body?.model, Date.now(), {
+        ...apiScope,
+        allowedEndpointIds: null,
+      })
+    }
     if (apiPicked && !apiPicked.ok) {
       stats.errors++
       logBag.error_code = apiPicked.code
@@ -1251,7 +1830,6 @@ export function createHandleProtocol(deps) {
       logBag.error_message = errorResult.body?.error?.message || null
       return json(res, 403, errorResult.body)
     }
-    if (imageModel) return serveImageModelTurn({ req, res, protocol, body: ctx.body, logBag })
     if (platform.platform === 'anthropic') {
       try {
         validateImageDimensions(ctx.body)
@@ -1266,8 +1844,9 @@ export function createHandleProtocol(deps) {
       }
     }
     // Codex returns before conversion. Distill does not apply to OpenAI platform models; the rest
-    // of the gate scans them only when jev.openai_platform_enabled is on.
+    // of the gate scans them only when jev.openai_platform_enabled is on or pool/scope matches.
     if (
+      !imageModel &&
       platform.platform !== 'openai' &&
       inferenceBackend !== 'api' &&
       protocol === 'anthropic.messages' &&
@@ -1293,20 +1872,48 @@ export function createHandleProtocol(deps) {
     }
     const auditBody = ctx.body
     const earlyBodyCtx = createRequestBodyContext(auditBody)
+    const candidateAccounts =
+      inferenceBackend === 'api' || imageModel
+        ? null
+        : projectCandidateAccounts({
+            projectRoot: cfg.paths?.project,
+            keyScope,
+            ownerScope: reqOwnerScope,
+            platform: platform.platform,
+            accountQuota,
+          })
+    const gateChannel = imageModel
+      ? 'images'
+      : protocol === 'google.gemini' || platform.platform === 'gemini'
+        ? 'gemini'
+        : platform.platform === 'openai'
+          ? 'openai'
+          : 'anthropic'
+    const poolIsZeroInject = isPoolZeroInjectMode(effectivePool, getRouting() || {}, {
+      nodeProvider: platform.platform,
+      isInternalCall: Boolean(req.apiKeyKind === 'master' && isHealthRealBypass(req.headers)),
+    })
     if (
       preReviewEnabled &&
       (await applyProtocolIntercept({
         ...gateArgs,
         body: auditBody,
         scopeMatched: apiRiskReview,
+        candidateAccounts,
+        poolJevProfile: effectivePool?.jev_profile || req.poolJevProfile || keyScope.jev_profile || null,
+        zeroInject: poolIsZeroInject,
+        channel: gateChannel,
+        enforceHardAndJev: imageModel || gateChannel === 'gemini',
+        skipDistill: Boolean(imageModel),
         bodyCtx: earlyBodyCtx,
         skipMandatory: true,
         backend: inferenceBackend,
-        apiPlatform: apiPicked ? apiOpenAI : undefined,
+        apiPlatform: imageModel ? false : apiPicked ? apiOpenAI : undefined,
       }))
     ) {
       return
     }
+    if (imageModel) return serveImageModelTurn({ req, res, protocol, body: ctx.body, logBag, keyScope })
     let observedHop = false
     const afterHop = (result) => {
       observedHop = true
@@ -1338,7 +1945,6 @@ export function createHandleProtocol(deps) {
       }
       return reason
     }
-    const scopedRiskGate = logBag.risk_wait === true
     const route = logBag.risk_route
     if (route) {
       const unavailable = () => {
@@ -1357,20 +1963,67 @@ export function createHandleProtocol(deps) {
         )
       }
       if (route.kind === 'pool') {
-        const narrowed = applyVmPool({ ...keyScope, vm_pool_id: route.target })
         const pin = pinVmId || ''
         const owner = panelDiagnostics ? { type: 'any' } : ownerScopeFromRequest(req, apiKeyStore?.users)
-        const eligible = narrowed.allowed_vms.filter((id) => {
-          const vm = getVm(cfg.paths.project, id)
-          return (
-            vm &&
-            vmMatchesOwnerScope(vm, owner) &&
-            keyAllowsVm({ ...narrowed, group_type: platform.platform }, vm) &&
-            keyAllowsVm(keyScope, vm)
-          )
-        })
-        if (narrowed.vm_pool_error || !eligible.length || (pin && !eligible.includes(pin))) return unavailable()
-        keyScope = { ...narrowed, allowed_vms: eligible }
+        const preDecision = req._preDispatchDecision
+        const isTrustedDowngrade =
+          isTrustedGateDecision(preDecision) &&
+          preDecision.action === 'downgrade' &&
+          preDecision.jev_downgrade_pool_id === route.target
+        const trustedDowngradePoolIds = [riskState.policy?.risk_audit?.downgrade_pool].filter(Boolean)
+        let handledBySchedulerPool = false
+        if (isTrustedDowngrade && (!activePoolAccess.legacy || deps.poolsRepo || isDbOpen())) {
+          const downgradedAccess = resolveRequestPoolAccess(req, {
+            model: ctx.body?.model || inbound?.model || null,
+            ownerScope: owner,
+            jevDowngradePoolId: route.target,
+            isTrustedDowngrade: true,
+            trustedDowngradePoolIds,
+          })
+          if (downgradedAccess.ok && !downgradedAccess.legacy) {
+            if (inferenceBackend === 'api') {
+              const allowedEps = downgradedAccess.allowedEndpointIds || []
+              if (!allowedEps.length) return unavailable()
+              apiScope = { ...apiScope, allowedEndpointIds: allowedEps }
+            } else {
+              const platformVmIds =
+                platform.platform === 'openai'
+                  ? downgradedAccess.allowedCodexVmIds || []
+                  : downgradedAccess.allowedClaudeVmIds || []
+              if (!platformVmIds.length || (pin && !platformVmIds.includes(pin))) return unavailable()
+              keyScope = {
+                ...keyScope,
+                vm_pool_id: route.target,
+                vm_pool_error: null,
+                allowed_vms: platformVmIds,
+              }
+            }
+            activePoolAccess = downgradedAccess
+            effectivePool = downgradedAccess.effectivePool
+            req._poolAccess = downgradedAccess
+            logBag.resolved_pool_id = effectivePool?.id || route.target
+            logBag.is_downgraded = true
+            logBag.jev_downgrade_pool_id = effectivePool?.id || route.target
+            handledBySchedulerPool = true
+          } else if (!activePoolAccess.legacy) {
+            return unavailable()
+          }
+        }
+        if (!handledBySchedulerPool) {
+          if (!activePoolAccess.legacy) return unavailable()
+          const narrowed = applyVmPool({ ...keyScope, vm_pool_id: route.target })
+          const eligible = narrowed.allowed_vms.filter((id) => {
+            const vm = getVm(cfg.paths.project, id)
+            return (
+              vm &&
+              vmMatchesOwnerScope(vm, owner) &&
+              keyAllowsVm({ ...narrowed, group_type: platform.platform }, vm) &&
+              keyAllowsVm(keyScope, vm)
+            )
+          })
+          if (narrowed.vm_pool_error || !eligible.length || (pin && !eligible.includes(pin))) return unavailable()
+          keyScope = { ...narrowed, allowed_vms: eligible }
+        }
       }
       if (route.kind === 'model') {
         if (keyModelError(req, route.target, { anthropic: protocol === 'anthropic.messages' })) return unavailable()
@@ -1394,7 +2047,7 @@ export function createHandleProtocol(deps) {
           return unavailable()
         }
         apiInbound = ctx.body
-        apiPicked = apiScheduler.pick(ctx.body.model, Date.now(), {
+        apiPicked = (apiScheduler.matchEndpoints || apiScheduler.pick).call(apiScheduler, ctx.body.model, Date.now(), {
           groupType: platform.platform,
           endpointId: route.kind === 'endpoint' ? route.target : apiScope.endpointId,
           ownerScope: apiScope.ownerScope,
@@ -1416,18 +2069,16 @@ export function createHandleProtocol(deps) {
         pinVmId,
         keyScope,
         afterHop,
+        poolAccess: activePoolAccess,
+        originPoolId: activePoolAccess.originPool?.id || effectivePool?.id || null,
+        jevDowngradePoolId:
+          logBag.jev_downgrade_pool_id || (activePoolAccess.isDowngraded ? effectivePool?.id || null : null),
+        inboundIdentity: ctx.inboundIdentity,
+        isAdminDiagnostic: panelDiagnostics,
+        allowQueue: queueAllowedByHeaders(req.headers),
+        schedulerRuntime: getSchedulerRuntime(req),
       }
-      // Account scope needs the slot, so the Codex hop runs the same gate again
-      // once a candidate is claimed. Without a scope the pre-hop verdict stands.
-      const accountGate = !scopedRiskGate
-        ? null
-        : (account) =>
-            applyProtocolIntercept({
-              ...gateArgs,
-              body: auditBody,
-              account,
-              skipMandatory: true,
-            })
+      // Pre-dispatch JEV has already run before slot admission (zero Phase-3 inversion).
       if (protocol === 'anthropic.messages') {
         const codex = normalizeCodexRouting(routing.codex)
         return runWithCodexKey(req, res, logBag, () =>
@@ -1454,7 +2105,7 @@ export function createHandleProtocol(deps) {
             },
             projectRoot: cfg.paths.project,
             captureOutbound: logCtx.capture_outbound === true,
-            accountGate,
+            preDispatchDecision: req._preDispatchDecision || null,
             ops: deps.codexOps || {},
             ...codexSticky,
           }),
@@ -1474,7 +2125,7 @@ export function createHandleProtocol(deps) {
           routing,
           projectRoot: cfg.paths.project,
           captureOutbound: logCtx.capture_outbound === true,
-          accountGate,
+          preDispatchDecision: req._preDispatchDecision || null,
           ops: deps.codexOps || {},
           ...codexSticky,
         }),
@@ -1511,8 +2162,8 @@ export function createHandleProtocol(deps) {
     const rememberPublic = (content) => {
       if (replayScope && Array.isArray(content)) issuedTools.remember(replayScope, inbound.messages, content)
     }
-    const sendPublicJson = (message) => {
-      const sent = json(res, 200, message)
+    const sendPublicJson = (message, upstreamHeaders = null) => {
+      const sent = json(res, 200, message, upstreamHeaders)
       if (message?.role === 'assistant' && message.type === 'message') rememberPublic(message.content)
       return sent
     }
@@ -1525,8 +2176,19 @@ export function createHandleProtocol(deps) {
     // Evaluated here on purpose -- after the risk/route pass may have re-picked
     // `apiPicked`, so the policy always comes from the endpoint actually used.
     // Never derived from caller input.
+    const apiPoolPrompt =
+      inferenceBackend === 'api'
+        ? resolvePoolSystemPromptPolicy(effectivePool, getRouting() || {}, {
+            nodeProvider: platform.platform,
+            isInternalCall: Boolean(requestContext || (req.apiKeyKind === 'master' && isHealthRealBypass(req.headers))),
+          })
+        : null
     const preserveApiCallerBody =
-      inferenceBackend === 'api' && !apiNonAnthropic && apiPicked?.endpoint?.body_policy === 'caller'
+      inferenceBackend === 'api' &&
+      !apiNonAnthropic &&
+      (apiPoolPrompt?.applies
+        ? apiPoolPrompt.apiBodyPolicy === 'caller'
+        : apiPicked?.endpoint?.body_policy === 'caller')
     const pfTarget =
       inferenceBackend === 'api'
         ? apiOpenAI
@@ -1544,7 +2206,7 @@ export function createHandleProtocol(deps) {
           targetFamily: pfTarget,
           handoffMode: 'canonical',
           reqPath: pathName,
-          headers: req.headers,
+          headers: outboundReqHeaders,
           body: ctx.body,
           routing: getRouting() || {},
           endpointBodyPolicy: apiPicked?.endpoint?.body_policy || '',
@@ -1574,7 +2236,7 @@ export function createHandleProtocol(deps) {
         targetFamily: pfTarget,
         handoffMode: 'canonical',
         reqPath: pathName,
-        headers: req.headers,
+        headers: outboundReqHeaders,
         body: ctx.body,
         routing: getRouting() || {},
         endpointBodyPolicy: apiPicked?.endpoint?.body_policy || '',
@@ -1589,6 +2251,11 @@ export function createHandleProtocol(deps) {
         })
         .catch(() => {})
     }
+    const strictPassthroughAtIngress =
+      inferenceBackend !== 'api' &&
+      !requestContext &&
+      protocol === 'anthropic.messages' &&
+      cragStrictPassthroughEnabled(officialPassthrough, getRouting())
     let converted
     try {
       if (pfMode === 'go' && !apiGemini && !apiOpenAI && pfCompile) {
@@ -1622,6 +2289,7 @@ export function createHandleProtocol(deps) {
                 rewrite: rewriteEnabled,
                 model_map: false,
                 preserve_content_shape: officialPassthrough,
+                strict_passthrough: strictPassthroughAtIngress,
                 onSystemBlock:
                   inferenceBackend !== 'api' && !officialPassthrough
                     ? trackCallerSystemBlock(ctx.body?.system, callerEnvironment)
@@ -1680,7 +2348,9 @@ export function createHandleProtocol(deps) {
       ) {
         ctx.body = { ...ctx.body, thinking: { type: 'disabled' } }
       }
-      ctx.body = applyMinMaxTokens(ctx.body, getRouting()?.compatibility?.min_max_tokens)
+      if (!strictPassthroughAtIngress) {
+        ctx.body = applyMinMaxTokens(ctx.body, getRouting()?.compatibility?.min_max_tokens)
+      }
     }
     let inboundToolReverse = {}
     const deferToolNameRewrite =
@@ -1698,7 +2368,7 @@ export function createHandleProtocol(deps) {
         ctx.body = standard.body
         inboundToolReverse = standard.reverse
       }
-      if (!apiGemini) {
+      if (!apiGemini && !strictPassthroughAtIngress) {
         validateBetweenToolsThinking(ctx.body)
         validateToolChoice(ctx.body)
       }
@@ -1709,7 +2379,7 @@ export function createHandleProtocol(deps) {
       logBag.error_message = error.body.error.message
       return json(res, error.status, error.body)
     }
-    if (!requestContext && officialPassthrough) {
+    if (!requestContext && officialPassthrough && !strictPassthroughAtIngress) {
       ctx.body = repairCacheBreakpoints(ctx.body, {
         limit: Number(getRouting()?.compatibility?.cache_control_limit) || 4,
         fallbackTtl: cacheTtlFromRouting(getRouting()),
@@ -1762,8 +2432,8 @@ export function createHandleProtocol(deps) {
       routing: getRouting(),
     }
     // Pool identity comes from inbound metadata.user_id (or an explicit device_id),
-    // read before outbound cleaning. API key never scopes it.
-    const inboundIdentity = resolveInboundIdentity({ inbound, body: ctx.body, headers: req.headers })
+    // extracted before sanitizeInboundBody ran. API key never scopes it.
+    const inboundIdentity = legacyInboundIdentity
     const stickyDeviceId = inboundIdentity.deviceId
     if (childDeclaredWithoutParent(inbound, req.headers)) {
       stats.errors++
@@ -1890,7 +2560,7 @@ export function createHandleProtocol(deps) {
     }
     // After OpenAI→Anthropic conversion so function tools already have input_schema;
     // leftover OpenAI-shaped tools are still marked (rewrite / mixed inbound).
-    if (!apiNonAnthropic) ctx.body = applyEagerToolStreaming(ctx.body, getRouting())
+    if (!apiNonAnthropic && !strictPassthroughAtIngress) ctx.body = applyEagerToolStreaming(ctx.body, getRouting())
     // Fill omitted TTLs from the resolved Web/session default before rendering,
     // retaining explicit caller 5m/1h (and legal 1h → 5m). Official passthrough
     // and caller-policy API endpoints leave caller omissions untouched.
@@ -1918,29 +2588,49 @@ export function createHandleProtocol(deps) {
     }
     // Anthropic 400s a subscription request whose system field carries a third-party
     // agent prompt; the same text in the first user message is accepted.
-    let cragRelocated = null
-    if (
-      !apiNonAnthropic &&
-      inferenceBackend !== 'api' &&
-      !requestContext &&
-      !officialPassthrough &&
-      (!officialTraffic || hasForeignSystemBlock(ctx.body.system)) &&
-      thirdPartyRelocateEnabled(getRouting())
-    ) {
+    // Skip relocation when an explicit Anthropic pool policy (`zero_inject` /
+    // `override` / `passthrough`) owns `system` directly.
+    const preRelocatePoolPrompt = resolvePoolSystemPromptPolicy(effectivePool, getRouting() || {}, {
+      nodeProvider: platform.platform,
+      isInternalCall: Boolean(requestContext || (req.apiKeyKind === 'master' && isHealthRealBypass(req.headers))),
+    })
+    const preRelocateBody = ctx.body
+    const preRelocateCragSystem = cragSystem
+    const shouldRelocateForAttempt = (policy, routingSnap, effectivePreset = null) => {
+      if (apiNonAnthropic || inferenceBackend === 'api' || requestContext || officialPassthrough) return false
+      if (policy?.applies && ['zero_inject', 'override', 'passthrough'].includes(policy.mode)) return false
+      const resolvedPreset = effectivePreset || (!policy?.applies ? resolveGlobalUnifiedPreset(routingSnap) : null)
+      if (resolvedPreset === 'zero') return false
+      return (
+        (!officialTraffic || hasForeignSystemBlock(preRelocateBody.system)) && thirdPartyRelocateEnabled(routingSnap)
+      )
+    }
+    let relocatedCache = null
+    const getRelocatedForAttempt = () => {
+      if (!relocatedCache) {
+        const relocated = relocateThirdPartySystem(preRelocateBody, { onlyForeign: officialTraffic === true })
+        let cragBody = null
+        if (relocated.moved && hasCragSystem) {
+          cragBody = relocateThirdPartySystem(
+            { ...preRelocateBody, system: preRelocateCragSystem },
+            { onlyForeign: officialTraffic === true },
+          ).body
+        }
+        relocatedCache = {
+          body: relocated.moved ? relocated.body : preRelocateBody,
+          cragBody,
+          moved: relocated.moved,
+        }
+      }
+      return relocatedCache
+    }
+    if (shouldRelocateForAttempt(preRelocatePoolPrompt, getRouting())) {
       // Official traffic only gets here because the gate found a positively
       // foreign block, so move just that block: the real official envelope has
       // standalone harness/boundary/guidance blocks that the greedy predicate
       // would strip along with it.
-      const relocated = relocateThirdPartySystem(ctx.body, { onlyForeign: officialTraffic === true })
+      const relocated = getRelocatedForAttempt()
       if (relocated.moved) {
-        // A CRAG hop sends cragSystem (the caller system without its <cwd>
-        // declaration) instead of personaIn.system. Relocate that projection
-        // too, or the hop would put the third-party prompt back into system.
-        if (hasCragSystem)
-          cragRelocated = relocateThirdPartySystem(
-            { ...ctx.body, system: cragSystem },
-            { onlyForeign: officialTraffic === true },
-          ).body
         ctx.body = relocated.body
       }
     }
@@ -1957,38 +2647,52 @@ export function createHandleProtocol(deps) {
           (message) => Array.isArray(message?.content) && message.content.some((block) => block?.cache_control != null),
         ))
     let personaHideTokens = 0
-    if (inferenceBackend === 'api') {
-      if (!preserveApiCallerBody && !apiNonAnthropic && !requestContext) {
-        ctx.body = applyCrsUnofficialPersona(ctx.body, {
-          officialClient: officialPassthrough,
-          forceConfigured: !officialPassthrough,
-          routingFile: routingConfigPath,
-          cacheTtl: requestedCacheTtl,
-          headers: req.headers,
-          sessionId: outboundSessionId,
-          model: ctx.body?.model,
-          cliVersion: OFFICIAL_CLI_VERSION,
-        })
+    const renderApiAttemptBody = (attemptPrompt) => {
+      let attemptBody = shallowCopyBody(personaIn)
+      const attemptPreserveCaller =
+        !apiNonAnthropic && (attemptPrompt?.applies ? attemptPrompt.apiBodyPolicy === 'caller' : preserveApiCallerBody)
+      if (!apiNonAnthropic && !requestContext) {
+        if (attemptPrompt?.applies && attemptPrompt.mode === 'override') {
+          attemptBody = applyPoolPromptToAnthropicBody(attemptBody, attemptPrompt)
+        } else if (!attemptPreserveCaller) {
+          attemptBody = applyCrsUnofficialPersona(attemptBody, {
+            officialClient: officialPassthrough,
+            forceConfigured: !officialPassthrough,
+            ...(attemptPrompt?.applies && attemptPrompt.cliPreset ? { mode: attemptPrompt.cliPreset } : {}),
+            routingFile: routingConfigPath,
+            cacheTtl: requestedCacheTtl,
+            headers: req.headers,
+            sessionId: outboundSessionId,
+            model: attemptBody?.model,
+            cliVersion: OFFICIAL_CLI_VERSION,
+          })
+          if (attemptPrompt?.applies && attemptPrompt.mode === 'append') {
+            attemptBody = applyPoolPromptToAnthropicBody(attemptBody, attemptPrompt)
+          }
+        }
       }
       if (!officialPassthrough && !requestContext && !apiGemini) {
-        ctx.body = repairCacheBreakpoints(ctx.body, {
+        attemptBody = repairCacheBreakpoints(attemptBody, {
           limit: Number(getRouting()?.compatibility?.cache_control_limit) || 4,
           fallbackTtl: requestedCacheTtl,
-          fillMissing: !preserveApiCallerBody,
+          fillMissing: !attemptPreserveCaller,
         })
       }
-      personaHideTokens =
+      const apiEffectivePersonaMode =
+        attemptPrompt?.applies && attemptPrompt.cliPreset ? attemptPrompt.cliPreset : personaMode
+      const hideTokens =
         requestContext ||
         apiNonAnthropic ||
-        preserveApiCallerBody ||
-        personaUsagePassthroughFromRoutingFile(routingConfigPath, personaMode)
+        attemptPreserveCaller ||
+        personaUsagePassthroughFromRoutingFile(routingConfigPath, apiEffectivePersonaMode)
           ? 0
-          : personaHideForUnofficial(personaIn, ctx.body, {
+          : personaHideForUnofficial(personaIn, attemptBody, {
               officialClient: officialPassthrough,
-              mode: personaMode,
-              hides: personaHidesUsageFromRoutingFile(routingConfigPath),
-              standing: standingUsageFromRoutingFile(routingConfigPath),
+              mode: apiEffectivePersonaMode,
+              hides: personaHidesUsageFromRoutingFile(routingConfigPath, apiEffectivePersonaMode),
+              standing: standingUsageFromRoutingFile(routingConfigPath, apiEffectivePersonaMode),
             })
+      return { attemptBody, hideTokens }
     }
 
     if (inferenceBackend === 'api') {
@@ -2007,51 +2711,274 @@ export function createHandleProtocol(deps) {
       const requestedDelivery = String(
         req.headers['x-kin-delivery'] || getRouting()?.failover?.delivery_mode || 'realtime',
       )
-      // Worker hop stays realtime unless the caller asked for verified.
-      // stream:false only changes the client response shape (assembled JSON).
       const deliveryMode = requestedDelivery === 'verified' ? 'verified' : 'realtime'
       logBag.via = 'api-kernel'
-      // This backend forwards caller cache controls unchanged. Billing must
-      // use the upstream 5m/1h split, not the TTL requested for template fills.
       cacheTtl = null
-      let result
+
+      const apiRt = getSchedulerRuntime(req)
+      const apiAcquireScope = {
+        groupType: route?.kind === 'endpoint' ? platform.platform : apiScope.groupType,
+        endpointId: route?.kind === 'endpoint' ? route.target : apiScope.endpointId,
+        ownerScope: apiScope.ownerScope,
+        allowedEndpointIds: activePoolAccess.legacy ? apiScope.allowedEndpointIds : null,
+      }
+      const apiOriginPoolId = activePoolAccess.originPool?.id || effectivePool?.id || VIRTUAL_POOL_IDS.api
+      const apiNoQueue = !queueAllowedByHeaders(req.headers)
+      const apiMaxSwitches = Math.max(0, Number(getRouting()?.failover?.max_account_switches ?? 3))
+      const excludedApiNodes = new Set()
+      let activeApiLeaseId = null
+      let activeApiSelection = null
+      let apiAttempts = 0
+      let apiFinalConvertedBody = ctx.body
+      let result = null
+
+      const isRetryableApiFailure = (r) => {
+        if (!r || r.ok || res.headersSent || clientAbort.signal.aborted) return false
+        const st = Number(r.upstreamStatus ?? r.status) || 0
+        if (st === 0 || st === 408 || st === 429 || st === 529) return true
+        return st >= 500 && st < 600
+      }
+
+      const sendApiSchedulerError = (err) => {
+        stats.errors++
+        if (err instanceof SchedulerUnavailableError || err?.code === 'scheduler_unavailable') {
+          logBag.error_code = 'scheduler_unavailable'
+          logBag.error_message = err?.message || 'Rust scheduler sidecar is unavailable'
+          logBag.final_state = 'scheduler_unavailable'
+          res.setHeader?.('retry-after', '1')
+          return json(res, 503, {
+            type: 'error',
+            error: {
+              type: 'api_error',
+              code: 'scheduler_unavailable',
+              message: logBag.error_message,
+            },
+          })
+        }
+        const formatted = formatSchedulerError(err)
+        logBag.error_code = formatted.code
+        logBag.error_message = formatted.body?.error?.message || null
+        if (formatted.explain) logBag.scheduler_explain = formatted.explain
+        logBag.final_state = formatted.status === 422 ? 'poison_abort' : 'failed'
+        if (formatted.retryAfterSec != null) res.setHeader?.('retry-after', String(formatted.retryAfterSec))
+        return json(res, formatted.status, formatted.body)
+      }
+
       try {
-        result = await runApiInference({
-          req,
-          res,
-          cfg,
-          scheduler: apiScheduler,
-          picked: apiPicked,
-          store: apiEndpointStore,
-          protocol,
-          inbound: apiInbound,
-          convertedBody: ctx.body,
-          clientStream,
-          deliveryMode,
-          signal: clientAbort.signal,
-          timeoutMs: cfg.limits.upstream_timeout_ms,
-          personaHideTokens,
-          cacheTtl,
-          onPublicLine: publicStream ? (line) => publicStream.observe(line) : null,
-          requestContext,
-          passthrough: officialPassthrough,
-          routing: getRouting(),
-          redactionPrincipal: req.apiKeyRecord?.id || (req.apiKeyKind === 'master' ? 'master' : ''),
-          redactionSession: String(req.headers?.['x-claude-code-session-id'] || ''),
-          converters: {
-            createClaudeMessageAssembler,
-            applyClaudeSSELineToMessage,
-            createOpenAIChatStreamState,
-            claudeSSELineToOpenAIChatChunks,
-            createOpenAICompletionStreamState,
-            claudeSSELineToOpenAICompletionChunks,
-            createResponsesStreamState: (model, id) => createResponsesStreamState(model, id, converted.responseTools),
-            claudeSSELineToResponsesEvents,
-            hidePersonaUsageInSseLine,
-            writeSSEHeaders,
-          },
-        })
+        try {
+          activeApiSelection = await apiScheduler.acquire(ctx.body?.model, {
+            schedulerRuntime: apiRt,
+            // Security: mint an unpredictable per-request UUID for Rust idempotency; never pass client X-Request-Id.
+            requestId: crypto.randomUUID(),
+            attemptNo: 1,
+            originPoolId: apiOriginPoolId,
+            jevDowngradePoolId:
+              logBag.jev_downgrade_pool_id || (activePoolAccess.isDowngraded ? effectivePool?.id || null : null),
+            apiKeyRecord: req.apiKeyRecord || null,
+            apiKeyKind: req.apiKeyKind || null,
+            poolAccess: activePoolAccess,
+            ownerScope: apiAcquireScope.ownerScope,
+            groupType: apiAcquireScope.groupType,
+            endpointId: apiAcquireScope.endpointId,
+            allowedEndpointIds: apiAcquireScope.allowedEndpointIds,
+            protocol,
+            inboundIdentity: summarySession
+              ? {
+                  ...(ctx.inboundIdentity || {}),
+                  sessionId: summarySession,
+                  sessionSource: 'summary_fork',
+                  parentSessionId: ctx.inboundIdentity?.sessionId || null,
+                  isEphemeralProbe: true,
+                }
+              : ctx.inboundIdentity,
+            noQueue: apiNoQueue,
+            isAdminDiagnostic: panelDiagnostics,
+            signal: clientAbort.signal,
+          })
+        } catch (err) {
+          if (clientAbort.signal.aborted || err?.name === 'AbortError' || err?.code === 'ABORT_ERR') {
+            return finishClientCancel(res, { cancelled: true }, logBag)
+          }
+          return sendApiSchedulerError(err)
+        }
+        if (!activeApiSelection?.ok) {
+          stats.errors++
+          logBag.error_code = activeApiSelection?.code || 'no_ready_api_key'
+          logBag.error_message = activeApiSelection?.message || 'No ready API endpoint'
+          return json(res, activeApiSelection?.code === 'model_not_found' ? 404 : 503, {
+            type: 'error',
+            error: { type: 'api_error', code: logBag.error_code, message: logBag.error_message },
+          })
+        }
+        activeApiLeaseId = activeApiSelection.leaseId
+        if (activeApiSelection.resolvedPoolId) logBag.resolved_pool_id = activeApiSelection.resolvedPoolId
+
+        for (;;) {
+          apiAttempts += 1
+          const attemptPrompt = resolveAttemptPoolPromptPolicy(
+            activeApiSelection.promptPolicy,
+            effectivePool,
+            getRouting() || {},
+            {
+              nodeProvider: apiNonAnthropic ? platform.platform : 'anthropic',
+              isInternalCall: Boolean(
+                requestContext || (req.apiKeyKind === 'master' && isHealthRealBypass(req.headers)),
+              ),
+            },
+          )
+          logBag.prompt_policy = {
+            mode: attemptPrompt.mode,
+            source: attemptPrompt.source,
+            pool_id: attemptPrompt.poolId,
+          }
+          const rendered = renderApiAttemptBody(attemptPrompt)
+          apiFinalConvertedBody = rendered.attemptBody
+          personaHideTokens = rendered.hideTokens
+
+          result = await runApiInference({
+            req,
+            res,
+            cfg,
+            scheduler: apiScheduler,
+            picked: activeApiSelection,
+            store: apiEndpointStore,
+            protocol,
+            inbound: apiInbound,
+            convertedBody: apiFinalConvertedBody,
+            clientStream,
+            deliveryMode,
+            signal: clientAbort.signal,
+            timeoutMs: cfg.limits.upstream_timeout_ms,
+            personaHideTokens,
+            cacheTtl,
+            onPublicLine: publicStream ? (line) => publicStream.observe(line) : null,
+            requestContext,
+            passthrough: officialPassthrough,
+            routing: getRouting(),
+            redactionPrincipal: req.apiKeyRecord?.id || (req.apiKeyKind === 'master' ? 'master' : ''),
+            redactionSession: String(req.headers?.['x-claude-code-session-id'] || ''),
+            converters: {
+              createClaudeMessageAssembler,
+              applyClaudeSSELineToMessage,
+              createOpenAIChatStreamState,
+              claudeSSELineToOpenAIChatChunks,
+              createOpenAICompletionStreamState,
+              claudeSSELineToOpenAICompletionChunks,
+              createResponsesStreamState: (model, id) => createResponsesStreamState(model, id, converted.responseTools),
+              claudeSSELineToResponsesEvents,
+              hidePersonaUsageInSseLine,
+              writeSSEHeaders,
+            },
+          })
+
+          if (result?.ok) {
+            await apiScheduler.commitLease(activeApiLeaseId, { schedulerRuntime: apiRt }).catch(() => {})
+            const lid = activeApiLeaseId
+            activeApiLeaseId = null
+            await apiScheduler
+              .releaseLease(
+                lid,
+                {
+                  outcome: 'ok',
+                  http_status: Number(result.upstreamStatus) || 200,
+                  ...(Number.isFinite(result.ttftMs) ? { ttft_ms: Math.max(0, Math.round(result.ttftMs)) } : {}),
+                },
+                { schedulerRuntime: apiRt },
+              )
+              .catch(() => {})
+            break
+          }
+
+          const failStatus = Number(result?.upstreamStatus ?? result?.status) || 0
+          const failCode = String(result?.body?.error?.code || 'upstream_error')
+          const failMsg = String(result?.body?.error?.message || '').slice(0, 300)
+          const failureReport = {
+            http_status: failStatus,
+            error_class: classifyErrorClass({
+              status: failStatus,
+              errorCode: failCode,
+              reason: failMsg,
+              isTransport: failStatus === 0,
+            }),
+            error_signature: failCode.slice(0, 128),
+            ...(failMsg ? { error_message: failMsg } : {}),
+          }
+
+          if (!isRetryableApiFailure(result) || apiAttempts > apiMaxSwitches) {
+            const lid = activeApiLeaseId
+            activeApiLeaseId = null
+            await apiScheduler
+              .releaseLease(
+                lid,
+                {
+                  outcome: clientAbort.signal.aborted
+                    ? 'aborted'
+                    : failureReport.error_class === 'timeout'
+                      ? 'timeout'
+                      : 'error',
+                  http_status: failStatus || undefined,
+                  error_class: failureReport.error_class,
+                  error_signature: failureReport.error_signature,
+                  error_message: failureReport.error_message,
+                },
+                { schedulerRuntime: apiRt },
+              )
+              .catch(() => {})
+            break
+          }
+
+          if (activeApiSelection.nodeKey) excludedApiNodes.add(activeApiSelection.nodeKey)
+          const prevLeaseId = activeApiLeaseId
+          activeApiLeaseId = null
+          try {
+            const switched = await apiScheduler.switchEndpoint({
+              schedulerRuntime: apiRt,
+              releaseLeaseId: prevLeaseId,
+              failure: failureReport,
+              nextAttempt: {
+                ...(activeApiSelection.acquireParams || {}),
+                attemptNo: apiAttempts + 1,
+                excludeNodes: [...excludedApiNodes],
+              },
+              requestedModel: ctx.body?.model,
+              groupType: apiAcquireScope.groupType,
+              endpointId: apiAcquireScope.endpointId,
+              ownerScope: apiAcquireScope.ownerScope,
+              allowedEndpointIds: apiAcquireScope.allowedEndpointIds,
+              poolAccess: activePoolAccess,
+              signal: clientAbort.signal,
+            })
+            if (!switched?.ok) break
+            activeApiSelection = switched
+            activeApiLeaseId = switched.leaseId
+            if (switched.resolvedPoolId) logBag.resolved_pool_id = switched.resolvedPoolId
+          } catch (switchErr) {
+            if (clientAbort.signal.aborted || switchErr?.name === 'AbortError' || switchErr?.code === 'ABORT_ERR') {
+              return finishClientCancel(res, { cancelled: true }, logBag)
+            }
+            if (
+              switchErr instanceof SchedulerUnavailableError ||
+              switchErr?.code === 'scheduler_unavailable' ||
+              (switchErr instanceof SchedulerApiError &&
+                (switchErr.code === 'poison_abort' || switchErr.status === 422))
+            ) {
+              return sendApiSchedulerError(switchErr)
+            }
+            break
+          }
+        }
       } finally {
+        if (activeApiLeaseId) {
+          const lid = activeApiLeaseId
+          activeApiLeaseId = null
+          await apiScheduler
+            .releaseLease(
+              lid,
+              { outcome: clientAbort.signal.aborted ? 'aborted' : 'error' },
+              { schedulerRuntime: apiRt },
+            )
+            .catch(() => {})
+        }
         clientAbort.settle()
         if (managedKey) {
           try {
@@ -2059,6 +2986,7 @@ export function createHandleProtocol(deps) {
           } catch {}
         }
       }
+      ctx.body = apiFinalConvertedBody
       // The api backend forwards the converted body untouched: its session is the outbound one.
       logBag.outbound_session_id = sessionIdForLog(sessionIdFromOutboundBody(ctx.body) || logBag.session_id)
       if (result?.outboundBody != null) {
@@ -2087,7 +3015,7 @@ export function createHandleProtocol(deps) {
         : (result?.firstByteMs ?? null)
       logBag.generation_ms = result?.generationMs ?? null
       logBag.final_state = result?.terminalState || null
-      logBag.attempt_count = result?.endpointId ? 1 : 0
+      logBag.attempt_count = apiAttempts || (result?.endpointId ? 1 : 0)
       if (result?.upstreamStatus != null) afterHop(result)
       attachPricing(logBag, {
         managedKey,
@@ -2137,10 +3065,10 @@ export function createHandleProtocol(deps) {
                 converted.responseTools,
               )
       }
-      return sendPublicJson(output)
+      return sendPublicJson(output, result?.headers)
     }
 
-    const canonicalBody = officialMessagesBody(ctx.body)
+    const canonicalBody = strictPassthroughAtIngress ? ctx.body : officialMessagesBody(ctx.body)
     const streamKeepaliveMs = Number(
       getRouting()?.failover?.stream_keepalive_ms ?? cfg.limits.stream_keepalive_ms ?? 15_000,
     )
@@ -2165,6 +3093,7 @@ export function createHandleProtocol(deps) {
     const anthropicSseErrorRemapper =
       clientStream && protocol === 'anthropic.messages'
         ? createAnthropicSseErrorRemapper({
+            strictPassthrough: strictPassthroughAtIngress,
             isStarted: () => streamTracker?.hasStarted() === true,
             // The client is told to retry, so the real cause has to survive here or
             // it survives nowhere: this relay path sets no other logBag fields, and
@@ -2265,6 +3194,15 @@ export function createHandleProtocol(deps) {
         // Set only when a group member actually supplied the sticky key.
         batchMember: !isProbe && batchApplied,
         stickyDeviceId,
+        inboundIdentity: summarySession
+          ? {
+              ...(ctx.inboundIdentity || {}),
+              sessionId: summarySession,
+              sessionSource: 'summary_fork',
+              parentSessionId: ctx.inboundIdentity?.sessionId || null,
+              isEphemeralProbe: true,
+            }
+          : ctx.inboundIdentity,
         deviceKey,
         skipSessionSeat: seatless,
         familyKey: summarySession ? null : familyKey,
@@ -2273,8 +3211,17 @@ export function createHandleProtocol(deps) {
         seatKey,
         familyVmId,
         pinVmId,
+        isAdminDiagnostic: panelDiagnostics,
         ownerScope,
         keyScope,
+        apiKeyRecord: req.apiKeyRecord || null,
+        apiKeyKind: req.apiKeyKind || null,
+        poolAccess: activePoolAccess,
+        originPoolId: activePoolAccess.originPool?.id || effectivePool?.id || null,
+        jevDowngradePoolId:
+          logBag.jev_downgrade_pool_id || (activePoolAccess.isDowngraded ? effectivePool?.id || null : null),
+        protocol,
+        schedulerRuntime: getSchedulerRuntime(req),
         countUsage: !healthReal,
         quotaRequest: {
           body: canonicalBody,
@@ -2287,16 +3234,18 @@ export function createHandleProtocol(deps) {
         allowQueue,
         signal: clientAbort.signal,
         applyAttempt: async (body, selected, extra = {}) => {
-          // Only this account's own thinking replays as thinking. Another
-          // account's signature, or one with no record, goes out as text.
-          const owned = filterThinkingForAccount(body, selected.accountId, thinkingOwnerStore)
-          body = owned.body
-          if (owned.kept || owned.converted || owned.dropped) {
-            const { kept, converted, dropped, unknown } = owned
-            logBag.hop_meta = {
-              ...logBag.hop_meta,
-              thinking_owner: { account_id: selected.accountId, kept, converted, dropped, unknown },
+          const applyAccountThinkingFilter = (target) => {
+            // Only this account's own thinking replays as thinking on non-CRAG
+            // paths. Another account's signature, or one with no record, goes out as text.
+            const owned = filterThinkingForAccount(target, selected.accountId, thinkingOwnerStore)
+            if (owned.kept || owned.converted || owned.dropped) {
+              const { kept, converted, dropped, unknown } = owned
+              logBag.hop_meta = {
+                ...logBag.hop_meta,
+                thinking_owner: { account_id: selected.accountId, kept, converted, dropped, unknown },
+              }
             }
+            return owned.body
           }
           const attemptStartedAt = extra.attemptStartedAt ?? Date.now()
           // The runner snapshots after this session's queue turn, before VM prebinding.
@@ -2315,21 +3264,6 @@ export function createHandleProtocol(deps) {
               ? `slot:${selected.slotIndex ?? 'x'}:${attemptStartedAt}`
               : `${attemptStartedAt}:${selected.vmId || extra.attemptNo || ''}`,
           })
-          if (scopedRiskGate) {
-            const blocked = await applyProtocolIntercept({
-              ...gateArgs,
-              body: auditBody,
-              account: scopeAccountFromVm(selected?.vm, findAccount(accountQuota, selected?.vm)?.unified),
-              bodyCtx: earlyBodyCtx,
-              skipMandatory: true,
-              interceptSessionKey: attemptSessionId ? `${selected.accountId}:${attemptSessionId}` : null,
-            })
-            if (blocked) {
-              const error = new Error('response already sent')
-              error.code = 'response_sent'
-              throw error
-            }
-          }
           const identity = loadVmIdentity(selected.exec)
           if (identity && attemptSessionId) identity.callerSessionId = attemptSessionId
           const credMode = credentialModeFromOauth(selected.vm?.claude || {})
@@ -2364,11 +3298,32 @@ export function createHandleProtocol(deps) {
           const preserveCliHopThinkingBlocks = !thinkingRepaired
           const cliHop = resolveOfficialCcInference(selected.vm, routingNow) === 'cli-hop'
           const resolvedPersona = resolveSlotPersonaPreset(selected.vm, routingNow)
-          const preserveCallerEnvironment = !presetFlagEnabled(
-            routingNow?.compatibility,
-            'persona_env_presets',
-            resolvedPersona,
-          )
+          const attemptPoolPrompt = resolveAttemptPoolPromptPolicy(selected.promptPolicy, effectivePool, routingNow, {
+            nodeProvider: 'anthropic',
+            isInternalCall: Boolean(requestContext || healthReal),
+          })
+          if (selected.resolvedPoolId) logBag.resolved_pool_id = selected.resolvedPoolId
+          logBag.prompt_policy = {
+            mode: attemptPoolPrompt.mode,
+            source: attemptPoolPrompt.source,
+            pool_id: attemptPoolPrompt.poolId,
+          }
+          const effectiveCliPersona =
+            attemptPoolPrompt.applies && attemptPoolPrompt.cliPreset ? attemptPoolPrompt.cliPreset : resolvedPersona
+          const preserveCallerEnvironment = !isPresetEnvEnabled(routingNow?.compatibility, effectiveCliPersona)
+          const attemptIsZero =
+            !(attemptPoolPrompt.applies && attemptPoolPrompt.mode === 'passthrough') &&
+            (effectiveCliPersona === 'zero' ||
+              (attemptPoolPrompt.applies && ['zero_inject', 'override'].includes(attemptPoolPrompt.mode)))
+          const attemptPoolOwnsSystemDirectly =
+            attemptIsZero ||
+            (attemptPoolPrompt.applies && ['zero_inject', 'override', 'passthrough'].includes(attemptPoolPrompt.mode))
+          const attemptNeedsRelocate = shouldRelocateForAttempt(attemptPoolPrompt, routingNow, effectiveCliPersona)
+          const attemptPersonaIn = attemptPoolOwnsSystemDirectly
+            ? preRelocateBody
+            : attemptNeedsRelocate
+              ? getRelocatedForAttempt().body
+              : preRelocateBody
           let hopBody = body
           if (cliHop) {
             const transportRouting = getRouting()
@@ -2388,22 +3343,79 @@ export function createHandleProtocol(deps) {
                 kernelConfig: readSlotKernelConfig(selected.exec?.homeDir),
               })
             if (cragPrint) {
-              const cragPersona = resolveCragPrintPersona(selected.vm, routingNow)
+              const cragPersona =
+                attemptPoolPrompt.applies && attemptPoolPrompt.cragPreset
+                  ? attemptPoolPrompt.cragPreset
+                  : resolveCragPrintPersona(selected.vm, routingNow)
               const caps = preparedHop.ready.health?.capabilities
-              const preserveToolNames = deferToolNameRewrite && caps?.includes('generation_controls_v3')
-              const cragInput = cragRelocated || (hasCragSystem ? { ...personaIn, system: cragSystem } : personaIn)
+              const headlessBridge = isHeadlessBridgeCaps(caps)
+              const strictPassthrough =
+                !requestContext &&
+                protocol === 'anthropic.messages' &&
+                (!attemptPoolPrompt.applies || ['official', 'passthrough'].includes(attemptPoolPrompt.mode)) &&
+                cragStrictPassthroughEnabled(officialPassthrough, routingNow)
+              // CRAG V4 (headless_claude_bridge_v1) removed the claude CLI MCP
+              // tool-wrapping layer while still advertising generation_controls_v3,
+              // so vm2api must rewrite third-party tool names to mcp__<name> here.
+              const preserveToolNames =
+                deferToolNameRewrite && caps?.includes('generation_controls_v3') && !headlessBridge
+              const customCragTemplate =
+                headlessBridge && !officialPassthrough && !strictPassthrough
+                  ? resolveCragCustomTemplate(selected.vm, routingNow, cragPersona)
+                  : null
+              const customCragTemplateUsesCallerSystem =
+                customCragTemplate != null &&
+                (customCragTemplate.preset === 'zero' ||
+                  (Array.isArray(customCragTemplate.blocks) &&
+                    customCragTemplate.blocks.some(
+                      (block) =>
+                        block?.id === 'caller_system' ||
+                        /\{\{\s*(?:caller_system|caller_agent|agent_official)\s*\}\}/i.test(String(block?.text || '')),
+                    )))
+              const usePreRelocate =
+                !officialPassthrough &&
+                (attemptPoolOwnsSystemDirectly ||
+                  cragPersona === 'zero' ||
+                  (headlessBridge && customCragTemplateUsesCallerSystem))
+              const attemptRelocated =
+                !strictPassthrough && !usePreRelocate && attemptNeedsRelocate ? getRelocatedForAttempt() : null
+              const cragInput = strictPassthrough
+                ? personaIn
+                : usePreRelocate
+                  ? hasCragSystem
+                    ? { ...preRelocateBody, system: preRelocateCragSystem }
+                    : preRelocateBody
+                  : attemptRelocated?.cragBody ||
+                    (attemptRelocated?.moved
+                      ? attemptRelocated.body
+                      : hasCragSystem
+                        ? { ...preRelocateBody, system: preRelocateCragSystem }
+                        : preRelocateBody)
+              const cragPromptSpec = resolveSystemPromptSpec({
+                routing: routingNow,
+                slot: selected.vm,
+                poolPolicy: attemptPoolPrompt.applies ? attemptPoolPrompt : null,
+                identity,
+                officialPassthrough: headlessBridge
+                  ? officialPassthrough
+                  : officialPassthrough && !cacheControlRepaired,
+                strictPassthrough,
+                // vm2api already ran attemptRelocated (when applicable) before calling CRAG,
+                // so never ask CRAG V4 to relocate caller system a second time.
+                relocateCallerSystem: false,
+              })
               const reuseHistory = !officialPassthrough && !repaired && !extra.repairs?.length
               const reuseIngress =
                 reuseHistory &&
                 preserveToolNames &&
-                caps.includes('linux_tui_native_queue') &&
+                isNativeCragV3Plus(caps) &&
                 !hasCragSystem &&
                 !summarySession &&
                 !toolPruneAttempt &&
-                personaIn.thread == null &&
-                (!Array.isArray(personaIn.system) ||
-                  !personaIn.system.some((block) => /x-anthropic-billing-header:/i.test(block?.text || ''))) &&
-                canReuseCanonicalHistory(personaIn.messages)
+                cragInput.thread == null &&
+                (!Array.isArray(cragInput.system) ||
+                  !cragInput.system.some((block) => /x-anthropic-billing-header:/i.test(block?.text || ''))) &&
+                canReuseCanonicalHistory(cragInput.messages)
               const scrubOptions = {
                 official: officialTraffic === true,
                 rewriteTools: routingNow?.compatibility?.tool_name_rewrite !== false,
@@ -2411,8 +3423,8 @@ export function createHandleProtocol(deps) {
                 shareUnchanged: reuseHistory,
               }
               let toolNames = inboundToolReverse
-              let source = cragInput
-              if (!reuseIngress) {
+              let source = strictPassthrough ? shallowCopyBody(cragInput) : cragInput
+              if (!strictPassthrough && !reuseIngress) {
                 const standard = toStandardAnthropicBody(cragInput, {
                   ...scrubOptions,
                   reuseCanonicalHistory: reuseHistory,
@@ -2423,46 +3435,79 @@ export function createHandleProtocol(deps) {
               // The CRAG kernel fingerprints the public stream it already sent,
               // including thinking. Rewriting an unrecorded signature into text
               // makes the tool continuation fail with tool_result history mismatch.
-              // routing.compatibility.crag_drop_foreign_thinking (default off): signed
-              // blocks this account did not mint (another account's, or never
-              // recorded) never came from this kernel; drop them before the hop
-              // instead of waiting for the 400. 'foreign_only' narrows that to
-              // blocks recorded against another account, so an incomplete record
-              // no longer costs the caller its own thinking.
+              // Single SQLite pass per CRAG hop: when crag_drop_foreign_thinking is
+              // enabled, dropForeignThinkingForCrag handles both dropping and foreign
+              // signature counting; when 'off' (and not strictPassthrough),
+              // inspectForeignThinking checks ownership read-only without cloning.
               const cragForeignMode = cragForeignThinkingMode(routingNow?.compatibility?.crag_drop_foreign_thinking)
-              const cragOwned =
-                cragForeignMode === 'off'
-                  ? { body: source }
-                  : dropForeignThinkingForCrag(source, selected.accountId, thinkingOwnerStore, {
+              let cragOwned = { body: source, foreign: 0 }
+              let foreignThinking = false
+              if (cragForeignMode !== 'off') {
+                cragOwned = dropForeignThinkingForCrag(source, selected.accountId, thinkingOwnerStore, {
+                  mode: cragForeignMode,
+                })
+                source = cragOwned.body
+                foreignThinking = !strictPassthrough && cragOwned.foreign > 0
+                if (cragOwned.dropped || cragOwned.bailed) {
+                  const { kept, unknownKept, dropped, droppedTurns, openLoop, thinkingOff, bailed } = cragOwned
+                  logBag.hop_meta = {
+                    ...logBag.hop_meta,
+                    thinking_owner_crag: {
+                      account_id: selected.accountId,
                       mode: cragForeignMode,
-                    })
-              source = cragOwned.body
-              if (cragOwned.dropped || cragOwned.bailed) {
-                const { kept, unknownKept, dropped, droppedTurns, openLoop, thinkingOff, bailed } = cragOwned
-                logBag.hop_meta = {
-                  ...logBag.hop_meta,
-                  thinking_owner_crag: {
-                    account_id: selected.accountId,
-                    mode: cragForeignMode,
-                    kept,
-                    unknown_kept: unknownKept,
-                    dropped,
-                    dropped_turns: droppedTurns,
-                    open_loop: openLoop,
-                    thinking_off: thinkingOff,
-                    bailed,
-                  },
+                      kept,
+                      unknown_kept: unknownKept,
+                      dropped,
+                      dropped_turns: droppedTurns,
+                      open_loop: openLoop,
+                      thinking_off: thinkingOff,
+                      bailed,
+                    },
+                  }
+                }
+              } else if (!strictPassthrough) {
+                const inspected = inspectForeignThinking(source, selected.accountId, thinkingOwnerStore)
+                foreignThinking = inspected.foreign > 0
+                if (inspected.kept || inspected.foreign) {
+                  logBag.hop_meta = {
+                    ...logBag.hop_meta,
+                    thinking_owner: {
+                      account_id: selected.accountId,
+                      kept: inspected.kept,
+                      converted: 0,
+                      dropped: 0,
+                      unknown: inspected.unknown,
+                      foreign: inspected.foreign,
+                    },
+                  }
                 }
               }
-              for (const policy of extra.repairs || []) source = repairAnthropicRequest(source, policy)
+              if (!strictPassthrough) {
+                for (const policy of extra.repairs || []) source = repairAnthropicRequest(source, policy)
+              }
               hopBody = prepareCragPrintBody(source, {
-                preset: cragPersona,
-                officialPassthrough: officialPassthrough && !cacheControlRepaired,
+                preset: cragPromptSpec.mode,
+                promptSpec: cragPromptSpec,
+                officialPassthrough: headlessBridge
+                  ? officialPassthrough
+                  : officialPassthrough && !cacheControlRepaired,
                 capabilities: Array.isArray(caps) ? caps : [],
+                health: preparedHop.ready.health || null,
+                promptPolicy: attemptPoolPrompt.applies ? attemptPoolPrompt : null,
                 agentSummary: !!summarySession,
-                foldSystemMessages: routingNow?.compatibility?.crag_fold_history_system !== false,
+                foldSystemMessages:
+                  strictPassthrough || headlessBridge
+                    ? false
+                    : routingNow?.compatibility?.crag_fold_history_system !== false,
+                strictPassthrough,
+                routing: officialPassthrough ? null : routingNow,
+                vm: selected.vm,
+                identity,
+                sessionId: attemptSessionId,
+                entrypoint: entrypointNow,
+                cacheTtl: requestedCacheTtl,
               })
-              if (cacheControlRepaired && needsCragProviderCompatibility(hopBody, caps)) {
+              if (!strictPassthrough && cacheControlRepaired && needsCragProviderCompatibility(hopBody, caps)) {
                 hopBody = repairCacheBreakpoints(
                   applyCacheBreakpoints(hopBody, {
                     ttl: requestedCacheTtl,
@@ -2474,14 +3519,16 @@ export function createHandleProtocol(deps) {
                   },
                 )
               }
-              const materialized = await materializeRemoteImageSources(hopBody)
-              if (materialized !== hopBody) {
-                validateImageDimensions(materialized)
-                hopBody = materialized
+              if (!strictPassthrough) {
+                const materialized = await materializeRemoteImageSources(hopBody)
+                if (materialized !== hopBody) {
+                  validateImageDimensions(materialized)
+                  hopBody = materialized
+                }
               }
-              const nativeCragV3 = caps?.includes('generation_controls_v3') && caps?.includes('linux_tui_native_queue')
-              if (identity && !nativeCragV3) {
-                hopBody = applyCrsIdentityReplace(hopBody, identity, inbound, req.headers, {
+              const nativeCragV3 = isNativeCragV3Plus(caps)
+              if (!strictPassthrough && identity && !nativeCragV3) {
+                hopBody = applyCrsIdentityReplace(hopBody, identity, inbound, outboundReqHeaders, {
                   officialClient: officialTraffic,
                   sessionId: attemptSessionId,
                   mode: sessionMode,
@@ -2493,6 +3540,7 @@ export function createHandleProtocol(deps) {
                 })
               }
               if (
+                !strictPassthrough &&
                 caps?.includes('generation_controls_v3') &&
                 hopBody.cache_ttl == null &&
                 hopBody.crag_options?.cache_ttl == null
@@ -2500,7 +3548,7 @@ export function createHandleProtocol(deps) {
                 // Carry the resolved session/menu default separately from usage accounting.
                 hopBody.cache_ttl = requestedCacheTtl
               }
-              preserveCacheBreakpoints = officialPassthrough && !cacheControlRepaired
+              preserveCacheBreakpoints = strictPassthrough || (officialPassthrough && !cacheControlRepaired)
               cacheTtl = null
               personaHideTokens = 0
               logBag.inference_engine = resolveInferenceEngine(selected.vm, routingNow)
@@ -2508,13 +3556,19 @@ export function createHandleProtocol(deps) {
               logBag.crag_print = {
                 transport: preparedHop.ready.health?.transport,
                 persona: cragPersona,
-                prompt_mode: hopBody.crag_prompt?.mode || 'default',
+                prompt_mode:
+                  hopBody.crag_prompt?.mode ||
+                  hopBody.crag_prompt_spec?.mode ||
+                  hopBody.crag_persona_preset ||
+                  'default',
+                ...(attemptPoolPrompt.applies ? { pool_prompt_mode: attemptPoolPrompt.mode } : {}),
+                strict_passthrough: strictPassthrough,
                 safeguards_stripped: Boolean(personaIn.safeguards != null && hopBody.safeguards == null),
                 ...(cacheControlRepaired ? { cache_control_repaired: true } : {}),
               }
               logBag.official_cc_inference = 'crag-print'
               logBag.provider = 'local_cli'
-              hopBody = noteCachePrefix(selected, attemptSessionId, hopBody)
+              if (!strictPassthrough) hopBody = noteCachePrefix(selected, attemptSessionId, hopBody)
               logBag.outbound_summary = summarizeBody(hopBody)
               logBag.outbound_session_id = sessionIdForLog(sessionIdFromOutboundBody(hopBody) || attemptSessionId)
               return {
@@ -2524,9 +3578,16 @@ export function createHandleProtocol(deps) {
                   sessionId: attemptSessionId,
                   cliHop: true,
                   cragPrint: true,
+                  strictPassthrough,
+                  stripClientBeta:
+                    headlessBridge &&
+                    !strictPassthrough &&
+                    !officialPassthrough &&
+                    !(attemptPoolPrompt.applies && attemptPoolPrompt.mode === 'passthrough'),
+                  safeguardsSanitized: !strictPassthrough,
                   // CRAG replays caller thinking unfiltered; signatures this pool never
                   // issued make an "Invalid signature" 400 safe to strip and retry.
-                  foreignThinking: owned.converted + owned.dropped > 0,
+                  foreignThinking,
                   callerCwd: callerEnvironment?.cwd,
                   preparedHop,
                   transportRouting,
@@ -2538,21 +3599,48 @@ export function createHandleProtocol(deps) {
                 },
               }
             }
+            hopBody = applyAccountThinkingFilter(body)
             // The front rewrite already produces the official two-block shape.
-            const outboundProfile = profileForPreset(resolvedPersona)
+            const cliPoolPassthrough = attemptPoolPrompt.applies && attemptPoolPrompt.mode === 'passthrough'
+            const effectiveOfficialPassthrough =
+              attemptPoolPrompt.applies && attemptPoolPrompt.mode !== 'official' ? false : officialPassthrough
+            const outboundProfile = profileForPreset(effectiveCliPersona)
             // Render once from caller input with the selected slot's identity, not the pre-selection environment.
-            if (!requestContext && !officialPassthrough) {
-              hopBody = applyCrsUnofficialPersona(prepareCliPersonaInput(shallowCopyBody(personaIn), resolvedPersona), {
-                forceConfigured: true,
-                routingFile: routingConfigPath,
-                cacheTtl: requestedCacheTtl,
-                mode: resolvedPersona,
-                sessionId: attemptSessionId,
-                model: hopBody?.model,
-                cliVersion: outboundProfile.cliVersion,
-                identity,
-                entrypoint: entrypointNow,
-              })
+            if (!requestContext && !effectiveOfficialPassthrough) {
+              if (cliPoolPassthrough) {
+                hopBody = shallowCopyBody(attemptPersonaIn)
+              } else if (attemptPoolPrompt.applies && attemptPoolPrompt.mode === 'override') {
+                const overridden = applyPoolPromptToAnthropicBody(shallowCopyBody(attemptPersonaIn), attemptPoolPrompt)
+                hopBody = applyCrsUnofficialPersona(prepareCliPersonaInput(overridden, 'zero'), {
+                  forceConfigured: true,
+                  routingFile: routingConfigPath,
+                  cacheTtl: requestedCacheTtl,
+                  mode: 'zero',
+                  sessionId: attemptSessionId,
+                  model: hopBody?.model,
+                  cliVersion: outboundProfile.cliVersion,
+                  identity,
+                  entrypoint: entrypointNow,
+                })
+              } else {
+                hopBody = applyCrsUnofficialPersona(
+                  prepareCliPersonaInput(shallowCopyBody(attemptPersonaIn), effectiveCliPersona),
+                  {
+                    forceConfigured: true,
+                    routingFile: routingConfigPath,
+                    cacheTtl: requestedCacheTtl,
+                    mode: effectiveCliPersona,
+                    sessionId: attemptSessionId,
+                    model: hopBody?.model,
+                    cliVersion: outboundProfile.cliVersion,
+                    identity,
+                    entrypoint: entrypointNow,
+                  },
+                )
+                if (attemptPoolPrompt.applies && attemptPoolPrompt.mode === 'append') {
+                  hopBody = applyPoolPromptToAnthropicBody(hopBody, attemptPoolPrompt)
+                }
+              }
               // The re-render starts from the raw caller body; re-apply this account's thinking ownership to it.
               hopBody = filterThinkingForAccount(hopBody, selected.accountId, thinkingOwnerStore).body
               for (const policy of extra.repairs || []) hopBody = repairAnthropicRequest(hopBody, policy)
@@ -2562,13 +3650,14 @@ export function createHandleProtocol(deps) {
               repaired: thinkingRepaired,
               cacheTtl: requestedCacheTtl,
               requestContext,
-              preserveSystem: false,
-              preserveCacheTtl: officialPassthrough && !cacheControlRepaired,
+              preserveSystem: cliPoolPassthrough,
+              preserveCacheTtl: effectiveOfficialPassthrough && !cacheControlRepaired,
               preserveThinkingBlocks: preserveCliHopThinkingBlocks,
               preserveCallerEnvironment,
               autoCompactWindow: ctx.autoCompactWindow,
               routing: routingNow,
-              personaPreset: !requestContext && !officialPassthrough ? resolvedPersona : null,
+              personaPreset:
+                !requestContext && !effectiveOfficialPassthrough && !cliPoolPassthrough ? effectiveCliPersona : null,
             })
             if (!requestContext) {
               hopBody = ensureBillingAttribution(hopBody, {
@@ -2577,7 +3666,7 @@ export function createHandleProtocol(deps) {
                 cliVersion: outboundProfile.cliVersion,
                 indexes: billingIndexesFromMessages(hopBody.messages),
                 entrypoint: entrypointNow,
-                passthrough: officialPassthrough,
+                passthrough: effectiveOfficialPassthrough,
               })
             }
             const materialized = await materializeRemoteImageSources(hopBody)
@@ -2586,7 +3675,7 @@ export function createHandleProtocol(deps) {
               hopBody = materialized
             }
             if (identity) {
-              hopBody = applyCrsIdentityReplace(hopBody, identity, inbound, req.headers, {
+              hopBody = applyCrsIdentityReplace(hopBody, identity, inbound, outboundReqHeaders, {
                 officialClient: officialTraffic,
                 sessionId: attemptSessionId,
                 mode: sessionMode,
@@ -2613,7 +3702,7 @@ export function createHandleProtocol(deps) {
 
             personaHideTokens = 0
             logBag.inference_engine = resolveInferenceEngine(selected.vm, routingNow)
-            logBag.persona_preset = resolveSlotPersonaPreset(selected.vm, routingNow)
+            logBag.persona_preset = effectiveCliPersona
             logBag.outbound_profile = { cli_version: outboundProfile.cliVersion }
             logBag.official_cc_inference = 'cli-hop'
             logBag.provider = 'local_cli'
@@ -2630,6 +3719,25 @@ export function createHandleProtocol(deps) {
               requestId: logCtx.request_id,
               ctx: bodyCtx,
             })
+            const cliPoolSystemApplied =
+              attemptPoolPrompt.applies &&
+              (attemptPoolPrompt.mode === 'append' || attemptPoolPrompt.mode === 'override')
+            const cliPromptSpec = !requestContext
+              ? compileSpecForCliNode(
+                  resolveSystemPromptSpec({
+                    routing: routingNow,
+                    slot: selected.vm,
+                    poolPolicy: attemptPoolPrompt.applies ? attemptPoolPrompt : null,
+                    identity,
+                    officialPassthrough: effectiveOfficialPassthrough,
+                    strictPassthrough: false,
+                    // vm2api already handled caller system relocation before cli-node dispatch.
+                    relocateCallerSystem: false,
+                  }),
+                  hopBody,
+                  { poolSystemApplied: cliPoolSystemApplied },
+                ).promptSpec
+              : null
             logBag.outbound_session_id = sessionIdForLog(sessionIdFromOutboundBody(hopBody) || attemptSessionId)
             return {
               body: hopBody,
@@ -2638,6 +3746,7 @@ export function createHandleProtocol(deps) {
                 sessionId: attemptSessionId,
                 cliHop: true,
                 cragPrint: false,
+                promptSpec: cliPromptSpec,
                 preparedHop,
                 transportRouting,
                 requestContext,
@@ -2647,12 +3756,46 @@ export function createHandleProtocol(deps) {
             }
           }
 
-          preserveCacheBreakpoints = officialPassthrough && !cacheControlRepaired
+          hopBody = applyAccountThinkingFilter(body)
+          const effectiveHttpOfficialPassthrough =
+            attemptPoolPrompt.applies && attemptPoolPrompt.mode !== 'official' ? false : officialPassthrough
+          preserveCacheBreakpoints = effectiveHttpOfficialPassthrough && !cacheControlRepaired
           cacheTtl = requestedCacheTtl
-          if (!requestContext && !officialPassthrough) {
-            const configuredMode = modeOverride || resolveSlotPersonaPreset(selected.vm, routingNow)
-            const rewritten = repairCacheBreakpoints(
-              applyCrsUnofficialPersona(shallowCopyBody(personaIn), {
+          const configuredMode =
+            attemptPoolPrompt.applies && attemptPoolPrompt.cliPreset
+              ? attemptPoolPrompt.cliPreset
+              : modeOverride || resolveSlotPersonaPreset(selected.vm, routingNow)
+          if (!requestContext && !effectiveHttpOfficialPassthrough) {
+            if (attemptPoolPrompt.applies && attemptPoolPrompt.mode === 'passthrough') {
+              hopBody = officialMessagesBody(shallowCopyBody(attemptPersonaIn))
+              for (const policy of extra.repairs || []) hopBody = repairAnthropicRequest(hopBody, policy)
+              personaHideTokens = 0
+            } else if (attemptPoolPrompt.applies && attemptPoolPrompt.mode === 'override') {
+              const overridden = applyPoolPromptToAnthropicBody(shallowCopyBody(attemptPersonaIn), attemptPoolPrompt)
+              const rewritten = repairCacheBreakpoints(
+                applyCrsUnofficialPersona(overridden, {
+                  officialClient: false,
+                  forceConfigured: true,
+                  routingFile: routingConfigPath,
+                  cacheTtl: requestedCacheTtl,
+                  mode: 'zero',
+                  headers: req.headers,
+                  sessionId: attemptSessionId,
+                  model: attemptPersonaIn?.model,
+                  cliVersion: OFFICIAL_CLI_VERSION,
+                  identity,
+                }),
+                {
+                  limit: Number(routingNow?.compatibility?.cache_control_limit) || 4,
+                  fallbackTtl: requestedCacheTtl,
+                  fillMissing: true,
+                },
+              )
+              hopBody = officialMessagesBody(rewritten)
+              for (const policy of extra.repairs || []) hopBody = repairAnthropicRequest(hopBody, policy)
+              personaHideTokens = 0
+            } else {
+              let rendered = applyCrsUnofficialPersona(shallowCopyBody(attemptPersonaIn), {
                 officialClient: false,
                 forceConfigured: true,
                 routingFile: routingConfigPath,
@@ -2660,29 +3803,32 @@ export function createHandleProtocol(deps) {
                 mode: configuredMode,
                 headers: req.headers,
                 sessionId: attemptSessionId,
-                model: personaIn?.model,
+                model: attemptPersonaIn?.model,
                 cliVersion: OFFICIAL_CLI_VERSION,
                 identity,
-              }),
-              {
+              })
+              if (attemptPoolPrompt.applies && attemptPoolPrompt.mode === 'append') {
+                rendered = applyPoolPromptToAnthropicBody(rendered, attemptPoolPrompt)
+              }
+              const rewritten = repairCacheBreakpoints(rendered, {
                 limit: Number(routingNow?.compatibility?.cache_control_limit) || 4,
                 fallbackTtl: requestedCacheTtl,
                 fillMissing: true,
-              },
-            )
-            hopBody = officialMessagesBody(rewritten)
-            for (const policy of extra.repairs || []) hopBody = repairAnthropicRequest(hopBody, policy)
-            personaHideTokens = personaUsagePassthroughFromRoutingFile(routingConfigPath, configuredMode)
-              ? 0
-              : personaHideForUnofficial(personaIn, rewritten, {
-                  officialClient: false,
-                  mode: configuredMode,
-                  hides: personaHidesUsageFromRoutingFile(routingConfigPath, configuredMode),
-                  standing: standingUsageFromRoutingFile(routingConfigPath, configuredMode),
-                })
+              })
+              hopBody = officialMessagesBody(rewritten)
+              for (const policy of extra.repairs || []) hopBody = repairAnthropicRequest(hopBody, policy)
+              personaHideTokens = personaUsagePassthroughFromRoutingFile(routingConfigPath, configuredMode)
+                ? 0
+                : personaHideForUnofficial(attemptPersonaIn, rewritten, {
+                    officialClient: false,
+                    mode: configuredMode,
+                    hides: personaHidesUsageFromRoutingFile(routingConfigPath, configuredMode),
+                    standing: standingUsageFromRoutingFile(routingConfigPath, configuredMode),
+                  })
+            }
           }
           logBag.inference_engine = resolveInferenceEngine(selected.vm, routingNow)
-          logBag.persona_preset = resolveSlotPersonaPreset(selected.vm, routingNow)
+          logBag.persona_preset = configuredMode
           logBag.official_cc_inference = 'http'
           logBag.provider = 'anthropic_api'
           const prepared = prepareOutboundEnvelope({
@@ -2712,7 +3858,7 @@ export function createHandleProtocol(deps) {
             cacheBreakpoints,
             preserveThinkingBlocks,
             preserveCallerEnvironment,
-            reqHeaders: req.headers,
+            reqHeaders: outboundReqHeaders,
             homeDir: selected.exec?.homeDir || '',
             credentialMode: credMode,
             authScheme: isApiKeyMode(credMode) ? 'apikey' : 'oauth',
@@ -2745,11 +3891,19 @@ export function createHandleProtocol(deps) {
         },
         onUpstreamRisk: afterHop,
         callAttempt: async ({ candidate, body, attemptMeta, deliveryMode: attemptDelivery, signal, onCommit }) => {
+          const attemptReqHeaders =
+            attemptMeta?.stripClientBeta && outboundReqHeaders && typeof outboundReqHeaders === 'object'
+              ? Object.fromEntries(
+                  Object.entries(outboundReqHeaders).filter(
+                    ([k]) => String(k || '').toLowerCase() !== 'anthropic-beta',
+                  ),
+                )
+              : outboundReqHeaders
           if (!clientStream) {
             return streamAndAssembleClaudeMessage({
               candidate,
               body,
-              reqHeaders: req.headers,
+              reqHeaders: attemptReqHeaders,
               timeoutMs: cfg.limits.upstream_timeout_ms,
               idleTimeoutMs: streamIdleTimeoutMs,
               signal,
@@ -2759,10 +3913,13 @@ export function createHandleProtocol(deps) {
               preserveCacheBreakpoints,
               cliHop: attemptMeta?.cliHop === true,
               cragPrint: attemptMeta?.cragPrint === true,
+              promptSpec: attemptMeta?.promptSpec || null,
               callerCwd: attemptMeta?.callerCwd,
               preparedHop: attemptMeta?.preparedHop,
               repaired: attemptMeta?.repaired === true,
               dropSampling: attemptMeta?.dropSampling === true,
+              strictPassthrough: attemptMeta?.strictPassthrough === true,
+              safeguardsSanitized: attemptMeta?.safeguardsSanitized === true,
               requestContext: attemptMeta?.requestContext || requestContext,
               want1m,
               routing: attemptMeta?.transportRouting ?? getRouting(),
@@ -2771,12 +3928,14 @@ export function createHandleProtocol(deps) {
               onOutboundHeaders: noteOutboundHeaders,
               redactionPrincipal: req.apiKeyRecord?.id || (req.apiKeyKind === 'master' ? 'master' : ''),
               redactionSession: String(req.headers?.['x-claude-code-session-id'] || ''),
+              cancelSessionId: String(req.headers?.['x-claude-code-session-id'] || ''),
               tenantId,
               gatewayRequestId: logCtx.request_id,
             })
           }
           const publicStream = replayScope ? createIssuedToolStream() : null
           const geminiCrossSseLines = protocol === 'google.gemini' ? [] : null
+          let sseUpstreamHeaders = null
           let state
           if (protocol === 'openai.chat') {
             state = createOpenAIChatStreamState(inbound.model || body.model, candidate.vmId)
@@ -2793,7 +3952,7 @@ export function createHandleProtocol(deps) {
               protocol,
               write: (chunk) => {
                 if (res.writableEnded || res.destroyed) return
-                if (!res.headersSent) writeSSEHeaders(res)
+                if (!res.headersSent) writeSSEHeaders(res, sseUpstreamHeaders)
                 res.write(chunk)
               },
             })
@@ -2807,13 +3966,16 @@ export function createHandleProtocol(deps) {
               preserveCacheBreakpoints,
               cliHop: attemptMeta?.cliHop === true,
               cragPrint: attemptMeta?.cragPrint === true,
+              promptSpec: attemptMeta?.promptSpec || null,
               callerCwd: attemptMeta?.callerCwd,
               preparedHop: attemptMeta?.preparedHop,
               repaired: attemptMeta?.repaired === true,
               dropSampling: attemptMeta?.dropSampling === true,
+              strictPassthrough: attemptMeta?.strictPassthrough === true,
+              safeguardsSanitized: attemptMeta?.safeguardsSanitized === true,
               requestContext: attemptMeta?.requestContext || requestContext,
               body,
-              reqHeaders: req.headers,
+              reqHeaders: attemptReqHeaders,
               timeoutMs: cfg.limits.upstream_timeout_ms,
               idleTimeoutMs: streamIdleTimeoutMs,
               identity: loadVmIdentity(candidate.exec),
@@ -2829,10 +3991,12 @@ export function createHandleProtocol(deps) {
               ensureCredential: (exec) => ensureWorkerCredential(exec),
               redactionPrincipal: req.apiKeyRecord?.id || (req.apiKeyKind === 'master' ? 'master' : ''),
               redactionSession: String(req.headers?.['x-claude-code-session-id'] || ''),
+              cancelSessionId: String(req.headers?.['x-claude-code-session-id'] || ''),
               onEnvelope: noteOutboundEnvelope,
               onOutboundHeaders: noteOutboundHeaders,
-              onCommit: () => {
-                if (protocol === 'anthropic.messages' && !res.headersSent) writeSSEHeaders(res)
+              onCommit: (upstreamHeaders) => {
+                if (upstreamHeaders && typeof upstreamHeaders === 'object') sseUpstreamHeaders = upstreamHeaders
+                if (protocol === 'anthropic.messages' && !res.headersSent) writeSSEHeaders(res, sseUpstreamHeaders)
                 onCommit()
               },
               onEvent: async (line) => {
@@ -2842,7 +4006,7 @@ export function createHandleProtocol(deps) {
                 keepalive.observeLine(line)
                 if (protocol === 'anthropic.messages') {
                   streamTracker?.observe(line)
-                  if (!res.headersSent) writeSSEHeaders(res)
+                  if (!res.headersSent) writeSSEHeaders(res, sseUpstreamHeaders)
                   const outbound = anthropicSseErrorRemapper ? anthropicSseErrorRemapper.remapLine(line) : line
                   res.write(String(outbound).endsWith('\n') ? String(outbound) : String(outbound) + '\n')
                   publicStream?.observe(outbound)
@@ -2850,7 +4014,7 @@ export function createHandleProtocol(deps) {
                 }
                 const writeChunks = (chunks) => {
                   if (!chunks.length) return
-                  if (!res.headersSent) writeSSEHeaders(res)
+                  if (!res.headersSent) writeSSEHeaders(res, sseUpstreamHeaders)
                   for (const chunk of chunks) {
                     const event = protocol === 'openai.responses' ? `event: ${chunk.type}\n` : ''
                     res.write(`${event}data: ${JSON.stringify(chunk)}\n\n`)
@@ -3036,7 +4200,9 @@ export function createHandleProtocol(deps) {
     if (clientStream) {
       if (isClientCancelledResult(result)) return finishClientCancel(res, result, logBag)
       if (!res.headersSent) {
-        const mapped = mapProtocolClientError(result, logBag, result?.body?.error?.code || 'upstream_error')
+        const mapped = mapProtocolClientError(result, logBag, result?.body?.error?.code || 'upstream_error', {
+          strictPassthrough: strictPassthroughAtIngress,
+        })
         if (!isClientCancelledResult(result) && mapped.body?.error?.code !== 'client_cancelled') stats.errors++
         return sendMapped(res, mapped)
       }
@@ -3077,29 +4243,44 @@ export function createHandleProtocol(deps) {
           }
           return res.end()
         }
-        const closing = isRecoverableTruncation(result) && !res.writableEnded ? streamTracker?.closingEvents() : null
+        const closing =
+          !strictPassthroughAtIngress && isRecoverableTruncation(result) && !res.writableEnded
+            ? streamTracker?.closingEvents()
+            : null
         if (closing) res.write(closing)
         else if (protocol === 'anthropic.messages' && !res.writableEnded && !streamTracker?.isFinished()) {
-          const mapped = mapProtocolClientError(result, logBag, logBag.error_code)
+          const mapped = mapProtocolClientError(result, logBag, logBag.error_code, {
+            strictPassthrough: strictPassthroughAtIngress,
+          })
           const mappedErr = mapped.body?.error || {}
-          const retryableStartedHandoff =
-            result?.nativeHandoff === true &&
-            streamTracker?.hasStarted() === true &&
-            mapped.status >= 500 &&
-            mappedErr.type === 'upstream_error' &&
-            !/timeout/i.test(`${logBag.error_code || ''} ${mappedErr.type || ''} ${logBag.error_message || ''}`)
-          if (retryableStartedHandoff || (result?.nativeHandoff !== true && streamTracker?.hasStarted() === true)) {
-            // Started but not closable: ask the client to retry instead of
-            // dropping the connection. error_code/error_message keep the cause.
-            logBag.client_error_type = 'rate_limit_error'
-            logBag.truncation_reason = retryableStartedHandoff
-              ? 'native_handoff_incomplete'
-              : truncationReason(result, streamTracker)
-            res.write(buildRetryableTruncationError())
+          if (strictPassthroughAtIngress) {
+            res.write(
+              buildAnthropicSseError(mappedErr, result?.poolReason, {
+                requestId:
+                  mapped.body?.request_id || result?.body?.request_id || result?.headers?.['request-id'] || null,
+                strictPassthrough: true,
+              }),
+            )
           } else {
-            // Unstarted streams (or non-retryable strict handoff failures like
-            // 4xx/timeout/policy) keep the mapped SSE error.
-            res.write(buildAnthropicSseError(mappedErr, result?.poolReason))
+            const retryableStartedHandoff =
+              result?.nativeHandoff === true &&
+              streamTracker?.hasStarted() === true &&
+              mapped.status >= 500 &&
+              mappedErr.type === 'upstream_error' &&
+              !/timeout/i.test(`${logBag.error_code || ''} ${mappedErr.type || ''} ${logBag.error_message || ''}`)
+            if (retryableStartedHandoff || (result?.nativeHandoff !== true && streamTracker?.hasStarted() === true)) {
+              // Started but not closable: ask the client to retry instead of
+              // dropping the connection. error_code/error_message keep the cause.
+              logBag.client_error_type = 'rate_limit_error'
+              logBag.truncation_reason = retryableStartedHandoff
+                ? 'native_handoff_incomplete'
+                : truncationReason(result, streamTracker)
+              res.write(buildRetryableTruncationError())
+            } else {
+              // Unstarted streams (or non-retryable strict handoff failures like
+              // 4xx/timeout/policy) keep the mapped SSE error.
+              res.write(buildAnthropicSseError(mappedErr, result?.poolReason))
+            }
           }
         }
       }
@@ -3109,7 +4290,9 @@ export function createHandleProtocol(deps) {
     if (!result?.ok || logBag.risk_upstream_reason || isIncompleteAssistantMessage(result)) {
       if (isClientCancelledResult(result)) return finishClientCancel(res, result, logBag)
       const failed = isIncompleteAssistantMessage(result) ? incompleteAssistantClientError(result) : result
-      const mapped = mapProtocolClientError(failed, logBag, failed?.body?.error?.code || 'upstream_error')
+      const mapped = mapProtocolClientError(failed, logBag, failed?.body?.error?.code || 'upstream_error', {
+        strictPassthrough: strictPassthroughAtIngress,
+      })
       if (mapped.body?.error?.code !== 'client_cancelled') stats.errors++
       return sendMapped(res, mapped)
     }
@@ -3144,7 +4327,7 @@ export function createHandleProtocol(deps) {
       output = fromClaudeToResponses(clientBody, inbound.model, result.vmId, converted.mode, converted.responseTools)
     }
     ctx = applyIntercept(cfg.intercept.rules, 'before_client', { ...ctx, body: output })
-    return sendPublicJson(ctx.body)
+    return sendPublicJson(ctx.body, result?.headers)
   }
 
   /** POST /v1/alpha/search (Codex web search): same logging, auth and body handling as handleProtocol. */
@@ -3212,6 +4395,59 @@ export function createHandleProtocol(deps) {
     logBag.model = typeof body?.model === 'string' ? body.model : null
     logBag.inbound_summary = summarizeBody(body)
     if (rejectKeyModel(req, res, protocol, body?.model, logBag)) return
+    const searchOwnerScope = ownerScopeFromRequest(req, apiKeyStore?.users)
+    const searchPoolAccess = resolveRequestPoolAccess(req, {
+      model: body?.model || null,
+      ownerScope: searchOwnerScope,
+    })
+    if (!searchPoolAccess.ok) {
+      return rejectPoolAccess(res, searchPoolAccess, logBag, protocol)
+    }
+    req._poolAccess = searchPoolAccess
+    if (searchPoolAccess.effectivePool?.id) logBag.resolved_pool_id = searchPoolAccess.effectivePool.id
+    const searchIdentity = refusalAuditIdentity({
+      inbound: body,
+      body,
+      headers: req.headers,
+      principal: riskPrincipal(req),
+    })
+    const searchRiskState = {
+      policy: refusalPolicy(),
+      repo: refusalRepo(),
+      devices: deviceRepo(),
+      sessions: sessionRepo(),
+    }
+    if (
+      await applyProtocolIntercept({
+        req,
+        inbound: body,
+        body,
+        fp: fingerprintRequest(req, body),
+        logBag,
+        requestId: logCtx.request_id,
+        res,
+        identity: searchIdentity,
+        riskState: searchRiskState,
+        poolJevProfile: searchPoolAccess.effectivePool?.jev_profile || req.poolJevProfile || null,
+        zeroInject: false,
+        channel: 'search',
+        enforceHardAndJev: true,
+        skipDistill: true,
+        backend: 'oauth',
+        apiPlatform: false,
+      })
+    ) {
+      return
+    }
+    const searchKeyScope =
+      !searchPoolAccess.legacy && searchPoolAccess.effectivePool
+        ? {
+            ...keyScopeFromRequest(req),
+            vm_pool_id: searchPoolAccess.effectivePool.id,
+            vm_pool_error: null,
+            allowed_vms: searchPoolAccess.allowedVmIds || [],
+          }
+        : undefined
     return runWithCodexKey(req, res, logBag, () =>
       handleCodexSearch({
         req,
@@ -3223,7 +4459,12 @@ export function createHandleProtocol(deps) {
         routing: getRouting() || {},
         projectRoot: cfg.paths.project,
         stickyRouter,
-        ownerScope: ownerScopeFromRequest(req, apiKeyStore?.users),
+        ownerScope: searchOwnerScope,
+        poolAccess: searchPoolAccess,
+        originPoolId: searchPoolAccess.originPool?.id || searchPoolAccess.effectivePool?.id || null,
+        schedulerRuntime: getSchedulerRuntime(req),
+        ops: deps.codexOps || {},
+        ...(searchKeyScope ? { keyScope: searchKeyScope } : {}),
       }),
     )
   }
@@ -3244,7 +4485,7 @@ export function createHandleProtocol(deps) {
    * when the last user message carries images) answered in the caller's protocol. The row is
    * an Images row, so it bills image usage alone like /v1/images.
    */
-  async function serveImageModelTurn({ req, res, protocol, body, logBag }) {
+  async function serveImageModelTurn({ req, res, protocol, body, logBag, keyScope = null }) {
     const turn = imagesRequestFromTurn(protocol, body)
     if (!turn.ok) {
       stats.errors++
@@ -3300,7 +4541,11 @@ export function createHandleProtocol(deps) {
           projectRoot: cfg.paths.project,
           stickyRouter,
           ownerScope: ownerScopeFromRequest(req, apiKeyStore?.users),
+          poolAccess: req._poolAccess || null,
+          originPoolId: req._poolAccess?.originPool?.id || req._poolAccess?.effectivePool?.id || null,
+          schedulerRuntime: getSchedulerRuntime(req),
           ops: deps.codexOps || {},
+          ...(keyScope ? { keyScope } : {}),
         })
       })
     } finally {
@@ -3428,6 +4673,59 @@ export function createHandleProtocol(deps) {
     logBag.inbound_summary = summarizeImagesBody(body)
     // No model means the upstream default, which a limited key cannot name.
     if (rejectKeyModel(req, res, protocol, body?.model, logBag)) return
+    const imagesOwnerScope = ownerScopeFromRequest(req, apiKeyStore?.users)
+    const imagesPoolAccess = resolveRequestPoolAccess(req, {
+      model: body?.model || null,
+      ownerScope: imagesOwnerScope,
+    })
+    if (!imagesPoolAccess.ok) {
+      return rejectPoolAccess(res, imagesPoolAccess, logBag, protocol)
+    }
+    req._poolAccess = imagesPoolAccess
+    if (imagesPoolAccess.effectivePool?.id) logBag.resolved_pool_id = imagesPoolAccess.effectivePool.id
+    const imagesIdentity = refusalAuditIdentity({
+      inbound: body,
+      body,
+      headers: req.headers,
+      principal: riskPrincipal(req),
+    })
+    const imagesRiskState = {
+      policy: refusalPolicy(),
+      repo: refusalRepo(),
+      devices: deviceRepo(),
+      sessions: sessionRepo(),
+    }
+    if (
+      await applyProtocolIntercept({
+        req,
+        inbound: body,
+        body,
+        fp: fingerprintRequest(req, body),
+        logBag,
+        requestId: logCtx.request_id,
+        res,
+        identity: imagesIdentity,
+        riskState: imagesRiskState,
+        poolJevProfile: imagesPoolAccess.effectivePool?.jev_profile || req.poolJevProfile || null,
+        zeroInject: false,
+        channel: 'images',
+        enforceHardAndJev: true,
+        skipDistill: true,
+        backend: 'oauth',
+        apiPlatform: false,
+      })
+    ) {
+      return
+    }
+    const imagesKeyScope =
+      !imagesPoolAccess.legacy && imagesPoolAccess.effectivePool
+        ? {
+            ...keyScopeFromRequest(req),
+            vm_pool_id: imagesPoolAccess.effectivePool.id,
+            vm_pool_error: null,
+            allowed_vms: imagesPoolAccess.allowedVmIds || [],
+          }
+        : undefined
     return runWithCodexKey(req, res, logBag, () =>
       handleCodexImages({
         req,
@@ -3440,7 +4738,12 @@ export function createHandleProtocol(deps) {
         routing: getRouting() || {},
         projectRoot: cfg.paths.project,
         stickyRouter,
-        ownerScope: ownerScopeFromRequest(req, apiKeyStore?.users),
+        ownerScope: imagesOwnerScope,
+        poolAccess: imagesPoolAccess,
+        originPoolId: imagesPoolAccess.originPool?.id || imagesPoolAccess.effectivePool?.id || null,
+        schedulerRuntime: getSchedulerRuntime(req),
+        ops: deps.codexOps || {},
+        ...(imagesKeyScope ? { keyScope: imagesKeyScope } : {}),
       }),
     )
   }

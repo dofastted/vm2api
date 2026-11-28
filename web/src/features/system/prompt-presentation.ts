@@ -5,6 +5,7 @@ const VARIABLES: Record<string, string> = {
   harness_303: 'official_harness',
   guidance_303: 'official_guidance',
   env_303: 'environment',
+  env_instructions_303: 'env_instructions',
 }
 
 const LABELS: Record<string, [string, string]> = {
@@ -20,6 +21,9 @@ const LABELS: Record<string, [string, string]> = {
   env: ['运行环境', '工作目录、平台与终端信息'],
   env_official: ['运行环境', '工作目录、平台、终端与时区'],
   env_extra: ['模型附加句', '当前模型的补充说明'],
+  env_instructions: ['长环境说明', '工具、Agent、MCP 与 Skills 环境指引'],
+  env_timezone: ['槽位时区', '附加槽位时区行（Timezone）'],
+  env_locale: ['槽位语言', '附加槽位语言行（Language）'],
 }
 
 export function promptBlockLabel(id: string): [string, string] {

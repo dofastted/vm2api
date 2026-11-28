@@ -142,11 +142,11 @@ test('crag kernel version is native v2, including a stored legacy pin', () => {
   ])
 })
 
-test('resolveCliSystemLayout follows persona_preset, not leftover inject-only', () => {
-  assert.equal(resolveCliSystemLayout({}, {}), 'identity')
-  assert.equal(resolveCliSystemLayout({}, { compatibility: { persona_preset: 'official_full' } }), 'identity')
-  assert.equal(resolveCliSystemLayout({}, { compatibility: { persona_preset: 'official' } }), 'identity')
-  assert.equal(resolveCliSystemLayout({}, { compatibility: { persona_inject: 'rewrite' } }), 'identity')
+test('resolveCliSystemLayout follows unified persona_preset, not legacy identity alias', () => {
+  assert.equal(resolveCliSystemLayout({}, {}), 'official_full')
+  assert.equal(resolveCliSystemLayout({}, { compatibility: { persona_preset: 'official_full' } }), 'official_full')
+  assert.equal(resolveCliSystemLayout({}, { compatibility: { persona_preset: 'official' } }), 'official')
+  assert.equal(resolveCliSystemLayout({}, { compatibility: { persona_inject: 'rewrite' } }), 'custom')
   assert.equal(resolveCliSystemLayout({}, { compatibility: { persona_preset: 'zero' } }), 'zero')
   assert.equal(
     resolveCliSystemLayout({ persona_preset: 'zero' }, { compatibility: { persona_inject: 'rewrite' } }),

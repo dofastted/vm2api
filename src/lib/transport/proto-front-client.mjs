@@ -4,6 +4,7 @@ import http from 'node:http'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
+import { resolveGlobalUnifiedPreset } from '../identity/system-prompt-spec.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const REPO_ROOT = path.resolve(__dirname, '../../..')
@@ -222,6 +223,7 @@ function normalizeRoutingForGo(routing = {}, endpointBodyPolicy = '') {
   const codex = routing?.codex || {}
   const gemini = routing?.gemini || {}
   const sticky = routing?.sticky || {}
+  const unifiedPreset = resolveGlobalUnifiedPreset(routing)
   return {
     compatibility: {
       official_cc_passthrough: compat.official_cc_passthrough === true,
@@ -229,8 +231,8 @@ function normalizeRoutingForGo(routing = {}, endpointBodyPolicy = '') {
         ? { detect_proxied_official_cc: compat.detect_proxied_official_cc }
         : {}),
       claude_code_only: compat.claude_code_only === true,
-      crag_persona_preset: String(compat.crag_persona_preset || ''),
-      persona_preset: String(compat.persona_preset || ''),
+      crag_persona_preset: unifiedPreset,
+      persona_preset: unifiedPreset,
       craggemini_persona_preset: String(compat.craggemini_persona_preset || ''),
       craggemini_system_prompt: String(compat.craggemini_system_prompt || ''),
       craggemini_prompt_normalization: String(compat.craggemini_prompt_normalization || ''),

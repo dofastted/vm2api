@@ -17,7 +17,7 @@
  *
  * Config: routing.slot_capacity (all keys optional).
  */
-import { KERNEL_NATIVE_SLOT_COUNT, resolveSessionSlots } from './slot-engine.mjs'
+import { isHeadlessBridgeCaps, KERNEL_NATIVE_SLOT_COUNT, resolveSessionSlots } from './slot-engine.mjs'
 import { memoryMiB, slotMemory, VM_MEMORY_OPTIONS } from './machine-spec.mjs'
 import { isCodexVm } from './vm-kind.mjs'
 
@@ -25,6 +25,15 @@ export const SLOT_PLAN_KEYS = Object.freeze(['pro', 'max_5x', 'max_20x', 'defaul
 /** Docker's default for slot containers before this module existed. */
 export const LEGACY_PIDS_LIMIT = 256
 export const MAX_PIDS_LIMIT = 8192
+
+export const HEADLESS_BRIDGE_CAPACITY_DEFAULTS = Object.freeze({
+  // Option 2A Headless Official Claude Bridge: 1 persistent Bun worker (~22 MiB
+  // PSS at 20 concurrent SSE) + Rust core (~25 MiB) + Drain-and-Swap headroom.
+  base_mib: 96,
+  per_session_mib: 12,
+  base_pids: 48,
+  per_session_pids: 2,
+})
 
 export const SLOT_CAPACITY_DEFAULTS = Object.freeze({
   enabled: true,
@@ -61,12 +70,41 @@ function ratioIn(value, fallback) {
   return Math.min(HOST_MEMORY_RATIO_MAX, Math.max(0.3, n))
 }
 
-export function normalizeSlotCapacityConfig(raw) {
+export function isHeadlessBridgeSlot(vm = null, options = null) {
+  if (options?.headlessBridge === true) return true
+  if (isHeadlessBridgeCaps(options?.capabilities)) return true
+  if (!vm || typeof vm !== 'object') return false
+  if (
+    isHeadlessBridgeCaps(vm.capabilities) ||
+    isHeadlessBridgeCaps(vm.runtime?.capabilities) ||
+    isHeadlessBridgeCaps(vm.workerStatus?.capabilities) ||
+    isHeadlessBridgeCaps(vm.worker_status?.capabilities) ||
+    isHeadlessBridgeCaps(vm.kernel_installation?.capabilities)
+  ) {
+    return true
+  }
+  return vm.workerStatus?.transport === 'headless_bridge' || vm.runtime?.transport === 'headless_bridge'
+}
+
+export function normalizeSlotCapacityConfig(raw, { headlessBridge = false } = {}) {
   const src = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {}
   const d = SLOT_CAPACITY_DEFAULTS
   const plansSrc = src.plans && typeof src.plans === 'object' ? src.plans : {}
   const plans = {}
   for (const key of SLOT_PLAN_KEYS) plans[key] = intIn(plansSrc[key], 1, KERNEL_NATIVE_SLOT_COUNT, d.plans[key])
+  if (headlessBridge) {
+    const h = HEADLESS_BRIDGE_CAPACITY_DEFAULTS
+    const hSrc = src.headless && typeof src.headless === 'object' && !Array.isArray(src.headless) ? src.headless : {}
+    return {
+      enabled: typeof src.enabled === 'boolean' ? src.enabled : d.enabled,
+      per_session_mib: intIn(hSrc.per_session_mib, 4, 4096, h.per_session_mib),
+      base_mib: intIn(hSrc.base_mib, 32, 4096, h.base_mib),
+      per_session_pids: intIn(hSrc.per_session_pids, 1, 512, h.per_session_pids),
+      base_pids: intIn(hSrc.base_pids, 16, 2048, h.base_pids),
+      host_memory_ratio: ratioIn(src.host_memory_ratio, d.host_memory_ratio),
+      plans,
+    }
+  }
   return {
     enabled: typeof src.enabled === 'boolean' ? src.enabled : d.enabled,
     per_session_mib: intIn(src.per_session_mib, 64, 4096, d.per_session_mib),
@@ -78,15 +116,21 @@ export function normalizeSlotCapacityConfig(raw) {
   }
 }
 
+let activeRaw = null
 let active = normalizeSlotCapacityConfig()
 
 /** Called when routing loads or saves; callers that get no routing read this. */
 export function configureSlotCapacity(raw) {
+  activeRaw = raw ?? null
   active = normalizeSlotCapacityConfig(raw)
   return active
 }
 
-export function slotCapacityConfig(routing) {
+export function slotCapacityConfig(routing, options = null) {
+  const headless = isHeadlessBridgeSlot(options?.vm, options)
+  if (headless) {
+    return normalizeSlotCapacityConfig(routing?.slot_capacity ?? activeRaw, { headlessBridge: true })
+  }
   return routing?.slot_capacity ? normalizeSlotCapacityConfig(routing.slot_capacity) : active
 }
 
@@ -125,8 +169,8 @@ export function planSlots(vm, routing) {
 }
 
 /** Smallest standard memory option that holds `slots` sessions. */
-export function resourcesForSlots(slots, routing) {
-  const cfg = slotCapacityConfig(routing)
+export function resourcesForSlots(slots, routing, options = null) {
+  const cfg = slotCapacityConfig(routing, options)
   const n = intIn(slots, 1, KERNEL_NATIVE_SLOT_COUNT, 1)
   const needMiB = cfg.base_mib + n * cfg.per_session_mib
   const memory = VM_MEMORY_OPTIONS.find((opt) => memoryMiB(opt) >= needMiB) || VM_MEMORY_OPTIONS.at(-1)
@@ -146,8 +190,8 @@ export function recordedPidsLimit(vm) {
 }
 
 /** Sessions the recorded container limits can hold (0 when not even one fits). */
-export function slotsForLimits({ memoryMiB: mib, pids }, routing) {
-  const cfg = slotCapacityConfig(routing)
+export function slotsForLimits({ memoryMiB: mib, pids }, routing, options = null) {
+  const cfg = slotCapacityConfig(routing, options)
   const byMemory = Math.floor((Number(mib) - cfg.base_mib) / cfg.per_session_mib)
   const byPids = Math.floor((Number(pids) - cfg.base_pids) / cfg.per_session_pids)
   return Math.max(0, Math.min(byMemory, byPids))
@@ -158,18 +202,24 @@ export function slotsForLimits({ memoryMiB: mib, pids }, routing) {
  * clamped to what the recorded limits hold. Never below 1, never above the
  * kernel maximum. With capacity disabled it is the kernel maximum (legacy).
  */
-export function effectiveSlotCount(vm, routing) {
-  const cfg = slotCapacityConfig(routing)
+export function effectiveSlotCount(vm, routing, options = null) {
+  const resolvedOptions = options ? { vm, ...options } : { vm }
+  const cfg = slotCapacityConfig(routing, resolvedOptions)
   if (!cfg.enabled) return KERNEL_NATIVE_SLOT_COUNT
   const target = planSlots(vm, routing)
-  const fits = slotsForLimits({ memoryMiB: memoryMiB(slotMemory(vm, routing)), pids: recordedPidsLimit(vm) }, routing)
+  const fits = slotsForLimits(
+    { memoryMiB: memoryMiB(slotMemory(vm, routing)), pids: recordedPidsLimit(vm) },
+    routing,
+    resolvedOptions,
+  )
   return Math.min(KERNEL_NATIVE_SLOT_COUNT, Math.max(1, Math.min(target, fits)))
 }
 
 /** What the reconciler should raise this VM's container to. */
-export function slotCapacityTarget(vm, routing) {
+export function slotCapacityTarget(vm, routing, options = null) {
+  const resolvedOptions = options ? { vm, ...options } : { vm }
   const plan = slotPlanOf(vm)
-  return { plan, ...resourcesForSlots(planSlots(vm, routing), routing) }
+  return { plan, ...resourcesForSlots(planSlots(vm, routing), routing, resolvedOptions) }
 }
 
 /**
@@ -177,12 +227,13 @@ export function slotCapacityTarget(vm, routing) {
  * Claude slot never below its plan target, so a fresh slot starts able to hold
  * its sessions. The reconciler persists the raise into vm.machine afterwards.
  */
-export function slotCreationLimits(vm, routing) {
+export function slotCreationLimits(vm, routing, options = null) {
+  const resolvedOptions = options ? { vm, ...options } : { vm }
   const recorded = slotMemory(vm, routing)
   const pids = recordedPidsLimit(vm)
-  const cfg = slotCapacityConfig(routing)
+  const cfg = slotCapacityConfig(routing, resolvedOptions)
   if (!cfg.enabled || isCodexVm(vm)) return { memory: recorded, pids }
-  const target = slotCapacityTarget(vm, routing)
+  const target = slotCapacityTarget(vm, routing, resolvedOptions)
   return {
     memory: memoryMiB(target.memory) > memoryMiB(recorded) ? target.memory : recorded,
     pids: Math.max(pids, target.pids),

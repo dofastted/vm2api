@@ -28,7 +28,10 @@ hypervisor/*.env
 .workflow/
 __pycache__/
 crates/
-patches/
+!/scheduler/crates/
+/scheduler/target/
+patches/*
+!/patches/kernel-6.12/
 .local/
 /local-src/
 /skills/

@@ -108,6 +108,7 @@ export function CragCommerce({
   catalogKey,
   customTitle,
   device = false,
+  quoteEndpoint,
   paymentMethods,
   deliveryOptions,
   onOrder,
@@ -124,6 +125,7 @@ export function CragCommerce({
   catalogKey?: string
   customTitle?: string
   device?: boolean
+  quoteEndpoint?: string
   paymentMethods: readonly PaymentMethod[]
   deliveryOptions?: ReactNode
   onOrder: (
@@ -182,12 +184,15 @@ export function CragCommerce({
     const controller = new AbortController()
     const timer = window.setTimeout(() => {
       const quoteRequest = device ? cragDeviceApi<Quote> : api<Quote>
-      void quoteRequest(device ? '/quote' : '/api/panel/crag-shop/quote', {
-        method: 'POST',
-        body,
-        signal: controller.signal,
-        cache: 'no-store',
-      }).then(
+      void quoteRequest(
+        device ? '/quote' : (quoteEndpoint ?? '/api/panel/crag-shop/quote'),
+        {
+          method: 'POST',
+          body,
+          signal: controller.signal,
+          cache: 'no-store',
+        }
+      ).then(
         (quote) => {
           if (controller.signal.aborted) return
           if (
@@ -215,7 +220,7 @@ export function CragCommerce({
       window.clearTimeout(timer)
       controller.abort()
     }
-  }, [body, canQuote, device, key, rules.max_amount_minor, sku])
+  }, [body, canQuote, device, key, quoteEndpoint, rules.max_amount_minor, sku])
 
   const selectionUnavailable =
     !available && (sku !== 'custom' || !customEnabled)

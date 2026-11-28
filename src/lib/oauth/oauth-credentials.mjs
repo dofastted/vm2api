@@ -23,6 +23,33 @@ import {
 import { resolveAuthScheme } from './auth-scheme.mjs'
 import { flattenOauthIdentity, normalizeSubscriptionType } from './oauth-identity.mjs'
 
+const credentialRefreshTail = new Map()
+
+/**
+ * Process-local per-key refresh serialization (SSOT shared across Claude & Codex).
+ * Prevents concurrent panel refreshes, imports, and pre-probe refreshes from
+ * racing on the same refresh token or read-modify-write credential file.
+ */
+export function withCredentialRefreshLock(key, fn) {
+  const prev = credentialRefreshTail.get(key) || Promise.resolve()
+  let release
+  const gate = new Promise((resolve) => {
+    release = resolve
+  })
+  const tail = prev.catch(() => {}).then(() => gate)
+  credentialRefreshTail.set(key, tail)
+  return prev
+    .catch(() => {})
+    .then(async () => {
+      try {
+        return await fn()
+      } finally {
+        release()
+        if (credentialRefreshTail.get(key) === tail) credentialRefreshTail.delete(key)
+      }
+    })
+}
+
 export const REFRESH_SKEW_MS = 5 * 60 * 1000
 
 /**
@@ -174,6 +201,49 @@ export function stripSlotCredentialEmailBytes(raw) {
   return { changed: true, data: Buffer.from(`${JSON.stringify(doc, null, 2)}\n`, 'utf8') }
 }
 
+function lstatOrNull(target) {
+  try {
+    return fs.lstatSync(target)
+  } catch (error) {
+    if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') return null
+    throw error
+  }
+}
+
+function unsafeCredentialPathError(message) {
+  const err = new Error(message)
+  err.code = 'unsafe_credential_path'
+  return err
+}
+
+/**
+ * Reject host-side symlink traversal on container-writable slot paths
+ * (`cli-home`, `.claude`, `credentials.json`, and its lock/attempt sidecars).
+ * `.credentials.json` is intentionally excluded because it is the official
+ * relative symlink alias pointing at `credentials.json`.
+ */
+export function assertSafeSlotCredentialPaths(homeDir) {
+  if (!homeDir) return { ok: false, reason: 'home_missing' }
+  const homeStat = lstatOrNull(homeDir)
+  if (homeStat && (homeStat.isSymbolicLink() || !homeStat.isDirectory())) {
+    throw unsafeCredentialPathError('slot cli-home must be a real directory')
+  }
+  const claudeDir = path.join(homeDir, '.claude')
+  const claudeStat = lstatOrNull(claudeDir)
+  if (claudeStat) {
+    if (claudeStat.isSymbolicLink() || !claudeStat.isDirectory()) {
+      throw unsafeCredentialPathError('slot .claude must be a real directory')
+    }
+    for (const name of ['credentials.json', 'credentials.json.lock', 'credentials.json.refresh-attempt']) {
+      const entryStat = lstatOrNull(path.join(claudeDir, name))
+      if (entryStat && (entryStat.isSymbolicLink() || !entryStat.isFile())) {
+        throw unsafeCredentialPathError(`slot ${name} must be a regular file`)
+      }
+    }
+  }
+  return { ok: true, claudeDir, file: path.join(claudeDir, 'credentials.json') }
+}
+
 /** Remove legacy email fields from an existing slot credentials.json in place without rewriting clean files. */
 export function stripWorkerCredentialEmail(homeDir, { uid, gid } = {}) {
   const file = slotWorkerCredentialPath(homeDir)
@@ -181,6 +251,7 @@ export function stripWorkerCredentialEmail(homeDir, { uid, gid } = {}) {
   let raw
   let prevMode = 0o600
   try {
+    assertSafeSlotCredentialPaths(homeDir)
     const st = fs.lstatSync(file)
     if (!st.isFile()) return { changed: false }
     prevMode = st.mode & 0o777
@@ -262,6 +333,11 @@ export function ensureOfficialCredentialLink(homeDir, { uid, gid, create = false
   const workerFile = path.join(claudeDir, 'credentials.json')
   const officialFile = path.join(claudeDir, '.credentials.json')
   if (!homeDir) return { wrote: false, error: 'home missing' }
+  try {
+    assertSafeSlotCredentialPaths(homeDir)
+  } catch (error) {
+    return { wrote: false, linked: false, error: error?.code || 'unsafe_credential_path' }
+  }
   const workerGrant = regularOauthGrant(workerFile)
   const adopt =
     !!adoptOfficial &&
@@ -330,6 +406,7 @@ export function readWorkerCredentialFile(homeDir) {
   const file = slotWorkerCredentialPath(homeDir)
   if (!file) return null
   try {
+    assertSafeSlotCredentialPaths(homeDir)
     if (!fs.existsSync(file)) return null
     const doc = JSON.parse(fs.readFileSync(file, 'utf8'))
     const api = doc?.anthropicApiKey && typeof doc.anthropicApiKey === 'object' ? doc.anthropicApiKey : null
@@ -463,6 +540,7 @@ export function slotUidGidFromHomeDir(homeDir) {
 
 export function ensureSlotClaudeOwnership(homeDir, uid = null, gid = null) {
   if (!homeDir) return
+  assertSafeSlotCredentialPaths(homeDir)
   let u = uid
   let g = gid
   if (u == null || g == null) {
@@ -478,7 +556,10 @@ export function ensureSlotClaudeOwnership(homeDir, uid = null, gid = null) {
   fs.mkdirSync(claudeDir, { recursive: true, mode: 0o700 })
   for (const p of [homeDir, claudeDir, ...SLOT_CLAUDE_FILES.map((name) => path.join(claudeDir, name))]) {
     try {
-      if (fs.existsSync(p)) fs.chownSync(p, user, group)
+      const st = lstatOrNull(p)
+      if (!st) continue
+      if (st.isSymbolicLink()) fs.lchownSync(p, user, group)
+      else fs.chownSync(p, user, group)
     } catch {}
   }
 }
@@ -494,10 +575,28 @@ function chownSlotCredentialFile(homeDir, file) {
 
 function sealSlotCredentialFile(file) {
   if (!file) return
-  // Slot Claude must not rewrite the shared RT; that drops kinGeneration.
+  // Slot processes must never rewrite panel credentials.json.
   try {
     fs.chmodSync(file, 0o444)
   } catch {}
+}
+
+/**
+ * Restore panel SSOT invariants after an in-place panel refresh: strip any email,
+ * keep slot ownership + 0444 read-only seal, and relink `.credentials.json` without
+ * ever adopting a slot-written regular file.
+ */
+export function sealWorkerCredentialFile(homeDir) {
+  const file = slotWorkerCredentialPath(homeDir)
+  if (!file) return { sealed: false, reason: 'missing' }
+  assertSafeSlotCredentialPaths(homeDir)
+  const st = lstatOrNull(file)
+  if (!st || !st.isFile()) return { sealed: false, reason: 'missing' }
+  stripWorkerCredentialEmail(homeDir)
+  chownSlotCredentialFile(homeDir, file)
+  sealSlotCredentialFile(file)
+  ensureOfficialCredentialLink(homeDir, { ...slotUidGidFromHomeDir(homeDir), adoptOfficial: false })
+  return { sealed: true, path: file }
 }
 
 /** Write slot credentials.json for imports and worker-owned credential updates. */
@@ -505,6 +604,7 @@ function sealSlotCredentialFile(file) {
 export function writeWorkerCredentialFile(homeDir, cred) {
   const file = slotWorkerCredentialPath(homeDir)
   if (!file) return null
+  assertSafeSlotCredentialPaths(homeDir)
   const mode = credentialModeFromOauth(cred)
   const authScheme = resolveAuthScheme({ mode, auth_scheme: cred.auth_scheme || cred.authScheme })
   if (mode === 'apikey') {
@@ -867,7 +967,8 @@ export function healLeftoverAuthState(vmPath) {
     vm.schedule_disabled_reason || vm.claude.refresh_error || vm.claude.temp_unschedulable_reason || '',
   )
   if (isQuotaParkReason(vm.claude.temp_unschedulable_reason || vm.temp_unschedulable_reason)) return vm
-  if (/oauth_revoked|oauth_invalid_grant|token has been revoked|token_revoked|invalidated oauth token/i.test(reason)) return vm
+  if (/oauth_revoked|oauth_invalid_grant|token has been revoked|token_revoked|invalidated oauth token/i.test(reason))
+    return vm
   const had =
     vm.claude.temp_unschedulable_until || vm.claude.temp_unschedulable_reason || vm.claude.oauth_401_generation
   if (!had) return vm
@@ -894,9 +995,9 @@ export function clearVmAuthCooldown(vmPath) {
   return vm
 }
 
-// The control plane lost track of the worker: the refresh may or may not have run.
+// The control plane lost track of the worker or slot projection failed after rotation.
 const WORKER_TRANSPORT_CODES =
-  /^(worker_output_invalid|worker_exec_failed|worker_timeout|worker_output_limit|credential_pull_failed)$/i
+  /^(worker_output_invalid|worker_exec_failed|worker_timeout|worker_output_limit|credential_pull_failed|credential_sync_failed)$/i
 
 /** Lost answers are retryable only when the worker's attempt journal guards the refresh token. */
 const unguardedTransportFailure = (result) =>

@@ -5,6 +5,7 @@ import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs'
+import { createMockSchedulerRuntime } from '../helpers/mock-scheduler-runtime.mjs'
 import { applyCrsUnofficialPersona, CRS_OFFICIAL_SYSTEM } from '../../src/lib/identity/crs-persona.mjs'
 import { estimateClaudeInputTokens, personaHideForUnofficial } from '../../src/lib/identity/crs-persona-usage.mjs'
 import { costColumnsFromUsage } from '../../src/lib/admin/pricing.mjs'
@@ -119,6 +120,13 @@ for (const stream of [false, true]) {
         end() {},
       }
       const input = { model, max_tokens: 128, stream, system: fixture.system, messages }
+      const apiRt = createMockSchedulerRuntime()
+      const pickApi = () => ({
+        ok: true,
+        endpoint: { id: 'ep', kind: 'claude', protocol: 'anthropic', base_url: 'https://upstream.invalid' },
+        upstream_model: model,
+        key: { id: 'fixture', api_key: 'fixture-not-secret' },
+      })
       const handler = createHandleProtocol({
         json: (_res, status, body) => {
           response.status = status
@@ -148,13 +156,31 @@ for (const stream of [false, true]) {
           release() {},
           recordUsage: (_key, usage, options) => charged.push({ usage, options }),
         },
+        schedulerRuntime: apiRt,
         apiScheduler: {
-          pick: () => ({
-            ok: true,
-            endpoint: { id: 'ep', kind: 'claude', protocol: 'anthropic', base_url: 'https://upstream.invalid' },
-            upstream_model: model,
-            key: { id: 'fixture', api_key: 'fixture-not-secret' },
-          }),
+          pick: pickApi,
+          async acquire(requestedModel, opts = {}) {
+            const picked = pickApi()
+            const acquired = await (opts.schedulerRuntime || apiRt).acquireNode({
+              ...opts,
+              nodeTypes: ['api_endpoint'],
+              allowedNodeKeys: [`api_endpoint:${picked.endpoint.id}`],
+              model: requestedModel,
+            })
+            return {
+              ...picked,
+              leaseId: acquired.lease_id,
+              leaseTtlMs: acquired.lease_ttl_ms,
+              nodeKey: acquired.selected_node.node_key,
+              resolvedPoolId: acquired.resolved_pool_id,
+            }
+          },
+          async commitLease(leaseId, opts = {}) {
+            return (opts.schedulerRuntime || apiRt).commitLease(leaseId)
+          },
+          async releaseLease(leaseId, payload = {}, opts = {}) {
+            return (opts.schedulerRuntime || apiRt).releaseLease(leaseId, payload)
+          },
         },
         apiEndpointStore: {},
         stats: { errors: 0, requests: 0, by_route: {}, passthrough: 0, rewrite: 0, convert: 0 },

@@ -1,3 +1,4 @@
+import crypto from 'node:crypto'
 import {
   classifyUpstreamResult,
   isFableModel,
@@ -9,8 +10,6 @@ import { flattenSearchResultHistory, searchHistoryFingerprint } from '../protoco
 import { MIN_THINKING_BUDGET } from '../protocol/thinking.mjs'
 import {
   CLIENT_POOL_BUSY_MESSAGE,
-  CLIENT_POOL_FABLE_RATE_LIMITED_MESSAGE,
-  CLIENT_POOL_RATE_LIMITED_MESSAGE,
   clientCancelledResult,
   extractErrorLogFields,
   isClientCancelledResult,
@@ -25,14 +24,21 @@ import { extractProviderCorrelation } from '../protocol/log-fields.mjs'
 import { hasRefreshPresence, readWorkerCredentialFile } from '../oauth/oauth-credentials.mjs'
 import { ensureWorkerCredential } from '../transport/go-worker-client.mjs'
 import { kernelFaults } from '../transport/rust-kernel-client.mjs'
-import { resolveOfficialCcInference } from '../vm/slot-engine.mjs'
 import { attachFailureDecision, AttemptCoordinator } from './unit-decision.mjs'
 import { SOFT_COOLDOWN_REASONS } from './pool-scheduler.mjs'
 import { PoisonRequestGuard } from './poison-request-guard.mjs'
 import { inferRateLimitWindow } from './rate-limit-service.mjs'
+import { PLATFORM_SCOPE } from '../admin/resource-owner.mjs'
+import {
+  SchedulerApiError,
+  SchedulerUnavailableError,
+  VIRTUAL_POOL_IDS,
+  classifyErrorClass,
+  formatNodeKey,
+  formatSchedulerError,
+  inferModelFamily,
+} from '../scheduler/scheduler-runtime.mjs'
 
-// Seat wait for the one-shot repair hop when the rejected hop already spent the deadline.
-const REPAIR_HOP_WAIT_MS = 30_000
 const SEARCH_REPAIR_IDLE_MS = 60 * 60 * 1000
 const SEARCH_REPAIR_LIMIT = 512
 
@@ -63,11 +69,6 @@ export const vmTimeoutTracker = {
     this.trips.set(vmId, recent)
     return recent.length
   },
-  /**
-   * Trips still inside the window. Prunes the aged-out ones so they cannot be
-   * counted later: only recordTrip writes the filtered list back, and it is not
-   * called while the circuit is already open.
-   */
   tripCount(vmId, now = Date.now()) {
     if (!vmId) return 0
     const recent = (this.trips.get(vmId) || []).filter((at) => now - at < TIMEOUT_TRIP_WINDOW_MS)
@@ -75,7 +76,6 @@ export const vmTimeoutTracker = {
     else this.trips.delete(vmId)
     return recent.length
   },
-  /** Until when a healthy kernel must not clear this VM's timeout fault (0 = no hold). */
   faultHoldUntil(vmId, now = Date.now()) {
     const recent = (this.trips.get(vmId) || []).filter((at) => now - at < TIMEOUT_TRIP_WINDOW_MS)
     if (recent.length < 2) return 0
@@ -87,7 +87,6 @@ export const vmTimeoutTracker = {
     this.counts.delete(vmId)
     this.trips.delete(vmId)
   },
-  /** Clears the consecutive count only: trip history survives a fault reset and ends on a real success. */
   reset(vmId) {
     if (vmId) this.counts.delete(vmId)
     else {
@@ -102,22 +101,11 @@ export const TIMEOUT_FAULT_PREFIX = 'consecutive_timeouts:'
 const OPAQUE_429_THRESHOLD = 3
 const OPAQUE_429_COOLDOWN_MS = 60_000
 
-/**
- * Consecutive opaque CRAG 429s per (account, model).
- *
- * A single bare 429 with no rate-limit headers proves nothing (#1139), so the
- * classifier deliberately stops the request without cooling anything down.
- * Repetition is different: the same conversation hammering one model while the
- * slot's other models stay healthy is a model-level signal, not a request one.
- * Keyed by model on purpose -- an account-level cooldown would take the slot's
- * other models down with it.
- */
 export const opaque429Tracker = {
   counts: new Map(),
   key(accountId, model) {
     return `${accountId || ''}\u0000${model || ''}`
   },
-  /** Returns true once the streak reaches `threshold`. */
   record(accountId, model, threshold = OPAQUE_429_THRESHOLD) {
     if (!accountId) return false
     const key = this.key(accountId, model)
@@ -146,27 +134,12 @@ function opaque429Setting(value, fallback, min, max) {
 const CIRCUIT_DEDUPE_TTL_MS = 10 * 60_000
 const CIRCUIT_DEDUPE_MAX_ENTRIES = 5000
 
-/**
- * One (session, unit) pair may only charge the unit circuit once per window.
- *
- * #1796 counts upstream 400/403 toward UnitCircuit on purpose: a slot that
- * rejects what other slots accept is a slot problem, and three strikes park
- * it. That reasoning holds when *some* slots are bad. When every slot shares
- * the defect -- a kernel build that mangles the outbound body, say -- an
- * unlucky client walks the pool and parks every slot in turn, so capacity
- * drops to zero and no slot was ever going to answer. Charging each session
- * once keeps the cross-session signal (several sessions failing on one slot
- * still parks it) while denying any single caller the ability to take a slot
- * down by retrying.
- */
 export const sessionCircuitDedupe = {
   seen: new Map(),
   key(sessionKey, accountId) {
     return `${sessionKey}\u0000${accountId}`
   },
-  /** True when this pair has not been charged inside the window. */
   shouldCount(sessionKey, accountId, now = Date.now()) {
-    // No session identity means no dedupe: fall back to #1796's behaviour.
     if (!sessionKey || !accountId) return true
     const key = this.key(sessionKey, accountId)
     const last = this.seen.get(key)
@@ -179,14 +152,11 @@ export const sessionCircuitDedupe = {
     if (!sessionKey || !accountId) return
     this.seen.delete(this.key(sessionKey, accountId))
   },
-  /** Drop aged-out pairs once half full; hard-cap so a key explosion cannot grow it without bound. */
   prune(now = Date.now()) {
     if (this.seen.size < CIRCUIT_DEDUPE_MAX_ENTRIES / 2) return
     for (const [key, at] of this.seen) {
       if (now - at >= CIRCUIT_DEDUPE_TTL_MS) this.seen.delete(key)
     }
-    // Still over the cap means live pairs, not stale ones. Dropping them only
-    // reverts to #1796's accounting, which is safe, just less forgiving.
     if (this.seen.size >= CIRCUIT_DEDUPE_MAX_ENTRIES) this.seen.clear()
   },
   reset() {
@@ -194,32 +164,11 @@ export const sessionCircuitDedupe = {
   },
 }
 
-/**
- * Only the request-scoped `stop` fallback is deduped. Unit-scoped circuits
- * (provider_overloaded, organization_disabled, credential_refresh_failed) each
- * describe the unit itself and must keep charging on every hit, or #1796 loses
- * the sensitivity it was built for.
- */
 function countsTowardCircuit(policy, sessionKey, accountId) {
   if (policy?.scope !== 'request' || policy?.action !== 'stop') return true
   return sessionCircuitDedupe.shouldCount(sessionKey, accountId)
 }
 
-/**
- * Preflight rejections another kernel kind could plausibly accept.
- *
- * These come out of the CRAG-only rebuild (prepareCragRequest ->
- * crag-whitelist), so a cli-node slot may answer the same body:
- * `invalid_kernel_request` is that whitelist's default code and covers block
- * types CRAG does not model, `unsupported_capability` is a capability gate by
- * definition, `crag_prompt_too_large` is a CRAG-specific size limit, and
- * `thinking_incompatible` depends on the kernel/model pairing.
- *
- * Deliberately excluded: invalid_cache_control (breakpoint budget and TTL
- * order are Anthropic protocol rules), image_too_large, invalid_image_url and
- * invalid_tool_schema. Every kernel rejects those, so re-dispatching would
- * only delay the same answer.
- */
 const KERNEL_CAPABILITY_400_CODES = new Set([
   'invalid_kernel_request',
   'unsupported_capability',
@@ -227,11 +176,6 @@ const KERNEL_CAPABILITY_400_CODES = new Set([
   'crag_prompt_too_large',
 ])
 
-/**
- * True for a `kernel-preflight` 400 whose code says the slot's kernel, not the
- * request, is what refused it. `via` is set by invalidKernelResult in
- * go-worker-client, so this never matches a rejection that came from upstream.
- */
 function isKernelCapabilityRejection(result) {
   if (result?.via !== 'kernel-preflight' || result?.status !== 400) return false
   return KERNEL_CAPABILITY_400_CODES.has(result?.body?.error?.code)
@@ -242,34 +186,16 @@ const DEFAULTS = {
   max_total_attempts: 12,
   max_accounts_per_request: 0,
   total_retry_deadline_ms: 120000,
-  // Same-session serialization waits out the previous turn. Cap a wedged tail
-  // so the queue cannot sit forever. 0 disables the cap. Long enough that a
-  // normal generation still runs serially; keepalive covers the Cloudflare wait.
   session_queue_timeout_ms: 900_000,
-  // A conversation whose request keeps hitting the kernel's silent-CLI watchdog is refused for a while
-  // instead of being replayed every few minutes. 0 disables it.
   poison_request_threshold: 2,
   poison_request_window_ms: 30 * 60_000,
   poison_request_quarantine_ms: 10 * 60_000,
-  // Different sessions that must go silent on one VM before requests that large are kept off it.
   poison_request_vm_sessions: 2,
   delivery_mode: 'realtime',
-  // Conservative programmatic fallback (shipped src/config/routing.json sets 3).
   max_same_account_retries: 1,
   same_account_retry_delay_ms: 500,
   same_account_retry_max_hop_ms: 10_000,
   signature_repair: false,
-  // A conversation that already had a session pin when the request arrived
-  // stays on the account its first attempt ran on: a failed attempt retries
-  // that account or returns its error, it never replays the transcript on
-  // another account. Off by default (upstream behaviour).
-  keep_session_home: false,
-  // keep_session_home: pause between retries of a home kernel that had no free slot.
-  home_slot_busy_retry_ms: 2000,
-  // keep_session_home: once the request has run this long, a busy home kernel
-  // answers 529 session_home_slot_busy instead of being retried until
-  // total_retry_deadline_ms. 0 keeps waiting until the deadline (upstream behaviour).
-  home_slot_busy_max_wait_ms: 0,
 }
 
 function clone(value) {
@@ -283,6 +209,17 @@ function searchRepairKey(stickyKey, model, selected) {
 
 function usageOf(result) {
   return result?.usage || result?.body?.usage || null
+}
+
+function totalTokensOf(result) {
+  const u = usageOf(result)
+  if (!u || typeof u !== 'object') return null
+  const total =
+    Number(u.input_tokens || 0) +
+    Number(u.output_tokens || 0) +
+    Number(u.cache_read_input_tokens || u.cache_read_tokens || 0) +
+    Number(u.cache_creation_input_tokens || u.cache_creation_tokens || 0)
+  return Number.isFinite(total) && total > 0 ? Math.round(total) : null
 }
 
 function attemptDiagnostics(result, { includeError = true } = {}) {
@@ -320,30 +257,6 @@ function uniqueStickyKeys(stickyKey, stickyKeys) {
   return out
 }
 
-function poolError(code, message, details = {}) {
-  return {
-    ok: false,
-    status: 503,
-    via: 'pool-failover',
-    terminalState: 'exhausted',
-    body: {
-      type: 'error',
-      error: {
-        type: 'api_error',
-        code,
-        message,
-        details,
-      },
-    },
-  }
-}
-
-/**
- * Real capacity exhaustion: every eligible seat stayed busy until the wait ran
- * out, or the pool queue was full. Anthropic's 529 `overloaded_error`, always
- * with a Retry-After: the planner's earliest seat release, else the soonest
- * known wake (cooldown / RPM / window reset), floored at 1s.
- */
 export function poolOverloadedError(details = {}) {
   const retryMs = Number(details.retry_after_ms ?? details.soonest_available_ms)
   return {
@@ -365,79 +278,160 @@ export function poolOverloadedError(details = {}) {
   }
 }
 
-const CAPACITY_SELECTION_REASONS = new Set([
-  'all_accounts_busy',
-  'pool_wait_queue_full',
-  'pool_queue_timeout',
-  'subagent_limit',
-  'pool_overload_cooldown',
+function schedulerUnavailableResult(err = null, extras = {}) {
+  return {
+    ok: false,
+    status: 503,
+    retryAfterSec: 1,
+    via: 'rust-scheduler',
+    terminalState: 'scheduler_unavailable',
+    finalState: 'scheduler_unavailable',
+    body: {
+      type: 'error',
+      error: {
+        type: 'api_error',
+        code: 'scheduler_unavailable',
+        message: err?.message || 'Rust scheduler sidecar is unavailable',
+      },
+    },
+    ...extras,
+  }
+}
+
+const TERMINAL_SWITCH_ERROR_CODES = new Set([
+  'poison_abort',
+  'pool_forbidden',
+  'session_in_flight',
+  'session_queue_full',
+  'session_queue_timeout',
+  'session_node_busy',
+  'fable_requires_max',
+  'pool_rate_limited',
 ])
 
-/**
- * Every remaining account sits in an upstream 429 rate-limit cooldown. The
- * caller hit the provider's limit, so this is a 429 with the earliest reset.
- */
-function poolRateLimitedError(details = {}) {
-  const retryMs = Number(details.retry_after_ms ?? details.soonest_available_ms)
-  const fableLimited = details.reason === 'pool_fable_rate_limited'
-  return {
-    ok: false,
-    status: 429,
-    via: 'pool-failover',
-    terminalState: 'exhausted',
-    retryAfterSec: Number.isFinite(retryMs) && retryMs > 0 ? Math.max(1, Math.ceil(retryMs / 1000)) : 1,
-    body: {
-      type: 'error',
-      error: {
-        type: 'rate_limit_error',
-        code: fableLimited ? 'pool_fable_rate_limited' : 'pool_rate_limited',
-        message: fableLimited ? CLIENT_POOL_FABLE_RATE_LIMITED_MESSAGE : CLIENT_POOL_RATE_LIMITED_MESSAGE,
-        details,
-      },
-    },
-  }
+function isTerminalSwitchApiError(err) {
+  if (!(err instanceof SchedulerApiError)) return false
+  if (err.status === 422 || err.status === 403 || err.status === 429) return true
+  const code = String(err.code || '').trim()
+  const reason = String(err.explain?.reason || '').trim()
+  return TERMINAL_SWITCH_ERROR_CODES.has(code) || TERMINAL_SWITCH_ERROR_CODES.has(reason)
 }
 
-function fableRequiresMaxError(details = {}) {
-  return {
-    ok: false,
-    status: 429,
-    via: 'pool-failover',
-    terminalState: 'exhausted',
-    body: {
-      type: 'error',
-      error: {
-        type: 'rate_limit_error',
-        code: 'fable_requires_max',
-        message: 'Fable requires an available Max account',
-        details,
-      },
-    },
-  }
-}
-
-const QUOTA_GUARD_TOO_LARGE_MESSAGE =
-  '临近额度闸线，本请求预估未命中缓存过大，未发往上游。请缩短上下文、等待窗口重置，或改用其他模型。'
-
-function quotaGuardTooLargeError(details = {}) {
-  return {
-    ok: false,
-    status: 429,
-    via: 'pool-failover',
-    terminalState: 'exhausted',
-    body: {
-      type: 'error',
-      error: {
-        type: 'rate_limit_error',
-        code: 'quota_guard_request_too_large',
-        message: QUOTA_GUARD_TOO_LARGE_MESSAGE,
-        details: {
-          ...details,
-          message_en:
-            'Near the quota safety line, this request looks like a large uncached prompt and was not sent upstream. Shorten the context, wait for the window to reset, or switch to another model.',
+function schedulerApiErrorResult(err, { extras = {}, lastResult = null, lastPolicy = null } = {}) {
+  const formatted = formatSchedulerError(err)
+  const retryAfterSec = formatted.retryAfterSec != null ? formatted.retryAfterSec : undefined
+  // Security: NEVER expose `err.explain` (`node_key`, `order`, `excluded`, `prompt_policy.text`)
+  // in public client `body.error` or `body.error.details`; keep it ONLY on the top-level
+  // internal `explain` property for server-side logging.
+  const explainField = formatted.explain && typeof formatted.explain === 'object' ? { explain: formatted.explain } : {}
+  const body = formatted.body
+    ? {
+        ...formatted.body,
+        error: {
+          ...(formatted.body.error || {}),
+          ...(formatted.status === 529 ? { type: 'overloaded_error' } : {}),
         },
-      },
-    },
+      }
+    : formatted.body
+  if (err?.code === 'poison_abort' || formatted.status === 422) {
+    return {
+      ok: false,
+      status: 422,
+      via: 'rust-scheduler',
+      terminalState: 'poison_abort',
+      finalState: 'poison_abort',
+      body,
+      ...explainField,
+      ...extras,
+    }
+  }
+  if (formatted.status === 403) {
+    return {
+      ok: false,
+      status: 403,
+      via: 'rust-scheduler',
+      terminalState: 'rejected',
+      finalState: 'rejected',
+      body,
+      ...explainField,
+      ...extras,
+    }
+  }
+  if (formatted.status === 429) {
+    return {
+      ok: false,
+      status: 429,
+      retryAfterSec: retryAfterSec ?? 1,
+      via: 'rust-scheduler',
+      terminalState: 'exhausted',
+      finalState: 'exhausted',
+      body,
+      ...explainField,
+      ...extras,
+    }
+  }
+  const fallback = {
+    ok: false,
+    status: formatted.status || 503,
+    ...(retryAfterSec != null ? { retryAfterSec } : {}),
+    via: 'rust-scheduler',
+    terminalState: 'exhausted',
+    finalState: 'exhausted',
+    body,
+    ...explainField,
+  }
+  return preferLastResult(lastResult, lastPolicy, fallback, extras)
+}
+
+function buildRustFailureReport(result, policy, error = null) {
+  const httpStatus = Number(result?.status ?? error?.status ?? 0) || 0
+  const rawCode = String(result?.body?.error?.code || policy?.reason || error?.code || '').trim()
+  const rawMsg = String(result?.body?.error?.message || error?.message || '').trim()
+  const isTimeout =
+    policy?.reason === 'worker_timeout' ||
+    policy?.reason === 'provider_timeout' ||
+    httpStatus === 504 ||
+    httpStatus === 408
+  const isTransport = Boolean(result?.transportError) || httpStatus === 0
+  let errorClass
+  if (isCredentialDeath(policy)) {
+    errorClass = 'permanent_ban'
+  } else if (policy?.reason === 'account_quota_exhausted' || policy?.reason === 'fable_rate_limited') {
+    errorClass = 'quota_exhausted'
+  } else if (httpStatus === 529 || policy?.reason === 'provider_overloaded') {
+    errorClass = 'overloaded529'
+  } else if (
+    policy?.reason === 'content_filter_refusal' ||
+    policy?.reason === 'usage_policy_refusal' ||
+    policy?.reason === 'content_policy_refusal'
+  ) {
+    errorClass = 'refusal'
+  } else {
+    errorClass = classifyErrorClass({
+      status: httpStatus,
+      errorCode: rawCode,
+      reason: policy?.reason || '',
+      upstreamType: result?.body?.error?.type || '',
+      isTimeout,
+      isTransport,
+    })
+  }
+  let retryAfterSec = null
+  if (Number.isFinite(policy?.cooldownUntil) && policy.cooldownUntil > Date.now() && policy.cooldownUntil < 1e15) {
+    retryAfterSec = Math.max(1, Math.ceil((policy.cooldownUntil - Date.now()) / 1000))
+  } else if (Number.isFinite(Number(result?.retryAfterSec)) && Number(result.retryAfterSec) > 0) {
+    retryAfterSec = Math.max(1, Math.ceil(Number(result.retryAfterSec)))
+  } else {
+    const hdr = result?.headers?.['retry-after'] ?? result?.headers?.['Retry-After']
+    const parsedHdr = Number(hdr)
+    if (Number.isFinite(parsedHdr) && parsedHdr > 0) retryAfterSec = Math.max(1, Math.ceil(parsedHdr))
+  }
+  return {
+    http_status: httpStatus,
+    error_class: errorClass,
+    ...(rawCode ? { error_signature: rawCode.slice(0, 128) } : {}),
+    ...(rawMsg ? { error_message: rawMsg.slice(0, 300) } : {}),
+    ...(retryAfterSec != null ? { retry_after_sec: retryAfterSec } : {}),
   }
 }
 
@@ -475,7 +469,7 @@ function selectedUsage(selected, accountQuota = null) {
 function classifyAttempt(
   result,
   selected,
-  { model, requestBody, repaired, oauth401CooldownMs, signatureRepair },
+  { model, requestBody, repaired, oauth401CooldownMs, signatureRepair, disableRequestRepair = false },
   accountQuota = null,
 ) {
   return classifyUpstreamResult(result, {
@@ -487,6 +481,7 @@ function classifyAttempt(
     credentialGeneration: credentialStamp(selected),
     priorAuth401Generation: priorAuth401Stamp(selected),
     signatureRepair,
+    disableRequestRepair,
     usage: selectedUsage(selected, accountQuota),
   })
 }
@@ -526,51 +521,10 @@ function sleepWithSignal(ms, signal) {
   })
 }
 
-function waitForSessionTurn(previous, signal, timeoutMs) {
-  const timeout = Number(timeoutMs)
-  const bounded = Number.isFinite(timeout) && timeout > 0
-  if (signal?.aborted) {
-    return Promise.reject(Object.assign(new Error('Request was cancelled'), { code: 'request_cancelled' }))
-  }
-  if (!signal && !bounded) return previous.catch(() => {})
-  return new Promise((resolve, reject) => {
-    let settled = false
-    let timer = null
-    const finish = (fn, value) => {
-      if (settled) return
-      settled = true
-      signal?.removeEventListener?.('abort', onAbort)
-      if (timer) clearTimeout(timer)
-      fn(value)
-    }
-    const onAbort = () => {
-      finish(reject, Object.assign(new Error('Request was cancelled'), { code: 'request_cancelled' }))
-    }
-    const onTimeout = () => {
-      finish(reject, Object.assign(new Error('Session queue timed out'), { code: 'session_queue_timeout' }))
-    }
-    if (signal) signal.addEventListener('abort', onAbort, { once: true })
-    if (bounded) {
-      // Keep the timer referenced. An unref'd wait looks idle to the process,
-      // and the queued request is still in flight until it times out or runs.
-      timer = setTimeout(onTimeout, timeout)
-    }
-    previous.catch(() => {}).then(() => finish(resolve))
-  })
-}
-
-/** The kernel named why the hop failed: report that, not a generic incomplete. */
 function hasKernelFailureCode(result) {
   return Object.hasOwn(KERNEL_FAILURE_STATUS, String(result?.body?.error?.code || ''))
 }
 
-/**
- * The provider answered 429 before anything reached the caller. The native
- * stream path tags every failed hop 'incomplete', so when all accounts were
- * rate limited the caller got a generic 502 incomplete_response and a gateway
- * in front read it as a broken upstream. The 429 (with its retry-after) is the
- * complete answer.
- */
 function isUncommittedRateLimitAnswer(result) {
   if (result.committed || Number(result.status) !== 429) return false
   return result.body?.type === 'error' || !!result.body?.error
@@ -580,8 +534,6 @@ function isUnfinishedLastResult(result, policy) {
   if (!result) return false
   if (policy?.reason === 'incomplete_assistant') return true
   if (isUncommittedRateLimitAnswer(result)) return false
-  // An upstream entitlement answer is a complete answer even when the kernel
-  // tags the hop incomplete; the caller needs its message, not a generic 502.
   if (policy?.reason === 'fable_credits_required' || policy?.reason === 'fable_plan_denied') return false
   if (hasKernelFailureCode(result)) return false
   if (result.terminalState === 'incomplete') return true
@@ -590,13 +542,13 @@ function isUnfinishedLastResult(result, policy) {
 
 function preferLastResult(lastResult, lastPolicy, fallback, extras = {}) {
   if (isClientCancelledResult(lastResult)) {
-    return { ...clientCancelledResult(lastResult), via: lastResult.via || 'pool-failover', ...extras }
+    return { ...clientCancelledResult(lastResult), via: lastResult.via || 'rust-scheduler', ...extras }
   }
   if (!lastResult) return { ...fallback, ...extras }
   if (isUnfinishedLastResult(lastResult, lastPolicy)) {
     return {
       ...incompleteAssistantClientError(lastResult),
-      via: lastResult.via || 'pool-failover',
+      via: lastResult.via || 'rust-scheduler',
       finalState: 'incomplete',
       policy: lastPolicy || lastResult.policy,
       ...extras,
@@ -604,7 +556,7 @@ function preferLastResult(lastResult, lastPolicy, fallback, extras = {}) {
   }
   return {
     ...lastResult,
-    via: lastResult.via || 'pool-failover',
+    via: lastResult.via || 'rust-scheduler',
     finalState: lastResult.finalState || lastResult.terminalState || 'exhausted',
     policy: lastPolicy || lastResult.policy,
     ...extras,
@@ -626,10 +578,6 @@ function isCredentialDeath(policy) {
   return policy?.action === 'disable' || policy?.reason === 'oauth_no_refresh' || policy?.reason === 'oauth_revoked'
 }
 
-/**
- * The kernel's job watchdog gave up after 180s without one CLI frame. The slot itself may be fine,
- * so this says something about the request rather than the seat.
- */
 function isSilentCliTimeout(policy, result) {
   if ((policy?.reason !== 'provider_timeout' && policy?.reason !== 'worker_timeout') || result?.committed) return false
   const text = `${result?.error?.message || ''} ${result?.body?.error?.message || ''} ${result?.message || ''}`
@@ -664,13 +612,12 @@ function quarantinedResult({ failures, retryAfterSec }) {
 
 const kb = (bytes) => Math.round(bytes / 1024)
 
-/** Every seat that could serve this request has been silent at this size; say so instead of waiting 180s again. */
 function oversizeForSlotResult({ requestBytes, ceilingBytes, retryAfterSec }) {
   const minutes = Math.max(1, Math.ceil(retryAfterSec / 60))
   return {
     ok: false,
     status: 400,
-    via: 'pool-failover',
+    via: 'rust-scheduler',
     terminalState: 'rejected',
     finalState: 'rejected',
     attemptCount: 0,
@@ -691,12 +638,10 @@ function oversizeForSlotResult({ requestBytes, ceilingBytes, retryAfterSec }) {
   }
 }
 
-/** Empty / thinking-only hop: replayable on another seat. Never a restart signal. */
 function isRetryableEmptyHop(policy) {
   return policy?.reason === 'incomplete_assistant' || policy?.reason === 'empty_response'
 }
 
-/** The kernel said this job is still held: replaying would run it twice. */
 function emptyHopReleased(result) {
   if (!result || result.committed) return false
   if (result.transportError === true) return false
@@ -704,7 +649,6 @@ function emptyHopReleased(result) {
   return true
 }
 
-/** Hidden transport / credential retries inside one hop still spend that unit's budget. */
 function executionsOf(result) {
   if (result?.upstreamExecutions === 0) return 0
   return 1 + (result?.rust_transport_retried ? 1 : 0) + (result?.credential_retried ? 1 : 0)
@@ -721,13 +665,6 @@ function incompleteHopResult(result, policy, extras = {}) {
   }
 }
 
-/**
- * The kernel keeps the provider's real HTTP headers (retry-after, request-id,
- * rate-limit) in providerResult.response_headers and may return the hop with
- * none of its own. Classification reads result.headers, so a 429 that said
- * "retry-after: 7547" read as a bare 429 and only stepped aside for 60s.
- * Fill in what the hop itself did not carry; the hop's own headers win.
- */
 export function adoptProviderResponseHeaders(result) {
   if (!result || result.ok) return result
   const provider = result.providerResult?.response_headers
@@ -742,44 +679,9 @@ export function adoptProviderResponseHeaders(result) {
   return result
 }
 
-/** Selection found no seat. Busy until the wait ran out is capacity; nothing eligible is not. */
-function selectionFailure(selected, { excluded, lastPolicy, lastResult, hops }) {
-  const reason = selected?.reason || 'no_eligible_accounts'
-  const details = {
-    excluded_accounts: [...excluded],
-    ...(selected?.selectionReason === 'subagent-fallback' && { selection_reason: 'subagent-fallback' }),
-    reason,
-    wait_ms: selected?.waitMs ?? selected?.wait_ms ?? 0,
-    soonest_available_ms: selected?.soonest_available_ms ?? null,
-    retry_after_ms: selected?.retry_after_ms ?? null,
-    wait_reasons: selected?.wait_reasons || [],
-    eligible: selected?.eligible ?? 0,
-    available: selected?.available ?? 0,
-    sticky_cleared: !!selected?.sticky_cleared,
-    attempt_count: hops,
-    last_reason: lastPolicy?.reason || null,
-    last_status: lastResult?.status ?? null,
-  }
-  if (CAPACITY_SELECTION_REASONS.has(reason)) return poolOverloadedError(details)
-  if (reason === 'pool_rate_limited' || reason === 'pool_fable_rate_limited') return poolRateLimitedError(details)
-  if (reason === 'quota_guard_request_too_large') return quotaGuardTooLargeError(details)
-  if (reason === ErrorCode.CLUSTER_SLOT_RECONNECTING) {
-    return {
-      ...poolError(ErrorCode.CLUSTER_SLOT_RECONNECTING, 'The session VM is temporarily unreachable', details),
-      retryAfterSec: 1,
-    }
-  }
-  const failed = poolError('account_pool_exhausted', 'No eligible Claude accounts remain', details)
-  // An all-rest pool knows when the first working window opens.
-  const retryMs = Number(details.retry_after_ms)
-  if (retryMs > 0) failed.retryAfterSec = Math.max(1, Math.ceil(retryMs / 1000))
-  return failed
-}
-
 function applyCooldown(scheduler, selected, policy, model, { diagnosticPin = false } = {}) {
+  if (!scheduler?.markCooldown) return
   if (policy?.action !== 'continue-and-cooldown' && policy?.action !== 'disable' && policy?.action !== 'pause') return
-  // VM / master pin is a diagnostic. A 401 from the wrong inbound class
-  // must not forever-park a Setup Token that has no refresh by design.
   if (diagnosticPin && (policy.reason === 'oauth_no_refresh' || policy.reason === 'oauth_revoked')) {
     return
   }
@@ -795,17 +697,36 @@ function applyCooldown(scheduler, selected, policy, model, { diagnosticPin = fal
         ? 'disabled'
         : 'cooldown',
   })
-  // A 5xx pause, an RPM cooldown, or an unproven bare 429 keeps the
-  // conversation pin: other seats absorb this turn. Quota and auth move
-  // every conversation off the unit, windows included (#163).
   if (policy.scope === 'account' && policy.action !== 'pause' && !SOFT_COOLDOWN_REASONS.has(policy.reason)) {
     scheduler.releaseAccountSessions?.({ accountId: selected?.accountId, vmId: selected?.vmId })
   }
 }
 
+function isAbortErr(error, signal) {
+  return Boolean(
+    signal?.aborted ||
+      error?.name === 'AbortError' ||
+      error?.code === 'ABORT_ERR' ||
+      error?.code === 'selection_cancelled' ||
+      error?.code === 'request_cancelled',
+  )
+}
+
+/**
+ * Anthropic / Claude VM FailoverRunner backed solely by Rust `kin-scheduler` (M3 / D4).
+ *
+ * - Same-session concurrency=1 FIFO serialization is owned exclusively by Rust `SessionGate`.
+ * - Initial acquisition calls `/internal/v1/schedule/acquire`.
+ * - Pre-commit node switches call atomic `/internal/v1/schedule/switch` without dropping `SessionGate`.
+ * - First emitted downstream byte invokes idempotent `/internal/v1/schedule/commit`.
+ * - Every code path guarantees `/internal/v1/schedule/release` in `finally`.
+ * - Strictly Fail-Closed HTTP 503 (`scheduler_unavailable`, `Retry-After: 1`) when Rust is unavailable.
+ */
 export class FailoverRunner {
   constructor({
     scheduler,
+    schedulerRuntime = null,
+    getSchedulerRuntime = null,
     stickyRouter = null,
     attemptsRepo = null,
     rateLimitService = null,
@@ -817,6 +738,8 @@ export class FailoverRunner {
     onSchedulePause = null,
   } = {}) {
     this.scheduler = scheduler
+    this.schedulerRuntime = schedulerRuntime || null
+    this._getSchedulerRuntime = typeof getSchedulerRuntime === 'function' ? getSchedulerRuntime : null
     this.stickyRouter = stickyRouter
     this.attemptsRepo = attemptsRepo
     this.rateLimitService = rateLimitService
@@ -826,10 +749,23 @@ export class FailoverRunner {
     this.onFablePlanDenied = onFablePlanDenied
     this.onFableSuccess = onFableSuccess
     this.onSchedulePause = onSchedulePause
-    this.sessionTails = new Map()
     this.searchRepairs = new Map()
     this.poisonGuard = new PoisonRequestGuard()
     this.applyPoisonConfig()
+  }
+
+  setSchedulerRuntime(rt) {
+    this.schedulerRuntime = rt || null
+  }
+
+  getSchedulerRuntime(override = null) {
+    return (
+      override ||
+      this.schedulerRuntime ||
+      (this._getSchedulerRuntime ? this._getSchedulerRuntime() : null) ||
+      this.scheduler?.schedulerRuntime ||
+      null
+    )
   }
 
   reloadConfig(config = {}) {
@@ -844,7 +780,6 @@ export class FailoverRunner {
     this.poisonGuard.vmSessions = Math.max(1, Number(this.config.poison_request_vm_sessions) || 2)
   }
 
-  /** A hop ended in the kernel's silent-CLI watchdog: remember the request so its retries can be refused. */
   noteSilentTimeout(stickyKey, canonicalBody, selected, policy, result) {
     if (!stickyKey || !isSilentCliTimeout(policy, result)) return
     this.poisonGuard.recordSilentTimeout(stickyKey, canonicalBody, {
@@ -879,7 +814,6 @@ export class FailoverRunner {
         if (isTimeout && ttft == null) {
           const tripped = vmTimeoutTracker.recordTimeout(vmId, 3)
           if (tripped) {
-            // In-flight hangs that land after the circuit opened are the same incident.
             const trips = kernelFaults.has(vmId) ? vmTimeoutTracker.tripCount(vmId) : vmTimeoutTracker.recordTrip(vmId)
             const holdUntil = vmTimeoutTracker.faultHoldUntil(vmId)
             const fault = `${TIMEOUT_FAULT_PREFIX} VM ${vmId} had 3 consecutive silent inference timeouts`
@@ -892,11 +826,6 @@ export class FailoverRunner {
     }
   }
 
-  /**
-   * An empty hop leaves the outbound session behind for a fresh-session retry.
-   * Client cancellation only ends its job; kernel cancel_ack fences slot reuse.
-   * Planner seat indexes are not kernel native slots.
-   */
   retireOutboundSession(selected, bindKeys) {
     if (!selected?.vmId) return
     for (const key of bindKeys || []) {
@@ -925,8 +854,6 @@ export class FailoverRunner {
     const after = readWorkerCredentialFile(exec.homeDir)
     const afterRefresh = String(after?.refresh_token || '')
     const blob = `${refreshed?.error?.code || ''} ${refreshed?.error?.message || ''} ${refreshed?.refresh_class || ''}`
-    // codex token endpoint answers revocation as code "token_revoked" /
-    // "Encountered invalidated oauth token for user" — grant death for OpenAI slots too.
     const grantDead = /invalid_grant|token has been revoked|token_revoked|invalidated oauth token|oauth_revoked/i.test(
       blob,
     )
@@ -945,9 +872,9 @@ export class FailoverRunner {
 
   forgetCredential(selected, policy, { familyKey = null, sessionKeys = [] } = {}) {
     if (familyKey) {
-      this.scheduler.releaseSticky?.(selected, null, sessionKeys)
+      this.scheduler?.releaseSticky?.(selected, null, sessionKeys)
     } else {
-      this.scheduler.releaseAccountSessions?.({ accountId: selected?.accountId, vmId: selected?.vmId })
+      this.scheduler?.releaseAccountSessions?.({ accountId: selected?.accountId, vmId: selected?.vmId })
     }
     if (typeof this.onCredentialFailure === 'function') {
       try {
@@ -956,9 +883,8 @@ export class FailoverRunner {
     }
   }
 
-  /** Upstream refused this seat outright: move its conversations off and park it for the operator. */
   pauseUnit(selected, policy, result) {
-    this.scheduler.releaseAccountSessions?.({ accountId: selected?.accountId, vmId: selected?.vmId })
+    this.scheduler?.releaseAccountSessions?.({ accountId: selected?.accountId, vmId: selected?.vmId })
     if (typeof this.onSchedulePause === 'function') {
       try {
         this.onSchedulePause({ selected, policy, result })
@@ -966,50 +892,54 @@ export class FailoverRunner {
     }
   }
 
+  #resolveSelected(acquired, { model, quotaRequest }) {
+    if (typeof this.scheduler?.resolveCandidateForNode === 'function') {
+      return this.scheduler.resolveCandidateForNode(acquired.selected_node, {
+        model,
+        resolvedPoolId: acquired.resolved_pool_id,
+        promptPolicy: acquired.prompt_policy,
+        leaseId: acquired.lease_id,
+        leaseTtlMs: acquired.lease_ttl_ms,
+        stoodIn: acquired.stood_in,
+        preserveMachineHome: acquired.preserve_machine_home,
+        sessionGateWaitMs: acquired.session_gate_wait_ms,
+        explain: acquired.explain,
+        quotaRequest,
+      })
+    }
+    const vmId = String(acquired?.selected_node?.node_id || '')
+    return {
+      ok: true,
+      vmId,
+      accountId: vmId,
+      vm: null,
+      exec: null,
+      state: null,
+      workerStatus: null,
+      model,
+      nodeKey: acquired?.selected_node?.node_key || formatNodeKey('claude_vm', vmId),
+      leaseId: acquired?.lease_id || null,
+      leaseTtlMs: acquired?.lease_ttl_ms || null,
+      resolvedPoolId: acquired?.resolved_pool_id || null,
+      promptPolicy: acquired?.prompt_policy || null,
+      stoodIn: acquired?.stood_in === true,
+      preserveMachineHome: acquired?.preserve_machine_home === true,
+      explain: acquired?.explain || null,
+      selectionReason: acquired?.explain?.affinity?.why || 'rust-scheduler',
+      waitMs: Number(acquired?.session_gate_wait_ms) || 0,
+      queueWaitMs: Number(acquired?.session_gate_wait_ms) || 0,
+      schedulingMs: 0,
+      quotaRequest,
+      release: () => {},
+    }
+  }
+
   async run(args = {}) {
-    const sessionKey = String(args.stickyKey || '')
-    // Before queueing behind the session's hung turn: a refused retry must cost nothing.
+    const sessionKey = String(args.inboundIdentity?.sessionId || args.stickyKey || '')
     const quarantined = args.pinVmId ? null : this.poisonGuard.check(sessionKey, args.canonicalBody)
     if (quarantined) return quarantinedResult(quarantined)
-    const subagent = args.rootSessionId ? this.scheduler?.trackSubagent?.(args) : null
-    if (args.rootSessionId) args = { ...args, subagent }
-    // A batch member key is a placement group, not a conversation: its requests
-    // are independent sessionless calls, so they run side by side up to the
-    // member's concurrency instead of queueing behind each other. Only the
-    // protocol layer says so (args.batchMember); the key text is caller-shaped.
-    if (!sessionKey || args.batchMember === true)
-      return subagent ? this.runOnce(args).finally(subagent.close) : this.runOnce(args)
-    const previous = this.sessionTails.get(sessionKey) || Promise.resolve()
-    let releaseTurn
-    const turn = new Promise((resolve) => {
-      releaseTurn = resolve
-    })
-    const tail = previous.catch(() => {}).then(() => turn)
-    this.sessionTails.set(sessionKey, tail)
-    try {
-      await waitForSessionTurn(previous, args.signal, this.config.session_queue_timeout_ms)
-      return await this.runOnce(args)
-    } catch (error) {
-      if (error?.code === 'request_cancelled') return clientCancelledResult()
-      if (error?.code === 'session_queue_timeout') {
-        const retryMs = Number(this.config.session_queue_timeout_ms)
-        return poolOverloadedError({
-          reason: 'session_queue_timeout',
-          retry_after_ms: Number.isFinite(retryMs) && retryMs > 0 ? retryMs : 1000,
-        })
-      }
-      throw error
-    } finally {
-      subagent?.close()
-      releaseTurn()
-      // Drop the chain only after this tail settles. A timeout or cancel
-      // releases our turn early, while the holder is still running; deleting
-      // immediately would let the next request overlap that holder.
-      const drop = () => {
-        if (this.sessionTails.get(sessionKey) === tail) this.sessionTails.delete(sessionKey)
-      }
-      tail.then(drop, drop)
-    }
+    // Same-session concurrency=1 FIFO serialization is owned solely by Rust `SessionGate`.
+    return this.runOnce(args)
   }
 
   async runOnce({
@@ -1019,8 +949,8 @@ export class FailoverRunner {
     stickyKey = null,
     stickyKeys = null,
     batchMember = false,
-    seatKey = null,
     stickyDeviceId = null,
+    inboundIdentity = null,
     stream = false,
     deliveryMode = null,
     signal,
@@ -1029,146 +959,111 @@ export class FailoverRunner {
     onAttempt = null,
     onUpstreamRisk = null,
     pinVmId = null,
+    isAdminDiagnostic = undefined,
     familyKey = null,
-    familyVmId = null,
     rootSessionId = null,
-    summarySession = null,
-    subagent,
     deviceKey = null,
     skipSessionSeat = false,
+    isEphemeralProbe = false,
     ownerScope = null,
     keyScope = null,
+    apiKeyScope = null,
+    apiKeyRecord = null,
+    apiKeyKind = null,
+    poolAccess = null,
+    originPoolId = null,
+    jevDowngradePoolId = null,
+    allowedNodeKeys = null,
+    protocol = 'anthropic.messages',
     countUsage = true,
     quotaRequest = null,
-    // false: never wait for a seat; a full pool fails at once (x-kin-queue: off).
     allowQueue = true,
+    schedulerRuntime = null,
   } = {}) {
-    if (!this.scheduler) throw new Error('FailoverRunner requires a scheduler')
     if (typeof callAttempt !== 'function') throw new Error('FailoverRunner requires callAttempt')
+
+    const rt = this.getSchedulerRuntime(schedulerRuntime)
+    if (!rt) {
+      return schedulerUnavailableResult(new Error('Rust scheduler runtime is unavailable'), { attemptCount: 0 })
+    }
+
+    if (signal?.aborted) {
+      return { ...clientCancelledResult(), via: 'rust-scheduler', attemptCount: 0 }
+    }
+
     const startedAt = Date.now()
+    const maxSameUnitRetries = Number(this.config.max_same_account_retries ?? DEFAULTS.max_same_account_retries)
+    const maxUnitSwitches = Number(this.config.max_account_switches ?? DEFAULTS.max_account_switches)
+    const maxTotalAttempts = Number(this.config.max_total_attempts ?? DEFAULTS.max_total_attempts)
     const budget = new AttemptCoordinator({
-      maxSameUnitRetries: Number(this.config.max_same_account_retries ?? DEFAULTS.max_same_account_retries),
-      maxUnitSwitches: Number(this.config.max_account_switches ?? DEFAULTS.max_account_switches),
-      maxTotalAttempts: Number(this.config.max_total_attempts ?? DEFAULTS.max_total_attempts),
+      maxSameUnitRetries,
+      maxUnitSwitches,
+      maxTotalAttempts,
       deadlineMs: Number(this.config.total_retry_deadline_ms || DEFAULTS.total_retry_deadline_ms),
       startedAt,
     })
     const deadline = budget.deadline
-    const excluded = budget.excluded
     const accountCap = Number(this.config.max_accounts_per_request)
     const bare429Accounts = new Set()
-    // Accounts left only because the kernel had no free slot; their pins stay.
-    const spilled = budget.spilled
-    // session_affinity_first: a turn that spilled to another unit wrote the
-    // whole prompt cache there, so the conversation follows it instead of
-    // returning to the home it spilled from (and rewriting the cache again).
-    const followCache = this.scheduler?.config?.session_affinity_first === true
     const bindKeys = uniqueStickyKeys(stickyKey, stickyKeys)
-    const pinKeys = familyKey ? [...bindKeys, familyKey] : bindKeys
-    // Pins as this request last saw them. A pin moved by someone else since
-    // (quota migration, credential death) is never written back by a late hop.
-    const pinBaseline = new Map()
-    const snapshotPins = () => {
-      for (const key of pinKeys) pinBaseline.set(key, this.stickyRouter?.resolve?.(key) || null)
+    const reqId = String(requestId || '').trim() || `req_${crypto.randomBytes(8).toString('hex')}`
+    // Security: NEVER pass client-controlled X-Request-Id (`reqId`) as Rust scheduler's
+    // idempotency `request_id`; mint an unpredictable per-run UUIDv4 for Rust scheduling.
+    const schedulerRequestId = crypto.randomUUID()
+
+    const sizeRefused = pinVmId ? [] : this.poisonGuard.refusedVms(canonicalBody)
+    const excludedNodeKeys = new Set(sizeRefused.map((r) => formatNodeKey('claude_vm', r.vmId)).filter(Boolean))
+
+    const resolvedOriginPoolId =
+      originPoolId ||
+      poolAccess?.originPool?.id ||
+      poolAccess?.effectivePool?.id ||
+      keyScope?.vm_pool_id ||
+      VIRTUAL_POOL_IDS.claude
+    const resolvedSessionId = inboundIdentity?.sessionId || (stickyKey ? String(stickyKey) : '') || crypto.randomUUID()
+    const resolvedMachineId = inboundIdentity?.machineId || stickyDeviceId || deviceKey || null
+    const isManagedPool = Boolean(poolAccess && poolAccess.legacy === false)
+    const resolvedAllowedKeys = Array.isArray(allowedNodeKeys)
+      ? allowedNodeKeys
+      : !isManagedPool && Array.isArray(keyScope?.allowed_vms) && keyScope.allowed_vms.length > 0
+        ? keyScope.allowed_vms.map((id) => formatNodeKey('claude_vm', id))
+        : undefined
+    const resolvedAdminDiagnostic = isAdminDiagnostic !== undefined ? Boolean(isAdminDiagnostic) : Boolean(pinVmId)
+
+    const baseAcquireParams = {
+      requestId: schedulerRequestId,
+      originPoolId: resolvedOriginPoolId,
+      jevDowngradePoolId: jevDowngradePoolId || null,
+      apiKeyScope: apiKeyScope || undefined,
+      apiKeyRecord: apiKeyRecord || null,
+      apiKeyKind: apiKeyKind || null,
+      poolAccess: poolAccess || null,
+      ownerScope: ownerScope || PLATFORM_SCOPE,
+      allowedNodeKeys: resolvedAllowedKeys,
+      nodeTypes: ['claude_vm'],
+      model: String(model || ''),
+      modelFamily: inferModelFamily(model, 'anthropic'),
+      protocol: protocol || 'anthropic.messages',
+      machineId: resolvedMachineId,
+      sessionId: resolvedSessionId,
+      sessionIdSource: inboundIdentity?.sessionSource || null,
+      parentSessionId: inboundIdentity?.parentSessionId || rootSessionId || null,
+      isEphemeralProbe: Boolean(
+        isEphemeralProbe || skipSessionSeat || batchMember === true || inboundIdentity?.isEphemeralProbe,
+      ),
+      noQueue: allowQueue === false,
+      isAdminDiagnostic: resolvedAdminDiagnostic,
+      pinNodeKey: pinVmId ? formatNodeKey('claude_vm', pinVmId) : null,
     }
-    const pinMoved = (key) => {
-      const base = pinBaseline.get(key)
-      if (!base) return false
-      const now = this.stickyRouter?.resolve?.(key)
-      return !now || now.accountId !== base.accountId || (now.generation || 0) !== (base.generation || 0)
-    }
-    let freshSlot = false
-    // The seat moved VMs on failover: device affinity follows it.
-    let seatMovedTo = null
-    let outboundSessionId = ''
-    let outboundSessionAccountId = ''
-    let currentDeviceVmId = null
-    let pinnedSlot = null
+
     let lastSelected = null
-    const attribution = () => ({
-      accountId: lastSelected?.accountId,
-      vmId: lastSelected?.vmId,
-      attemptCount: budget.hops,
-    })
-    const bindAll = (account, opts) => {
-      if (!this.stickyRouter || !account) return
-      // keep_pin_on_model_gate: the pinned home only could not serve this
-      // model, so this request borrows the account. No session, family or
-      // device pin follows it; the next turn goes home.
-      if (lastSelected?.stickyBorrowed === true && lastSelected.accountId === account.accountId) return
-      const sessionId = account.sessionId || (account.accountId === outboundSessionAccountId ? outboundSessionId : '')
-      const payload = { accountId: account.accountId, vmId: account.vmId }
-      const slotIndex = account.slotIndex != null ? account.slotIndex : pinnedSlot
-      if (slotIndex != null) payload.slotIndex = slotIndex
-      if (sessionId) payload.sessionId = sessionId
-      if (stickyDeviceId) payload.deviceId = stickyDeviceId
-      if (this.stickyRouter.bind) {
-        for (const key of bindKeys) {
-          if (pinMoved(key)) continue
-          const prev = this.stickyRouter.resolve?.(key)
-          // A granted seat follows the scheduler's device home even when the
-          // previous account is still eligible. Capacity spills keep its pin.
-          const ownMove =
-            !!prev?.accountId &&
-            prev.accountId !== account.accountId &&
-            opts?.borrowed !== true &&
-            (prev.accountId === outboundSessionAccountId ||
-              (!!lastSelected?.seatKey && (followCache || !spilled.has(prev.accountId))))
-          if (prev?.accountId && prev.accountId !== account.accountId && !ownMove) continue
-          let guard = opts
-          if (prev) guard = { ...opts, ifGeneration: prev.generation || 0 }
-          if (freshSlot || opts?.replaceSession) guard = { ...guard, replaceSession: true }
-          if (ownMove) guard = { ...guard, allowMove: true }
-          this.stickyRouter.bind(key, payload, guard)
-          pinBaseline.set(key, this.stickyRouter.resolve?.(key) || null)
-        }
-      }
-      if (familyKey && account.vmId && lastSelected?.selectionReason !== 'subagent-fallback' && !pinMoved(familyKey)) {
-        this.stickyRouter.bind?.(familyKey, { accountId: account.accountId, vmId: account.vmId }, { countHit: false })
-        pinBaseline.set(familyKey, this.stickyRouter.resolve?.(familyKey) || null)
-      }
-      if (
-        deviceKey &&
-        account.vmId &&
-        (!currentDeviceVmId || currentDeviceVmId === account.vmId || seatMovedTo === account.vmId)
-      ) {
-        const devicePayload = { accountId: account.accountId, vmId: account.vmId }
-        if (this.stickyRouter.bindDeviceAffinity) {
-          this.stickyRouter.bindDeviceAffinity(deviceKey, devicePayload, { countHit: false })
-        } else {
-          this.stickyRouter.bind?.(deviceKey, devicePayload, { countHit: false })
-        }
-      }
-    }
-    // The dialog ended. Drop the persisted slot index so a restart does not
-    // put this session back into session_slots. VM / account memory and its
-    // original sticky expiry stay.
-    const releaseStickySlots = () => {
-      if (!this.stickyRouter?.bind) return
-      for (const key of bindKeys) {
-        if (pinMoved(key)) continue
-        const prev = this.stickyRouter.resolve?.(key)
-        if (!prev?.vmId || prev.slotIndex == null) continue
-        this.stickyRouter.bind(
-          key,
-          {
-            accountId: prev.accountId,
-            vmId: prev.vmId,
-            sessionId: prev.sessionId || outboundSessionId || '',
-          },
-          { countHit: false, ifGeneration: prev.generation || 0, clearSlot: true, keepExpiry: true },
-        )
-        pinBaseline.set(key, this.stickyRouter.resolve?.(key) || null)
-      }
-    }
     let lastResult = null
     let lastPolicy = null
     let repaired = false
     let repairPolicy = null
-    // The repaired body is the known fix and has not been sent yet; a slow
-    // rejected hop (a 400 can take minutes on a long transcript) must not
-    // turn it into the client's error. Bounded: repair is one-shot.
     let repairPending = false
+    let freshSlot = false
+    let kernelMismatchRetried = false
     let requestBody = clone(canonicalBody)
     let searchRepair = null
     let searchFingerprint
@@ -1176,743 +1071,842 @@ export class FailoverRunner {
       if (searchFingerprint === undefined) searchFingerprint = searchHistoryFingerprint(canonicalBody)
       return searchFingerprint
     }
-    // A unit that just failed replayably waits behind every other free seat.
-    let avoid = null
-    // keep_session_home: the continuing conversation's account for this
-    // request is the one its first attempt ran on.
-    const keepHome = this.config.keep_session_home === true && !pinVmId && !!stickyKey && batchMember !== true
-    const continuing = !subagent && keepHome && !!this.stickyRouter?.resolve?.(stickyKey)?.accountId
-    let homeAccountId = null
-    let homeRetryPending = false
-    let subagentSlotDeadline = null
-    // A kernel capability rejection gets exactly one re-dispatch. The split is
-    // CRAG vs cli-node, so one hop covers it; more would burn budget whenever
-    // every slot refuses and turn a clear 400 into pool exhaustion.
-    let kernelMismatchRetried = false
-    const switchUnit = (unit, policy) => {
-      budget.noteSwitch(unit.accountId, unit.vmId, { spill: policy.reason === 'slot_busy' })
-      if (unit.isSubagent) {
-        unit.release()
-        subagent?.close()
-        familyVmId = null
-        subagentSlotDeadline = null
+    const attribution = () => ({
+      accountId: lastSelected?.accountId,
+      vmId: lastSelected?.vmId,
+      resolvedPoolId: lastSelected?.resolvedPoolId || null,
+      stoodIn: lastSelected?.stoodIn === true,
+      attemptCount: budget.hops,
+    })
+
+    // Step 1: Acquire initial lease from Rust `kin-scheduler` (acquires SessionGate + node slot).
+    let acquired
+    try {
+      acquired = await rt.acquireNode(
+        { ...baseAcquireParams, attemptNo: 1, excludeNodes: [...excludedNodeKeys] },
+        { signal },
+      )
+    } catch (err) {
+      if (isAbortErr(err, signal)) {
+        return { ...clientCancelledResult(), via: 'rust-scheduler', ...attribution() }
       }
-    }
-    const isHome = (unit) => continuing && !!homeAccountId && unit?.accountId === homeAccountId
-    const retryOrStay = (unit) => {
-      if (isHome(unit) || unit?.isSubagent) {
-        homeRetryPending = true
-        return null
+      if (err instanceof SchedulerUnavailableError || err?.code === 'scheduler_unavailable') {
+        return schedulerUnavailableResult(err, attribution())
       }
-      return new Set([unit.accountId, unit.vmId])
-    }
-    // The home kernel had no free slot: nothing ran, so wait for it instead of
-    // spilling the transcript to another account. The request deadline bounds it.
-    const waitHomeSlot = (unit, policy) => {
-      if ((!isHome(unit) && !unit?.isSubagent) || policy?.reason !== 'slot_busy') return false
-      homeRetryPending = 'slot_busy'
-      return true
-    }
-    // x-kin-queue: off — the home kernel being full is the pool being full for this
-    // conversation: answer 529 now rather than wait for the slot.
-    // home_slot_busy_max_wait_ms bounds the same wait for every request.
-    const homeSlotRefused = (unit, policy) => {
-      if (policy?.reason !== 'slot_busy') return null
-      this.scheduler?.noteKernelSlotBusy?.(unit)
-      if (unit?.isSubagent) {
-        subagentSlotDeadline ??= unit.slotWaitDeadlineMs
-        if (allowQueue && Date.now() < subagentSlotDeadline) return null
-        releaseStickySlots()
-        return {
-          ...poolOverloadedError({ reason: 'pool_queue_timeout', attempt_count: budget.hops }),
-          ...attribution(),
+      if (err instanceof SchedulerApiError) {
+        if (
+          sizeRefused.length > 0 &&
+          err.status !== 529 &&
+          err.status !== 429 &&
+          err.status !== 403 &&
+          err.status !== 422
+        ) {
+          return { ...oversizeForSlotResult(sizeRefused[0]), ...attribution() }
         }
+        return schedulerApiErrorResult(err, { extras: attribution() })
       }
-      if (!isHome(unit)) return null
-      const maxWait = Number(this.config.home_slot_busy_max_wait_ms) || 0
-      const waitedOut = maxWait > 0 && Date.now() - startedAt >= maxWait
-      if (allowQueue && !waitedOut) return null
-      releaseStickySlots()
-      return {
-        ...poolOverloadedError({ reason: 'session_home_slot_busy', attempt_count: budget.hops }),
-        ...attribution(),
-      }
-    }
-    const keptHome = () => {
-      releaseStickySlots()
-      return preferLastResult(lastResult, lastPolicy, null, { ...attribution(), session_home_kept: true })
+      return schedulerUnavailableResult(err, attribution())
     }
 
-    for (;;) {
-      const attemptNo = budget.hops + 1
-      if (signal?.aborted || isClientCancelledResult(lastResult)) {
-        return { ...clientCancelledResult(lastResult || {}), via: 'pool-failover', ...attribution() }
-      }
-      if (!repairPending && Date.now() >= deadline) {
-        return preferLastResult(
-          lastResult,
-          lastPolicy,
-          // With no hop yet the whole budget went to waiting for a seat: capacity.
-          poolOverloadedError({
-            reason: 'pool_deadline_exceeded',
-            attempt_count: budget.hops,
-            last_scope: lastPolicy?.scope || null,
-          }),
-          attribution(),
-        )
-      }
-      let selected = null
-      // Seats that stopped answering requests of this size: skip them, unless an operator pinned one for diagnosis.
-      const sizeRefused = pinVmId ? [] : this.poisonGuard.refusedVms(canonicalBody)
+    let activeLeaseId = acquired.lease_id
+    let activeSelected = this.#resolveSelected(acquired, { model, quotaRequest })
+    let activeCommitted = false
+    let commitPromise = null
+    let activeInflightCounted = false
+    let finalReleasePayload = null
+
+    const markInflight = (sel) => {
+      if (activeInflightCounted || !sel) return
+      activeInflightCounted = true
+      this.scheduler?.bumpInflight?.(sel.accountId, sel.vmId, 1)
+    }
+    const clearInflight = (sel) => {
+      if (!activeInflightCounted || !sel) return
+      activeInflightCounted = false
+      this.scheduler?.bumpInflight?.(sel.accountId, sel.vmId, -1)
+    }
+
+    markInflight(activeSelected)
+
+    const releaseActiveLeaseNow = async (payload) => {
+      const lid = activeLeaseId
+      const sel = activeSelected
+      activeLeaseId = null
+      clearInflight(sel)
+      if (!lid) return
       try {
-        currentDeviceVmId = deviceKey ? this.stickyRouter?.resolve?.(deviceKey)?.vmId || null : null
-        const selectArgs = {
-          model,
-          stickyKey,
-          stickyKeys: bindKeys,
-          seatKey,
-          excluded: sizeRefused.length ? new Set([...excluded, ...sizeRefused.map((r) => r.vmId)]) : excluded,
-          spilled,
-          signal,
-          deadline: repairPending ? Math.max(deadline, Date.now() + REPAIR_HOP_WAIT_MS) : deadline,
-          pinVmId,
-          familyVmId,
-          rootSessionId,
-          summarySession,
-          subagent,
-          deviceVmId: currentDeviceVmId,
-          deviceKey,
-          skipSessionSlot: skipSessionSeat,
-          ownerScope,
-          keyScope,
-          quotaRequest: {
-            body: requestBody,
-            sessionId: outboundSessionId || quotaRequest?.sessionId || stickyKey,
-            preserveMessageCache: quotaRequest?.preserveMessageCache,
+        await rt.releaseLease(lid, payload)
+      } catch {}
+    }
+
+    const advanceOrRetrySame = async ({ selected, policy, failureReport, hopMs, committedNow }) => {
+      const canSameUnit =
+        !committedNow &&
+        budget.allowSameUnit(selected.accountId, policy, hopMs, this.config.same_account_retry_max_hop_ms) &&
+        budget.hops < maxTotalAttempts &&
+        Date.now() < deadline
+
+      // Pinned VM or freshly refreshed OAuth credential stays on the current lease directly.
+      if (canSameUnit && (pinVmId || policy?.reason === 'oauth_refresh_required')) {
+        budget.noteSameUnit(selected.accountId)
+        try {
+          await sleepWithSignal(this.config.same_account_retry_delay_ms, signal)
+        } catch {
+          await releaseActiveLeaseNow({ outcome: 'aborted' })
+          return { done: true, result: { ...clientCancelledResult(), via: 'rust-scheduler', ...attribution() } }
+        }
+        return { done: false }
+      }
+
+      // Past total/switch caps only untried units stay reachable (via excludedNodeKeys).
+      const canSwitch = !committedNow && !pinVmId && Date.now() < deadline
+      if (!canSwitch) {
+        await releaseActiveLeaseNow({
+          outcome: failureReport.error_class === 'timeout' ? 'timeout' : 'error',
+          http_status: failureReport.http_status || undefined,
+          error_class: failureReport.error_class,
+          error_signature: failureReport.error_signature,
+          error_message: failureReport.error_message,
+          retry_after_sec: failureReport.retry_after_sec,
+        })
+        return { done: true, result: preferLastResult(lastResult, lastPolicy, null, attribution()) }
+      }
+
+      const currentNodeKey = selected.nodeKey || formatNodeKey('claude_vm', selected.vmId)
+      const switchExclude = new Set(excludedNodeKeys)
+      switchExclude.add(currentNodeKey)
+      const prevLeaseId = activeLeaseId
+      activeLeaseId = null
+      clearInflight(selected)
+
+      let switched
+      try {
+        switched = await rt.switchNode(
+          {
+            release_lease_id: prevLeaseId,
+            failure: failureReport,
+            next_attempt: {
+              ...baseAcquireParams,
+              attemptNo: budget.hops + 1,
+              excludeNodes: [...switchExclude],
+            },
           },
+          { signal },
+        )
+      } catch (switchErr) {
+        if (isAbortErr(switchErr, signal)) {
+          return { done: true, result: { ...clientCancelledResult(), via: 'rust-scheduler', ...attribution() } }
         }
-        if (homeRetryPending) {
-          const waitMs =
-            homeRetryPending === 'slot_busy'
-              ? Number(this.config.home_slot_busy_retry_ms ?? 2000)
-              : this.config.same_account_retry_delay_ms
-          homeRetryPending = false
-          await sleepWithSignal(Math.min(waitMs, (subagentSlotDeadline ?? Infinity) - Date.now()), signal)
+        if (switchErr instanceof SchedulerUnavailableError || switchErr?.code === 'scheduler_unavailable') {
+          return { done: true, result: schedulerUnavailableResult(switchErr, attribution()) }
         }
-        if (subagentSlotDeadline != null) {
-          selectArgs.deadline = Math.min(selectArgs.deadline, subagentSlotDeadline)
-          if (Date.now() >= subagentSlotDeadline) {
-            releaseStickySlots()
-            return {
-              ...poolOverloadedError({ reason: 'pool_queue_timeout', attempt_count: budget.hops }),
-              ...attribution(),
+        if (switchErr instanceof SchedulerApiError && canSameUnit && !isTerminalSwitchApiError(switchErr)) {
+          // No other free VM is available: fall back to a bounded same-unit retry on this VM.
+          budget.noteSameUnit(selected.accountId)
+          try {
+            await sleepWithSignal(this.config.same_account_retry_delay_ms, signal)
+          } catch {
+            return { done: true, result: { ...clientCancelledResult(), via: 'rust-scheduler', ...attribution() } }
+          }
+          let reacquired
+          try {
+            reacquired = await rt.acquireNode(
+              {
+                ...baseAcquireParams,
+                attemptNo: budget.hops + 1,
+                excludeNodes: [...excludedNodeKeys],
+              },
+              { signal },
+            )
+          } catch (reErr) {
+            if (isAbortErr(reErr, signal)) {
+              return { done: true, result: { ...clientCancelledResult(), via: 'rust-scheduler', ...attribution() } }
             }
+            if (reErr instanceof SchedulerUnavailableError || reErr?.code === 'scheduler_unavailable') {
+              return { done: true, result: schedulerUnavailableResult(reErr, attribution()) }
+            }
+            if (reErr instanceof SchedulerApiError) {
+              return {
+                done: true,
+                result: schedulerApiErrorResult(reErr, {
+                  extras: attribution(),
+                  lastResult,
+                  lastPolicy,
+                }),
+              }
+            }
+            return { done: true, result: schedulerUnavailableResult(reErr, attribution()) }
+          }
+          activeLeaseId = reacquired.lease_id
+          activeSelected = this.#resolveSelected(reacquired, { model, quotaRequest })
+          activeCommitted = false
+          commitPromise = null
+          markInflight(activeSelected)
+          return { done: false }
+        }
+        if (switchErr instanceof SchedulerApiError) {
+          return {
+            done: true,
+            result: schedulerApiErrorResult(switchErr, {
+              extras: attribution(),
+              lastResult,
+              lastPolicy,
+            }),
           }
         }
-        if (avoid) {
-          const elsewhere = await this.scheduler.selectAndReserve({ ...selectArgs, avoid, allowWait: false })
-          avoid = null
-          if (elsewhere?.ok) selected = elsewhere
-          else await sleepWithSignal(this.config.same_account_retry_delay_ms, signal)
+        return { done: true, result: schedulerUnavailableResult(switchErr, attribution()) }
+      }
+
+      excludedNodeKeys.add(currentNodeKey)
+      budget.noteSwitch(selected.accountId, selected.vmId, { spill: policy?.reason === 'slot_busy' })
+      activeLeaseId = switched.lease_id
+      activeSelected = this.#resolveSelected(switched, { model, quotaRequest })
+      activeCommitted = false
+      commitPromise = null
+      markInflight(activeSelected)
+      return { done: false }
+    }
+
+    try {
+      for (;;) {
+        const attemptNo = budget.hops + 1
+        const selected = activeSelected
+        lastSelected = selected
+
+        if (signal?.aborted || isClientCancelledResult(lastResult)) {
+          finalReleasePayload = { outcome: 'aborted' }
+          return { ...clientCancelledResult(lastResult || {}), via: 'rust-scheduler', ...attribution() }
         }
-        if (!selected) selected = await this.scheduler.selectAndReserve({ ...selectArgs, allowWait: allowQueue })
-      } catch (error) {
-        if (error?.code === 'selection_cancelled') {
-          return { ...clientCancelledResult(), via: 'pool-failover', ...attribution() }
-        }
-        if (error?.code === 'pool_wait_queue_full') {
+        if (!repairPending && Date.now() >= deadline) {
+          finalReleasePayload = { outcome: 'timeout' }
           return preferLastResult(
             lastResult,
             lastPolicy,
             poolOverloadedError({
-              reason: 'pool_wait_queue_full',
+              reason: 'pool_deadline_exceeded',
               attempt_count: budget.hops,
-              retry_after_ms: error.retryAfterMs ?? null,
+              last_scope: lastPolicy?.scope || null,
             }),
             attribution(),
           )
         }
-        throw error
-      }
-      let attemptStarted
-      let result
-      let policy
-      let committed = false
-      let hopNoted = false
-      const noteHop = (value) => {
-        if (hopNoted) return
-        hopNoted = true
-        const executions = executionsOf(value)
-        if (executions > 0) budget.noteHop(selected.accountId, selected.vmId, executions)
-      }
-      try {
-        if (signal?.aborted) {
-          return { ...clientCancelledResult(), via: 'pool-failover', ...attribution() }
-        }
         if (
-          selected?.ok &&
           Number.isSafeInteger(accountCap) &&
           accountCap > 0 &&
           budget.executions.size >= accountCap &&
           !budget.executions.has(selected.accountId)
         ) {
-          releaseStickySlots()
+          finalReleasePayload = { outcome: 'error' }
           return preferLastResult(lastResult, lastPolicy, null, { ...attribution(), account_cap: accountCap })
         }
-        if (continuing && selected?.ok) {
-          if (!homeAccountId) homeAccountId = selected.accountId
-          else if (selected.accountId !== homeAccountId) return keptHome()
-        }
-        if (selected?.familyGated && selected.selectionReason !== 'subagent-fallback' && familyKey && familyVmId) {
-          // The family home left the pool (quota, credential): the family moves
-          // with the next bind. An exclusion this request made itself is not proof.
-          const home = this.stickyRouter?.resolve?.(familyKey)
-          const ownExclusion =
-            !!home && (budget.tried.has(home.accountId) || budget.tried.has(home.vmId) || spilled.has(home.accountId))
-          if (!ownExclusion) this.stickyRouter?.unbind?.(familyKey)
-          familyVmId = null
-        }
-        if (!selected?.ok && selected?.reason === 'fable_requires_max') {
-          return {
-            ...fableRequiresMaxError({
-              wait_ms: selected?.waitMs ?? selected?.wait_ms ?? 0,
-              eligible: selected?.eligible ?? 0,
-              available: selected?.available ?? 0,
-              attempt_count: budget.hops,
-            }),
-            ...attribution(),
-          }
-        }
-        if (
-          !selected?.ok &&
-          sizeRefused.length &&
-          !CAPACITY_SELECTION_REASONS.has(selected?.reason) &&
-          selected?.reason !== 'pool_rate_limited'
-        ) {
-          return { ...oversizeForSlotResult(sizeRefused[0]), ...attribution() }
-        }
-        if (!selected?.ok) {
-          const exhausted = selectionFailure(selected, { excluded, lastPolicy, lastResult, hops: budget.hops })
-          if (
-            selected?.reason === 'subagent_limit' ||
-            (selected?.isSubagent && selected.reason === 'pool_queue_timeout')
-          ) {
-            return { ...exhausted, ...attribution() }
-          }
-          return preferLastResult(lastResult, lastPolicy, exhausted, attribution())
-        }
+
         repairPending = false
-        snapshotPins()
-        const attemptStickyBound = pinBaseline.get(stickyKey) || null
-        lastSelected = selected
-        pinnedSlot = selected.slotIndex ?? null
-        if (selected.seatMoved) seatMovedTo = selected.vmId
-        bindAll(
-          { accountId: selected.accountId, vmId: selected.vmId, slotIndex: pinnedSlot },
-          { countHit: false, borrowed: lastPolicy?.reason === 'slot_busy' && !followCache },
-        )
-        const started = Date.now()
-        this.attemptsRepo?.begin?.({
-          requestId,
-          attemptNo,
-          vmId: selected.vmId,
-          accountId: selected.accountId,
-          model,
-          selectionReason: selected.selectionReason,
-          waitMs: selected.waitMs,
-          queueWaitMs: selected.queueWaitMs,
-          schedulingMs: selected.schedulingMs,
-        })
-        attemptStarted = started
-        const attemptResetGenerations = this.scheduler?.accountQuota?.resetGenerations?.(selected.accountId) || null
-        const repairKey = searchRepairKey(stickyKey, model, selected)
-        const hint = this.searchRepairs.get(repairKey)
-        if (hint && hint.expiresAt <= Date.now()) this.searchRepairs.delete(repairKey)
-        const knownSearchRepair = hint && hint.expiresAt > Date.now() && hint.fingerprint === fingerprint()
-        const attemptBody = knownSearchRepair ? flattenSearchResultHistory(requestBody) : requestBody
-        const prepared =
-          typeof applyAttempt === 'function'
-            ? await applyAttempt(clone(attemptBody), selected, {
-                attemptNo,
-                repaired,
-                // Assemblers may rebuild from caller input for each selected
-                // slot. Replay the same repairs on that freshly rendered body.
-                repairs: [
-                  ...(knownSearchRepair ? [{ action: 'repair-and-retry', reason: 'search_repairable' }] : []),
-                  ...(repairPolicy ? [repairPolicy] : []),
-                ],
-                attemptStartedAt: attemptStarted,
-                freshSlot,
-                stickyBound: attemptStickyBound,
-              })
-            : clone(attemptBody)
-        if (signal?.aborted) {
-          noteHop({ upstreamExecutions: 0 })
-          throw Object.assign(new Error('Request cancelled'), { code: 'request_cancelled' })
+        let attemptStarted
+        let result
+        let policy
+        let committed = false
+        let hopNoted = false
+        const noteHop = (value) => {
+          if (hopNoted) return
+          hopNoted = true
+          const executions = executionsOf(value)
+          if (executions > 0) budget.noteHop(selected.accountId, selected.vmId, executions)
         }
-        const wrappedAttempt =
-          prepared &&
-          typeof prepared === 'object' &&
-          Object.prototype.hasOwnProperty.call(prepared, 'body') &&
-          Object.prototype.hasOwnProperty.call(prepared, 'meta')
-        const body = wrappedAttempt ? prepared.body : prepared
-        const attemptMeta = wrappedAttempt ? prepared.meta : null
-        if (attemptMeta?.sessionId) {
-          outboundSessionId = String(attemptMeta.sessionId)
-          outboundSessionAccountId = selected.accountId
-          bindAll(
-            { accountId: selected.accountId, vmId: selected.vmId, sessionId: outboundSessionId },
-            {
-              countHit: false,
-              // Prebinding moved the VM already; replace the previous VM's session.
-              replaceSession: !!attemptStickyBound?.vmId && attemptStickyBound.vmId !== selected.vmId,
-            },
-          )
-        }
-        result = await callAttempt({
-          candidate: selected,
-          body,
-          attemptMeta,
-          attemptNo,
-          stream,
-          deliveryMode: deliveryMode || this.config.delivery_mode,
-          signal,
-          onCommit: () => {
-            committed = true
-          },
-        })
-        noteHop(result)
-        if (result) {
-          result.committed = result.committed || committed
-          if (result.attemptStartedAt == null) result.attemptStartedAt = attemptStarted
-          if (result.attemptResetGenerations == null && attemptResetGenerations) {
-            result.attemptResetGenerations = attemptResetGenerations
-          }
-        }
-        adoptProviderResponseHeaders(result)
-        if (signal?.aborted || isClientCancelledResult(result)) {
-          this.attemptsRepo?.complete?.(requestId, attemptNo, {
-            upstreamStatus: result?.status ?? null,
-            errorScope: 'request',
-            action: 'stop',
-            downstreamCommitted: !!(result?.committed || committed),
-            terminalState: 'cancelled',
-            latencyMs: Date.now() - attemptStarted,
-            ...attemptDiagnostics(result, { includeError: false }),
+
+        try {
+          const started = Date.now()
+          this.attemptsRepo?.begin?.({
+            requestId: reqId,
+            attemptNo,
+            vmId: selected.vmId,
+            accountId: selected.accountId,
+            model,
+            selectionReason: selected.selectionReason,
+            waitMs: selected.waitMs,
+            queueWaitMs: selected.queueWaitMs,
+            schedulingMs: selected.schedulingMs,
           })
-          releaseStickySlots()
-          return { ...clientCancelledResult(result), via: result?.via || 'pool-failover', ...attribution() }
-        }
-        const audited = onUpstreamRisk?.(result)
-        policy = audited
-          ? { scope: 'request', action: 'stop', reason: 'usage_policy_refusal' }
-          : classifyAttempt(
-              result,
-              selected,
-              {
-                model,
-                requestBody,
-                repaired,
-                oauth401CooldownMs: this.config.oauth_401_cooldown_ms,
-                signatureRepair: signatureRepairEnabled(this.config) || attemptMeta?.foreignThinking === true,
+          attemptStarted = started
+          const attemptResetGenerations = this.scheduler?.accountQuota?.resetGenerations?.(selected.accountId) || null
+          const repairKey = searchRepairKey(stickyKey || resolvedSessionId, model, selected)
+          const hint = repairKey ? this.searchRepairs.get(repairKey) : null
+          if (hint && hint.expiresAt <= Date.now()) this.searchRepairs.delete(repairKey)
+          const knownSearchRepair = hint && hint.expiresAt > Date.now() && hint.fingerprint === fingerprint()
+          const attemptBody = knownSearchRepair ? flattenSearchResultHistory(requestBody) : requestBody
+
+          const primaryStickyKey = stickyKey || bindKeys[0] || null
+          const attemptStickyBound =
+            primaryStickyKey && typeof this.stickyRouter?.resolve === 'function'
+              ? this.stickyRouter.resolve(primaryStickyKey)
+              : null
+
+          const prepared =
+            typeof applyAttempt === 'function'
+              ? await applyAttempt(clone(attemptBody), selected, {
+                  attemptNo,
+                  repaired,
+                  repairs: [
+                    ...(knownSearchRepair ? [{ action: 'repair-and-retry', reason: 'search_repairable' }] : []),
+                    ...(repairPolicy ? [repairPolicy] : []),
+                  ],
+                  attemptStartedAt: attemptStarted,
+                  freshSlot,
+                  stickyBound: attemptStickyBound,
+                })
+              : clone(attemptBody)
+
+          if (signal?.aborted) {
+            noteHop({ upstreamExecutions: 0 })
+            throw Object.assign(new Error('Request cancelled'), { code: 'request_cancelled' })
+          }
+
+          const wrappedAttempt =
+            prepared &&
+            typeof prepared === 'object' &&
+            Object.prototype.hasOwnProperty.call(prepared, 'body') &&
+            Object.prototype.hasOwnProperty.call(prepared, 'meta')
+          const body = wrappedAttempt ? prepared.body : prepared
+          const attemptMeta = wrappedAttempt ? prepared.meta : null
+
+          // Outbound session_id ledger only (Rust kin-scheduler owns inbound routing & SessionGate).
+          // Borrowed hops and slot_busy spills never overwrite the pinned home's outbound session.
+          if (
+            attemptMeta?.sessionId &&
+            bindKeys.length > 0 &&
+            selected?.stickyBorrowed !== true &&
+            typeof this.stickyRouter?.bind === 'function'
+          ) {
+            const outboundSessionId = String(attemptMeta.sessionId)
+            const followCache = this.scheduler?.config?.session_affinity_first === true
+            const replaceSession =
+              freshSlot || Boolean(attemptStickyBound?.vmId && attemptStickyBound.vmId !== selected.vmId)
+            for (const key of bindKeys) {
+              const prev = this.stickyRouter.resolve?.(key) || null
+              if (
+                prev?.accountId &&
+                prev.accountId !== selected.accountId &&
+                !followCache &&
+                budget.spilled.has(prev.accountId)
+              ) {
+                continue
+              }
+              this.stickyRouter.bind(
+                key,
+                {
+                  accountId: selected.accountId,
+                  vmId: selected.vmId,
+                  sessionId: outboundSessionId,
+                  ...(stickyDeviceId ? { deviceId: stickyDeviceId } : {}),
+                },
+                {
+                  countHit: false,
+                  ...(prev ? { ifGeneration: prev.generation || 0 } : {}),
+                  replaceSession,
+                  allowMove: true,
+                },
+              )
+            }
+          }
+
+          result = await callAttempt({
+            candidate: selected,
+            body,
+            attemptMeta,
+            attemptNo,
+            stream,
+            deliveryMode: deliveryMode || this.config.delivery_mode,
+            signal,
+            onCommit: () => {
+              committed = true
+              activeCommitted = true
+              if (activeLeaseId && !commitPromise) {
+                const lid = activeLeaseId
+                commitPromise = rt.commitLease(lid).catch(() => {})
+              }
+            },
+          })
+          noteHop(result)
+          if (result) {
+            result.committed = result.committed || committed
+            if (result.attemptStartedAt == null) result.attemptStartedAt = attemptStarted
+            if (result.attemptResetGenerations == null && attemptResetGenerations) {
+              result.attemptResetGenerations = attemptResetGenerations
+            }
+          }
+          adoptProviderResponseHeaders(result)
+
+          if (signal?.aborted || isClientCancelledResult(result)) {
+            this.attemptsRepo?.complete?.(reqId, attemptNo, {
+              upstreamStatus: result?.status ?? null,
+              errorScope: 'request',
+              action: 'stop',
+              downstreamCommitted: !!(result?.committed || committed),
+              terminalState: 'cancelled',
+              latencyMs: Date.now() - attemptStarted,
+              ...attemptDiagnostics(result, { includeError: false }),
+            })
+            await releaseActiveLeaseNow({ outcome: 'aborted' })
+            return { ...clientCancelledResult(result), via: result?.via || 'rust-scheduler', ...attribution() }
+          }
+
+          const audited = onUpstreamRisk?.(result)
+          policy = audited
+            ? { scope: 'request', action: 'stop', reason: 'usage_policy_refusal' }
+            : classifyAttempt(
+                result,
+                selected,
+                {
+                  model,
+                  requestBody,
+                  repaired,
+                  oauth401CooldownMs: this.config.oauth_401_cooldown_ms,
+                  signatureRepair: signatureRepairEnabled(this.config) || attemptMeta?.foreignThinking === true,
+                  disableRequestRepair: attemptMeta?.strictPassthrough === true,
+                },
+                this.scheduler?.accountQuota,
+              )
+
+          if (
+            policy.reason === 'thinking_incompatible' &&
+            !result?.committed &&
+            attemptMeta?.strictPassthrough !== true
+          ) {
+            const upstreamMessage = String(result?.body?.error?.message || '').trim()
+            const detail = `thinking.budget_tokens must be at least ${MIN_THINKING_BUDGET} and less than max_tokens (got max_tokens=${requestBody?.max_tokens})`
+            const message = upstreamMessage ? `${upstreamMessage}; ${detail}` : detail
+            result = {
+              ...result,
+              ok: false,
+              status: 400,
+              body: {
+                type: 'error',
+                error: {
+                  ...(result?.body?.error || {}),
+                  type: 'invalid_request_error',
+                  code: 'thinking_incompatible',
+                  param: 'max_tokens',
+                  message,
+                  details: { ...(result?.body?.error?.details || {}), retryable: false },
+                },
               },
-              this.scheduler?.accountQuota,
+            }
+          }
+
+          if (
+            !pinVmId &&
+            selected.accountId &&
+            policy.reason === 'rate_limited_unknown' &&
+            policy.action === 'continue' &&
+            executionsOf(result) > 0
+          ) {
+            bare429Accounts.add(selected.accountId)
+            if (bare429Accounts.size >= 2) {
+              policy = attachFailureDecision({ scope: 'request', action: 'stop', reason: 'rate_limited_request' })
+            }
+          }
+
+          if (knownSearchRepair && policy.reason === 'search_repairable') {
+            this.searchRepairs.delete(repairKey)
+            policy = { ...policy, action: 'stop', circuit: true }
+          }
+
+          const hardBlock =
+            !result?.committed && !pinVmId
+              ? this.rateLimitService?.handleUpstreamError?.({
+                  accountId: selected.accountId,
+                  vmId: selected.vmId,
+                  result,
+                  policy,
+                  requestStartedAt: attemptStarted,
+                  resetGenerations: attemptResetGenerations,
+                }) || null
+              : null
+          let preResetRateLimitIgnored = hardBlock?.ignored === true
+          if (
+            !preResetRateLimitIgnored &&
+            !this.rateLimitService &&
+            !result?.committed &&
+            !pinVmId &&
+            policy.action === 'continue-and-cooldown' &&
+            (policy.reason === 'account_quota_exhausted' || policy.reason === 'fable_rate_limited') &&
+            this.scheduler?.accountQuota?.isPreResetResponse
+          ) {
+            const targetWindow =
+              policy.reason === 'fable_rate_limited' ? '7d_oi' : inferRateLimitWindow(result, Date.now())
+            preResetRateLimitIgnored = !!this.scheduler.accountQuota.isPreResetResponse(
+              selected.accountId,
+              targetWindow,
+              {
+                requestStartedAt: attemptStarted,
+                resetGenerations: attemptResetGenerations,
+              },
             )
-        if (policy.reason === 'thinking_incompatible' && !result?.committed) {
-          const upstreamMessage = String(result?.body?.error?.message || '').trim()
-          const detail = `thinking.budget_tokens must be at least ${MIN_THINKING_BUDGET} and less than max_tokens (got max_tokens=${requestBody?.max_tokens})`
-          const message = upstreamMessage ? `${upstreamMessage}; ${detail}` : detail
+          }
+          if (preResetRateLimitIgnored && policy.action === 'continue-and-cooldown') {
+            policy = { ...policy, action: 'continue', cooldownUntil: null }
+          } else if (hardBlock?.until && policy.action === 'continue-and-cooldown' && policy.scope === 'account') {
+            policy = { ...policy, cooldownUntil: hardBlock.until }
+          }
+
+          if (policy.reason === 'crag_opaque_429') {
+            const threshold = opaque429Setting(this.config.crag_opaque_429_threshold, OPAQUE_429_THRESHOLD, 2, 10)
+            if (opaque429Tracker.record(selected.accountId, model, threshold)) {
+              opaque429Tracker.clear(selected.accountId, model)
+              policy = attachFailureDecision({
+                ...policy,
+                decision: undefined,
+                scope: 'model',
+                action: 'continue-and-cooldown',
+                reason: 'crag_opaque_429_model_cooldown',
+                retrySameAccount: false,
+                cooldownUntil:
+                  Date.now() +
+                  opaque429Setting(
+                    this.config.crag_opaque_429_cooldown_ms,
+                    OPAQUE_429_COOLDOWN_MS,
+                    10_000,
+                    10 * 60_000,
+                  ),
+              })
+            }
+          } else if (verifiedSuccess(result)) {
+            opaque429Tracker.clear(selected.accountId, model)
+          }
+
+          lastResult = result
+          lastPolicy = policy
+          this.noteUnitHealth(selected, policy, result, { sessionKey: stickyKey || resolvedSessionId })
+          this.noteSilentTimeout(stickyKey || resolvedSessionId, canonicalBody, selected, policy, result)
+          notifyProxyFailure(this.onProxyFailure, selected, policy)
+          if (
+            (policy.reason === 'fable_plan_denied' || policy.reason === 'fable_credits_required') &&
+            typeof this.onFablePlanDenied === 'function'
+          ) {
+            try {
+              this.onFablePlanDenied({ selected, policy })
+            } catch {}
+          }
+
+          const terminalState = result?.terminalState || (result?.ok ? 'unknown' : 'error')
+          this.attemptsRepo?.complete?.(reqId, attemptNo, {
+            upstreamStatus: result?.status ?? null,
+            errorScope: policy.scope,
+            action: policy.action,
+            cooldownUntil: policy.cooldownUntil,
+            downstreamCommitted: result?.committed || committed,
+            terminalState,
+            usage: usageOf(result),
+            ttftMs: result?.ttftMs ?? null,
+            latencyMs: Date.now() - attemptStarted,
+            ...attemptDiagnostics(result, { includeError: !result?.ok }),
+          })
+          if (typeof onAttempt === 'function') {
+            await onAttempt({ attemptNo, selected, result, policy })
+          }
+
+          if (
+            policy.reason === 'content_filter_refusal' ||
+            policy.reason === 'usage_policy_refusal' ||
+            policy.reason === 'content_policy_refusal' ||
+            policy.reason === 'third_party_client'
+          ) {
+            if (activeLeaseId) {
+              await (commitPromise || rt.commitLease(activeLeaseId).catch(() => {}))
+            }
+            const ttftMs = Number.isFinite(result?.ttftMs) ? Math.max(0, Math.round(result.ttftMs)) : undefined
+            const tokensUsed = totalTokensOf(result)
+            await releaseActiveLeaseNow({
+              outcome: 'ok',
+              http_status: Number(result?.status) || 200,
+              ...(ttftMs != null ? { ttft_ms: ttftMs } : {}),
+              ...(tokensUsed != null ? { tokens_used: tokensUsed } : {}),
+            })
+            this.scheduler?.markSuccess?.(selected, { workerStatus: result.workerStatus || null, countUsage })
+            return {
+              ...result,
+              ...attribution(),
+              finalState: policy.reason === 'content_filter_refusal' ? 'content_filter' : 'rejected',
+              policy,
+            }
+          }
+
+          if (verifiedSuccess(result)) {
+            this.poisonGuard.recordSuccess(stickyKey || resolvedSessionId, {
+              vmId: selected.vmId,
+              body: canonicalBody,
+            })
+            if (repairKey && (knownSearchRepair || searchRepair?.key === repairKey)) {
+              this.searchRepairs.delete(repairKey)
+              while (this.searchRepairs.size >= SEARCH_REPAIR_LIMIT) {
+                this.searchRepairs.delete(this.searchRepairs.keys().next().value)
+              }
+              this.searchRepairs.set(repairKey, {
+                fingerprint: fingerprint(),
+                expiresAt: Date.now() + SEARCH_REPAIR_IDLE_MS,
+              })
+            }
+            if (activeLeaseId) {
+              await (commitPromise || rt.commitLease(activeLeaseId).catch(() => {}))
+            }
+            const ttftMs = Number.isFinite(result?.ttftMs) ? Math.max(0, Math.round(result.ttftMs)) : undefined
+            const tokensUsed = totalTokensOf(result)
+            await releaseActiveLeaseNow({
+              outcome: 'ok',
+              http_status: Number(result?.status) || 200,
+              ...(ttftMs != null ? { ttft_ms: ttftMs } : {}),
+              ...(tokensUsed != null ? { tokens_used: tokensUsed } : {}),
+            })
+            this.scheduler?.markSuccess?.(selected, { workerStatus: result.workerStatus || null, countUsage })
+            if (isFableModel(model) && typeof this.onFableSuccess === 'function') {
+              try {
+                this.onFableSuccess({ selected, model })
+              } catch {}
+            }
+            return { ...result, ...attribution(), finalState: 'verified' }
+          }
+
+          // One-shot body repair stays on the currently held Rust lease & SessionGate.
+          if (policy.action === 'repair-and-retry' && !repaired && !result?.committed) {
+            let nextBody
+            try {
+              nextBody = repairAnthropicRequest(requestBody, policy)
+            } catch (repairError) {
+              if (repairError?.status === 400 && repairError?.body?.error) {
+                await releaseActiveLeaseNow({ outcome: 'error', http_status: 400, error_class: 'client4xx' })
+                return {
+                  ...result,
+                  ok: false,
+                  status: 400,
+                  body: repairError.body,
+                  ...attribution(),
+                  finalState: 'invalid_request',
+                  policy: attachFailureDecision({
+                    scope: 'request',
+                    action: 'stop',
+                    reason: repairError.body.error.code || 'invalid_request',
+                    cooldownUntil: null,
+                  }),
+                }
+              }
+              throw repairError
+            }
+            repaired = true
+            repairPolicy = { action: policy.action, reason: policy.reason }
+            repairPending = true
+            if (policy.reason === 'search_repairable' && repairKey && fingerprint()) {
+              searchRepair = { key: repairKey }
+            }
+            requestBody = nextBody
+            continue
+          }
+
+          applyCooldown(this.scheduler, selected, policy, model, { diagnosticPin: !!pinVmId })
+          if (policy.pauseSchedule) this.pauseUnit(selected, policy, result)
+          if (!pinVmId && isCredentialDeath(policy)) {
+            this.forgetCredential(selected, policy, { familyKey, sessionKeys: bindKeys })
+          }
+
+          const failureReport = buildRustFailureReport(result, policy)
+          const kernelCapabilityHop =
+            !shouldContinue(policy) && !kernelMismatchRetried && isKernelCapabilityRejection(result)
+          if (kernelCapabilityHop) {
+            kernelMismatchRetried = true
+            for (const key of bindKeys) this.stickyRouter?.unbind?.(key)
+            if (typeof rt.deleteSticky === 'function') {
+              await rt.deleteSticky({ scope_kind: 'session', session_id: resolvedSessionId }).catch(() => {})
+            }
+          }
+
+          if (!shouldContinue(policy) && !kernelCapabilityHop) {
+            await releaseActiveLeaseNow({
+              outcome: failureReport.error_class === 'timeout' ? 'timeout' : 'error',
+              http_status: failureReport.http_status || undefined,
+              error_class: failureReport.error_class,
+              error_signature: failureReport.error_signature,
+              error_message: failureReport.error_message,
+              retry_after_sec: failureReport.retry_after_sec,
+            })
+            return { ...result, ...attribution(), finalState: result?.terminalState || 'rejected', policy }
+          }
+
+          policy = await this.recoverCredential(selected, policy)
+          const hopMs = Date.now() - attemptStarted
+          if (isRetryableEmptyHop(policy)) {
+            if (!emptyHopReleased(result) || pinVmId) {
+              await releaseActiveLeaseNow({
+                outcome: 'error',
+                http_status: failureReport.http_status || undefined,
+                error_class: failureReport.error_class,
+                error_signature: failureReport.error_signature,
+                error_message: failureReport.error_message,
+              })
+              return incompleteHopResult(result, policy, attribution())
+            }
+            this.retireOutboundSession(selected, bindKeys)
+            freshSlot = true
+          }
+
+          const nextStep = await advanceOrRetrySame({
+            selected,
+            policy,
+            failureReport,
+            hopMs,
+            committedNow: Boolean(result?.committed || committed),
+          })
+          if (nextStep.done) return nextStep.result
+        } catch (error) {
+          if (attemptStarted === undefined) throw error
+          const invalidRequest =
+            error?.status === 400 &&
+            [
+              'invalid_cache_control',
+              'crag_prompt_too_large',
+              'image_too_large',
+              'invalid_image_url',
+              'invalid_kernel_request',
+              'unsupported_capability',
+              'invalid_tool_schema',
+              'thinking_incompatible',
+            ].includes(error.body?.error?.code)
+          noteHop(invalidRequest ? { upstreamExecutions: 0 } : null)
+          if (error?.code === 'response_sent') {
+            this.attemptsRepo?.complete?.(reqId, attemptNo, {
+              upstreamStatus: 403,
+              errorScope: 'request',
+              action: 'stop',
+              downstreamCommitted: true,
+              terminalState: 'policy_block',
+              latencyMs: Date.now() - attemptStarted,
+            })
+            await releaseActiveLeaseNow({ outcome: 'error', http_status: 403, error_class: 'client4xx' })
+            return {
+              ok: false,
+              responseSent: true,
+              status: 403,
+              via: 'account-scope',
+              vmId: selected.vmId,
+              accountId: selected.accountId,
+              attemptCount: attemptNo,
+              finalState: 'policy_block',
+            }
+          }
+          if (invalidRequest) {
+            this.attemptsRepo?.complete?.(reqId, attemptNo, {
+              upstreamStatus: 0,
+              errorScope: 'request',
+              action: 'stop',
+              downstreamCommitted: false,
+              terminalState: 'invalid_request',
+              latencyMs: Date.now() - attemptStarted,
+              ...attemptDiagnostics({ ok: false, status: 400, body: error.body }),
+            })
+            await releaseActiveLeaseNow({
+              outcome: 'error',
+              http_status: 400,
+              error_class: 'client4xx',
+              error_signature: error.body?.error?.code,
+              error_message: error.body?.error?.message,
+            })
+            return {
+              ok: false,
+              status: 400,
+              body: error.body,
+              terminalState: 'invalid_request',
+              finalState: 'invalid_request',
+              ...attribution(),
+            }
+          }
+          if (isAbortErr(error, signal)) {
+            this.attemptsRepo?.complete?.(reqId, attemptNo, {
+              upstreamStatus: 0,
+              errorScope: 'request',
+              action: 'stop',
+              downstreamCommitted: !!committed,
+              terminalState: 'cancelled',
+              latencyMs: Date.now() - attemptStarted,
+            })
+            await releaseActiveLeaseNow({ outcome: 'aborted' })
+            return { ...clientCancelledResult({ committed }), via: 'rust-scheduler', ...attribution() }
+          }
+
           result = {
-            ...result,
             ok: false,
-            status: 400,
+            status: 0,
+            transportError: true,
+            committed,
+            terminalState: committed ? 'incomplete' : 'transport_error',
             body: {
               type: 'error',
               error: {
-                ...(result?.body?.error || {}),
-                type: 'invalid_request_error',
-                code: 'thinking_incompatible',
-                param: 'max_tokens',
-                message,
-                details: { ...(result?.body?.error?.details || {}), retryable: false },
+                type: 'worker_error',
+                code: error.code || 'attempt_failed',
+                message: String(error.message || error).slice(0, 300),
               },
             },
           }
-        }
-        if (
-          !pinVmId &&
-          selected.accountId &&
-          policy.reason === 'rate_limited_unknown' &&
-          policy.action === 'continue' &&
-          executionsOf(result) > 0
-        ) {
-          bare429Accounts.add(selected.accountId)
-          if (bare429Accounts.size >= 2) {
-            policy = attachFailureDecision({ scope: 'request', action: 'stop', reason: 'rate_limited_request' })
-          }
-        }
-        if (knownSearchRepair && policy.reason === 'search_repairable') {
-          // Repeating the identical flatten cannot fix a second rejection.
-          this.searchRepairs.delete(repairKey)
-          policy = { ...policy, action: 'stop', circuit: true }
-        }
-        // The rate limit service is the sole writer of rate_limit_reset_at / overload_until.
-        const hardBlock =
-          !result?.committed && !pinVmId
-            ? this.rateLimitService?.handleUpstreamError?.({
-                accountId: selected.accountId,
-                vmId: selected.vmId,
-                result,
-                policy,
-                requestStartedAt: attemptStarted,
-                resetGenerations: attemptResetGenerations,
-              }) || null
-            : null
-        let preResetRateLimitIgnored = hardBlock?.ignored === true
-        if (
-          !preResetRateLimitIgnored &&
-          !this.rateLimitService &&
-          !result?.committed &&
-          !pinVmId &&
-          policy.action === 'continue-and-cooldown' &&
-          (policy.reason === 'account_quota_exhausted' || policy.reason === 'fable_rate_limited') &&
-          this.scheduler?.accountQuota?.isPreResetResponse
-        ) {
-          const targetWindow =
-            policy.reason === 'fable_rate_limited' ? '7d_oi' : inferRateLimitWindow(result, Date.now())
-          preResetRateLimitIgnored = !!this.scheduler.accountQuota.isPreResetResponse(
-            selected.accountId,
-            targetWindow,
+          policy = classifyAttempt(
+            result,
+            selected,
             {
-              requestStartedAt: attemptStarted,
-              resetGenerations: attemptResetGenerations,
+              model,
+              repaired,
+              oauth401CooldownMs: this.config.oauth_401_cooldown_ms,
+              signatureRepair: signatureRepairEnabled(this.config),
             },
+            this.scheduler?.accountQuota,
           )
-        }
-        if (preResetRateLimitIgnored && policy.action === 'continue-and-cooldown') {
-          policy = { ...policy, action: 'continue', cooldownUntil: null }
-        } else if (hardBlock?.until && policy.action === 'continue-and-cooldown' && policy.scope === 'account') {
-          policy = { ...policy, cooldownUntil: hardBlock.until }
-        }
-        // An opaque CRAG 429 stops the request without cooling anything down,
-        // which is right once (#1139) and wrong on repeat: the same conversation
-        // kept landing on one model for 47 minutes. Escalate to a model-level
-        // cooldown so the next attempt moves to another slot. `decision` is
-        // recomputed because scope and action both change here.
-        if (policy.reason === 'crag_opaque_429') {
-          const threshold = opaque429Setting(this.config.crag_opaque_429_threshold, OPAQUE_429_THRESHOLD, 2, 10)
-          if (opaque429Tracker.record(selected.accountId, model, threshold)) {
-            opaque429Tracker.clear(selected.accountId, model)
-            policy = attachFailureDecision({
-              ...policy,
-              decision: undefined,
-              scope: 'model',
-              action: 'continue-and-cooldown',
-              reason: 'crag_opaque_429_model_cooldown',
-              retrySameAccount: false,
-              cooldownUntil:
-                Date.now() +
-                opaque429Setting(this.config.crag_opaque_429_cooldown_ms, OPAQUE_429_COOLDOWN_MS, 10_000, 10 * 60_000),
-            })
-          }
-        } else if (verifiedSuccess(result)) {
-          opaque429Tracker.clear(selected.accountId, model)
-        }
+          lastResult = result
+          lastPolicy = policy
+          this.noteUnitHealth(selected, policy, result, { sessionKey: stickyKey || resolvedSessionId })
+          this.noteSilentTimeout(stickyKey || resolvedSessionId, canonicalBody, selected, policy, result)
+          notifyProxyFailure(this.onProxyFailure, selected, policy)
+          this.attemptsRepo?.complete?.(reqId, attemptNo, {
+            upstreamStatus: 0,
+            errorScope: policy.scope,
+            action: policy.action,
+            cooldownUntil: policy.cooldownUntil,
+            downstreamCommitted: committed,
+            terminalState: result.terminalState,
+            latencyMs: Date.now() - attemptStarted,
+            ...attemptDiagnostics(result),
+          })
 
-        lastResult = result
-        lastPolicy = policy
-        this.noteUnitHealth(selected, policy, result, { sessionKey: stickyKey })
-        this.noteSilentTimeout(stickyKey, canonicalBody, selected, policy, result)
-        if (attemptMeta?.sessionId) {
-          bindAll(
-            { accountId: selected.accountId, vmId: selected.vmId, sessionId: outboundSessionId },
-            {
-              countHit: false,
-              borrowed: policy?.reason === 'slot_busy' && !followCache,
-              // Prebinding moved the VM already; replace the previous VM's session.
-              replaceSession: !!attemptStickyBound?.vmId && attemptStickyBound.vmId !== selected.vmId,
-            },
-          )
-        }
-        notifyProxyFailure(this.onProxyFailure, selected, policy)
-        if (
-          (policy.reason === 'fable_plan_denied' || policy.reason === 'fable_credits_required') &&
-          typeof this.onFablePlanDenied === 'function'
-        ) {
-          try {
-            this.onFablePlanDenied({ selected, policy })
-          } catch {}
-        }
-        const terminalState = result?.terminalState || (result?.ok ? 'unknown' : 'error')
-        this.attemptsRepo?.complete?.(requestId, attemptNo, {
-          upstreamStatus: result?.status ?? null,
-          errorScope: policy.scope,
-          action: policy.action,
-          cooldownUntil: policy.cooldownUntil,
-          downstreamCommitted: result?.committed || committed,
-          terminalState,
-          usage: usageOf(result),
-          ttftMs: result?.ttftMs ?? null,
-          latencyMs: Date.now() - attemptStarted,
-          ...attemptDiagnostics(result, { includeError: !result?.ok }),
-        })
-        if (typeof onAttempt === 'function') {
-          await onAttempt({ attemptNo, selected, result, policy })
-        }
-        if (
-          policy.reason === 'content_filter_refusal' ||
-          policy.reason === 'usage_policy_refusal' ||
-          policy.reason === 'content_policy_refusal' ||
-          policy.reason === 'third_party_client'
-        ) {
-          this.scheduler.markSuccess(selected, { workerStatus: result.workerStatus || null, countUsage })
-          bindAll({ accountId: selected.accountId, vmId: selected.vmId })
-          releaseStickySlots()
-          return {
-            ...result,
-            ...attribution(),
-            finalState: policy.reason === 'content_filter_refusal' ? 'content_filter' : 'rejected',
-            policy,
-          }
-        }
-        if (verifiedSuccess(result)) {
-          this.poisonGuard.recordSuccess(stickyKey, { vmId: selected.vmId, body: canonicalBody })
-          if (repairKey && (knownSearchRepair || searchRepair?.key === repairKey)) {
-            this.searchRepairs.delete(repairKey)
-            while (this.searchRepairs.size >= SEARCH_REPAIR_LIMIT) {
-              this.searchRepairs.delete(this.searchRepairs.keys().next().value)
-            }
-            this.searchRepairs.set(repairKey, {
-              fingerprint: fingerprint(),
-              expiresAt: Date.now() + SEARCH_REPAIR_IDLE_MS,
+          const failureReport = buildRustFailureReport(result, policy, error)
+          if (committed || !shouldContinue(policy)) {
+            await releaseActiveLeaseNow({
+              outcome: failureReport.error_class === 'timeout' ? 'timeout' : 'error',
+              http_status: failureReport.http_status || undefined,
+              error_class: failureReport.error_class,
+              error_signature: failureReport.error_signature,
+              error_message: failureReport.error_message,
             })
-          }
-          this.scheduler.markSuccess(selected, { workerStatus: result.workerStatus || null, countUsage })
-          if (isFableModel(model) && typeof this.onFableSuccess === 'function') {
-            try {
-              this.onFableSuccess({ selected, model })
-            } catch {}
-          }
-          bindAll({ accountId: selected.accountId, vmId: selected.vmId })
-          releaseStickySlots()
-          return { ...result, ...attribution(), finalState: 'verified' }
-        }
-        if (policy.action === 'repair-and-retry' && !repaired && !result?.committed) {
-          let nextBody
-          try {
-            nextBody = repairAnthropicRequest(requestBody, policy)
-          } catch (repairError) {
-            if (repairError?.status === 400 && repairError?.body?.error) {
-              releaseStickySlots()
-              return {
-                ...result,
-                ok: false,
-                status: 400,
-                body: repairError.body,
-                ...attribution(),
-                finalState: 'invalid_request',
-                policy: attachFailureDecision({
-                  scope: 'request',
-                  action: 'stop',
-                  reason: repairError.body.error.code || 'invalid_request',
-                  cooldownUntil: null,
-                }),
-              }
-            }
-            throw repairError
-          }
-          repaired = true
-          repairPolicy = { action: policy.action, reason: policy.reason }
-          repairPending = true
-          if (policy.reason === 'search_repairable' && repairKey && fingerprint()) {
-            searchRepair = { key: repairKey }
-          }
-          requestBody = nextBody
-          continue
-        }
-        applyCooldown(this.scheduler, selected, policy, model, { diagnosticPin: !!pinVmId })
-        if (policy.pauseSchedule) this.pauseUnit(selected, policy, result)
-        if (!pinVmId && isCredentialDeath(policy)) {
-          this.forgetCredential(selected, policy, { familyKey, sessionKeys: bindKeys })
-          if (familyKey && (!selected.isSubagent || result.committed)) {
-            releaseStickySlots()
-            return { ...result, ...attribution(), finalState: result?.terminalState || 'rejected', policy }
-          }
-        }
-        // The slot's kernel refused to assemble this body, which is a trait of
-        // the slot rather than of the request: the other kernel kind may accept
-        // it unchanged. Selection never consults capability bits, so without
-        // this hop the sticky binding kept feeding the conversation back to the
-        // one kernel that cannot serve it -- the same 400 for as long as the
-        // session lived. lastResult/lastPolicy are already set above, so an
-        // exhausted pool still answers with this 400 rather than a less useful
-        // pool_exhausted.
-        if (!shouldContinue(policy) && !kernelMismatchRetried && isKernelCapabilityRejection(result)) {
-          kernelMismatchRetried = true
-          // releaseStickySlots only returns the slot's concurrency seat; the
-          // session->unit binding has to be dropped explicitly or the next turn
-          // lands on the same kernel again.
-          for (const key of bindKeys) this.stickyRouter?.unbind?.(key)
-          switchUnit(selected, { reason: 'kernel_capability_mismatch' })
-          continue
-        }
-        if (!shouldContinue(policy)) {
-          releaseStickySlots()
-          return { ...result, ...attribution(), finalState: result?.terminalState || 'rejected', policy }
-        }
-        policy = await this.recoverCredential(selected, policy)
-        const hopMs = Date.now() - attemptStarted
-        if (isRetryableEmptyHop(policy)) {
-          if (!emptyHopReleased(result) || pinVmId) return incompleteHopResult(result, policy, attribution())
-          this.retireOutboundSession(selected, bindKeys)
-          freshSlot = true
-        }
-        const refusedHome = homeSlotRefused(selected, policy)
-        if (refusedHome) return refusedHome
-        if (budget.allowSameUnit(selected.accountId, policy, hopMs, this.config.same_account_retry_max_hop_ms)) {
-          budget.noteSameUnit(selected.accountId)
-          avoid = retryOrStay(selected)
-          continue
-        }
-        if (waitHomeSlot(selected, policy)) continue
-        if (isHome(selected)) return keptHome()
-        switchUnit(selected, policy)
-      } catch (error) {
-        if (attemptStarted === undefined) throw error
-        const invalidRequest =
-          error?.status === 400 &&
-          [
-            'invalid_cache_control',
-            'crag_prompt_too_large',
-            'image_too_large',
-            'invalid_image_url',
-            'invalid_kernel_request',
-            'unsupported_capability',
-            'invalid_tool_schema',
-            'thinking_incompatible',
-          ].includes(error.body?.error?.code)
-        noteHop(invalidRequest ? { upstreamExecutions: 0 } : null)
-        if (error?.code === 'response_sent') {
-          this.attemptsRepo?.complete?.(requestId, attemptNo, {
-            upstreamStatus: 403,
-            errorScope: 'request',
-            action: 'stop',
-            downstreamCommitted: true,
-            terminalState: 'policy_block',
-            latencyMs: Date.now() - attemptStarted,
-          })
-          releaseStickySlots()
-          return {
-            ok: false,
-            responseSent: true,
-            status: 403,
-            via: 'account-scope',
-            vmId: selected.vmId,
-            accountId: selected.accountId,
-            attemptCount: attemptNo,
-            finalState: 'policy_block',
-          }
-        }
-        if (invalidRequest) {
-          this.attemptsRepo?.complete?.(requestId, attemptNo, {
-            upstreamStatus: 0,
-            errorScope: 'request',
-            action: 'stop',
-            downstreamCommitted: false,
-            terminalState: 'invalid_request',
-            latencyMs: Date.now() - attemptStarted,
-            ...attemptDiagnostics({ ok: false, status: 400, body: error.body }),
-          })
-          releaseStickySlots()
-          return {
-            ok: false,
-            status: 400,
-            body: error.body,
-            terminalState: 'invalid_request',
-            finalState: 'invalid_request',
-            ...attribution(),
-          }
-        }
-        if (signal?.aborted || error?.code === 'selection_cancelled' || error?.code === 'request_cancelled') {
-          this.attemptsRepo?.complete?.(requestId, attemptNo, {
-            upstreamStatus: 0,
-            errorScope: 'request',
-            action: 'stop',
-            downstreamCommitted: !!committed,
-            terminalState: 'cancelled',
-            latencyMs: Date.now() - attemptStarted,
-          })
-          releaseStickySlots()
-          return { ...clientCancelledResult({ committed }), via: 'pool-failover', ...attribution() }
-        }
-        result = {
-          ok: false,
-          status: 0,
-          transportError: true,
-          committed,
-          terminalState: committed ? 'incomplete' : 'transport_error',
-          body: {
-            type: 'error',
-            error: {
-              type: 'worker_error',
-              code: error.code || 'attempt_failed',
-              message: String(error.message || error).slice(0, 300),
-            },
-          },
-        }
-        policy = classifyAttempt(
-          result,
-          selected,
-          {
-            model,
-            repaired,
-            oauth401CooldownMs: this.config.oauth_401_cooldown_ms,
-            signatureRepair: signatureRepairEnabled(this.config),
-          },
-          this.scheduler?.accountQuota,
-        )
-        lastResult = result
-        lastPolicy = policy
-        this.noteUnitHealth(selected, policy, result, { sessionKey: stickyKey })
-        this.noteSilentTimeout(stickyKey, canonicalBody, selected, policy, result)
-        notifyProxyFailure(this.onProxyFailure, selected, policy)
-        this.attemptsRepo?.complete?.(requestId, attemptNo, {
-          upstreamStatus: 0,
-          errorScope: policy.scope,
-          action: policy.action,
-          cooldownUntil: policy.cooldownUntil,
-          downstreamCommitted: committed,
-          terminalState: result.terminalState,
-          latencyMs: Date.now() - attemptStarted,
-          ...attemptDiagnostics(result),
-        })
-        if (committed || !shouldContinue(policy)) {
-          releaseStickySlots()
-          return { ...result, ...attribution(), finalState: result.terminalState, policy }
-        }
-        applyCooldown(this.scheduler, selected, policy, model, { diagnosticPin: !!pinVmId })
-        if (!pinVmId && isCredentialDeath(policy)) {
-          this.forgetCredential(selected, policy, { familyKey, sessionKeys: bindKeys })
-          if (familyKey && !selected.isSubagent) {
-            releaseStickySlots()
             return { ...result, ...attribution(), finalState: result.terminalState, policy }
           }
+          applyCooldown(this.scheduler, selected, policy, model, { diagnosticPin: !!pinVmId })
+          if (!pinVmId && isCredentialDeath(policy)) {
+            this.forgetCredential(selected, policy, { familyKey, sessionKeys: bindKeys })
+          }
+          policy = await this.recoverCredential(selected, policy)
+          const hopMs = Date.now() - attemptStarted
+          const nextStep = await advanceOrRetrySame({
+            selected,
+            policy,
+            failureReport,
+            hopMs,
+            committedNow: Boolean(committed),
+          })
+          if (nextStep.done) return nextStep.result
         }
-        policy = await this.recoverCredential(selected, policy)
-        const hopMs = Date.now() - attemptStarted
-        const refusedHome = homeSlotRefused(selected, policy)
-        if (refusedHome) return refusedHome
-        if (budget.allowSameUnit(selected.accountId, policy, hopMs, this.config.same_account_retry_max_hop_ms)) {
-          budget.noteSameUnit(selected.accountId)
-          avoid = retryOrStay(selected)
-          continue
-        }
-        if (waitHomeSlot(selected, policy)) continue
-        if (isHome(selected)) return keptHome()
-        switchUnit(selected, policy)
-      } finally {
-        // Setup and attempt share the same permit lifetime.
-        selected?.release?.()
+      }
+    } finally {
+      if (activeLeaseId) {
+        await releaseActiveLeaseNow(
+          finalReleasePayload || {
+            outcome: signal?.aborted ? 'aborted' : activeCommitted ? 'ok' : 'error',
+          },
+        )
+      } else {
+        clearInflight(activeSelected)
       }
     }
   }

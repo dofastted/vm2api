@@ -59,6 +59,11 @@ import { PlatformChip, SlotIdentity } from '@/components/platform-chip'
 import { QueryGate } from '@/components/query-gate'
 import { StatusMark } from '@/components/status-mark'
 import { dashboardQueryOptions } from '@/features/overview/queries'
+import {
+  buildNodePoolsIndex,
+  NodePoolBadges,
+} from '@/features/pools/node-pool-badges'
+import { schedulerPoolsQueryOptions } from '@/features/pools/queries'
 import { proxiesForVmBind } from '@/features/proxies/proxy-sort'
 import { proxiesQueryOptions } from '@/features/proxies/queries'
 import {
@@ -154,6 +159,11 @@ function VmDetailBody({
     enabled: perms.known && !perms.dashboard,
   })
   const proxies = useQuery({ ...proxiesQueryOptions(), enabled: perms.admin })
+  const schedulerPools = useQuery({
+    ...schedulerPoolsQueryOptions(),
+    enabled: perms.admin,
+    retry: false,
+  })
   const detail = useQuery({
     ...vmQueryOptions(id),
     refetchInterval: wantedTab === 'seed' ? 2000 : false,
@@ -189,7 +199,22 @@ function VmDetailBody({
   const slotList: Vm[] =
     (perms.dashboard ? dash.data?.vms : slots.data?.items) || []
   const listVm = slotList.find((v) => v.id === id)
-  const vm = ((data.vm as Vm | undefined) || listVm || { id }) as Vm
+  const detailVm = data.vm as Vm | undefined
+  const rawVm = useMemo(
+    () => (detailVm || listVm || { id }) as Vm,
+    [detailVm, listVm, id]
+  )
+  const nodePools = useMemo(
+    () =>
+      buildNodePoolsIndex(perms.admin ? schedulerPools.data : undefined).get(
+        id
+      ),
+    [perms.admin, schedulerPools.data, id]
+  )
+  const vm = useMemo(
+    () => (nodePools?.length ? { ...rawVm, pools: nodePools } : rawVm),
+    [rawVm, nodePools]
+  )
   const kernel = (data.kernel as VmKernelSnapshot | undefined) || null
   const acc = (data.account as Record<string, unknown> | undefined) || {}
   const proxy = ((data.proxy as VmProxySnap | undefined) ||
@@ -403,10 +428,10 @@ function VmDetailBody({
   )
   const todayInput = Number(
     acc.today_input_tokens ??
-    vm.today_input_tokens ??
-    acc.tokens_in ??
-    vm.tokens_in ??
-    0
+      vm.today_input_tokens ??
+      acc.tokens_in ??
+      vm.tokens_in ??
+      0
   )
   const todayHit = cacheHitPct(todayInput, todayReadCache, todayWriteCache)
   const today = vmTodayCounts(vm, data.billing)
@@ -456,6 +481,7 @@ function VmDetailBody({
           <ActiveVmBadge vm={vm} className='text-[11px]' />
           <RuntimeChip vm={vm} className='text-[11px]' />
           <NodeChip nodeId={vm.node_id} className='text-[11px]' />
+          <NodePoolBadges pools={vm.pools} maxVisible={4} />
           <StatusMark tone={accountStatus(vm)} variant='pill' />
           {claudeTier(vm).key !== 'none' ? (
             <StatusMark tone={claudeTier(vm)} variant='pill' />

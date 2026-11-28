@@ -105,7 +105,10 @@ export function normalizeCacheControlObject(
     ttl = control.ttl === '5m' || control.ttl === '1h' ? control.ttl : normalizeCacheTtl(control.ttl, fallbackTtl)
   }
   if (stripExtraFields) {
-    return ttl ? { type: 'ephemeral', ttl } : { type: 'ephemeral' }
+    const out = ttl ? { type: 'ephemeral', ttl } : { type: 'ephemeral' }
+    if (typeof control.scope === 'string' && control.scope.trim()) out.scope = control.scope.trim()
+    if (typeof control.evict_on_complete === 'boolean') out.evict_on_complete = control.evict_on_complete
+    return out
   }
   const out = { ...control, type: 'ephemeral' }
   if (ttl === undefined) delete out.ttl
@@ -113,13 +116,17 @@ export function normalizeCacheControlObject(
   return out
 }
 
+const CACHE_CONTROL_ALLOWED_EXTRA_KEYS = new Set(['type', 'ttl', 'scope', 'evict_on_complete'])
+
 export function isCleanCacheControl(control, { stripExtraFields = false } = {}) {
   if (!isPlainObject(control) || control.type !== 'ephemeral') return false
   if (control.ttl != null && control.ttl !== '5m' && control.ttl !== '1h') return false
   if (stripExtraFields) {
     for (const key of Object.keys(control)) {
-      if (key !== 'type' && key !== 'ttl') return false
+      if (!CACHE_CONTROL_ALLOWED_EXTRA_KEYS.has(key)) return false
     }
+    if (Object.hasOwn(control, 'scope') && (typeof control.scope !== 'string' || !control.scope.trim())) return false
+    if (Object.hasOwn(control, 'evict_on_complete') && typeof control.evict_on_complete !== 'boolean') return false
   }
   return true
 }

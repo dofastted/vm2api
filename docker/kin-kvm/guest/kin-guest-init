@@ -1,0 +1,731 @@
+#!/bin/sh
+# Minimal PID 1 init for Custom Debian 13 (Trixie) EROFS KVM slots.
+# Zero cloud-init, zero systemd, zero virtio-9p, zero kin-crag-apparmor.
+#
+# 8-step boot sequence:
+#   1. mount_early_vfs: /proc, /sys, /dev, /dev/pts, /dev/shm, /sys/fs/cgroup, /run, /tmp
+#   2. mount_state_ext4_early: mount LABEL=kinstate -> /var/lib/kin-slot; zero-eval parse boot.env
+#      (falling back to /proc/cmdline for legacy disks); resolve SLOT_USER / SLOT_UID / SLOT_GID
+#   3. preload_kernel_drivers: modprobe required KVM modules before any UTS release override
+#   4. apply_kernel_uts_once: optional Phase 3 prctl() atomic write-once UTS override (silent EINVAL fallback) + dmesg_restrict=1
+#   5. setup_slot_runtime_dirs: tmpfs + ownership aligned to actual SLOT_UID:SLOT_GID
+#   6. apply_slot_identity_binds: machine-id RO bind, tmpfs /home + /home/$SLOT_USER bind,
+#      filtered /etc/{passwd,group,shadow} RO bind, /etc/{os-release,localtime,timezone} & /usr/lib/os-release RO bind,
+#      managed-settings.d RO bind, hostname
+#   7. configure_locale + mount_shared_store + setup_network
+#   8. start_sshd + start_slot_agent (--slot-uid/--slot-gid/--etc-tz-dir) + start_kernel_relay + supervise_crag_once
+set -eu
+
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+KINCLI_UID=999
+KINCLI_GID=987
+SLOT_USER=kincli
+SLOT_UID=999
+SLOT_GID=987
+SLOT_HOME=/home/kincli
+STATE_DIR=/var/lib/kin-slot
+STORE_DIR=/opt/kin/store
+CRAG_TMPFS=/run/vm2api-crag
+RUN_KIN=/run/kin
+RUN_GUEST=/run/kin-guest
+ETC_TZ_DIR=/run/kin/etc-tz
+AGENT_BIN=/usr/local/sbin/kin-slot-agent
+RELAY_BIN=/usr/local/sbin/kin-kernel-relay
+SSHD_BIN=/usr/sbin/sshd
+SSHD_CFG=/etc/ssh/sshd_config.kin
+AGENT_PID=''
+RELAY_PID=''
+SSHD_PID=''
+CRAG_PID=''
+SHUTTING_DOWN=0
+
+KIN_VM_ID=''
+KIN_HOSTNAME=''
+KIN_STORE_MODE='auto'
+KIN_AGENT_TRANSPORT='auto'
+KIN_VSOCK_PORT='7070'
+KIN_AGENT_VSOCK_PORT='7071'
+KIN_TZ='America/Los_Angeles'
+KIN_LANG='en_US.UTF-8'
+KIN_SLOT_USER=''
+KIN_SLOT_UID=''
+KIN_SLOT_GID=''
+KIN_KERNEL_RELEASE=''
+KIN_KERNEL_VERSION=''
+KIN_KERNEL_PROC_MID=''
+
+log() {
+  printf 'kin-guest-init: %s\n' "$*" >&2
+}
+
+die() {
+  log "FATAL: $*"
+  sleep 2
+  exit 1
+}
+
+mount_if_needed() {
+  fstype=$1
+  src=$2
+  dest=$3
+  opts=$4
+  [ -d "$dest" ] || mkdir -p "$dest"
+  if ! grep -Fq " $dest " /proc/mounts 2>/dev/null; then
+    mount -t "$fstype" -o "$opts" "$src" "$dest"
+  fi
+}
+
+bind_ro() {
+  src=$1
+  dest=$2
+  mount --bind "$src" "$dest"
+  mount -o remount,bind,ro,nosuid,nodev,noexec "$dest"
+}
+
+is_valid_slot_user() {
+  case "${1:-}" in
+    ''|root|daemon|bin|sys|sync|games|man|lp|mail|news|uucp|proxy|www-data|backup|list|irc|_apt|nobody|nogroup|sshd|messagebus|systemd-*)
+      return 1
+      ;;
+  esac
+  printf '%s' "$1" | grep -Eq '^[a-z][a-z0-9_-]{1,31}$' || return 1
+  case "$1" in
+    *-|*_ |*--*) return 1 ;;
+  esac
+  return 0
+}
+
+is_valid_slot_id() {
+  case "${1:-}" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  [ "$1" -ge 1 ] && [ "$1" -le 2147483647 ]
+}
+
+parse_cmdline() {
+  [ -r /proc/cmdline ] || return 0
+  for tok in $(cat /proc/cmdline); do
+    case "$tok" in
+      kin.vm_id=*) KIN_VM_ID=${tok#kin.vm_id=} ;;
+      kin.hostname=*) KIN_HOSTNAME=${tok#kin.hostname=} ;;
+      kin.store_mode=*) KIN_STORE_MODE=${tok#kin.store_mode=} ;;
+      kin.agent_transport=*) KIN_AGENT_TRANSPORT=${tok#kin.agent_transport=} ;;
+      kin.vsock_port=*) KIN_VSOCK_PORT=${tok#kin.vsock_port=} ;;
+      kin.agent_vsock_port=*) KIN_AGENT_VSOCK_PORT=${tok#kin.agent_vsock_port=} ;;
+      kin.tz=*) KIN_TZ=${tok#kin.tz=} ;;
+      kin.lang=*) KIN_LANG=${tok#kin.lang=} ;;
+      kin.slot_user=*) KIN_SLOT_USER=${tok#kin.slot_user=} ;;
+      kin.slot_uid=*) KIN_SLOT_UID=${tok#kin.slot_uid=} ;;
+      kin.slot_gid=*) KIN_SLOT_GID=${tok#kin.slot_gid=} ;;
+    esac
+  done
+}
+
+# Zero-eval allowlisted KEY=VALUE loader for /var/lib/kin-slot/boot.env (and legacy slot.env).
+load_boot_env() {
+  env_file=$1
+  [ -f "$env_file" ] && [ ! -L "$env_file" ] || return 0
+  while IFS= read -r _line || [ -n "$_line" ]; do
+    _line=${_line%$(printf '\r')}
+    case "$_line" in
+      ''|'#'*) continue ;;
+      *=*) ;;
+      *) continue ;;
+    esac
+    _k=${_line%%=*}
+    _v=${_line#*=}
+    case "$_k" in
+      KIN_VM_ID) KIN_VM_ID=$_v ;;
+      KIN_HOSTNAME) KIN_HOSTNAME=$_v ;;
+      KIN_STORE_MODE) KIN_STORE_MODE=$_v ;;
+      KIN_AGENT_TRANSPORT) KIN_AGENT_TRANSPORT=$_v ;;
+      KIN_VSOCK_PORT) KIN_VSOCK_PORT=$_v ;;
+      KIN_AGENT_VSOCK_PORT) KIN_AGENT_VSOCK_PORT=$_v ;;
+      KIN_TZ) [ -n "$_v" ] && KIN_TZ=$_v ;;
+      KIN_LANG) [ -n "$_v" ] && KIN_LANG=$_v ;;
+      TZ) [ -z "${KIN_TZ:-}" ] && [ -n "$_v" ] && KIN_TZ=$_v ;;
+      LANG) [ -z "${KIN_LANG:-}" ] && [ -n "$_v" ] && KIN_LANG=$_v ;;
+      KIN_SLOT_USER) KIN_SLOT_USER=$_v ;;
+      KIN_SLOT_UID) KIN_SLOT_UID=$_v ;;
+      KIN_SLOT_GID) KIN_SLOT_GID=$_v ;;
+      KIN_KERNEL_RELEASE) KIN_KERNEL_RELEASE=$_v ;;
+      KIN_KERNEL_VERSION) KIN_KERNEL_VERSION=$_v ;;
+      KIN_KERNEL_PROC_MID) KIN_KERNEL_PROC_MID=$_v ;;
+    esac
+  done < "$env_file"
+}
+
+resolve_slot_identity() {
+  if is_valid_slot_user "${KIN_SLOT_USER:-}"; then
+    SLOT_USER=$KIN_SLOT_USER
+  else
+    SLOT_USER=kincli
+  fi
+  if is_valid_slot_id "${KIN_SLOT_UID:-}" && is_valid_slot_id "${KIN_SLOT_GID:-}"; then
+    SLOT_UID=$KIN_SLOT_UID
+    SLOT_GID=$KIN_SLOT_GID
+  elif [ "$SLOT_USER" = kincli ]; then
+    SLOT_UID=999
+    SLOT_GID=987
+  else
+    SLOT_UID=1000
+    SLOT_GID=1000
+  fi
+  KINCLI_UID=$SLOT_UID
+  KINCLI_GID=$SLOT_GID
+  SLOT_HOME="/home/${SLOT_USER}"
+}
+
+mount_early_vfs() {
+  for d in /proc /sys /dev /run /tmp; do
+    [ -d "$d" ] || mkdir -p "$d"
+  done
+  mount -t proc -o nosuid,nodev,noexec proc /proc 2>/dev/null || true
+  mount -t sysfs -o nosuid,nodev,noexec sysfs /sys 2>/dev/null || true
+  mount -t devtmpfs -o mode=0755,nosuid devtmpfs /dev 2>/dev/null || true
+  mkdir -p /dev/pts /dev/shm
+  mount -t devpts -o gid=5,mode=0620,nosuid,noexec devpts /dev/pts 2>/dev/null || true
+  mount -t tmpfs -o mode=1777,nosuid,nodev tmpfs /dev/shm 2>/dev/null || true
+  mount -t cgroup2 -o nosuid,nodev,noexec cgroup2 /sys/fs/cgroup 2>/dev/null || true
+
+  # Isolated volatile tmpfs layers (decoupled from /tmp).
+  mount_if_needed tmpfs tmpfs /run "mode=0755,nosuid,nodev"
+  mount_if_needed tmpfs tmpfs /tmp "mode=1777,nosuid,nodev"
+}
+
+find_state_dev() {
+  for cand in /dev/disk/by-label/kinstate /dev/disk/by-id/virtio-kinstate /dev/vdb; do
+    if [ -b "$cand" ]; then
+      printf '%s' "$cand"
+      return 0
+    fi
+  done
+  return 1
+}
+
+mount_state_ext4_early() {
+  [ -d "$STATE_DIR" ] || mkdir -p "$STATE_DIR"
+  state_dev=$(find_state_dev) || die "exclusive ext4 state disk (kinstate / /dev/vdb) not found"
+  mount -t ext4 -o rw,nosuid,nodev "$state_dev" "$STATE_DIR" || die "failed to mount $state_dev on $STATE_DIR"
+
+  # Legacy cmdline first, then boot.env overrides (zero-eval); legacy slot.env provides fallback only if boot.env absent.
+  parse_cmdline
+  if [ -f "$STATE_DIR/boot.env" ] && [ ! -L "$STATE_DIR/boot.env" ]; then
+    load_boot_env "$STATE_DIR/boot.env"
+  elif [ -f "$STATE_DIR/slot.env" ] && [ ! -L "$STATE_DIR/slot.env" ]; then
+    load_boot_env "$STATE_DIR/slot.env"
+  fi
+  resolve_slot_identity
+}
+
+preload_kernel_drivers() {
+  # Load required modules before any UTS release override so modprobe finds /lib/modules/$(uname -r).
+  krel=$(uname -r 2>/dev/null || true)
+  if [ -n "$krel" ] && { [ -d "/lib/modules/$krel" ] || [ -d "/usr/lib/modules/$krel" ]; }; then
+    for mod in virtiofs virtio_net vsock vmw_vsock_virtio_transport virtio_console; do
+      modprobe "$mod" 2>/dev/null || true
+    done
+  fi
+}
+
+apply_kernel_uts_once() {
+  if [ -n "${KIN_KERNEL_RELEASE:-}" ] && command -v python3 >/dev/null 2>&1; then
+    uts_status=$(python3 - "$KIN_KERNEL_RELEASE" "${KIN_KERNEL_VERSION:-}" "${KIN_KERNEL_PROC_MID:-}" <<'PY' 2>/dev/null || printf 'error'
+import ctypes, errno, struct, sys
+
+PR_KIN_SET_UTS_ONCE = 0x564d3201
+rel = sys.argv[1].encode("ascii", "ignore")[:64]
+ver = sys.argv[2].encode("ascii", "ignore")[:64]
+mid = sys.argv[3].encode("ascii", "ignore")[:191]
+if not rel:
+    print("skipped")
+    sys.exit(0)
+buf = ctypes.create_string_buffer(struct.pack("65s65s192s", rel, ver, mid))
+libc = ctypes.CDLL(None, use_errno=True)
+libc.prctl.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong]
+libc.prctl.restype = ctypes.c_int
+rc = libc.prctl(PR_KIN_SET_UTS_ONCE, ctypes.byref(buf), 0, 0, 0)
+if rc == 0:
+    print("applied")
+else:
+    err = ctypes.get_errno()
+    if err == errno.EINVAL:
+        print("unsupported(official_kernel)")
+    else:
+        print(f"err({err})")
+PY
+)
+    log "uts_override=${uts_status} release=${KIN_KERNEL_RELEASE}"
+  fi
+  if [ -w /proc/sys/kernel/dmesg_restrict ]; then
+    printf '1\n' > /proc/sys/kernel/dmesg_restrict 2>/dev/null || true
+  fi
+}
+
+setup_slot_runtime_dirs() {
+  mkdir -p \
+    "$RUN_KIN" \
+    "$RUN_KIN/bridge" \
+    "$RUN_KIN/work" \
+    "$RUN_KIN/crag-native-assets" \
+    "$RUN_KIN/crag-license" \
+    "$RUN_KIN/crag-host" \
+    "$ETC_TZ_DIR" \
+    "$RUN_GUEST"
+  chmod 0755 "$RUN_KIN" "$ETC_TZ_DIR"
+  mount_if_needed tmpfs tmpfs "$RUN_KIN/bridge" "mode=0750,uid=${SLOT_UID},gid=${SLOT_GID},nosuid,nodev,noexec"
+  mount_if_needed tmpfs tmpfs "$RUN_KIN/work" "mode=0750,uid=${SLOT_UID},gid=${SLOT_GID},nosuid,nodev"
+  chown "${SLOT_UID}:${SLOT_GID}" "$RUN_KIN/crag-native-assets" "$RUN_GUEST"
+  chmod 0700 "$RUN_KIN/crag-native-assets"
+  chmod 0770 "$RUN_GUEST"
+
+  # Root-private volatile tmpfs (f_type == 0x01021994) projected RO to /run/kin/crag-{license,host}.
+  mkdir -p "$CRAG_TMPFS"
+  mount_if_needed tmpfs tmpfs "$CRAG_TMPFS" "mode=0700,uid=0,gid=0,nosuid,nodev,noexec"
+  chmod 0700 "$CRAG_TMPFS"
+  mkdir -p "$CRAG_TMPFS/license" "$CRAG_TMPFS/host"
+  chown "${SLOT_UID}:${SLOT_GID}" "$CRAG_TMPFS/license"
+  chmod 0700 "$CRAG_TMPFS/license"
+  chmod 0755 "$CRAG_TMPFS/host"
+  bind_ro "$CRAG_TMPFS/license" "$RUN_KIN/crag-license"
+  bind_ro "$CRAG_TMPFS/host" "$RUN_KIN/crag-host"
+}
+
+synthesize_slot_accounts() {
+  # Filter kincli (when custom user) & colliding uid/gid out of RO /etc/{passwd,group,shadow} and RO-bind back.
+  if [ -f /etc/passwd ] && [ ! -L /etc/passwd ]; then
+    awk -F: -v user="$SLOT_USER" -v uid="$SLOT_UID" '
+      $1 == "kincli" || $1 == user || $3 == uid || (user != "kincli" && $3 == "999") { next }
+      { print }
+    ' /etc/passwd > "$RUN_KIN/passwd"
+    printf '%s:x:%s:%s::%s:/bin/bash\n' "$SLOT_USER" "$SLOT_UID" "$SLOT_GID" "$SLOT_HOME" >> "$RUN_KIN/passwd"
+    chown 0:0 "$RUN_KIN/passwd"
+    chmod 0644 "$RUN_KIN/passwd"
+    bind_ro "$RUN_KIN/passwd" /etc/passwd
+  fi
+
+  if [ -f /etc/group ] && [ ! -L /etc/group ]; then
+    awk -F: -v user="$SLOT_USER" -v gid="$SLOT_GID" '
+      $1 == "kincli" || $1 == user || $3 == gid || (user != "kincli" && $3 == "987") { next }
+      { print }
+    ' /etc/group > "$RUN_KIN/group"
+    printf '%s:x:%s:\n' "$SLOT_USER" "$SLOT_GID" >> "$RUN_KIN/group"
+    chown 0:0 "$RUN_KIN/group"
+    chmod 0644 "$RUN_KIN/group"
+    bind_ro "$RUN_KIN/group" /etc/group
+  fi
+
+  if [ -f /etc/shadow ] && [ ! -L /etc/shadow ]; then
+    shadow_gid=$(stat -c '%g' /etc/shadow 2>/dev/null || printf '0')
+    awk -F: -v user="$SLOT_USER" '
+      $1 == "kincli" || $1 == user { next }
+      { print }
+    ' /etc/shadow > "$RUN_KIN/shadow"
+    printf '%s:!:19800:0:99999:7:::\n' "$SLOT_USER" >> "$RUN_KIN/shadow"
+    chown "0:${shadow_gid}" "$RUN_KIN/shadow" 2>/dev/null || chown 0:0 "$RUN_KIN/shadow"
+    if [ "$shadow_gid" = 0 ]; then
+      chmod 0600 "$RUN_KIN/shadow"
+    else
+      chmod 0640 "$RUN_KIN/shadow"
+    fi
+    bind_ro "$RUN_KIN/shadow" /etc/shadow
+  fi
+}
+
+apply_slot_identity_binds() {
+  mkdir -p "$STATE_DIR/home/.claude" "$STATE_DIR/run" "$STATE_DIR/managed-settings.d" "$STATE_DIR/ssh" "$STATE_DIR/etc-override"
+  # Backward-compatible migration if an older slot-state.ext4 stored credentials under $STATE_DIR/claude.
+  if [ -d "$STATE_DIR/claude" ] && [ ! -L "$STATE_DIR/claude" ]; then
+    cp -a "$STATE_DIR/claude/." "$STATE_DIR/home/.claude/" 2>/dev/null || true
+  fi
+  if [ ! -e "$STATE_DIR/home/.claude.json" ] && [ ! -L "$STATE_DIR/home/.claude.json" ]; then
+    ln -s .claude/.claude.json "$STATE_DIR/home/.claude.json"
+  fi
+  chown 0:0 "$STATE_DIR" "$STATE_DIR/ssh" "$STATE_DIR/etc-override"
+  chmod 0755 "$STATE_DIR" "$STATE_DIR/etc-override"
+  chmod 0700 "$STATE_DIR/ssh"
+  if [ -f "$STATE_DIR/ssh/authorized_keys" ]; then
+    chown 0:0 "$STATE_DIR/ssh/authorized_keys"
+    chmod 0600 "$STATE_DIR/ssh/authorized_keys"
+  fi
+  chown "${SLOT_UID}:${SLOT_GID}" "$STATE_DIR/home" "$STATE_DIR/home/.claude" "$STATE_DIR/run"
+  chown -h "${SLOT_UID}:${SLOT_GID}" "$STATE_DIR/home/.claude.json" 2>/dev/null || true
+  chmod 0750 "$STATE_DIR/home" "$STATE_DIR/run"
+  chmod 0700 "$STATE_DIR/home/.claude"
+
+  # Immutable machine-id: RO bind to /etc/machine-id and /var/lib/dbus/machine-id (zero drift).
+  [ -f "$STATE_DIR/machine-id" ] || die "missing immutable $STATE_DIR/machine-id"
+  chmod 0444 "$STATE_DIR/machine-id" 2>/dev/null || true
+  if [ -e /etc/machine-id ]; then
+    bind_ro "$STATE_DIR/machine-id" /etc/machine-id
+  fi
+  if [ -e /var/lib/dbus/machine-id ] && [ ! -L /var/lib/dbus/machine-id ]; then
+    bind_ro "$STATE_DIR/machine-id" /var/lib/dbus/machine-id
+  fi
+
+  # Shadow RO EROFS /home with a tiny tmpfs so /home/kincli disappears for custom users,
+  # then bind-mount persistent ext4 $STATE_DIR/home at /home/$SLOT_USER (keeps ext4 exec flags).
+  mount -t tmpfs -o mode=0755,nosuid,nodev,noexec,size=4m tmpfs /home
+  mkdir -p "$SLOT_HOME"
+  chown "${SLOT_UID}:${SLOT_GID}" "$SLOT_HOME"
+  chmod 0750 "$SLOT_HOME"
+  mount --bind "$STATE_DIR/home" "$SLOT_HOME"
+
+  synthesize_slot_accounts
+
+  # Per-slot /etc/os-release + /usr/lib/os-release RO projection when regular non-symlink targets exist.
+  if [ -f "$STATE_DIR/etc-override/os-release" ] && [ ! -L "$STATE_DIR/etc-override/os-release" ]; then
+    cp "$STATE_DIR/etc-override/os-release" "$RUN_KIN/os-release"
+    chown 0:0 "$RUN_KIN/os-release"
+    chmod 0644 "$RUN_KIN/os-release"
+    if [ -f /etc/os-release ] && [ ! -L /etc/os-release ]; then
+      bind_ro "$RUN_KIN/os-release" /etc/os-release
+    fi
+    if [ -f /usr/lib/os-release ] && [ ! -L /usr/lib/os-release ]; then
+      bind_ro "$RUN_KIN/os-release" /usr/lib/os-release
+    fi
+  fi
+
+  # Per-slot /etc/localtime + /etc/timezone RO bind backed by writable /run/kin/etc-tz for live agent sync.
+  if [ -f "$STATE_DIR/etc-override/localtime" ] && [ ! -L "$STATE_DIR/etc-override/localtime" ]; then
+    cp "$STATE_DIR/etc-override/localtime" "$ETC_TZ_DIR/localtime"
+  elif [ -n "${KIN_TZ:-}" ] && [ -f "/usr/share/zoneinfo/$KIN_TZ" ]; then
+    cp -L "/usr/share/zoneinfo/$KIN_TZ" "$ETC_TZ_DIR/localtime"
+  elif [ -f /etc/localtime ]; then
+    cp -L /etc/localtime "$ETC_TZ_DIR/localtime"
+  fi
+  if [ -f "$ETC_TZ_DIR/localtime" ]; then
+    chown 0:0 "$ETC_TZ_DIR/localtime"
+    chmod 0644 "$ETC_TZ_DIR/localtime"
+    if [ -f /etc/localtime ] && [ ! -L /etc/localtime ]; then
+      bind_ro "$ETC_TZ_DIR/localtime" /etc/localtime
+    fi
+  fi
+
+  if [ -f "$STATE_DIR/etc-override/timezone" ] && [ ! -L "$STATE_DIR/etc-override/timezone" ]; then
+    cp "$STATE_DIR/etc-override/timezone" "$ETC_TZ_DIR/timezone"
+  elif [ -n "${KIN_TZ:-}" ]; then
+    printf '%s\n' "$KIN_TZ" > "$ETC_TZ_DIR/timezone"
+  fi
+  if [ -f "$ETC_TZ_DIR/timezone" ]; then
+    chown 0:0 "$ETC_TZ_DIR/timezone"
+    chmod 0644 "$ETC_TZ_DIR/timezone"
+    if [ -f /etc/timezone ] && [ ! -L /etc/timezone ]; then
+      bind_ro "$ETC_TZ_DIR/timezone" /etc/timezone
+    fi
+  fi
+
+  # Read-only per-slot managed-settings.d projection.
+  if [ -d /etc/claude-code/managed-settings.d ]; then
+    bind_ro "$STATE_DIR/managed-settings.d" /etc/claude-code/managed-settings.d
+  fi
+
+  host_val=$KIN_HOSTNAME
+  if [ -z "$host_val" ] && [ -f "$STATE_DIR/hostname" ]; then
+    host_val=$(tr -d '[:space:]' < "$STATE_DIR/hostname")
+  fi
+  if [ -n "$host_val" ]; then
+    KIN_HOSTNAME=$host_val
+    if [ -w /proc/sys/kernel/hostname ]; then
+      printf '%s\n' "$host_val" > /proc/sys/kernel/hostname
+    fi
+  fi
+}
+
+mount_shared_store() {
+  [ -d "$STORE_DIR" ] || mkdir -p "$STORE_DIR"
+  store_type='none'
+  if [ "$KIN_STORE_MODE" != virtio-blk ]; then
+    modprobe virtiofs 2>/dev/null || true
+    if mount -t virtiofs -o ro kinstore "$STORE_DIR" 2>/dev/null; then
+      store_type='virtiofs'
+    fi
+  fi
+  if [ "$store_type" = none ]; then
+    for cand in /dev/disk/by-id/virtio-kinstore /dev/vdc; do
+      if [ -b "$cand" ]; then
+        if mount -o ro,nosuid,nodev "$cand" "$STORE_DIR" 2>/dev/null; then
+          store_type='virtio-blk'
+          break
+        fi
+      fi
+    done
+  fi
+  [ "$store_type" != none ] || die "failed to mount read-only shared store on $STORE_DIR"
+  printf '%s\n' "$store_type" > "$RUN_KIN/store-mount-type"
+  chmod 0644 "$RUN_KIN/store-mount-type"
+  log "mounted shared store ($store_type) at $STORE_DIR"
+}
+
+find_net_iface() {
+  for p in /sys/class/net/*; do
+    [ -e "$p" ] || continue
+    name=${p##*/}
+    [ "$name" = lo ] && continue
+    printf '%s' "$name"
+    return 0
+  done
+  return 1
+}
+
+setup_network() {
+  modprobe virtio_net 2>/dev/null || true
+  ip link set lo up 2>/dev/null || true
+  iface=''
+  i=0
+  while [ "$i" -lt 20 ]; do
+    if [ -e /sys/class/net/eth0 ]; then
+      iface=eth0
+      break
+    fi
+    if cand=$(find_net_iface); then
+      iface=$cand
+      break
+    fi
+    sleep 0.1 2>/dev/null || sleep 1
+    i=$((i + 1))
+  done
+  if [ -n "$iface" ]; then
+    ip addr replace 10.0.2.15/24 dev "$iface" 2>/dev/null || ip addr add 10.0.2.15/24 dev "$iface" 2>/dev/null || true
+    ip link set "$iface" up 2>/dev/null || true
+    ip route replace default via 10.0.2.2 dev "$iface" 2>/dev/null || true
+    log "network ready iface=$iface addr=10.0.2.15/24 gw=10.0.2.2"
+  else
+    log "WARNING: no non-loopback network interface found after 2s"
+  fi
+  printf 'nameserver 8.8.8.8\noptions use-vc\n' > "$RUN_KIN/resolv.conf"
+  chmod 0644 "$RUN_KIN/resolv.conf"
+  if [ -f /etc/resolv.conf ] && [ ! -L /etc/resolv.conf ]; then
+    mount --bind "$RUN_KIN/resolv.conf" /etc/resolv.conf 2>/dev/null || true
+  fi
+  host_entry=$(printf '%s' "${KIN_HOSTNAME:-}" | tr -cd 'A-Za-z0-9.-')
+  {
+    printf '127.0.0.1 localhost\n'
+    printf '::1 localhost ip6-localhost ip6-loopback\n'
+    if [ -n "$host_entry" ]; then
+      printf '127.0.1.1 %s\n' "$host_entry"
+    fi
+  } > "$RUN_KIN/hosts"
+  chmod 0644 "$RUN_KIN/hosts"
+  if [ -f /etc/hosts ] && [ ! -L /etc/hosts ]; then
+    mount --bind "$RUN_KIN/hosts" /etc/hosts 2>/dev/null || true
+  fi
+}
+
+configure_locale() {
+  if [ -z "${KIN_LANG:-}" ]; then
+    KIN_LANG='en_US.UTF-8'
+  fi
+  if [ -f /usr/lib/locale/locale-archive ] || [ -d /usr/lib/locale/en_US.utf8 ]; then
+    LANG="$KIN_LANG"
+  else
+    LANG='C.UTF-8'
+  fi
+  export LANG
+}
+
+start_sshd() {
+  if [ ! -x "$SSHD_BIN" ] || [ ! -f "$SSHD_CFG" ]; then
+    log "sshd unavailable ($SSHD_BIN / $SSHD_CFG); skipping"
+    return 0
+  fi
+  mkdir -p /run/sshd
+  chown 0:0 /run/sshd
+  chmod 0755 /run/sshd
+  host_key="$STATE_DIR/ssh/ssh_host_ed25519_key"
+  if [ ! -f "$host_key" ]; then
+    mkdir -p "$STATE_DIR/ssh"
+    chown 0:0 "$STATE_DIR/ssh"
+    chmod 0700 "$STATE_DIR/ssh"
+    ssh-keygen -q -t ed25519 -N '' -f "$host_key" || {
+      log "WARNING: failed to generate per-slot SSH host key $host_key"
+      return 0
+    }
+  fi
+  chown 0:0 "$host_key" 2>/dev/null || true
+  chmod 0600 "$host_key" 2>/dev/null || true
+  "$SSHD_BIN" -D -e -f "$SSHD_CFG" &
+  SSHD_PID=$!
+  log "started sshd pid=$SSHD_PID cfg=$SSHD_CFG"
+}
+
+start_slot_agent() {
+  modprobe vsock 2>/dev/null || true
+  modprobe vmw_vsock_virtio_transport 2>/dev/null || true
+  modprobe virtio_console 2>/dev/null || true
+  [ -x "$AGENT_BIN" ] || die "missing $AGENT_BIN"
+  "$AGENT_BIN" \
+    --transport "$KIN_AGENT_TRANSPORT" \
+    --vsock-port "$KIN_AGENT_VSOCK_PORT" \
+    --virtio-serial /dev/virtio-ports/kin.agent.0 \
+    --token-file "$STATE_DIR/.agent-token" \
+    --state-dir "$STATE_DIR" \
+    --claude-dir "$STATE_DIR/home/.claude" \
+    --run-dir "$RUN_KIN" \
+    --crag-root "$CRAG_TMPFS" \
+    --managed-preset-dir "$STATE_DIR/managed-settings.d" \
+    --etc-tz-dir "$ETC_TZ_DIR" \
+    --store-dir "$STORE_DIR" \
+    --machine-id-file "$STATE_DIR/machine-id" \
+    --crag-pid-file "$RUN_KIN/crag.pid" \
+    --slot-uid "$SLOT_UID" \
+    --slot-gid "$SLOT_GID" &
+  AGENT_PID=$!
+  log "started kin-slot-agent pid=$AGENT_PID transport=$KIN_AGENT_TRANSPORT uid=${SLOT_UID}:${SLOT_GID}"
+}
+
+start_kernel_relay() {
+  [ "$KIN_AGENT_TRANSPORT" != vsock ] || return 0
+  [ -x "$RELAY_BIN" ] || die "missing fallback TCP relay $RELAY_BIN"
+  KIN_RELAY_PORT="$KIN_VSOCK_PORT" \
+  KIN_RELAY_UNIX="$RUN_GUEST/kernel.sock" \
+  "$RELAY_BIN" --port "$KIN_VSOCK_PORT" --unix "$RUN_GUEST/kernel.sock" &
+  RELAY_PID=$!
+  log "started fallback kin-kernel-relay pid=$RELAY_PID port=$KIN_VSOCK_PORT"
+}
+
+find_crag_bin() {
+  for cand in \
+    "$STORE_DIR/crag/current/crag-v2" \
+    "$STORE_DIR/crag/crag-v2" \
+    /usr/local/bin/crag-v2
+  do
+    if [ -x "$cand" ]; then
+      printf '%s' "$cand"
+      return 0
+    fi
+  done
+  return 1
+}
+
+proc_alive() {
+  pid=$1
+  [ -n "$pid" ] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  if [ -r "/proc/$pid/status" ]; then
+    while IFS= read -r _line; do
+      case "$_line" in
+        State:*)
+          # shellcheck disable=SC2086
+          set -- $_line
+          case "${2:-}" in
+            Z|X)
+              wait "$pid" 2>/dev/null || true
+              return 1
+              ;;
+          esac
+          break
+          ;;
+      esac
+    done < "/proc/$pid/status"
+  fi
+  return 0
+}
+
+supervise_crag_once() {
+  [ -f "$RUN_KIN/kernel.json" ] || return 0
+  if [ -n "$CRAG_PID" ]; then
+    if proc_alive "$CRAG_PID"; then
+      return 0
+    fi
+    wait "$CRAG_PID" 2>/dev/null || true
+    log "crag-v2 pid=$CRAG_PID exited; restarting"
+    CRAG_PID=''
+    rm -f "$RUN_KIN/crag.pid"
+  fi
+  crag_bin=$(find_crag_bin) || return 0
+  _eff_user=${SLOT_USER:-kincli}
+  _eff_home=${SLOT_HOME:-/home/$_eff_user}
+  _eff_uid=${SLOT_UID:-$KINCLI_UID}
+  _eff_gid=${SLOT_GID:-$KINCLI_GID}
+  # Backward-compatible test harness hook: when a caller overrides KINCLI_UID/GID directly without SLOT_UID/GID.
+  if [ "$KINCLI_UID" != 999 ] && [ "$SLOT_UID" = 999 ]; then _eff_uid=$KINCLI_UID; fi
+  if [ "$KINCLI_GID" != 987 ] && [ "$SLOT_GID" = 987 ]; then _eff_gid=$KINCLI_GID; fi
+  HOME="$_eff_home" \
+  USER="$_eff_user" \
+  LOGNAME="$_eff_user" \
+  CLAUDE_CONFIG_DIR="${_eff_home}/.claude" \
+  TZ="$KIN_TZ" \
+  LANG="${LANG:-en_US.UTF-8}" \
+  LC_ALL="${LANG:-en_US.UTF-8}" \
+  setpriv --reuid="$_eff_uid" --regid="$_eff_gid" --clear-groups -- \
+    "$crag_bin" --gateway-worker --config "$RUN_KIN/kernel.json" &
+  CRAG_PID=$!
+  printf '%s\n' "$CRAG_PID" > "$RUN_KIN/.crag.pid.tmp"
+  chmod 0644 "$RUN_KIN/.crag.pid.tmp"
+  mv -f "$RUN_KIN/.crag.pid.tmp" "$RUN_KIN/crag.pid"
+  log "started crag-v2 pid=$CRAG_PID user=${_eff_user}(${_eff_uid}:${_eff_gid}) bin=$crag_bin"
+}
+
+shutdown_guest() {
+  SHUTTING_DOWN=1
+  log "shutdown signal received"
+  if [ -n "$CRAG_PID" ] && kill -0 "$CRAG_PID" 2>/dev/null; then
+    kill -TERM "$CRAG_PID" 2>/dev/null || true
+  fi
+  if [ -n "$SSHD_PID" ] && kill -0 "$SSHD_PID" 2>/dev/null; then
+    kill -TERM "$SSHD_PID" 2>/dev/null || true
+  fi
+  if [ -n "$RELAY_PID" ] && kill -0 "$RELAY_PID" 2>/dev/null; then
+    kill -TERM "$RELAY_PID" 2>/dev/null || true
+  fi
+  if [ -n "$AGENT_PID" ] && kill -0 "$AGENT_PID" 2>/dev/null; then
+    kill -TERM "$AGENT_PID" 2>/dev/null || true
+  fi
+  sleep 1
+  sync
+  # Reverse unmount order so $STATE_DIR detaches cleanly without EBUSY.
+  umount "$SLOT_HOME" 2>/dev/null || true
+  umount /home 2>/dev/null || true
+  umount /etc/claude-code/managed-settings.d 2>/dev/null || true
+  umount /etc/machine-id 2>/dev/null || true
+  umount /var/lib/dbus/machine-id 2>/dev/null || true
+  umount "$STATE_DIR" 2>/dev/null || true
+  if [ "$$" = 1 ]; then
+    poweroff -f 2>/dev/null || {
+      printf '%s\n' 1 > /proc/sys/kernel/sysrq 2>/dev/null || true
+      printf '%s\n' o > /proc/sysrq-trigger 2>/dev/null || true
+    }
+    exit 0
+  fi
+  exit 0
+}
+
+trap shutdown_guest TERM INT PWR
+
+mount_early_vfs
+mount_state_ext4_early
+preload_kernel_drivers
+apply_kernel_uts_once
+setup_slot_runtime_dirs
+apply_slot_identity_binds
+configure_locale
+mount_shared_store
+setup_network
+start_sshd
+start_slot_agent
+start_kernel_relay
+
+log "guest ready vm_id=${KIN_VM_ID:-unknown} host=${KIN_HOSTNAME:-unknown} user=${SLOT_USER}(${SLOT_UID}:${SLOT_GID}) lang=${LANG:-C.UTF-8}"
+
+while [ "$SHUTTING_DOWN" = 0 ]; do
+  if [ -n "$SSHD_PID" ] && ! proc_alive "$SSHD_PID"; then
+    wait "$SSHD_PID" 2>/dev/null || true
+    log "sshd exited; restarting"
+    start_sshd
+  fi
+  if [ -n "$AGENT_PID" ] && ! proc_alive "$AGENT_PID"; then
+    wait "$AGENT_PID" 2>/dev/null || true
+    log "kin-slot-agent exited; restarting"
+    start_slot_agent
+  fi
+  if [ "$KIN_AGENT_TRANSPORT" != vsock ] && [ -n "$RELAY_PID" ] && ! proc_alive "$RELAY_PID"; then
+    wait "$RELAY_PID" 2>/dev/null || true
+    log "kin-kernel-relay exited; restarting"
+    start_kernel_relay
+  fi
+  supervise_crag_once
+  sleep 1
+done

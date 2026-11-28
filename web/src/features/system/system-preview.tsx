@@ -4,6 +4,7 @@ import type { PersonaPreset } from '@/types/panel-routing'
 import { Copy, EyeOff, FileText } from 'lucide-react'
 import { toast } from 'sonner'
 import {
+  CLI_IDENTITY,
   PREVIEW_CALLER_AGENT,
   PREVIEW_CALLER_SYSTEM,
   PREVIEW_REQUEST_VARS,
@@ -12,10 +13,13 @@ import {
   dropLegacyAutoScope,
   envTimezoneText,
   estimateTokens,
+  isPresetEnvEnabled,
+  isPresetGuidanceEnabled,
   personaHideEnabled,
   personaPresetLabel,
   presetFlagEnabled,
   migrateLegacyOfficialTemplate,
+  previewBillingVars,
   previewModelSentence,
   previewSystemBlocks,
   selectedPreviewBlocks,
@@ -101,6 +105,7 @@ export function SystemPreview({
   })
 
   const standing = agentStandingVar(compat, preset).trimEnd()
+  const envOn = isPresetEnvEnabled(compat, preset)
   const usagePassthrough = presetFlagEnabled(
     compat,
     'usage_passthrough_presets',
@@ -119,6 +124,7 @@ export function SystemPreview({
   )
   const timezoneOnly =
     preset === 'official_full' &&
+    blocks.some((block) => block.id === 'env_official') &&
     !templateBlockEnabled(compat, preset, 'env_official')
   const env = envTimezoneText(timezone)
   const previewVars = vars.data
@@ -126,8 +132,17 @@ export function SystemPreview({
         {
           ...vars.data.vars,
           ...PREVIEW_REQUEST_VARS,
+          ...previewBillingVars(compat, vars.data.vars.cli_version),
+          identity: CLI_IDENTITY,
+          identity_cli: CLI_IDENTITY,
+          guidance_303: isPresetGuidanceEnabled(compat, preset)
+            ? vars.data.vars.guidance_303 || ''
+            : '',
           timezone,
           env_timezone_only: env,
+          env_timezone:
+            vars.data.vars.env_timezone || ` - Timezone: ${timezone}`,
+          env_locale: vars.data.vars.env_locale || ' - Language: en-US',
           env_official: timezoneOnly ? env : vars.data.vars.env_official,
           env,
           agent_standing: agentStandingVar(compat, preset),
@@ -144,13 +159,16 @@ export function SystemPreview({
   const rendered = previewVars
     ? previewSystemBlocks(source, previewVars, {
         preserveCallerSystem: preset === 'zero',
+        includeBilling: true,
       }).map((block) => ({
         ...block,
         region:
           block.id === 'caller_system' &&
           source.some((template) => template.id === 'caller_system')
             ? 'messages · 首条 user'
-            : 'system',
+            : block.role === 'system'
+              ? 'messages · role=system'
+              : 'system',
       }))
     : []
   const plain = rendered.map((block) => block.text).join('\n\n')
@@ -181,7 +199,7 @@ export function SystemPreview({
           </Button>
         </div>
         <div className='flex flex-wrap items-center gap-x-3 gap-y-2'>
-          {presetFlagEnabled(compat, 'persona_env_presets', preset) ? (
+          {envOn ? (
             <Select value={timezone} onValueChange={setPicked}>
               <SelectTrigger
                 size='sm'
@@ -203,7 +221,8 @@ export function SystemPreview({
               </SelectContent>
             </Select>
           ) : null}
-          {presetFlagEnabled(compat, 'model_env_extra_presets', preset) ? (
+          {envOn &&
+          presetFlagEnabled(compat, 'model_env_extra_presets', preset) ? (
             <Select value={previewModel} onValueChange={setPreviewModel}>
               <SelectTrigger
                 size='sm'

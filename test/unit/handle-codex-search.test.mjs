@@ -1,16 +1,78 @@
-import { test } from 'node:test'
+import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { handleCodexSearch } from '../../src/lib/protocol/handle-codex.mjs'
 import { CODEX_APP_VERSION, CODEX_SEARCH_URL } from '../../src/lib/protocol/codex-models.mjs'
 import { readCodexAccounts } from '../../src/lib/vm/codex-slot.mjs'
-import { getVm } from '../../src/lib/vm/vm-registry.mjs'
+import { getVm, listVms } from '../../src/lib/vm/vm-registry.mjs'
 import { resetOpenAIAccountRuntime } from '../../src/lib/pool/openai-account-runtime.mjs'
 import { Readable } from 'node:stream'
 import { readBody } from '../../src/lib/http/respond.mjs'
 import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs'
+import { createSchedulerRuntime, formatNodeKey } from '../../src/lib/scheduler/scheduler-runtime.mjs'
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
+const REPO_ROOT = path.resolve(__dirname, '../..')
+
+function resolveSchedulerBin() {
+  for (const candidate of [
+    process.env.KIN_SCHEDULER_BIN,
+    path.join(REPO_ROOT, 'bin', process.platform === 'win32' ? 'kin-scheduler.exe' : 'kin-scheduler'),
+    '/tmp/vm2api-sched-m3-target/release/kin-scheduler',
+    '/tmp/vm2api-sched-target/release/kin-scheduler',
+  ]) {
+    if (candidate && fs.existsSync(candidate)) return candidate
+  }
+  return null
+}
+
+let sharedSchedRoot = null
+let sharedSchedulerRuntime = null
+let activeProjectRoot = null
+let searchReqSeq = 0
+
+async function syncProjectVms(root) {
+  activeProjectRoot = root
+  await sharedSchedulerRuntime.syncConfigNow('codex_search_test')
+  await sharedSchedulerRuntime.pushTelemetryNow()
+  for (const vm of listVms(root)) {
+    await sharedSchedulerRuntime.unrestNode(formatNodeKey('codex_vm', vm.id)).catch(() => {})
+  }
+}
+
+before(async () => {
+  const binPath = resolveSchedulerBin()
+  assert.ok(binPath, 'kin-scheduler binary must exist for handle-codex-search tests (set KIN_SCHEDULER_BIN)')
+  sharedSchedRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-search-rust-sched-'))
+  sharedSchedulerRuntime = createSchedulerRuntime({
+    cfg: { paths: { data: sharedSchedRoot, project: sharedSchedRoot } },
+    getVms: () => (activeProjectRoot ? listVms(activeProjectRoot) : []),
+    getRoutingConfig: () => ({}),
+    telemetryIntervalMs: 0,
+    clientOptions: {
+      binPath,
+      socketPath: path.join(sharedSchedRoot, 'run', 'scheduler.sock'),
+      tokenPath: path.join(sharedSchedRoot, 'run', 'scheduler.token'),
+      capFile: path.join(sharedSchedRoot, 'run', 'scheduler.cap.json'),
+      manageProcess: true,
+    },
+  })
+  await sharedSchedulerRuntime.start({ waitMs: 5_000, startLoops: false })
+})
+
+after(async () => {
+  if (sharedSchedulerRuntime) {
+    await sharedSchedulerRuntime.shutdown({ drain: false, stopProcess: true })
+    sharedSchedulerRuntime = null
+  }
+  if (sharedSchedRoot) {
+    fs.rmSync(sharedSchedRoot, { recursive: true, force: true })
+    sharedSchedRoot = null
+  }
+})
 
 function writeGptVm(root, id, account = {}) {
   const dir = path.join(root, 'vms')
@@ -32,6 +94,7 @@ function upstream(status, payload, headers = {}) {
 }
 
 async function search(root, { body, headers = {}, ops = {} } = {}) {
+  await syncProjectVms(root)
   const res = { statusCode: 0, body: null, setHeader() {} }
   const logBag = {}
   const stats = { errors: 0, requests: 0, by_route: {} }
@@ -49,6 +112,7 @@ async function search(root, { body, headers = {}, ops = {} } = {}) {
     routing: {},
     projectRoot: root,
     ops,
+    schedulerRuntime: sharedSchedulerRuntime,
   })
   return { res, logBag, stats }
 }
@@ -204,6 +268,7 @@ test('search passes a backend 404 through without trying other slots', async () 
 test('the alpha/search route authenticates, logs and reaches the Codex search hop', async () => {
   const root = tempRoot('route')
   writeGptVm(root, 'vm-gpt-a') // no SOCKS5 bound: the hop must stop at proxy_required
+  await syncProjectVms(root)
   const rows = []
   const { handleSearch } = createHandleProtocol({
     cfg: { limits: { max_body_bytes: 1 << 20 }, rewrite: { enabled: false }, paths: { project: root } },
@@ -216,10 +281,14 @@ test('the alpha/search route authenticates, logs and reaches the Codex search ho
       req.apiKeyKind = 'managed'
       return true
     },
-    requestLog: { start: () => ({ request_id: 'req-search' }), finish: (_ctx, row) => rows.push(row) },
+    requestLog: {
+      start: () => ({ request_id: `req-search-${++searchReqSeq}` }),
+      finish: (_ctx, row) => rows.push(row),
+    },
     stats: { errors: 0, requests: 0, by_route: {} },
     groupsRepo: { rateMultiplier: () => 1 },
     routingConfig: {},
+    schedulerRuntime: sharedSchedulerRuntime,
   })
   const req = Readable.from([Buffer.from('{"model":"gpt-6.1-sol","commands":{"search_query":[{"q":"x"}]}}')])
   req.headers = { 'user-agent': 'codex_exec/0.160.1' }

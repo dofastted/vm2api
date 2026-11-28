@@ -1,19 +1,18 @@
 import { useEffect, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { Link } from '@tanstack/react-router'
 import { VIEW_TITLES } from '@/config/nav'
-import type { Dashboard } from '@/types/panel-overview'
+import { Info } from 'lucide-react'
 import { toast } from 'sonner'
-import { api, patchVm } from '@/lib/api'
+import { api } from '@/lib/api'
 import { cn } from '@/lib/utils'
-import { isCodexVm } from '@/lib/vm-kind'
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { PageHeader } from '@/components/page-header'
 import { QueryGate } from '@/components/query-gate'
 import { dashboardQueryOptions } from '@/features/overview/queries'
-import { inheritProtocolOnSlots } from '@/features/settings/protocol-authority'
 import { routingQueryOptions } from '@/features/settings/queries'
 import { SaveBar } from '@/features/settings/save-bar'
 import { SettingsSkeleton } from '@/features/settings/settings-skeleton'
-import { CragPrintPanel } from '@/features/system/crag-print-panel'
 import {
   CragGeminiPanel,
   cragGeminiPromptProblem,
@@ -43,7 +42,7 @@ export function SystemPromptPage() {
   const [draft, setDraft] = useState<Record<string, unknown>>({})
   const [personaProblems, setPersonaProblems] = useState<string[]>([])
   const [discardKey, setDiscardKey] = useState(0)
-  const [kernelSet, setKernelSet] = useState<SystemPromptKernelSet>('cli-node')
+  const [kernelSet, setKernelSet] = useState<SystemPromptKernelSet>('claude')
 
   useEffect(() => {
     if (routing.data) setDraft(routing.data)
@@ -64,36 +63,8 @@ export function SystemPromptPage() {
       const compat =
         saved?.compatibility ||
         (draft.compatibility as Record<string, unknown> | undefined)
-      let inherited = 0
-      try {
-        const dash = await api<Dashboard>('/api/panel/dashboard')
-        const follow = await inheritProtocolOnSlots(
-          (dash.vms || []).filter((vm) => !isCodexVm(vm)),
-          patchVm
-        )
-        inherited = follow.changed
-        if (follow.errors.length) {
-          toast.error(
-            `已保存，${follow.errors.length} 个槽位未跟随：${follow.errors
-              .slice(0, 3)
-              .map((item) => `${item.id} ${followError(item.message)}`)
-              .join('；')}`
-          )
-        }
-      } catch (error) {
-        toast.error(
-          `已保存，槽位未跟随全局：${followError(
-            error instanceof Error ? error.message : String(error)
-          )}`
-        )
-      }
       toast.success(
-        systemPromptSaveToast(
-          kernelSet,
-          compat,
-          inherited,
-          saved?.kernel_persona
-        )
+        systemPromptSaveToast(kernelSet, compat, saved?.kernel_persona)
       )
       await Promise.all([
         qc.invalidateQueries({ queryKey: routingQueryOptions().queryKey }),
@@ -140,6 +111,26 @@ export function SystemPromptPage() {
   return (
     <PageHeader title={VIEW_TITLES.system}>
       <div className={cn(dirty && 'pb-16')}>
+        <Alert className='mb-4'>
+          <Info className='size-4' />
+          <AlertTitle>
+            全局默认兜底（仅作用于选择「继承全局」的 Anthropic 分组池）
+          </AlertTitle>
+          <AlertDescription className='flex flex-wrap items-center gap-x-2 gap-y-1'>
+            <span>
+              本页配置仅作为 Anthropic
+              分组池选择「继承全局（inherit_global）」时的默认兜底；各 Anthropic
+              分组池的独立 System Prompt
+              策略优先级高于全局默认，保存全局配置不会清空任何分组池或单槽覆盖。
+            </span>
+            <Link
+              to='/pools'
+              className='font-medium text-primary underline underline-offset-4'
+            >
+              前往分组池配置独立策略 →
+            </Link>
+          </AlertDescription>
+        </Alert>
         <QueryGate
           loading={routing.isLoading}
           error={routing.error}
@@ -148,13 +139,20 @@ export function SystemPromptPage() {
           <div
             role='tablist'
             aria-label='提示词内核'
-            className='mb-4 grid gap-2 sm:grid-cols-3'
+            className='mb-4 grid gap-2 sm:grid-cols-2'
           >
             {(
               [
-                ['cli-node', 'cli-node 原生内核', '模板注入，写入 kernel.json'],
-                ['crag', 'CRAG v2 print', '不读 persona_preset，不是 TUI'],
-                ['craggemini', 'CRAGGemini (Antigravity)', 'agy 官方 / 0 提示词'],
+                [
+                  'claude',
+                  'Claude 系统提示词',
+                  '统一作用于 cli-node / CRAG / API 直连',
+                ],
+                [
+                  'craggemini',
+                  'CRAGGemini (Antigravity)',
+                  'agy 官方 / 0 提示词',
+                ],
               ] as const
             ).map(([value, label, detail]) => {
               const selected = kernelSet === value
@@ -180,7 +178,7 @@ export function SystemPromptPage() {
               )
             })}
           </div>
-          <div hidden={kernelSet !== 'cli-node'}>
+          <div hidden={kernelSet !== 'claude'}>
             <SystemPromptWorkspace
               key={discardKey}
               compat={
@@ -193,15 +191,6 @@ export function SystemPromptPage() {
               }
               onChange={(next) => setDraft({ ...draft, compatibility: next })}
               onProblemsChange={setPersonaProblems}
-            />
-          </div>
-          <div hidden={kernelSet !== 'crag'}>
-            <CragPrintPanel
-              compat={
-                (draft.compatibility as Record<string, unknown> | undefined) ||
-                {}
-              }
-              onChange={(next) => setDraft({ ...draft, compatibility: next })}
             />
           </div>
           <div hidden={kernelSet !== 'craggemini'}>

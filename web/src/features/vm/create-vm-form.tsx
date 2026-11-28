@@ -40,11 +40,13 @@ import {
   type CreateExit,
 } from '@/features/vm/create-exit-field'
 import {
+  CRAG_DEBIAN13_SLOT_NOTICE,
   KERNELS,
   VM_CREATE_AFTER,
   VM_LOCALES,
   VM_REGION_AUTO,
   VM_REGIONS,
+  isCragDebian13Kernel,
   kernelProfile,
 } from '@/features/vm/create-options'
 import {
@@ -155,6 +157,8 @@ export interface CreateVmDraft {
   dataplane: CreateVmDataplane
   setDataplane: (next: CreateVmDataplane) => void
   cragDisabledReason: string | null
+  cragOsSelected?: boolean
+  cragOsDisabledReason?: string | null
   kernel: string
   setKernel: (next: string) => void
   name: string
@@ -237,9 +241,21 @@ export function useCreateVmDraft({
     createOptions.data?.crag_supported,
     createOptions.isPending
   )
+  const cragOsDisabledReason =
+    platform === 'openai'
+      ? 'CRAG Debian 13 仅支持 Claude / CRAG 槽位'
+      : disabledReason
+  const effectiveKernel =
+    isCragDebian13Kernel(kernel) && cragOsDisabledReason !== null
+      ? KERNELS[0].id
+      : kernel
+  if (kernel !== effectiveKernel) setKernel(effectiveKernel)
+  const cragOsSelected = isCragDebian13Kernel(effectiveKernel)
   const dataplane =
     platform === 'anthropic' && disabledReason === null
-      ? preferredDataplane
+      ? cragOsSelected
+        ? 'crag'
+        : preferredDataplane
       : 'wrap'
   // 清除失效的选择，切回受支持的目标也不会自动选中 CRAG。
   if (preferredDataplane !== dataplane) setDataplane(dataplane)
@@ -281,7 +297,7 @@ export function useCreateVmDraft({
         body: JSON.stringify({
           id,
           ...(typedName ? { name: typedName } : {}),
-          kernel,
+          kernel: effectiveKernel,
           locale,
           // 「自动」是纯 UI 哨兵值，不发给后端。
           region: region === VM_REGION_AUTO ? undefined : region,
@@ -340,7 +356,9 @@ export function useCreateVmDraft({
     dataplane,
     setDataplane,
     cragDisabledReason: disabledReason,
-    kernel,
+    cragOsSelected,
+    cragOsDisabledReason,
+    kernel: effectiveKernel,
     setKernel,
     name,
     setName,
@@ -443,7 +461,12 @@ export function draftSpecRows(d: CreateVmDraft): SpecRow[] {
             : '虚拟机 (KVM)'
           : '容器 (Docker)',
     },
-    { label: '系统', value: kernelProfile(d.kernel)?.name || d.kernel },
+    {
+      label: '系统',
+      value: isCragDebian13Kernel(d.kernel)
+        ? `${kernelProfile(d.kernel)?.name || d.kernel}（占用 CRAG 槽位）`
+        : kernelProfile(d.kernel)?.name || d.kernel,
+    },
     {
       label: '规格',
       value: machineLine(d.runtimeType, d.memory, d.vcpus, d.diskGb),
@@ -571,6 +594,12 @@ export function CreateVmForm({
 }) {
   const remote = !!d.placement.nodeId
   const kvm = d.runtimeType === 'kvm'
+  const cragOs = d.cragOsSelected ?? isCragDebian13Kernel(d.kernel)
+  const cragOsDisabled =
+    d.cragOsDisabledReason ??
+    (d.platform === 'openai'
+      ? 'CRAG Debian 13 仅支持 Claude / CRAG 槽位'
+      : (d.cragDisabledReason ?? null))
 
   return (
     <div className='space-y-5'>
@@ -598,17 +627,24 @@ export function CreateVmForm({
         <Section
           title='推理内核'
           hint={
-            d.cragDisabledReason === null
-              ? '两套内核均预装，此处只选择运行内核'
-              : undefined
+            cragOs
+              ? '已选 CRAG Debian 13：自动锁定 CRAG 推理内核，使用会占用 CRAG 槽位。'
+              : d.cragDisabledReason === null
+                ? '两套内核均预装，此处只选择运行内核'
+                : undefined
           }
         >
           <ChoiceTiles
             label='推理内核'
-            value={d.dataplane}
+            value={cragOs ? 'crag' : d.dataplane}
             onChange={d.setDataplane}
             choices={[
-              { value: 'wrap', title: DATAPLANE_LABEL.wrap },
+              {
+                value: 'wrap',
+                title: DATAPLANE_LABEL.wrap,
+                disabled: cragOs,
+                detail: cragOs ? 'CRAG Debian 13 仅支持 CRAG 推理内核' : null,
+              },
               {
                 value: 'crag',
                 title: DATAPLANE_LABEL.crag,
@@ -662,12 +698,23 @@ export function CreateVmForm({
           value={d.kernel}
           onChange={d.setKernel}
           className='grid-cols-2 lg:grid-cols-4'
-          choices={KERNELS.map((k) => ({
-            value: k.id,
-            title: k.name,
-            detail: k.feats.slice(0, 2).join(' · '),
-          }))}
+          choices={KERNELS.map((k) => {
+            const isCragOs = isCragDebian13Kernel(k.id)
+            return {
+              value: k.id,
+              title: k.name,
+              disabled: isCragOs && cragOsDisabled !== null,
+              detail: isCragOs
+                ? cragOsDisabled || k.feats.slice(0, 2).join(' · ')
+                : k.feats.slice(0, 2).join(' · '),
+            }
+          })}
         />
+        {cragOs ? (
+          <p role='note' className='text-xs text-[color:var(--status-caution)]'>
+            {CRAG_DEBIAN13_SLOT_NOTICE}
+          </p>
+        ) : null}
       </Section>
 
       <Section

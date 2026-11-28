@@ -147,7 +147,7 @@ class Fixture:
             run.native_invocation._process.wait(timeout=5)
             assert (
                 run.native_invocation.poll()["error"]["code"]
-                == "gemini_inference_failed"
+                == "gemini_upstream_unavailable"
             )
             run.egress = subprocess.Popen(["/bin/sleep", "30"], start_new_session=True)
             run.native_tui_pid = run.pid = run.terminal = run.network_lock = None

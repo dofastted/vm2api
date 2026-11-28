@@ -28,6 +28,7 @@ import { CRAG_HOST_MOUNT, cragSubscriptionPublicDirectory } from './crag-subscri
 import { isNativeNodeVm } from '../cluster/placement.mjs'
 import { workerPaths as transportWorkerPaths } from '../transport/go-worker-client.mjs'
 import {
+  activeCragManifestForSlot,
   assertCliHopAllowed,
   resolveKernelDataplane,
   resolveCragKernelVersion,
@@ -38,7 +39,14 @@ import { profileForPreset } from '../identity/official-profiles.mjs'
 import { ensureSlotClaudeOwnership, chownSlotRuntimeFile, replaceSlotOwnedFile } from '../oauth/oauth-credentials.mjs'
 import { cragV2KernelWrapperScript, installedCragV2Root, materializeResolvedKernel } from './wrap-cli-runtime.mjs'
 import { ensureGuestMachineIdFile } from '../identity/workstation-fingerprint.mjs'
-import { ensureSlotComputer, rememberComputer } from '../identity/slot-computer.mjs'
+import {
+  ensureDockerSlotPasswdFiles,
+  ensureSlotComputer,
+  rememberComputer,
+  slotComputerRuntimeEtcDir,
+  syncSlotIdentityTimezoneAndPreset,
+} from '../identity/slot-computer.mjs'
+import { isCustomSlotUser, slotClaudeDir, slotGuestUidGid, slotHome, slotUser } from './slot-identity.mjs'
 import { coerceRfc4122Uuid } from '../identity/rfc4122-uuid.mjs'
 import {
   boundProxyUrl,
@@ -61,10 +69,41 @@ import {
   buildDirForKernel,
   kvmImageForKernel,
   KVM_BUILD_DIR,
+  normalizeOsKernel,
 } from './os-catalog.mjs'
 import { slotMemory, slotDockerCpus, memoryMiB } from './machine-spec.mjs'
-import { slotCreationLimits } from './slot-capacity.mjs'
-import { ensureKvmMachineRecord, kvmContainerEnvIncomplete, kvmMachineFields } from './kvm-machine.mjs'
+import { isHeadlessBridgeSlot, slotCreationLimits } from './slot-capacity.mjs'
+import {
+  CUSTOM_OS_ASSETS_GUEST_DIR,
+  CUSTOM_OS_BRIDGE_TMPFS_DIR,
+  CUSTOM_OS_BRIDGE_TMPFS_OPTS,
+  CUSTOM_OS_EROFS_FILENAME,
+  CUSTOM_OS_MANAGED_SETTINGS_D,
+  CUSTOM_OS_STORE_GUEST_DIR,
+  DEFAULT_KVM_AGENT_VSOCK_PORT,
+  DEFAULT_KVM_STORE_MODE,
+  DEFAULT_KVM_VSOCK_PORT,
+  KVM_KERNEL_TRACK_CUSTOM,
+  KVM_MODE_CUSTOM_EROFS,
+  dockerLxcfsMountArgs,
+  isCragDebian13Kernel,
+  isCustomKvmMode,
+  isCustomOsSlot,
+  isVhostVsockUsable,
+  resolveHostCragDebian13OsDir,
+  resolveHostSharedStoreDir,
+  resolveKvmKernelAssets,
+  resolveKvmKernelTrack,
+  verifyKvmKernelTrackFiles,
+} from './custom-os-runtime.mjs'
+import { allocateCid, attachCidOwnerPid, claimExistingCid, releaseCid } from './kvm-vsock-cid.mjs'
+import { ensureSlotAgentToken, readSlotAgentToken, syncCustomKvmSlotFiles } from './kvm-slot-agent-client.mjs'
+import {
+  ensureKvmMachineRecord,
+  kvmContainerEnvIncomplete,
+  kvmMachineFields,
+  readDockerContainerEnv,
+} from './kvm-machine.mjs'
 import { probeLocalKvm } from './kvm-host.mjs'
 import { slotExecArgv } from './slot-exec.mjs'
 import { isDockerInspectNotFound } from './docker-container.mjs'
@@ -127,12 +166,16 @@ function kvmContainerMemory(mem) {
   return `${memoryMiB(mem) + KVM_MEMORY_OVERHEAD_MIB}m`
 }
 
-export { OS_REGISTRY, OS_CATALOG, OS_ORDER, imageForKernel } from './os-catalog.mjs'
+export { OS_REGISTRY, OS_CATALOG, OS_ORDER, imageForKernel, normalizeOsKernel } from './os-catalog.mjs'
+export { dockerLxcfsMountArgs } from './custom-os-runtime.mjs'
 export { normalizeTimezone, normalizeTimezone as normalizeUsTimezone, US_TIMEZONES } from '../core/timezone.mjs'
 export const STANDARD_LOCALE = 'en_US.UTF-8'
 
+const GENERAL_OS_ORDER = OS_ORDER.filter((k) => !OS_CATALOG[k]?.cragOnly)
+
 export function kernelForIndex(i) {
-  return OS_ORDER[(Number(i) - 1) % OS_ORDER.length]
+  const pool = GENERAL_OS_ORDER.length ? GENERAL_OS_ORDER : OS_ORDER
+  return pool[(Number(i) - 1) % pool.length]
 }
 
 export function timezoneForIndex(i) {
@@ -415,7 +458,7 @@ function* subscriptionTargetChecks(projectRoot, vm, routing, { reclaim = false, 
     throw unsupported()
   }
   const capabilities = yield {
-    argv: ['docker', ...slotExecArgv(vm, ['/home/kincli/.kin/crag-v2/crag-v2', '--license-capabilities'])],
+    argv: ['docker', ...slotExecArgv(vm, [`${slotHome(vm)}/.kin/crag-v2/crag-v2`, '--license-capabilities'])],
     timeout: 5000,
   }
   try {
@@ -470,6 +513,83 @@ export function suspendVmRuntimeRestart(vm, { run = sh } = {}) {
   return { ok: result.ok === true, code: result.ok ? undefined : 'kernel_restart_policy_failed', error: result.stderr }
 }
 
+export function isV4CustomOsDockerSlot(vm, routing = {}, options = {}) {
+  if (!isCustomOsSlot(vm, options)) return false
+  if (!vm || isKvmRuntime(vm) || isCodexVm(vm)) return false
+  if (resolveKernelDataplane(vm, routing) !== 'crag' || resolveCragKernelVersion(vm, routing) !== 'v2') return false
+  if (options?.headlessBridge === false) return false
+  if (isHeadlessBridgeSlot(vm, options)) return true
+  const explicitCaps = Array.isArray(options?.capabilities) && options.capabilities.length > 0
+  return isCragDebian13Kernel(vm?.kernel) && !explicitCaps
+}
+
+/**
+ * Security flags for a local Docker slot.
+ * - V4 + Custom Debian 13 OS unloads `crag-v2-seccomp.json` and AppArmor overrides
+ *   (`vm2api-crag-docker` / `unconfined`), returning to Docker default seccomp & AppArmor
+ *   with `--read-only --cap-drop ALL --security-opt no-new-privileges`.
+ * - Deliberately keeps Docker slots WITHOUT `PR_SET_DUMPABLE=0` so non-root `kincli`
+ *   verification in `crag-core-check.mjs` remains 100% compatible.
+ * - Legacy mode / V3 retains the narrow userns seccomp + AppArmor profile unchanged.
+ */
+export function cragDockerSandboxArgs(vm, routing = {}, options = {}) {
+  const crag =
+    !isCodexVm(vm) && resolveKernelDataplane(vm, routing) === 'crag' && resolveCragKernelVersion(vm, routing) === 'v2'
+  if (!crag) return ['--security-opt', 'no-new-privileges']
+  if (isV4CustomOsDockerSlot(vm, routing, options)) {
+    return ['--security-opt', 'no-new-privileges', '--init']
+  }
+  const profile = cragDockerAppArmorProfile(options)
+  return [
+    '--security-opt',
+    'no-new-privileges',
+    '--init',
+    '--security-opt',
+    `seccomp=${CRAG_V2_SECCOMP_PATH}`,
+    ...(profile ? ['--security-opt', `apparmor=${profile}`] : []),
+  ]
+}
+
+/**
+ * Extra tmpfs & read-only mounts for V4 + Custom Debian 13 OS Docker slots:
+ *   - dedicated `/run/kin/bridge` tmpfs (decoupled from `/tmp` 32m)
+ *   - host read-only shared store `/opt/kin/store:ro`
+ *   - per-slot read-only `/etc/claude-code/managed-settings.d:ro` (when present)
+ */
+export function cragCustomOsDockerMountArgs(
+  vm,
+  {
+    routing = {},
+    projectRoot = '',
+    hostOf = (p) => p,
+    computerDir = '',
+    sharedStoreHostDir = '',
+    managedSettingsDir = '',
+    runtimeMode,
+    capabilities,
+    headlessBridge,
+  } = {},
+) {
+  if (!isV4CustomOsDockerSlot(vm, routing, { runtimeMode, capabilities, headlessBridge })) return []
+  const args = ['--tmpfs', `${CUSTOM_OS_BRIDGE_TMPFS_DIR}:${CUSTOM_OS_BRIDGE_TMPFS_OPTS}`]
+  const storeDir = resolveHostSharedStoreDir(projectRoot, { sharedStoreHostDir })
+  if (storeDir && (sharedStoreHostDir || fs.existsSync(storeDir))) {
+    if (projectRoot && fs.existsSync(storeDir)) {
+      try {
+        syncSharedStoreGuestBins(projectRoot, { sharedStoreHostDir: storeDir })
+      } catch {}
+    }
+    args.push('--mount', `type=bind,source=${hostOf(storeDir)},target=${CUSTOM_OS_STORE_GUEST_DIR},readonly`)
+  }
+  const slotManagedDir =
+    managedSettingsDir ||
+    (computerDir ? path.join(computerDir, 'system', 'etc', 'claude-code', 'managed-settings.d') : '')
+  if (slotManagedDir && (managedSettingsDir || fs.existsSync(slotManagedDir))) {
+    args.push('--mount', `type=bind,source=${hostOf(slotManagedDir)},target=${CUSTOM_OS_MANAGED_SETTINGS_D},readonly`)
+  }
+  return args
+}
+
 /** Docker cannot change seccomp or AppArmor on restart. */
 export function nativeSlotSandboxNeedsRecreate(existing, vm, routing = {}, options = {}) {
   if (
@@ -480,6 +600,12 @@ export function nativeSlotSandboxNeedsRecreate(existing, vm, routing = {}, optio
   )
     return false
   const opts = existing.securityOpts || []
+  if (isV4CustomOsDockerSlot(vm, routing, options)) {
+    const hasLegacyOverride = opts.some(
+      (option) => String(option).startsWith('seccomp=') || String(option).startsWith('apparmor='),
+    )
+    return hasLegacyOverride || existing.init !== true
+  }
   const seccompOk = opts.some((option) => {
     if (option === `seccomp=${CRAG_V2_SECCOMP_PATH}`) return true
     if (!option.startsWith('seccomp=')) return false
@@ -522,7 +648,7 @@ export const CODEX_SLOT_ROLE = 'codex'
 export function slotContainerCommand(vm, { wrapKernel = false, routing = {} } = {}) {
   if (isCodexVm(vm)) return ['sleep', 'infinity']
   const argv = [
-    wrapKernel ? '/home/kincli/.kin/kin-kernel' : '/usr/local/bin/kin-kernel',
+    wrapKernel ? `${slotHome(vm)}/.kin/kin-kernel` : '/usr/local/bin/kin-kernel',
     '--gateway-worker',
     '--config',
     '/run/kin/kernel.json',
@@ -859,7 +985,7 @@ export function resolveSlotRouting(projectRoot, routing) {
   return readProjectRouting(projectRoot) || {}
 }
 
-export function writeWorkerFiles(vm, projectRoot, { transparent, routing } = {}) {
+export function writeWorkerFiles(vm, projectRoot, { transparent, routing, accel } = {}) {
   assertProxyAllowed(vm.proxy)
   const paths = workerPaths(projectRoot, vm.id, vm)
   const uid = runtimeUidNum(vm)
@@ -897,7 +1023,7 @@ export function writeWorkerFiles(vm, projectRoot, { transparent, routing } = {})
   const workerConfig = {
     vm_id: vm.id,
     socket_path: nodePaths ? `${nodePaths.run}/worker.sock` : '/run/kin/worker.sock',
-    credential_path: nodePaths ? `${nodePaths.claude}/credentials.json` : '/home/kincli/.claude/credentials.json',
+    credential_path: nodePaths ? `${nodePaths.claude}/credentials.json` : `${slotClaudeDir(vm)}/credentials.json`,
     proxy_url: proxyUrl,
     proxy_required: onEgress || local ? false : vm.proxy_required !== false,
     internal_token: token,
@@ -937,6 +1063,7 @@ export function writeWorkerFiles(vm, projectRoot, { transparent, routing } = {})
     officialCcInference: resolveOfficialCcInference(vm, resolvedRouting),
     timezone: vm.timezone || '',
     routing: resolvedRouting,
+    accel: accel || vm?.runtime?.accel || '',
   })
   // Slot uid is added via --group-add. These files stay in the control-plane
   // group; chownSlotRuntimeFile would move a successful chown back to KIN_VM_GID.
@@ -946,6 +1073,17 @@ export function writeWorkerFiles(vm, projectRoot, { transparent, routing } = {})
   shareRuntimeFile(paths.config)
   if (kernel?.configPath) shareRuntimeFile(kernel.configPath)
   ensureSlotClaudeOwnership(path.join(projectRoot, 'vms', vm.id, 'cli-home'), uid, gid)
+  if (!vm?.node_id && isKvmRuntime(vm) && isCustomKvmMode({ vm })) {
+    const kvmDir = path.join(projectRoot, 'vms', vm.id, 'kvm')
+    const sockPath = path.join(kvmDir, 'agent.sock')
+    if (fs.existsSync(sockPath) && readSlotAgentToken(kvmDir)) {
+      void syncCustomKvmSlotFiles(projectRoot, vm, {
+        runDir: paths.runDir,
+        targets: ['worker_config'],
+        timeoutMs: 2500,
+      }).catch(() => {})
+    }
+  }
   return { ...paths, kernelSocket: kernel?.socketPath || paths.kernelSocket }
 }
 
@@ -1078,6 +1216,66 @@ export function oauthAuthBinPath(projectRoot) {
   return String(process.env.KIN_OAUTH_AUTH_BIN || '').trim() || path.join(projectRoot, 'bin', 'kin-oauth-auth')
 }
 
+/**
+ * Sync host `bin/{kin-oauth-auth,kin-worker}` into `<sharedStoreDir>/bin/` as read-only (`0555`)
+ * so custom-os Docker and custom-erofs KVM guests resolve `/usr/local/bin/kin-{oauth-auth,worker}`
+ * through `/opt/kin/store:ro` without 9p or baking closed-source ELFs into the OS image.
+ * Missing host binaries are skipped silently for unit-test/partial-install environments.
+ */
+export function syncSharedStoreGuestBins(
+  projectRoot,
+  { sharedStoreHostDir = '', oauthAuthBin = projectRoot ? oauthAuthBinPath(projectRoot) : '', workerBin = '' } = {},
+) {
+  const storeHost = resolveHostSharedStoreDir(projectRoot, { sharedStoreHostDir })
+  if (!storeHost || !fs.existsSync(storeHost)) {
+    return { ok: true, dir: '', synced: [], present: [] }
+  }
+  const localWorker = projectRoot ? path.join(projectRoot, 'bin', 'kin-worker') : ''
+  const resolvedWorker =
+    String(workerBin || '').trim() ||
+    (localWorker && fs.existsSync(localWorker) ? localWorker : fs.existsSync(WORKER_BIN) ? WORKER_BIN : '')
+  const candidates = [
+    ['kin-oauth-auth', String(oauthAuthBin || '').trim()],
+    ['kin-worker', resolvedWorker],
+  ]
+  const binDir = path.join(storeHost, 'bin')
+  const synced = []
+  const present = []
+  for (const [name, srcPath] of candidates) {
+    if (!srcPath) continue
+    const srcStat = fs.statSync(srcPath, { throwIfNoEntry: false })
+    if (!srcStat?.isFile()) continue
+    const target = fs.realpathSync(srcPath)
+    fs.mkdirSync(binDir, { recursive: true, mode: 0o755 })
+    const dest = path.join(binDir, name)
+    let upToDate = false
+    try {
+      const cur = fs.lstatSync(dest)
+      const modeOk = process.platform === 'win32' || (cur.mode & 0o777) === 0o555
+      if (cur.isFile() && cur.size === srcStat.size && modeOk && fileDigest(dest) === fileDigest(target)) {
+        upToDate = true
+      }
+    } catch {}
+    if (!upToDate) {
+      const tmp = path.join(binDir, `.${name}.tmp.${crypto.randomBytes(4).toString('hex')}`)
+      try {
+        fs.copyFileSync(target, tmp)
+        if (process.platform !== 'win32') fs.chmodSync(tmp, 0o555)
+        fs.renameSync(tmp, dest)
+        if (process.platform !== 'win32') fs.chmodSync(dest, 0o555)
+      } catch (err) {
+        try {
+          fs.rmSync(tmp, { force: true })
+        } catch {}
+        throw err
+      }
+      synced.push(name)
+    }
+    present.push(name)
+  }
+  return { ok: true, dir: present.length ? binDir : '', synced, present }
+}
+
 export function ensureSlotGuestBinDir(
   projectRoot,
   { workerBin, kernelBin, oauthAuthBin = oauthAuthBinPath(projectRoot) } = {},
@@ -1161,10 +1359,32 @@ export function slotGuestBinMountArgs({
   return args
 }
 
+export const REGULAR_ETC_TARGETS_LABEL = 'org.vm2api.regular-etc-targets'
+export const DOCKER_HOME_TMPFS_OPTS = 'rw,noexec,nosuid,nodev,mode=0755,size=4m'
+
+function regularNonSymlinkFile(filePath) {
+  try {
+    const st = fs.lstatSync(filePath)
+    return !st.isSymbolicLink() && st.isFile()
+  } catch {
+    return false
+  }
+}
+
+export function dockerImageHasRegularEtcTargets(image, { run = sh } = {}) {
+  const ref = String(image || '').trim()
+  if (!ref) return false
+  const res = run(
+    ['docker', 'image', 'inspect', '--format', `{{index .Config.Labels "${REGULAR_ETC_TARGETS_LABEL}"}}`, ref],
+    { timeout: 5_000 },
+  )
+  return res.ok === true && String(res.stdout || '').trim() === '1'
+}
+
 /** Read-only persona mounts for a non-KVM kin-os container. */
-export function computerDockerArgs({ dir, mac, hostOf = (p) => p }) {
+export function computerDockerArgs({ dir, mac, hostOf = (p) => p, regularEtcTargets = false }) {
   const etc = path.join(dir, 'system', 'etc')
-  return [
+  const args = [
     '--mac-address',
     mac,
     '-v',
@@ -1178,9 +1398,87 @@ export function computerDockerArgs({ dir, mac, hostOf = (p) => p }) {
     '-v',
     `${hostOf(path.join(dir, 'system', 'hardware'))}:/etc/kin-hardware:ro`,
   ]
+  if (regularEtcTargets) {
+    for (const name of ['os-release', 'localtime', 'timezone']) {
+      const src = path.join(etc, name)
+      if (regularNonSymlinkFile(src)) {
+        args.push('-v', `${hostOf(src)}:/etc/${name}:ro`)
+      }
+    }
+  }
+  return args
+}
+
+/**
+ * Per-slot home / passwd / group mounts and env for local Docker slots.
+ * Legacy `kincli` slots keep their historical `/home/kincli` bind with zero extra tmpfs/passwd mounts.
+ * Custom-username slots shadow `/home` via tmpfs, nest `cli-home` at `/home/<user>`, and bind `:ro`
+ * runtime-etc `{passwd,group}` mapping the actual `--user uid:gid` to `<username>`.
+ */
+export function dockerSlotUserArgs({
+  vm,
+  home,
+  projectRoot,
+  uid,
+  gid,
+  hostOf = (p) => p,
+  ensurePasswdFiles = ensureDockerSlotPasswdFiles,
+  runtimeEtcDirOf = slotComputerRuntimeEtcDir,
+}) {
+  const user = slotUser(vm)
+  const userHome = slotHome(vm)
+  const claudeDir = slotClaudeDir(vm)
+  const customUser = isCustomSlotUser(vm)
+  const mountArgs = []
+  if (customUser) {
+    mountArgs.push('--tmpfs', `/home:${DOCKER_HOME_TMPFS_OPTS}`)
+    mountArgs.push('-v', `${hostOf(home)}:${userHome}`)
+    if (projectRoot && vm?.id) {
+      ensurePasswdFiles(projectRoot, vm, { uid, gid })
+      const runtimeEtcDir = runtimeEtcDirOf(projectRoot, vm.id)
+      mountArgs.push(
+        '-v',
+        `${hostOf(path.join(runtimeEtcDir, 'passwd'))}:/etc/passwd:ro`,
+        '-v',
+        `${hostOf(path.join(runtimeEtcDir, 'group'))}:/etc/group:ro`,
+      )
+    }
+  } else {
+    mountArgs.push('-v', `${hostOf(home)}:/home/kincli`)
+  }
+  const envArgs = [
+    '-e',
+    `HOME=${userHome}`,
+    '-e',
+    `USER=${user}`,
+    '-e',
+    `LOGNAME=${user}`,
+    '-e',
+    `CLAUDE_CONFIG_DIR=${claudeDir}`,
+  ]
+  return { user, userHome, claudeDir, customUser, mountArgs, envArgs }
 }
 
 /** Test seam: kvm `docker run` argv (including `docker`). */
+export function verifyLocalKvmKernelTrack(projectRoot, vm, options = {}) {
+  const track = resolveKvmKernelTrack({ vm, ...options })
+  if (track !== KVM_KERNEL_TRACK_CUSTOM) {
+    return { ok: true, track }
+  }
+  const osAssetsHost = resolveHostCragDebian13OsDir(projectRoot, {
+    osAssetsHostDir: options.osAssetsHostDir,
+  })
+  if (!osAssetsHost) {
+    return {
+      ok: false,
+      code: 'kvm_custom_kernel_missing',
+      track,
+      error: 'KIN_KVM_KERNEL_TRACK=custom requires local crag-debian13 OS assets directory',
+    }
+  }
+  return verifyKvmKernelTrackFiles(osAssetsHost, { vm, ...options })
+}
+
 export function buildKvmRunArgs({
   vm,
   name,
@@ -1203,15 +1501,115 @@ export function buildKvmRunArgs({
   hostOf = (p) => p,
   projectRoot,
   routing = {},
+  kvmMode,
+  runtimeMode,
+  vsockCid,
+  vsockPort = DEFAULT_KVM_VSOCK_PORT,
+  agentVsockPort = DEFAULT_KVM_AGENT_VSOCK_PORT,
+  vhostVsockAvailable,
+  storeMode = DEFAULT_KVM_STORE_MODE,
+  sharedStoreHostDir = '',
+  osAssetsHostDir = '',
+  storeBlkImage = '',
+  agentToken = '',
+  vsockLeaseFile = '',
+  kernelTrack = '',
 }) {
   const slotName = displayName(vm.id)
   const mem = kvmContainerMemory(memory)
   const memMb = memoryMiB(memory)
   const machineId = String(vm.fingerprint?.guest_machine_id || vm.fingerprint?.machine_id || '').trim()
   const smbios = readFingerprintSmbios(kvmDir)
+  const customKvm = isCustomKvmMode({ vm, kvmMode, runtimeMode })
+  const hasVhostVsock =
+    customKvm &&
+    accel === 'kvm' &&
+    (typeof vhostVsockAvailable === 'boolean' ? vhostVsockAvailable : isVhostVsockUsable())
+  let resolvedCid = Number.isInteger(vsockCid) && vsockCid >= 1000 ? vsockCid : null
+  if (hasVhostVsock && resolvedCid == null && (vsockLeaseFile || projectRoot)) {
+    const alloc = allocateCid(vm.id, { leaseFile: vsockLeaseFile || undefined, projectRoot })
+    if (alloc.ok) resolvedCid = alloc.cid
+  }
+  const vsockActive = hasVhostVsock && resolvedCid != null
+  let resolvedAgentToken = String(agentToken || '')
+    .trim()
+    .toLowerCase()
+  if (customKvm && !resolvedAgentToken && kvmDir && fs.existsSync(kvmDir)) {
+    resolvedAgentToken = ensureSlotAgentToken(kvmDir)
+  }
   const env = kvmEnvPairs(vm, { uid, gid, memMb, accel, hostName, machineId, shares, smbios, routing })
+  const customMounts = []
+  if (customKvm) {
+    const resolvedStoreMode = String(storeMode || process.env.KIN_KVM_STORE_MODE || DEFAULT_KVM_STORE_MODE).trim()
+    const resolvedStoreBlk = String(storeBlkImage || process.env.KIN_KVM_STORE_BLK_IMAGE || '').trim()
+    const guestUser = slotUser(vm)
+    const guestIds = slotGuestUidGid(vm)
+    const kernelAssets = resolveKvmKernelAssets(CUSTOM_OS_ASSETS_GUEST_DIR, {
+      vm,
+      ...(kernelTrack ? { kernelTrack } : {}),
+    })
+    env.push(
+      `KIN_KVM_MODE=${KVM_MODE_CUSTOM_EROFS}`,
+      `KIN_SLOT_USER=${guestUser}`,
+      `KIN_SLOT_UID=${guestIds.uid}`,
+      `KIN_SLOT_GID=${guestIds.gid}`,
+      `KIN_KVM_KERNEL_TRACK=${kernelAssets.track}`,
+      `KIN_KVM_VSOCK_PORT=${Number(vsockPort || DEFAULT_KVM_VSOCK_PORT)}`,
+      `KIN_KVM_AGENT_VSOCK_PORT=${Number(agentVsockPort || DEFAULT_KVM_AGENT_VSOCK_PORT)}`,
+      `KIN_KVM_STORE_MODE=${resolvedStoreMode}`,
+      `KIN_KVM_STORE_DIR=${CUSTOM_OS_STORE_GUEST_DIR}`,
+      'KIN_KVM_SMBIOS_ARGS_FILE=/slot/kvm/fingerprint/qemu-smbios.args',
+      'KIN_KVM_HW_PLAN_FILE=/slot/kvm/fingerprint/hardware.json',
+      'KIN_KVM_AGENT_SOCK=/slot/kvm/agent.sock',
+      'KIN_KVM_KERNEL_SOCK=/slot/run/kernel.sock',
+    )
+    if (vsockActive) {
+      env.push(`KIN_KVM_VSOCK_CID=${resolvedCid}`)
+    }
+    if (resolvedStoreBlk) {
+      env.push(`KIN_KVM_STORE_BLK_IMAGE=${resolvedStoreBlk}`)
+    }
+    if (resolvedAgentToken) {
+      env.push(`KIN_AGENT_TOKEN=${resolvedAgentToken}`)
+    }
+    const storeHost = resolveHostSharedStoreDir(projectRoot, { sharedStoreHostDir })
+    if (storeHost && (sharedStoreHostDir || fs.existsSync(storeHost))) {
+      if (projectRoot && fs.existsSync(storeHost)) {
+        try {
+          syncSharedStoreGuestBins(projectRoot, {
+            sharedStoreHostDir: storeHost,
+            ...(workerBin ? { workerBin } : {}),
+          })
+        } catch {}
+      }
+      customMounts.push('-v', `${hostOf(storeHost)}:${CUSTOM_OS_STORE_GUEST_DIR}:ro`)
+    }
+    const osAssetsHost = resolveHostCragDebian13OsDir(projectRoot, { osAssetsHostDir })
+    const explicitOsAssets = Boolean(String(osAssetsHostDir || '').trim())
+    const hasOsCoreAssets =
+      Boolean(osAssetsHost) &&
+      fs.existsSync(path.join(osAssetsHost, CUSTOM_OS_EROFS_FILENAME)) &&
+      fs.existsSync(path.join(osAssetsHost, kernelAssets.kernelFilename))
+    if (osAssetsHost && (explicitOsAssets || hasOsCoreAssets)) {
+      // Mount under a dedicated read-only path so `/opt/kin-kvm/guest` inside the runner image is never shadowed.
+      customMounts.push('-v', `${hostOf(osAssetsHost)}:${CUSTOM_OS_ASSETS_GUEST_DIR}:ro`)
+      env.push(
+        `KIN_KVM_EROFS_IMAGE=${CUSTOM_OS_ASSETS_GUEST_DIR}/${CUSTOM_OS_EROFS_FILENAME}`,
+        `KIN_KVM_KERNEL=${kernelAssets.kernelPath}`,
+      )
+      if (
+        kernelAssets.track === KVM_KERNEL_TRACK_CUSTOM ||
+        fs.existsSync(path.join(osAssetsHost, kernelAssets.initrdFilename))
+      ) {
+        env.push(`KIN_KVM_INITRD=${kernelAssets.initrdPath}`)
+      }
+    }
+  }
   const capAdd = KVM_CAPS.flatMap((cap) => ['--cap-add', cap])
-  const device = accel === 'kvm' ? ['--device', '/dev/kvm'] : []
+  const device = [
+    ...(accel === 'kvm' ? ['--device', '/dev/kvm'] : []),
+    ...(vsockActive ? ['--device', '/dev/vhost-vsock'] : []),
+  ]
   return [
     'docker',
     'run',
@@ -1255,6 +1653,7 @@ export function buildKvmRunArgs({
     `${hostOf(runDir)}:/slot/run`,
     '-v',
     `${hostOf(kvmDir)}:/slot/kvm`,
+    ...customMounts,
     ...slotGuestBinMountArgs({
       workerBin,
       kernelBin,
@@ -1285,6 +1684,54 @@ export function dockerSlotResourceArgs(vm, routing) {
     String(pids),
     ...(cpus > 0 ? ['--cpus', String(cpus)] : []),
   ]
+}
+
+/**
+ * Before `docker start` on a stopped custom KVM container, check its baked `KIN_KVM_VSOCK_CID`
+ * against the host lease table: restore the lease if free, or force container recreate if another
+ * live slot now owns that CID.
+ */
+export function reconcileStoppedKvmContainerCid(
+  vmId,
+  container,
+  { projectRoot, leaseFile, run = sh, isPidAlive } = {},
+) {
+  const env = readDockerContainerEnv(container, { run })
+  const bakedCid = Number(env?.KIN_KVM_VSOCK_CID)
+  if (!Number.isInteger(bakedCid) || bakedCid < 1000 || bakedCid > 65535) {
+    return { ok: true, needsRecreate: false, cid: null }
+  }
+  const claimed = claimExistingCid(vmId, bakedCid, { projectRoot, leaseFile, isPidAlive })
+  if (claimed.ok) {
+    return { ok: true, needsRecreate: false, cid: bakedCid, restored: claimed.restored }
+  }
+  return {
+    ok: false,
+    needsRecreate: true,
+    cid: bakedCid,
+    code: claimed.code,
+    error: claimed.error,
+  }
+}
+
+/**
+ * Reconcile a custom KVM CID lease immediately after `docker run` / `docker start`:
+ * bind the live container PID on success, or release an unowned/exited lease on start failure.
+ */
+export function finalizeKvmCidAfterStart(
+  vmId,
+  { ok, pid = 0, bakedCid = null, projectRoot, leaseFile, isPidAlive } = {},
+) {
+  if (!ok) {
+    return releaseCid(vmId, { projectRoot, leaseFile, verifyExited: true, isPidAlive })
+  }
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return { ok: false, code: 'vsock_cid_missing_pid', vmId }
+  }
+  if (Number.isInteger(bakedCid) && bakedCid >= 1000 && bakedCid <= 65535) {
+    return claimExistingCid(vmId, bakedCid, { projectRoot, leaseFile, ownerPid: pid, isPidAlive })
+  }
+  return attachCidOwnerPid(vmId, pid, { projectRoot, leaseFile })
 }
 
 export async function startVmRuntime(vm, projectRoot, { recreate = false, routing, accel, useInstalledCrag } = {}) {
@@ -1344,7 +1791,13 @@ async function startVmRuntimeAdmitted(
   if (zone) vm.timezone = zone
   vm.locale = vm.locale || STANDARD_LOCALE
   const mem = slotMemory(vm, resolvedRouting)
-  const image = kvm ? kvmImageForKernel(kernel) : imageForKernel(kernel)
+  // A slot resized in place keeps booting the exact base image it was created on
+  // (vm.machine.kvm_image_id): a different backing image can reset its qcow overlay.
+  const pinnedKvmImage =
+    kvm && !vm.node_id && /^sha256:[a-f0-9]{64}$/.test(String(vm.machine?.kvm_image_id || ''))
+      ? vm.machine.kvm_image_id
+      : null
+  const image = pinnedKvmImage || (kvm ? kvmImageForKernel(kernel) : imageForKernel(kernel))
   const home = path.join(projectRoot, 'vms', vm.id, 'cli-home')
   fs.mkdirSync(home, { recursive: true })
   try {
@@ -1425,7 +1878,7 @@ async function startVmRuntimeAdmitted(
 
   let worker
   try {
-    worker = writeWorkerFiles(vm, projectRoot, { transparent: true, routing: resolvedRouting })
+    worker = writeWorkerFiles(vm, projectRoot, { transparent: true, routing: resolvedRouting, accel: accelOpt })
   } catch (error) {
     return { ok: false, error: String(error.message || error) }
   }
@@ -1433,7 +1886,7 @@ async function startVmRuntimeAdmitted(
     fs.chownSync(home, runtimeUidNum(vm), Number(GID))
   } catch {}
 
-  const replaceContainer =
+  let replaceContainer =
     shouldReplaceSlotContainer({
       existing,
       recreate: replace,
@@ -1442,6 +1895,15 @@ async function startVmRuntimeAdmitted(
       runtime: runtimeKind(vm),
     }) ||
     (kvm && existing && kvmContainerEnvIncomplete(name, { run: sh }))
+  let stoppedCidCheck = null
+  if (!replaceContainer && kvm && existing && !existing.running && isCustomKvmMode({ vm })) {
+    try {
+      stoppedCidCheck = reconcileStoppedKvmContainerCid(vm.id, name, { projectRoot, run: sh })
+      if (stoppedCidCheck.needsRecreate) replaceContainer = true
+    } catch {
+      replaceContainer = true
+    }
+  }
   if (replaceContainer) {
     // Container only. Host bind mounts (cli-home, run, kvm/, machine-id) stay.
     sh(['docker', 'rm', '-f', name])
@@ -1453,12 +1915,40 @@ async function startVmRuntimeAdmitted(
     runtimePatch(vm, existing, { ...workerRuntimeExtra(worker), memory: mem, routing: resolvedRouting })
     return { ok: true, action: 'already-running', runtime: vm.runtime }
   }
+  if (kvm && isCustomKvmMode({ vm })) {
+    const trackCheck = verifyLocalKvmKernelTrack(projectRoot, vm)
+    if (!trackCheck.ok) {
+      return {
+        ok: false,
+        code: trackCheck.code || 'kvm_custom_kernel_missing',
+        error: trackCheck.error || 'custom KVM kernel verification failed',
+      }
+    }
+  }
   if (existing) {
     const r = sh(['docker', 'start', name])
-    if (!r.ok) return { ok: false, error: r.stderr || 'docker start failed' }
+    if (!r.ok) {
+      if (kvm && isCustomKvmMode({ vm }) && stoppedCidCheck?.cid != null) {
+        try {
+          finalizeKvmCidAfterStart(vm.id, { ok: false, projectRoot })
+        } catch {}
+      }
+      return { ok: false, error: r.stderr || 'docker start failed' }
+    }
+    const startedInfo = inspectContainer(name)
+    if (kvm && isCustomKvmMode({ vm })) {
+      try {
+        finalizeKvmCidAfterStart(vm.id, {
+          ok: true,
+          pid: startedInfo?.pid || 0,
+          bakedCid: stoppedCidCheck?.cid ?? null,
+          projectRoot,
+        })
+      } catch {}
+    }
     const chownErr = applyKvmBindChown(name, vm)
     if (chownErr) return chownErr
-    runtimePatch(vm, inspectContainer(name), { ...workerRuntimeExtra(worker), memory: mem, routing: resolvedRouting })
+    runtimePatch(vm, startedInfo, { ...workerRuntimeExtra(worker), memory: mem, routing: resolvedRouting })
     return { ok: true, action: 'started', runtime: vm.runtime }
   }
 
@@ -1469,14 +1959,22 @@ async function startVmRuntimeAdmitted(
   try {
     computer = ensureSlotComputer(projectRoot, vm)
     rememberComputer(projectRoot, vm, computer)
+    try {
+      syncSlotIdentityTimezoneAndPreset(projectRoot, vm)
+    } catch {}
   } catch (e) {
     return { ok: false, error: e.message || 'computer identity failed' }
   }
   if (!kvm && !computer?.mac) return { ok: false, error: 'computer MAC missing' }
   host = computer.hostname
 
-  const img = await ensureSlotImage(kernel, { projectRoot, runtime: runtimeKind(vm) })
-  if (!img.ok) return img
+  if (pinnedKvmImage) {
+    if (!sh(['docker', 'image', 'inspect', pinnedKvmImage], { timeout: 15_000 }).ok)
+      return { ok: false, code: 'kvm_pinned_image_missing', error: '槽位锁定的基础镜像不存在' }
+  } else {
+    const img = await ensureSlotImage(kernel, { projectRoot, runtime: runtimeKind(vm) })
+    if (!img.ok) return img
+  }
 
   try {
     fs.rmSync(worker.socket, { force: true })
@@ -1545,6 +2043,19 @@ async function startVmRuntimeAdmitted(
       }
       machineMounts.push('--mount', `type=bind,source=${hostOf(directory)},target=${CRAG_HOST_MOUNT},readonly`)
     }
+    const activeCragCaps =
+      !codex && resolveKernelDataplane(vm, resolvedRouting) === 'crag'
+        ? activeCragManifestForSlot(projectRoot, vm, home)?.capabilities
+        : undefined
+    const regularEtcTargets = dockerImageHasRegularEtcTargets(image)
+    const slotIdentityArgs = dockerSlotUserArgs({
+      vm,
+      home,
+      projectRoot,
+      uid: runtimeUidNum(vm),
+      gid: Number(GID),
+      hostOf,
+    })
     args = [
       'docker',
       'run',
@@ -1565,20 +2076,7 @@ async function startVmRuntimeAdmitted(
       '--read-only',
       '--tmpfs',
       '/tmp:rw,noexec,nosuid,size=32m',
-      '--security-opt',
-      'no-new-privileges',
-      ...(resolveKernelDataplane(vm, resolvedRouting) === 'crag' &&
-      resolveCragKernelVersion(vm, resolvedRouting) === 'v2'
-        ? ['--init']
-        : []),
-      ...(resolveKernelDataplane(vm, resolvedRouting) === 'crag' &&
-      resolveCragKernelVersion(vm, resolvedRouting) === 'v2'
-        ? [
-            '--security-opt',
-            `seccomp=${CRAG_V2_SECCOMP_PATH}`,
-            ...(cragDockerAppArmorProfile() ? ['--security-opt', `apparmor=${cragDockerAppArmorProfile()}`] : []),
-          ]
-        : []),
+      ...cragDockerSandboxArgs(vm, resolvedRouting, { capabilities: activeCragCaps }),
       '--cap-drop',
       'ALL',
       '--label',
@@ -1592,8 +2090,7 @@ async function startVmRuntimeAdmitted(
       '--label',
       'kin.vm.runtime=docker',
       ...(codex ? ['--label', `kin.vm.role=${CODEX_SLOT_ROLE}`] : []),
-      '-v',
-      `${hostOf(home)}:/home/kincli`,
+      ...slotIdentityArgs.mountArgs,
       '-v',
       `${hostOf(worker.runDir)}:/run/kin`,
       ...slotGuestBinMountArgs({
@@ -1604,15 +2101,22 @@ async function startVmRuntimeAdmitted(
         projectRoot,
       }),
       ...machineMounts,
-      ...computerDockerArgs({ dir: computer.dir, mac: computer.mac, hostOf }),
-      '-e',
-      'HOME=/home/kincli',
-      '-e',
-      'CLAUDE_CONFIG_DIR=/home/kincli/.claude',
+      ...computerDockerArgs({ dir: computer.dir, mac: computer.mac, hostOf, regularEtcTargets }),
+      ...cragCustomOsDockerMountArgs(vm, {
+        routing: resolvedRouting,
+        projectRoot,
+        hostOf,
+        computerDir: computer.dir,
+        capabilities: activeCragCaps,
+      }),
+      ...dockerLxcfsMountArgs({ hostOf }),
+      ...slotIdentityArgs.envArgs,
       '-e',
       `TZ=${zone || 'UTC'}`,
       '-e',
       `LANG=${vm.locale}`,
+      '-e',
+      `LC_ALL=${vm.locale}`,
       '-e',
       `KIN_VM_ID=${vm.id}`,
       '-e',
@@ -1625,23 +2129,36 @@ async function startVmRuntimeAdmitted(
       '--dns-opt',
       'use-vc',
       '-w',
-      '/home/kincli',
+      slotIdentityArgs.userHome,
       image,
       ...slotContainerCommand(vm, { wrapKernel: fs.existsSync(wrapKernel), routing: resolvedRouting }),
     ]
   }
 
   const r = sh(args, { timeout: 90_000 })
-  if (!r.ok) return { ok: false, error: r.stderr || r.stdout || 'docker run failed' }
+  if (!r.ok) {
+    if (kvm && isCustomKvmMode({ vm })) {
+      try {
+        finalizeKvmCidAfterStart(vm.id, { ok: false, projectRoot })
+      } catch {}
+    }
+    return { ok: false, error: r.stderr || r.stdout || 'docker run failed' }
+  }
   // The container is on the bridge now, so the network can speak for this
   // address and the claim has done its job. Dropping it is tidiness rather
   // than correctness: a claim left behind keeps an address reserved until it
   // expires, which is the safe direction, and readSharedClaims discards
   // expired entries on read.
   if (slotNet.ip) releaseSharedIp(projectRoot, sharedNodeIdForVm(vm), vm.id)
+  const startedInfo = inspectContainer(name)
+  if (kvm && isCustomKvmMode({ vm })) {
+    try {
+      finalizeKvmCidAfterStart(vm.id, { ok: true, pid: startedInfo?.pid || 0, projectRoot })
+    } catch {}
+  }
   const chownErr = applyKvmBindChown(name, vm)
   if (chownErr) return chownErr
-  runtimePatch(vm, inspectContainer(name), {
+  runtimePatch(vm, startedInfo, {
     container_id: r.stdout,
     memory: mem,
     routing: resolvedRouting,

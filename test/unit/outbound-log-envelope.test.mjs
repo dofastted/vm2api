@@ -532,8 +532,10 @@ unixTest('zero CRAG sends mixed Responses tools and structured system to the cap
   assert.equal(Object.hasOwn(envelope, 'headers'), false)
   assert.equal(envelope.body.tools.length, 48)
   assert.deepEqual(envelope.body.tools[47], search)
-  assert.deepEqual(envelope.body.system, [{ type: 'text', text: CRS_OFFICIAL_CLI_SYSTEM }])
-  assert.deepEqual(envelope.body.messages[0].content[0], { type: 'text', text: 'Caller policy' })
+  // Mode 3 (zero) preserves caller system verbatim in system[] without relocating to messages[0]
+  // or injecting an official identity placeholder.
+  assert.deepEqual(envelope.body.system, [{ type: 'text', text: 'Caller policy' }])
+  assert.deepEqual(envelope.body.messages[0].content[0], { type: 'text', text: 'Sample' })
   assert.equal(envelope.body.crag_prompt, undefined)
 })
 
@@ -657,16 +659,19 @@ for (const stream of [false, true]) {
           }),
         )
         assert.equal(envelope.caller_cwd, trustedCwd)
-        assertIdentityPlaceholderOmitted(envelope)
-        assert.deepEqual(envelope.body.messages[0].content[0], { type: 'text', text: 'caller guidance' })
+        if (preset === 'zero') {
+          // Mode 3 (zero) never relocates caller system into messages[0]; legacy CRAG carries it via crag_prompt replace.
+          assert.deepEqual(envelope.body.crag_prompt, { mode: 'replace', text: 'caller guidance' })
+          assert.deepEqual(envelope.body.messages[0].content[0], { type: 'text', text: 'hi' })
+        } else {
+          assertIdentityPlaceholderOmitted(envelope)
+          assert.deepEqual(envelope.body.messages[0].content[0], { type: 'text', text: 'caller guidance' })
+        }
         assert.equal(envelope.body.crag_model.id, 'claude-haiku-4-5-20251001')
         assert.equal(JSON.stringify(envelope.body).includes(trustedCwd), false)
         assert.equal(JSON.stringify(extra.outbound_body).includes(trustedCwd), false)
         assert.equal(extra.official_cc_inference, 'crag-print')
-        // No prompt override leaves the gateway once the identity placeholder is
-        // dropped, so the hop log records 'default' for both presets rather than
-        // the preset's mode. `preset` still drives the test matrix above.
-        assert.equal(extra.crag_print.prompt_mode, 'default')
+        assert.equal(extra.crag_print.prompt_mode, preset === 'zero' ? 'replace' : 'default')
       },
     )
 
@@ -685,14 +690,25 @@ for (const stream of [false, true]) {
           }),
         )
         assert.equal(envelope.caller_cwd, trustedCwd)
-        assertIdentityPlaceholderOmitted(envelope)
-        // The declaration leaves with caller_cwd; the lifted history keeps its own copy.
-        assert.deepEqual(
-          envelope.body.messages[0].content.slice(0, 2).map((block) => block.text),
-          ['caller guidance', history],
-        )
+        if (preset === 'zero') {
+          // Mode 3 (zero) never relocates caller system (including lifted role=system history) into messages[0];
+          // legacy CRAG receives the caller system verbatim via crag_prompt replace, keeping history's <cwd> intact.
+          assert.deepEqual(envelope.body.crag_prompt, { mode: 'replace', text: `caller guidance\n\n${history}` })
+          assert.deepEqual(
+            envelope.body.messages[0].content.slice(0, 1).map((block) => block.text),
+            ['hi'],
+          )
+          assert.deepEqual(extra.outbound_body.crag_prompt.text, `caller guidance\n\n${history}`)
+        } else {
+          assertIdentityPlaceholderOmitted(envelope)
+          // The declaration leaves with caller_cwd; the lifted history keeps its own copy.
+          assert.deepEqual(
+            envelope.body.messages[0].content.slice(0, 2).map((block) => block.text),
+            ['caller guidance', history],
+          )
+          assert.deepEqual(extra.outbound_body.messages[0].content[1].text, history)
+        }
         assert.equal(JSON.stringify(envelope.body).split(trustedCwd).length - 1, 1)
-        assert.deepEqual(extra.outbound_body.messages[0].content[1].text, history)
         assert.equal(Object.hasOwn(envelope.body, 'system'), false)
         assert.equal(
           envelope.body.messages.some((message) => message.role === 'system'),
@@ -744,9 +760,9 @@ for (const stream of [false, true]) {
         assert.equal(Object.hasOwn(envelope.body, 'crag_model'), false)
         assert.equal(extra.official_cc_inference, 'cli-hop')
         assert.equal(Object.hasOwn(extra, 'crag_print'), false)
-        // cli-node does not extract the declaration: the caller system moves verbatim.
-        assert.equal(envelope.body.messages[0].content[0].text, `${cwdTag(trustedCwd)}\ncaller guidance`)
-        assert.equal(JSON.stringify(envelope.body.system).includes(trustedCwd), false)
+        // cli-node Mode 3 (zero) preserves caller system verbatim in system[] (never relocated into messages[0]).
+        assert.equal(envelope.body.system[1].text, `${cwdTag(trustedCwd)}\ncaller guidance`)
+        assert.equal(envelope.body.messages[0].content[0].text, 'hi')
       }
       const stableSystem = ({ envelope }) => {
         const [billing, ...system] = envelope.body.system

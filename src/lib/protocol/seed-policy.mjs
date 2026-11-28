@@ -180,6 +180,33 @@ export function standardSeedPolicy(partial = {}, { defaultEnabled = false } = {}
   return defaultSeedPolicy({ ...partial, telemetry_disabled: telemetryDisabled })
 }
 
+export const INBOUND_IDENTITY_HEADER_KEYS = Object.freeze(['x-machine-id', 'x-kin-machine-id', 'x-kin-device-id'])
+
+export const INBOUND_IDENTITY_BODY_KEYS = Object.freeze([
+  'machine_id',
+  'machineId',
+  'meachine_id',
+  'meachineId',
+  'device_id',
+  'deviceId',
+])
+
+const STRIPPED_IDENTITY_HEADER_SET = new Set(INBOUND_IDENTITY_HEADER_KEYS)
+
+/**
+ * Strip inbound machine/device identity headers before forwarding upstream.
+ * Matches header names case-insensitively so mixed-case keys never leak.
+ */
+export function sanitizeOutboundHeaders(headers = {}) {
+  if (!headers || typeof headers !== 'object') return {}
+  const out = {}
+  for (const [k, v] of Object.entries(headers)) {
+    if (STRIPPED_IDENTITY_HEADER_SET.has(String(k).toLowerCase())) continue
+    out[k] = v
+  }
+  return out
+}
+
 /**
  * Strip client-local settings fingerprints from inbound body.
  * Forwarding layer must not honor client settings.json / machine metadata.
@@ -196,10 +223,14 @@ export function sanitizeInboundBody(body, seedPolicy = {}) {
     delete md.userId
     delete md.machine_id
     delete md.machineId
+    delete md.meachine_id
+    delete md.meachineId
+    delete md.device_id
+    delete md.deviceId
     delete md.session_source
     const allow = {}
     for (const [k, v] of Object.entries(md)) {
-      if (!/user|machine|device|host|tz|timezone|locale|setting/i.test(k)) allow[k] = v
+      if (!/user|me?achine|device|host|tz|timezone|locale|setting/i.test(k)) allow[k] = v
     }
     if (Object.keys(allow).length) out.metadata = allow
     else delete out.metadata
@@ -212,6 +243,7 @@ export function sanitizeInboundBody(body, seedPolicy = {}) {
   if (rejectMeta) {
     delete out.user
     delete out.user_id
+    for (const key of INBOUND_IDENTITY_BODY_KEYS) delete out[key]
   }
   return out
 }

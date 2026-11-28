@@ -56,6 +56,7 @@ import { vmCostLedger, vmTodayStats, vmWeekOutcome } from '@/lib/vm-usage'
 import { useNow } from '@/hooks/use-now'
 import { Button } from '@/components/ui/button'
 import { StatusMark } from '@/components/status-mark'
+import { NodePoolBadges } from '@/features/pools/node-pool-badges'
 import { ProxyChip } from '@/features/proxies/proxy-chip'
 import {
   SchedulableSwitch,
@@ -216,13 +217,15 @@ function SchedCell({ vm }: { vm: Vm }) {
         )}
         title={
           levelOk
-            ? `${manual ? '手动指定' : '自动分配'}的优先级，数字越大越优先`
+            ? `${manual ? '手动（manual）' : '自动（auto）'} · 有效值 ${level}（1–10，数字越大越优先）`
             : '没有调度优先级'
         }
       >
         P{levelOk ? level : '—'}
-        {levelOk && manual ? (
-          <small className='ml-0.5 font-sans font-semibold'>手</small>
+        {levelOk ? (
+          <small className='ml-0.5 font-sans font-semibold'>
+            {manual ? '手' : '自'}
+          </small>
         ) : null}
       </span>
       {reason ? (
@@ -596,6 +599,12 @@ function ProdCell({ vm }: { vm: Vm }) {
       >
         {vm.gemini ? 'CRAGAnti' : crag ? 'crag' : '默认'}
       </span>
+      <NodePoolBadges
+        pools={vm.pools}
+        maxVisible={1}
+        compact
+        className='shrink-0'
+      />
       <span
         className={cn(
           'min-w-0 flex-1 truncate text-[11.5px] text-muted-foreground',

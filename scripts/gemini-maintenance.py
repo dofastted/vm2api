@@ -31,6 +31,13 @@ _SCRIPT_DIR = Path(__file__).resolve().parent
 if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
+from gemini_agy_patch import (
+    AGY_PATCHED_SHA256,
+    AGY_UNPATCHED_SHA256,
+    file_sha256,
+    inspect_agy_patch,
+    patch_agy,
+)
 from gemini_host_apparmor import (
     APPARMOR_MARKER,
     APPARMOR_PROFILE_NAME,
@@ -77,6 +84,7 @@ RUNTIME_FILES = (
     "src/lib/gemini/payload.mjs",
     "bin/kin-egress",
     "scripts/gemini_host_apparmor.py",
+    "scripts/gemini_agy_patch.py",
 )
 VERIFIER_FILES = RUNTIME_FILES[5:7]
 MEMBERS = ("manifest.json", "manifest.sig", "agy", "craggemini", "libagy_bridge.so")
@@ -95,6 +103,7 @@ CRAG_MEMBERS = (
 )
 CRAG_ASSETS = tuple(name for name in CRAG_MEMBERS if name != "agy")
 SYSTEMD_UNIT = "vm2api-gemini.service"
+OAUTH_ENV_FILE = "/etc/vm2api/gemini-oauth.env"
 APPARMOR_SERVICE = "apparmor.service"
 APPARMOR_PROFILE_CONTENT = apparmor_profile_bytes()
 SANDBOX_ERROR_CODES = frozenset(
@@ -683,12 +692,19 @@ class Maintenance:
             rb"(?m)^export const AGY_SHA256 = '([0-9a-f]{64})'$", verifier_code
         )
         self.known_cli = cli_pin[1].decode("ascii") if cli_pin else None
+        self.known_cli_digests = (
+            {self.known_cli, AGY_PATCHED_SHA256}
+            if self.known_cli == AGY_UNPATCHED_SHA256
+            else ({self.known_cli} if self.known_cli else set())
+        )
         self.guard = threading.Lock()
         self.job = None
         self.verified = {}
         self.last_inspection = 0.0
         self.inspecting = False
         self.egress_ok = None
+        self.agy_patch_status = None
+        self.agy_patch_cache = None
         self.sandbox_status = None
         self.sandbox_checked_at = 0.0
 
@@ -844,6 +860,8 @@ class Maintenance:
             with self.guard:
                 self.last_inspection = 0.0
                 if action != "diagnose":
+                    self.agy_patch_status = None
+                    self.agy_patch_cache = None
                     self.sandbox_status = None
                     self.sandbox_checked_at = 0.0
                 self.job.update(
@@ -934,7 +952,15 @@ class Maintenance:
         )
         with self.guard:
             egress_ok = self.egress_ok
+            agy_patch = self.agy_patch_status
             job = self.job.copy() if self.job else None
+        if agy_patch is None:
+            agy_patch = (
+                ("warning", "gemini_payload_not_installed")
+                if not exists(self.current)
+                else ("warning", "gemini_maintenance_agy_patch_unverified")
+            )
+        check("agy_patch", agy_patch[0], agy_patch[1])
         check(
             "pinned_egress",
             "pass" if egress_ok else "warning" if egress_ok is None else "fail",
@@ -1395,6 +1421,50 @@ class Maintenance:
             return static
         return ("warning", "gemini_maintenance_sandbox_unverified")
 
+    def attach_unit_oauth_env_file(self, data):
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            raise fail("unsupported_service_config") from None
+        directive = f"EnvironmentFile=-{OAUTH_ENV_FILE}"
+        lines = text.splitlines()
+        section = ""
+        has_service = False
+        has_env_file = False
+        for raw_line in lines:
+            trimmed = raw_line.strip()
+            if not trimmed or trimmed.startswith(("#", ";")):
+                continue
+            if trimmed.startswith("[") and trimmed.endswith("]"):
+                section = trimmed
+                if section == "[Service]":
+                    has_service = True
+                continue
+            if section == "[Service]" and trimmed.startswith("EnvironmentFile="):
+                target = trimmed.split("=", 1)[1].strip().lstrip("-")
+                if target == OAUTH_ENV_FILE:
+                    has_env_file = True
+        if not has_service or has_env_file:
+            return data
+        out = []
+        section = ""
+        inserted = False
+        for raw_line in lines:
+            trimmed = raw_line.strip()
+            if trimmed.startswith("[") and trimmed.endswith("]"):
+                if section == "[Service]" and not inserted:
+                    out.append(directive)
+                    inserted = True
+                section = trimmed
+            out.append(raw_line)
+            if section == "[Service]" and not inserted and trimmed == "[Service]":
+                out.append(directive)
+                inserted = True
+        if section == "[Service]" and not inserted:
+            out.append(directive)
+        suffix = "\n" if text.endswith("\n") else ""
+        return ("\n".join(out) + suffix).encode("utf-8")
+
     def write_unit(self, before, default=None, *, apparmor=None):
         want_apparmor = (
             self.apparmor_userns_restricted() if apparmor is None else bool(apparmor)
@@ -1417,7 +1487,8 @@ class Maintenance:
         if default is None and options["--egress"] == str(
             self.runtime / "bin/kin-egress"
         ):
-            return self.attach_unit_apparmor(before) if want_apparmor else before
+            updated = self.attach_unit_oauth_env_file(before)
+            return self.attach_unit_apparmor(updated) if want_apparmor else updated
         options["--egress"] = str(self.runtime / "bin/kin-egress")
         if default is not None:
             if self.crag_bundle:
@@ -1456,6 +1527,7 @@ class Maintenance:
         updated = re.sub(
             rb"(?m)^[ \t]*ExecStart=[^\r\n]*", line.encode(), before, count=1
         )
+        updated = self.attach_unit_oauth_env_file(updated)
         return self.attach_unit_apparmor(updated) if want_apparmor else updated
 
     def is_crag_manifest(self, raw):
@@ -1611,7 +1683,7 @@ class Maintenance:
             declared = manifest.get("cli_version")
             if isinstance(declared, str) and SAFE_VERSION.fullmatch(declared):
                 cli = declared
-            elif self.known_cli is not None and members["agy"][1] == self.known_cli:
+            elif self.known_cli_digests and members["agy"][1] in self.known_cli_digests:
                 cli = self.release["cli_version"]
         result = {
             "version": version,
@@ -1669,12 +1741,12 @@ class Maintenance:
 
         version = field("software_version")
         cli = field("cli_version")
-        if version is not None and cli is None and self.known_cli is not None:
+        if version is not None and cli is None and self.known_cli_digests:
             # A schema-1 or crag manifest carries no CLI version field. Order against
             # the pinned CLI only when the payload records the agy this release pins,
             # read from the same manifest map the verified crag path uses for members.
             digests = manifest.get("sha256")
-            if isinstance(digests, dict) and digests.get("agy") == self.known_cli:
+            if isinstance(digests, dict) and digests.get("agy") in self.known_cli_digests:
                 cli = self.release["cli_version"]
         return version, cli
 
@@ -1728,6 +1800,76 @@ class Maintenance:
             "activation_required": locked,
         }
 
+    def assess_agy_patch(self):
+        agy_path = self.current / "agy"
+        if not exists(agy_path):
+            status = ("warning", "gemini_payload_not_installed")
+            with self.guard:
+                self.agy_patch_status = status
+                self.agy_patch_cache = None
+            return status
+        try:
+            info = require_root(agy_path, stat.S_ISREG)
+            stat_key = (
+                info.st_dev,
+                info.st_ino,
+                info.st_size,
+                info.st_ctime_ns,
+                info.st_mtime_ns,
+            )
+            with self.guard:
+                cached = self.agy_patch_cache
+            if cached is not None and cached[0] == stat_key:
+                with self.guard:
+                    self.agy_patch_status = cached[1]
+                return cached[1]
+            inspected = inspect_agy_patch(agy_path)
+            if inspected["state"] == "patched":
+                status = ("pass", None)
+            elif inspected["state"] == "unpatched":
+                status = ("fail", "gemini_maintenance_agy_patch_missing")
+            else:
+                status = ("fail", "gemini_maintenance_agy_patch_unknown")
+            with self.guard:
+                self.agy_patch_cache = (stat_key, status)
+                self.agy_patch_status = status
+            return status
+        except (OSError, ValueError):
+            status = ("fail", "gemini_maintenance_agy_patch_unknown")
+            with self.guard:
+                self.agy_patch_status = status
+                self.agy_patch_cache = None
+            return status
+
+    def ensure_staged_agy_patched(self, payload_dir):
+        agy_path = payload_dir / "agy"
+        try:
+            require_root(agy_path, stat.S_ISREG)
+            inspected = inspect_agy_patch(agy_path)
+            if inspected["state"] == "patched":
+                return False
+            if inspected["state"] == "unpatched":
+                before_sha = file_sha256(agy_path)
+                if before_sha == AGY_UNPATCHED_SHA256:
+                    patch_agy(
+                        agy_path,
+                        create_backup=False,
+                        expected_unpatched_sha256=AGY_UNPATCHED_SHA256,
+                        expected_patched_sha256=AGY_PATCHED_SHA256,
+                    )
+                else:
+                    patch_agy(agy_path, create_backup=False)
+                return True
+            if inspected["state"] == "unknown":
+                if file_sha256(agy_path) == AGY_UNPATCHED_SHA256:
+                    raise fail("agy_patch_failed")
+                return False
+        except Failure:
+            raise
+        except (LookupError, OSError, ValueError):
+            raise fail("agy_patch_failed") from None
+        raise fail("agy_patch_failed")
+
     def inspect(self, *, force_sandbox=False):
         if exists(self.pending):
             return
@@ -1743,6 +1885,10 @@ class Maintenance:
             egress_ok = False
         with self.guard:
             self.egress_ok = egress_ok
+        try:
+            self.assess_agy_patch()
+        except (Failure, OSError, ValueError):
+            pass
         service = getattr(self, "service", None)
         if service is not None:
             try:
@@ -2079,6 +2225,11 @@ class Maintenance:
                 and current["digest"] != self.pins["manifest.json"]["sha256"]
             )
             verifier_root = current["verifier_root"] if current is not None else None
+            agy_needs_patch = (
+                current is not None
+                and self.assess_agy_patch()
+                == ("fail", "gemini_maintenance_agy_patch_missing")
+            )
             rollback = action == "rollback"
             if rollback:
                 record = self.backup_record()
@@ -2114,17 +2265,27 @@ class Maintenance:
                 if (
                     target["pinned"]
                     and current["digest"] == self.pins["manifest.json"]["sha256"]
+                    and not agy_needs_patch
                 ):
                     return
                 use_apparmor = self.prepare_apparmor(service_info, before)
                 default, staged_digest, members = self.stage_release(target["id"])
-                if current["digest"] == staged_digest:
+                if current["digest"] == staged_digest and not agy_needs_patch:
                     return
                 if action == "update_cli" and any(
                     members[m] != current["members"][m]
                     for m in ("craggemini", "libagy_bridge.so")
                 ):
                     raise fail("cli_incompatible", 409)
+                if self.ensure_staged_agy_patched(self.transaction / "payload"):
+                    staged_key = (
+                        default / "crag-license-public.pem"
+                        if self.crag_bundle
+                        else default / "gemini-ed25519.pub"
+                    )
+                    self.verify(
+                        self.transaction / "payload", staged_key, self.bundle
+                    )
                 target_unit = self.write_unit(before, default, apparmor=use_apparmor)
                 new_activation = None
                 preserve_runtime = False
@@ -2147,8 +2308,17 @@ class Maintenance:
                         candidate["verifier_root"],
                         dest=self.transaction / "payload",
                     )
-                    preserve_runtime = True
-                    verifier_root = candidate["verifier_root"]
+                    if self.ensure_staged_agy_patched(self.transaction / "payload"):
+                        self.verify(
+                            self.transaction / "payload",
+                            candidate["key"],
+                            self.bundle,
+                        )
+                        preserve_runtime = False
+                        verifier_root = self.bundle
+                    else:
+                        preserve_runtime = True
+                        verifier_root = candidate["verifier_root"]
                     materialized = True
                 if not materialized:
                     configured_key = (
@@ -2195,10 +2365,34 @@ class Maintenance:
                             if configured["manifest_sha256"] != pinned_digest:
                                 raise fail("repair_release_unknown", 409)
                     default, staged_digest, _ = self.stage_release(target["id"])
+                    if self.ensure_staged_agy_patched(self.transaction / "payload"):
+                        staged_key = (
+                            default / "crag-license-public.pem"
+                            if self.crag_bundle
+                            else default / "gemini-ed25519.pub"
+                        )
+                        self.verify(
+                            self.transaction / "payload", staged_key, self.bundle
+                        )
                     target_unit = self.write_unit(before, default, apparmor=use_apparmor)
                     if current_id is None or digest != staged_digest:
                         new_activation = None
                     verifier_root = self.bundle
+            elif agy_needs_patch and action in {"install", "repair", "recover"}:
+                self.verify(
+                    self.current,
+                    current["key"],
+                    current["verifier_root"],
+                    dest=self.transaction / "payload",
+                )
+                self.ensure_staged_agy_patched(self.transaction / "payload")
+                self.verify(
+                    self.transaction / "payload",
+                    current["key"],
+                    self.bundle,
+                )
+                preserve_runtime = False
+                verifier_root = self.bundle
             target_unit = self.write_unit(
                 target_unit, apparmor=False if rollback else use_apparmor
             )
@@ -2244,6 +2438,7 @@ class Maintenance:
                 self.service.reload()
                 self.service.start()
                 self.verify_existing(self.current, self.unit_bytes())
+                self.assess_agy_patch()
                 if journal["new_unit"]:
                     self.service.set_enabled(True)
                 journal["committed"] = True
@@ -2575,6 +2770,7 @@ def serve(daemon, socket_path, gid, *, stop=None):
             bound = socket_identity(socket_path)
             os.chown(socket_path, 0, gid, follow_symlinks=False)
             socket_path.chmod(0o660)
+            daemon.inspect_later()
             notify = os.environ.get("NOTIFY_SOCKET")
             if notify:
                 with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as readiness:

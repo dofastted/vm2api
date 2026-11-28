@@ -665,3 +665,45 @@ unixTest('administrator configuration at the transcript drop-in path is left in 
   assert.equal(successful(fx.run()).transcripts, 'operator-managed')
   assert.equal(fx.read(transcriptDropinPath), custom)
 })
+
+const guestSetupPath = '/usr/local/sbin/kin-guest-setup'
+const guestSetup = (cache) =>
+  '#!/bin/sh\nif has_share home; then\n' +
+  `  mount_9p kinhome /home/kincli ${cache}\nfi\nif has_share claude; then\n` +
+  `  mount_9p kinclaude /home/kincli/.claude ${cache}\nfi\n` +
+  'mount_9p kinrun /run/kin none\nmount_9p kinpayload /opt/kin-payload loose\n'
+
+unixTest(
+  'existing guests get kinhome/kinclaude switched from cache=mmap to cache=none for the next boot (#1877)',
+  (context) => {
+    const fx = fixture(context)
+    fx.write(guestSetupPath, guestSetup('mmap'), 0o755)
+    assert.equal(successful(fx.run({ restart: true })).guest_9p_cache, 'upgraded-next-boot')
+    assert.equal(fx.read(guestSetupPath), guestSetup('none'))
+    assert.equal(fs.statSync(fx.file(guestSetupPath)).mode & 0o777, 0o755)
+    // Only the two home mounts change; kinpayload keeps cache=loose.
+    assert.match(fx.read(guestSetupPath), /mount_9p kinpayload \/opt\/kin-payload loose/)
+    assert.equal(successful(fx.run()).guest_9p_cache, 'current')
+  },
+)
+
+unixTest('the 9p cache upgrade also runs when the slot is not on CRAG v2', (context) => {
+  const fx = fixture(context, { config: { dataplane: 'wrap' } })
+  fx.write(guestSetupPath, guestSetup('mmap'), 0o755)
+  assert.equal(successful(fx.run()).guest_9p_cache, 'upgraded-next-boot')
+  assert.equal(fx.read(guestSetupPath), guestSetup('none'))
+})
+
+unixTest('guest setup scripts that are missing, symlinked or hand-edited are left alone', (context) => {
+  const fx = fixture(context)
+  assert.equal(successful(fx.run()).guest_9p_cache, 'no-guest-setup')
+  const doubled = guestSetup('mmap') + '  mount_9p kinhome /home/kincli mmap\n'
+  fx.write(guestSetupPath, doubled, 0o755)
+  assert.equal(successful(fx.run()).guest_9p_cache, 'operator-managed')
+  assert.equal(fx.read(guestSetupPath), doubled)
+  fs.rmSync(fx.file(guestSetupPath))
+  fx.write('/usr/local/sbin/real-setup', guestSetup('mmap'), 0o755)
+  fs.symlinkSync(fx.file('/usr/local/sbin/real-setup'), fx.file(guestSetupPath))
+  assert.equal(successful(fx.run()).guest_9p_cache, 'operator-managed')
+  assert.equal(fx.read('/usr/local/sbin/real-setup'), guestSetup('mmap'))
+})

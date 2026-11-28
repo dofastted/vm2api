@@ -4,7 +4,7 @@ import { classifyCredentialRefresh, refreshErrorCodeOf } from '../../src/lib/oau
 import { needsScheduledRefresh } from '../../src/lib/oauth/credential-refresh-monitor.mjs'
 import { runSlotOauth } from '../../src/lib/transport/slot-oauth.mjs'
 
-const exec = { vmId: 'vm-07', vm: {} }
+const exec = { vmId: 'vm-07', vm: { id: 'vm-07', proxy: { id: 'px-local', kind: 'local' } } }
 const ok = '{"ok":true,"status":200,"body":{"refreshed":true},"headers":{}}'
 const invalidArguments =
   '{"ok":false,"status":0,"body":{"error":{"code":"invalid_arguments","message":"invalid oauth arguments"}},"headers":{}}'
@@ -70,7 +70,13 @@ test('an attempt that started but never reported back is telemetry-recorded as u
 })
 
 test('transport failures are safe to retry only behind the attempt journal', () => {
-  for (const code of ['worker_output_invalid', 'worker_exec_failed', 'worker_timeout', 'credential_pull_failed']) {
+  for (const code of [
+    'worker_output_invalid',
+    'worker_exec_failed',
+    'worker_timeout',
+    'credential_pull_failed',
+    'credential_sync_failed',
+  ]) {
     assert.equal(classifyCredentialRefresh({ ok: false, error: { code }, attempt_guard: true }), 'retryable', code)
     const unguarded = { ok: false, error: { code }, attempt_guard: false }
     assert.equal(classifyCredentialRefresh(unguarded), 'failed', code)

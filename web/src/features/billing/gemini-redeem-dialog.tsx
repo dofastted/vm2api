@@ -75,10 +75,15 @@ export function GeminiRedeemDialog({
   const [open, setOpen] = useState(false)
   const [code, setCode] = useState('')
   const [successMessage, setSuccessMessage] = useState<string>()
-  const [error, setError] = useState<{ message: string; code?: string } | null>(
-    null
-  )
+  const [error, setError] = useState<{
+    message: string
+    code?: string
+    recovery?: string
+    requestId?: string
+  } | null>(null)
   const [pending, setPending] = useState(false)
+  const [rebuilding, setRebuilding] = useState(false)
+  const [rebuildNotice, setRebuildNotice] = useState<string>()
   const redeeming = useRef(false)
   const done = useRef<HTMLButtonElement>(null)
   const codeId = useId()
@@ -87,6 +92,33 @@ export function GeminiRedeemDialog({
     if (successMessage) done.current?.focus()
   }, [successMessage])
 
+  async function rebuildIdentity() {
+    if (rebuilding || pending) return
+    setRebuilding(true)
+    setRebuildNotice(undefined)
+    try {
+      await api('/api/panel/gemini/crag-subscription/rebuild-identity', {
+        method: 'POST',
+        body: '{}',
+      })
+      setError(null)
+      setRebuildNotice(
+        '已为本机重建 CRAGGemini 设备标识，请点击下方按钮重新提交兑换码。'
+      )
+      onRedeemed()
+    } catch (failure) {
+      setError({
+        message:
+          isApiError(failure) && isDisplayableRedeemError(failure.code)
+            ? failure.message
+            : '重建设备标识失败，请稍后重试。',
+        code: isApiError(failure) ? failure.code : undefined,
+      })
+    } finally {
+      setRebuilding(false)
+    }
+  }
+
   async function redeem(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
     const trimmed = code.trim()
@@ -94,6 +126,7 @@ export function GeminiRedeemDialog({
     redeeming.current = true
     setPending(true)
     setError(null)
+    setRebuildNotice(undefined)
     const useSubscriptionEndpoint =
       trimmed.startsWith('CRAGR1.') ||
       (isSubscriptionMode && !trimmed.startsWith('CGG1-'))
@@ -127,12 +160,26 @@ export function GeminiRedeemDialog({
       }
       onRedeemed()
     } catch (failure) {
+      const details = isApiError(failure)
+        ? (failure.details as
+            { recovery?: unknown; authority_request_id?: unknown } | undefined)
+        : undefined
+      const recovery =
+        typeof details?.recovery === 'string' ? details.recovery : undefined
+      const requestId =
+        typeof details?.authority_request_id === 'string'
+          ? details.authority_request_id
+          : undefined
       setError({
         message:
           isApiError(failure) && isDisplayableRedeemError(failure.code)
-            ? failure.message
+            ? recovery === 'host_id_collision'
+              ? '检测到本机 CRAGGemini 设备标识与其他主机冲突（常见于克隆镜像未重置 machine-id）。可点击下方「重建设备标识」后重新兑换。'
+              : failure.message
             : '无法确认兑换结果，请重试。',
         code: isApiError(failure) ? failure.code : undefined,
+        recovery,
+        requestId,
       })
     } finally {
       redeeming.current = false
@@ -144,10 +191,11 @@ export function GeminiRedeemDialog({
     <Dialog
       open={open}
       onOpenChange={(next) => {
-        if (redeeming.current) return
+        if (redeeming.current || rebuilding) return
         if (!next) {
           setCode('')
           setError(null)
+          setRebuildNotice(undefined)
           setSuccessMessage(undefined)
         }
         setOpen(next)
@@ -212,15 +260,33 @@ export function GeminiRedeemDialog({
                 aria-describedby={error ? `${codeId}-error` : undefined}
                 required
               />
+              {rebuildNotice ? (
+                <p role='status' className='text-sm text-muted-foreground'>
+                  {rebuildNotice}
+                </p>
+              ) : null}
               {error ? (
-                <div className='space-y-1'>
+                <div className='space-y-1.5'>
                   <p
                     id={`${codeId}-error`}
                     role='alert'
                     className='text-sm text-destructive'
                   >
                     {error.message}
+                    {error.requestId ? `（请求 ID：${error.requestId}）` : ''}
                   </p>
+                  {error.code === 'auth_forbidden' &&
+                  error.recovery === 'host_id_collision' ? (
+                    <Button
+                      type='button'
+                      size='sm'
+                      variant='outline'
+                      disabled={pending || rebuilding}
+                      onClick={() => void rebuildIdentity()}
+                    >
+                      {rebuilding ? '正在重建…' : '重建设备标识'}
+                    </Button>
+                  ) : null}
                   {isGeminiHostIssue(error.code) ? (
                     <GeminiMaintenanceLink />
                   ) : null}

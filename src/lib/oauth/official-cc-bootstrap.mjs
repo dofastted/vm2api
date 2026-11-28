@@ -29,6 +29,7 @@ import {
 } from '../vm/vm-runtime.mjs'
 import { slotMemory } from '../vm/machine-spec.mjs'
 import { isKvmRuntime } from '../vm/runtime-kind.mjs'
+import { isCustomKvmMode } from '../vm/custom-os-runtime.mjs'
 import { slotExecArgv } from '../vm/slot-exec.mjs'
 import { reloadSlotReady } from '../vm/slot-runtime.mjs'
 import {
@@ -52,11 +53,13 @@ import {
   REMOTE_CRAG_CLAUDE,
   normalizeOfficialCcInference,
   resolveOfficialCcInference,
+  slotLocalCragClaude,
 } from '../vm/slot-engine.mjs'
+import { slotHome, slotUser } from '../vm/slot-identity.mjs'
 import { getVm } from '../vm/vm-registry.mjs'
 import { guardUsageTier } from '../pool/claude-tier.mjs'
 import { slotHost } from '../vm/slot-host.mjs'
-import { materializeCragV2 } from '../vm/wrap-cli-runtime.mjs'
+import { cragSlotArch, elfMachineArch, materializeCragV2, normalizeCragArch } from '../vm/wrap-cli-runtime.mjs'
 
 export { officialCcUidGid } from '../vm/vm-runtime.mjs'
 export const DEFAULT_HELLO_PROMPT = 'hello'
@@ -303,22 +306,128 @@ export function restoreSlotMemoryAfterOfficialCc(vmId, idleMemory, { keepCli = f
   return applyContainerMemory(vmId, idleMemory || slotIdleMemory(vm), vm)
 }
 
-export function startOfficialCcResidentProcess({ vmId, projectRoot, uid, gid, timezone, locale, vm }) {
-  const script = path.join(scriptsDir(), 'official-cc-resident.py')
-  const runDir = officialCcRunDir(projectRoot, vmId)
-  fs.mkdirSync(runDir, { recursive: true, mode: 0o700 })
-  const pidFile = officialCcPidPath(projectRoot, vmId, 'resident')
-  const host = slotHost(vm || { id: vmId })
-  const bin = host.bakedKernel ? REMOTE_CRAG_CLAUDE : LOCAL_CRAG_CLAUDE
-  const execArgv = slotExecArgv(vm || { id: vmId }, [bin], {
-    user: `${uid}:${gid}`,
+function resolveOfficialCcExecUser(targetVm, host, uid, gid) {
+  if (isKvmRuntime(targetVm) && isCustomKvmMode({ vm: targetVm })) {
+    const guestUser = host.execUser(targetVm)
+    if (guestUser) return guestUser
+  }
+  return `${uid}:${gid}`
+}
+
+function splitUidGid(spec, fallbackUid, fallbackGid) {
+  const [rawUid, rawGid] = String(spec || '').split(':')
+  return {
+    uid: rawUid || String(fallbackUid),
+    gid: rawGid || String(fallbackGid),
+  }
+}
+
+const NO_CORE_DUMP_SHELL = 'ulimit -c 0 2>/dev/null; exec "$@"'
+
+/**
+ * Wrap in-container official Claude CLI invocations so a Bun/QEMU abort cannot
+ * write multi-GB core dumps onto the host root filesystem (docker exec itself
+ * does not support --ulimit) (#1987).
+ */
+export function wrapOfficialCcNoCoreCmd(argv) {
+  return ['sh', '-c', NO_CORE_DUMP_SHELL, '_', ...argv]
+}
+
+/**
+ * Detect when running the official Claude CLI binary inside a local Docker slot
+ * would execute under cross-architecture qemu-user emulation (e.g. amd64 Bun on
+ * an arm64 host), where JavaScriptCore aborts during heap init (#1987).
+ * KVM slots run a full guest kernel and remote hosts run on their own CPU arch.
+ */
+export function officialCcArchMismatch(projectRoot, vm, options = {}) {
+  if (!vm || isKvmRuntime(vm) || slotHost(vm).bakedKernel) return null
+  const hostArch = normalizeCragArch(options.arch ?? process.arch)
+  if (!hostArch) return null
+  let slotArch = ''
+  if (projectRoot && vm.id) {
+    slotArch = elfMachineArch(officialCcNativeCli(officialCcHome(projectRoot, vm.id)))
+  }
+  if (!slotArch) {
+    slotArch = cragSlotArch(projectRoot, vm, options)
+  }
+  if (!slotArch || slotArch === 'darwin' || slotArch === hostArch) return null
+  return {
+    hostArch,
+    slotArch,
+    reason: 'arch_mismatch_emulated',
+    error: `official Claude Code bootstrap unsupported under cross-arch emulation (host ${hostArch}, slot ${slotArch}); serving path continues via native cli-node`,
+  }
+}
+
+const ANSI_ESCAPE_RE = /\x1b\[[0-9;?]*[ -/]*[@-~]/g
+const STDERR_SIGNAL_RE =
+  /^(?:ASSERTION FAILED:|panic\([^)]*\):|qemu:|fatal:|error:|oh no:|segfault|illegal instruction)/i
+
+/**
+ * Extract a concise crash diagnostic from official Claude CLI stderr (e.g. Bun
+ * MemoryExhaustion / qemu uncaught signal) so status.error is actionable instead
+ * of an opaque hello=137 (#1987).
+ */
+export function summarizeOfficialCcStderr(stderrText, exitCode = null) {
+  const cleaned = String(stderrText || '')
+    .replace(ANSI_ESCAPE_RE, '')
+    .replace(/\r/g, '\n')
+  const lines = cleaned
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line && !/^[=\-*_~]{3,}$/.test(line))
+  if (!lines.length) return null
+  const picked = []
+  const seen = new Set()
+  for (const line of lines) {
+    if (!STDERR_SIGNAL_RE.test(line)) continue
+    if (seen.has(line)) continue
+    seen.add(line)
+    picked.push(line)
+    if (picked.length >= 2) break
+  }
+  const detail = (picked.length ? picked.join(' | ') : lines[0]).slice(0, 240)
+  return exitCode != null ? `official claude exit ${exitCode}: ${detail}` : detail
+}
+
+function readOfficialCcStderrSnippet(errFile, maxBytes = 16384) {
+  if (!errFile) return ''
+  let fd = null
+  try {
+    fd = fs.openSync(errFile, 'r')
+    const buf = Buffer.alloc(maxBytes)
+    const n = fs.readSync(fd, buf, 0, maxBytes, 0)
+    return n > 0 ? buf.subarray(0, n).toString('utf8') : ''
+  } catch {
+    return ''
+  } finally {
+    if (fd != null) {
+      try {
+        fs.closeSync(fd)
+      } catch {}
+    }
+  }
+}
+
+export function buildOfficialCcResidentLaunch({ vmId, uid, gid, timezone, locale, vm }) {
+  const targetVm = vm || { id: vmId }
+  const host = slotHost(targetVm)
+  const userHome = slotHome(targetVm)
+  const userName = slotUser(targetVm)
+  const execUser = resolveOfficialCcExecUser(targetVm, host, uid, gid)
+  const execIds = splitUidGid(execUser, uid, gid)
+  const bin = host.bakedKernel ? REMOTE_CRAG_CLAUDE : slotLocalCragClaude(targetVm)
+  const execArgv = slotExecArgv(targetVm, wrapOfficialCcNoCoreCmd([bin]), {
+    user: execUser,
     env: [
-      'HOME=/home/kincli',
-      'TMPDIR=/home/kincli/.cache/tmp',
+      `HOME=${userHome}`,
+      `USER=${userName}`,
+      `LOGNAME=${userName}`,
+      `TMPDIR=${userHome}/.cache/tmp`,
       `TZ=${timezone || 'UTC'}`,
       `LANG=${locale || 'en_US.UTF-8'}`,
       `LC_ALL=${locale || 'en_US.UTF-8'}`,
-      'PATH=/home/kincli/.local/bin:/usr/bin:/bin',
+      `PATH=${userHome}/.local/bin:/usr/bin:/bin`,
       'CLAUDE_CODE_HOST_REFRESH=1',
       'USER_TYPE=external',
       OFFICIAL_CC_MARKER,
@@ -330,21 +439,40 @@ export function startOfficialCcResidentProcess({ vmId, projectRoot, uid, gid, ti
       'ANTHROPIC_API_KEY=',
       'ANTHROPIC_AUTH_TOKEN=',
     ],
-    workdir: '/home/kincli',
+    workdir: userHome,
     interactive: true,
     tty: true,
   })
+  return {
+    execUser,
+    execUid: execIds.uid,
+    execGid: execIds.gid,
+    userHome,
+    userName,
+    bin,
+    execArgv,
+  }
+}
+
+export function startOfficialCcResidentProcess({ vmId, projectRoot, uid, gid, timezone, locale, vm }) {
+  const script = path.join(scriptsDir(), 'official-cc-resident.py')
+  const runDir = officialCcRunDir(projectRoot, vmId)
+  fs.mkdirSync(runDir, { recursive: true, mode: 0o700 })
+  const pidFile = officialCcPidPath(projectRoot, vmId, 'resident')
+  const launch = buildOfficialCcResidentLaunch({ vmId, uid, gid, timezone, locale, vm })
   const child = spawn('python3', [script], {
     env: {
       ...process.env,
       KIN_CONTAINER: containerName(vmId),
-      KIN_UID: String(uid),
-      KIN_GID: String(gid),
-      KIN_CLI_BIN: bin,
+      KIN_UID: launch.execUid,
+      KIN_GID: launch.execGid,
+      KIN_SLOT_HOME: launch.userHome,
+      KIN_SLOT_USER: launch.userName,
+      KIN_CLI_BIN: launch.bin,
       TZ: timezone || 'UTC',
       LANG: locale || 'en_US.UTF-8',
       LC_ALL: locale || 'en_US.UTF-8',
-      KIN_DOCKER_ARGV: JSON.stringify(execArgv),
+      KIN_DOCKER_ARGV: JSON.stringify(launch.execArgv),
     },
     detached: true,
     stdio: 'ignore',
@@ -708,7 +836,7 @@ export function wipeOfficialFirstUseHome(homeDir, { uid, gid } = {}) {
  * that name onto host-owned credentials.json so wrap cannot copy RT.
  */
 export function materializeOfficialClaudeCredentials(homeDir, { uid, gid } = {}) {
-  return ensureOfficialCredentialLink(homeDir, { uid, gid })
+  return ensureOfficialCredentialLink(homeDir, { uid, gid, adoptOfficial: false })
 }
 
 /** Init may run only when the on-disk grant is inside its expiry and the alias is the relative symlink. */
@@ -838,25 +966,31 @@ export function buildOfficialCcDockerArgs({
 }) {
   const text = String(prompt || '').trim() || DEFAULT_PLAN_PROMPT
   const slash = isOfficialCcSlashPrompt(text)
-  const host = slotHost(vm || { id: vmId })
-  const bin = host.bakedKernel ? REMOTE_CRAG_CLAUDE : LOCAL_CRAG_CLAUDE
+  const targetVm = vm || { id: vmId }
+  const host = slotHost(targetVm)
+  const userHome = slotHome(targetVm)
+  const userName = slotUser(targetVm)
+  const execUser = resolveOfficialCcExecUser(targetVm, host, uid, gid)
+  const bin = host.bakedKernel ? REMOTE_CRAG_CLAUDE : slotLocalCragClaude(targetVm)
   return slotExecArgv(
-    vm || { id: vmId },
-    [
+    targetVm,
+    wrapOfficialCcNoCoreCmd([
       bin,
       ...(slash
         ? [text, '--print', '--permission-mode', 'bypassPermissions', '--output-format', 'stream-json', '--verbose']
         : ['-p', text, '--permission-mode', 'bypassPermissions', '--output-format', 'json']),
-    ],
+    ]),
     {
-      user: `${uid}:${gid}`,
+      user: execUser,
       env: [
-        'HOME=/home/kincli',
-        'TMPDIR=/home/kincli/.cache/tmp',
+        `HOME=${userHome}`,
+        `USER=${userName}`,
+        `LOGNAME=${userName}`,
+        `TMPDIR=${userHome}/.cache/tmp`,
         `TZ=${timezone}`,
         `LANG=${locale}`,
         `LC_ALL=${locale}`,
-        'PATH=/home/kincli/.local/bin:/usr/bin:/bin',
+        `PATH=${userHome}/.local/bin:/usr/bin:/bin`,
         'CLAUDE_CODE_HOST_REFRESH=1',
         OFFICIAL_CC_MARKER,
         'USER_TYPE=external',
@@ -868,7 +1002,7 @@ export function buildOfficialCcDockerArgs({
         'ANTHROPIC_API_KEY=',
         'ANTHROPIC_AUTH_TOKEN=',
       ],
-      workdir: '/home/kincli',
+      workdir: userHome,
     },
   )
 }
@@ -951,11 +1085,15 @@ export async function runOfficialCcTurn({
     if (raw && !slash) parsed = JSON.parse(raw)
   } catch {}
   const ok = officialCcTurnSucceeded({ code: finished.code, timedOut: finished.timed_out, raw, slash })
+  const stderrSummary =
+    !ok && !finished.timed_out && !finished.error
+      ? summarizeOfficialCcStderr(readOfficialCcStderrSnippet(errFile), finished.code)
+      : null
   return {
     ok,
     timed_out: !!finished.timed_out,
     code: finished.code,
-    error: finished.error || null,
+    error: finished.error || stderrSummary || null,
     parsed,
     raw_len: raw.length,
   }
@@ -1109,6 +1247,19 @@ export async function runOfficialCcBootstrap(rawOpts = {}) {
   if (!canOfficialCc(credentialModeOfVm(vm))) {
     return { ok: false, error: 'official Claude Code init requires full OAuth' }
   }
+  const archMismatch = officialCcArchMismatch(projectRoot, vm, rawOpts)
+  if (archMismatch) {
+    const status = writeOfficialCcStatus(homeDir, {
+      status: 'skipped',
+      vm_id: vmId,
+      started_at: startedAt,
+      finished_at: new Date().toISOString(),
+      force,
+      step: 'arch_check',
+      error: archMismatch.error,
+    })
+    return { ok: false, skipped: true, reason: archMismatch.reason, error: status.error, status }
+  }
   const ready = officialCcNativeReady(homeDir)
   if (!ready.ok) return { ok: false, error: ready.error }
 
@@ -1202,7 +1353,7 @@ export async function runOfficialCcBootstrap(rawOpts = {}) {
     })
 
     const host = slotHost(vm)
-    const bin = host.bakedKernel ? REMOTE_CRAG_CLAUDE : LOCAL_CRAG_CLAUDE
+    const bin = host.bakedKernel ? REMOTE_CRAG_CLAUDE : slotLocalCragClaude(vm)
     const staged = ensureOfficialCcNativeCli(projectRoot, vm, homeDir, { uid, gid })
     if (!host.bakedKernel && !fs.existsSync(staged)) {
       const status = writeOfficialCcStatus(homeDir, {
@@ -1217,10 +1368,13 @@ export async function runOfficialCcBootstrap(rawOpts = {}) {
     }
     const claudeVersion =
       (
-        await spawnCaptured(['docker', ...slotExecArgv(vm, [bin, '--version'], { user: host.execUser(vm) })], {
-          timeoutMs: 15_000,
-          env: host.dockerEnv() || process.env,
-        })
+        await spawnCaptured(
+          ['docker', ...slotExecArgv(vm, wrapOfficialCcNoCoreCmd([bin, '--version']), { user: host.execUser(vm) })],
+          {
+            timeoutMs: 15_000,
+            env: host.dockerEnv() || process.env,
+          },
+        )
       ).stdout || null
 
     const timezone = vm.timezone || vm.fingerprint?.timezone || 'UTC'
@@ -1492,6 +1646,23 @@ export function scheduleOfficialCcBootstrap(opts = {}) {
   const config = normalizeOfficialCcConfig(opts.config || loadOfficialCcConfig(opts.routingFile))
   if (config.enabled === false && opts.manual !== true) {
     return { scheduled: false, reason: 'disabled' }
+  }
+  const archMismatch = officialCcArchMismatch(opts.projectRoot, target, opts)
+  if (archMismatch && opts.manual !== true) {
+    if (opts.projectRoot && target) {
+      try {
+        writeOfficialCcStatus(officialCcHome(opts.projectRoot, vmId), {
+          status: 'skipped',
+          vm_id: vmId,
+          started_at: new Date().toISOString(),
+          finished_at: new Date().toISOString(),
+          force: opts.force !== false,
+          step: 'arch_check',
+          error: archMismatch.error,
+        })
+      } catch {}
+    }
+    return { scheduled: false, reason: archMismatch.reason, error: archMismatch.error }
   }
   const merged = applyOfficialCcConfig({ ...opts, config }, config)
   const current = running.get(vmId)

@@ -70,6 +70,12 @@ export function blockedRiskTool(inbound, body, rules = []) {
       for (const name of [tool?.name, tool?.function?.name, tool?.type]) {
         if (typeof name === 'string') names.add(name.trim().toLowerCase())
       }
+      for (const decl of [
+        ...(Array.isArray(tool?.functionDeclarations) ? tool.functionDeclarations : []),
+        ...(Array.isArray(tool?.function_declarations) ? tool.function_declarations : []),
+      ]) {
+        if (typeof decl?.name === 'string') names.add(decl.name.trim().toLowerCase())
+      }
     }
   }
   return rules.find((rule) => names.has(rule.name.toLowerCase())) || null

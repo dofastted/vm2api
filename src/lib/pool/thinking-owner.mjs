@@ -114,6 +114,32 @@ function historyKeys(body) {
 }
 
 /**
+ * Lightweight single-query ownership probe for CRAG hops when
+ * `crag_drop_foreign_thinking` is `'off'`. Never clones or rewrites `body`.
+ * @returns {{ kept: number, foreign: number, unknown: number }}
+ */
+export function inspectForeignThinking(body, accountId, store = thinkingOwners) {
+  const account = String(accountId || '')
+  const counts = { kept: 0, foreign: 0, unknown: 0 }
+  const keys = account ? historyKeys(body) : []
+  if (!keys.length) return counts
+  let owners = null
+  try {
+    owners = store.ownersOf([...new Set(keys)])
+  } catch {}
+  if (!owners) return { ...counts, kept: keys.length }
+  for (const key of keys) {
+    const owner = owners.get(key)
+    if (owner === account) counts.kept += 1
+    else {
+      counts.foreign += 1
+      if (owner == null) counts.unknown += 1
+    }
+  }
+  return counts
+}
+
+/**
  * The body this account may replay: its own thinking stays, every other
  * signed block becomes text (dropped when empty). Without a reachable
  * database the body goes unchanged.
@@ -225,6 +251,7 @@ export function dropForeignThinkingForCrag(body, accountId, store = thinkingOwne
   const counts = {
     kept: 0,
     unknownKept: 0,
+    foreign: 0,
     dropped: 0,
     droppedTurns: 0,
     openLoop: false,
@@ -261,6 +288,7 @@ export function dropForeignThinkingForCrag(body, accountId, store = thinkingOwne
         counts.kept += 1
         return
       }
+      counts.foreign += 1
       // foreign_only: no record is not proof of another account. Keep it and
       // let the upstream 400 (plus the signature repair) handle the rare miss,
       // rather than dropping the caller's own thinking on an incomplete table.

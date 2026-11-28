@@ -1,4 +1,4 @@
-import { cragShopRoute } from './crag-shop.mjs'
+import { cragShopRoute, geminiCragShopRoute } from './crag-shop.mjs'
 
 /**
  * Panel RBAC.
@@ -13,6 +13,7 @@ export const PANEL_VIEWS = [
   'cluster',
   'vm',
   'import',
+  'pools',
   'specs',
   'proxies',
   'models',
@@ -224,7 +225,7 @@ export function authorizePanelRoute(method, path, role) {
   const m = String(method || 'GET').toUpperCase()
   const p = String(path || '')
 
-  const shopRoute = cragShopRoute(m, p)
+  const shopRoute = cragShopRoute(m, p) ?? geminiCragShopRoute(m, p)
   if (shopRoute === 'apply-renewal') return { ok: false, role: r, code: 'forbidden', message: 'Forbidden' }
   if (shopRoute) return { ok: true, role: r }
 

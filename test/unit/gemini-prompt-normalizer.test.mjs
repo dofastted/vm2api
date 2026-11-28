@@ -10,6 +10,7 @@ import {
 } from '../../src/lib/gemini/prompt-normalizer.mjs'
 import { createGeminiPublicHandler } from '../../src/lib/gemini/routes.mjs'
 import { createGeminiScheduler } from '../../src/lib/gemini/scheduler.mjs'
+import { createMockSchedulerRuntime } from '../helpers/mock-scheduler-runtime.mjs'
 import {
   NATIVE_TUI_CAPABILITIES,
   buildGeminiRequest,
@@ -345,6 +346,7 @@ test('end-to-end 4-protocol Codex/Claude/OpenCode requests normalize cleanly thr
   const logEvents = []
 
   const scheduler = createGeminiScheduler({
+    schedulerRuntime: createMockSchedulerRuntime(),
     callHost: async (op) => {
       if (op === 'list') {
         return {

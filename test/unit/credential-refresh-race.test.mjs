@@ -78,16 +78,18 @@ test('rotation never adopts another account or seeds an empty slot', (t) => {
   assert.equal(fs.existsSync(path.join(empty, '.claude', 'credentials.json')), false)
 })
 
-test('repairLocalCredentialLink relinks a regular alias file without losing the grant', async (t) => {
+test('repairLocalCredentialLink enforces Panel SSOT by relinking without adopting a CLI-written alias', async (t) => {
   const home = slotHome(t)
   const worker = path.join(home, '.claude', 'credentials.json')
   const official = path.join(home, '.claude', '.credentials.json')
-  fs.writeFileSync(worker, grant('rt-1', 1000))
-  fs.writeFileSync(official, grant('rt-1', 1000, { rateLimitTier: 'default_claude_ai' }))
+  fs.writeFileSync(worker, grant('rt-panel', 1000))
+  fs.writeFileSync(official, grant('rt-cli-newer', 9000, { rateLimitTier: 'default_claude_ai' }))
   const r = await repairLocalCredentialLink(home)
   assert.equal(r.linked, true)
+  assert.equal(r.adopted, false)
   assert.equal(fs.readlinkSync(official), 'credentials.json')
-  assert.equal(readGrant(official).refreshToken, 'rt-1')
+  assert.equal(readGrant(worker).refreshToken, 'rt-panel')
+  assert.equal(readGrant(official).refreshToken, 'rt-panel')
 })
 
 test('monitor relinks idle local Claude slots every tick and reports failures', async () => {

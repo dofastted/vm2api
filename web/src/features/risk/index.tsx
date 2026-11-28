@@ -3,7 +3,7 @@ import { useQuery } from '@tanstack/react-query'
 import { useBlocker, useNavigate, useSearch } from '@tanstack/react-router'
 import { VIEW_TITLES } from '@/config/nav'
 import type { UsageLogRow } from '@/types/panel-usage-logs'
-import { Activity, ScanText, ShieldCheck } from 'lucide-react'
+import { Activity, ChevronRight, ScanText, ShieldCheck } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { PageHeader } from '@/components/page-header'
@@ -103,6 +103,11 @@ export function RiskAuditPage() {
       title={VIEW_TITLES.risk}
       description='先执行前置规则，再由 Jev 审核；在状态页查看拦截、放行和上游响应。'
     >
+      <PipelineStrip
+        activeView={view}
+        activeRule={rule}
+        onNavigate={(nextView, nextRule) => go(nextView, nextRule)}
+      />
       <Tabs
         value={view}
         activationMode='manual'
@@ -114,16 +119,16 @@ export function RiskAuditPage() {
       >
         <TabsList
           aria-label='风险审计页面'
-          className='grid h-auto min-h-12 w-full grid-cols-3 border p-1 sm:min-h-14'
+          className='grid h-auto min-h-12 w-full grid-cols-3 border bg-muted/50 p-1 sm:min-h-14'
         >
           {PAGES.map(({ id, label, icon: Icon, hint }) => (
             <TabsTrigger
               key={id}
               value={id}
-              className='h-full min-w-0 cursor-pointer py-2 motion-reduce:transition-none'
+              className='h-full min-w-0 cursor-pointer gap-2 rounded-lg border border-transparent py-2 transition-colors duration-150 focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none data-[state=active]:border-select-border data-[state=active]:bg-select-surface data-[state=active]:text-foreground data-[state=active]:shadow-none motion-reduce:transition-none'
             >
-              <Icon aria-hidden='true' />
-              <span>{label}</span>
+              <Icon aria-hidden='true' className='size-4 shrink-0' />
+              <span className='font-medium'>{label}</span>
               <span className='hidden truncate text-xs font-normal text-muted-foreground md:inline'>
                 {hint}
               </span>
@@ -156,6 +161,102 @@ export function RiskAuditPage() {
       </Tabs>
       <LogDetailDialog state={detail} onClose={() => setDetail(null)} />
     </PageHeader>
+  )
+}
+
+function PipelineStrip({
+  activeView,
+  activeRule,
+  onNavigate,
+}: {
+  activeView: RiskView
+  activeRule: PreflightRule
+  onNavigate: (view: RiskView, rule?: PreflightRule) => void
+}) {
+  const distill = useQuery(distillQueryOptions())
+  const regex = useQuery(jevInterceptQueryOptions())
+  const refusal = useQuery(refusalGuardsQueryOptions())
+  const jevEnabled = regex.data?.enabled
+  const jevTone =
+    jevEnabled && !regex.data?.base_url.trim() && !regex.isError
+      ? STATE_TONE.unset
+      : ruleTone(jevEnabled, regex.isError)
+  const banCount =
+    (refusal.data?.device_count ?? 0) + (refusal.data?.session_count ?? 0)
+
+  const stages = [
+    {
+      id: 'distill',
+      label: '蒸馏识别',
+      tone: ruleTone(distill.data?.enabled, distill.isError),
+      meta: null as string | null,
+      active: activeView === 'preflight' && activeRule === 'distill',
+      onClick: () => onNavigate('preflight', 'distill'),
+    },
+    {
+      id: 'hard-regex',
+      label: '硬正则',
+      tone: ruleTone(regex.data?.hard_regex_enabled, regex.isError),
+      meta: null as string | null,
+      active: activeView === 'preflight' && activeRule === 'hard-regex',
+      onClick: () => onNavigate('preflight', 'hard-regex'),
+    },
+    {
+      id: 'refusal',
+      label: '拒答与封禁',
+      tone: ruleTone(refusal.data?.enabled, refusal.isError),
+      meta: banCount > 0 ? `${banCount} 封禁` : null,
+      active: activeView === 'preflight' && activeRule === 'refusal',
+      onClick: () => onNavigate('preflight', 'refusal'),
+    },
+    {
+      id: 'jev',
+      label: 'Jev 审核模型',
+      tone: jevTone,
+      meta: regex.data?.model || null,
+      active: activeView === 'jev',
+      onClick: () => onNavigate('jev'),
+    },
+  ]
+
+  return (
+    <nav
+      aria-label='拦截链路实时状态'
+      className='mb-4 flex flex-wrap items-center gap-1.5 rounded-xl border bg-card px-3 py-2'
+    >
+      <span className='mr-1 text-xs font-medium text-[var(--text-tertiary)]'>
+        审查链路
+      </span>
+      {stages.map((stage, index) => (
+        <div key={stage.id} className='flex items-center gap-1.5'>
+          {index > 0 ? (
+            <ChevronRight
+              aria-hidden='true'
+              className='size-3.5 shrink-0 text-muted-foreground/60'
+            />
+          ) : null}
+          <button
+            type='button'
+            onClick={stage.onClick}
+            aria-current={stage.active ? 'page' : undefined}
+            className={cn(
+              'inline-flex cursor-pointer items-center gap-2 rounded-lg border px-2.5 py-1 text-xs transition-colors duration-150 focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none',
+              stage.active
+                ? 'border-select-border bg-select-surface text-foreground'
+                : 'border-transparent bg-muted/40 text-foreground hover:border-border hover:bg-muted/70'
+            )}
+          >
+            <span className='font-medium'>{stage.label}</span>
+            <StatusMark tone={stage.tone} />
+            {stage.meta ? (
+              <span className='hidden font-mono text-[11px] text-muted-foreground tabular-nums sm:inline'>
+                {stage.meta}
+              </span>
+            ) : null}
+          </button>
+        </div>
+      ))}
+    </nav>
   )
 }
 
@@ -198,8 +299,8 @@ function PreflightSettings({
             key={entry.id}
             value={entry.id}
             className={cn(
-              'h-full min-w-0 cursor-pointer flex-col gap-1.5 border-border bg-card px-1 py-2.5 motion-reduce:transition-none sm:flex-row sm:gap-3',
-              'data-[state=active]:border-primary/60 data-[state=active]:bg-muted dark:data-[state=active]:border-primary/60'
+              'h-full min-w-0 cursor-pointer flex-col gap-1.5 rounded-lg border border-border bg-card px-2 py-2.5 transition-colors duration-150 hover:border-select-border/60 focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none motion-reduce:transition-none sm:flex-row sm:gap-3',
+              'data-[state=active]:border-select-border data-[state=active]:bg-select-surface data-[state=active]:text-foreground data-[state=active]:shadow-none'
             )}
           >
             <span>{entry.name}</span>

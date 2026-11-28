@@ -516,6 +516,9 @@ export async function recoverSlot({
   watchdog = null,
   poolScheduler = null,
   internal = false,
+  clearUnschedulable = true,
+  beforeStop = null,
+  verifyAfter = null,
   ops = {},
   now = () => Date.now(),
 }) {
@@ -539,6 +542,17 @@ export async function recoverSlot({
       poolScheduler,
       operation: () =>
         withCragRuntimeAdmission(vm, projectRoot, { routing, action: 'recovery' }, async () => {
+          if (typeof beforeStop === 'function') {
+            const guard = await beforeStop(getVm(projectRoot, id))
+            if (guard && guard.ok === false) {
+              return {
+                ok: false,
+                status: guard.status || 409,
+                code: guard.code || 'recover_aborted',
+                error: guard.error || '槽位状态已变化，已取消自动重启',
+              }
+            }
+          }
           const manager = (ops.cluster || cluster)()
           const stop = ops.stopSlot || stopSlot
           const powerOn = ops.powerOn || ((args) => powerOnSlot(args))
@@ -619,12 +633,20 @@ export async function recoverSlot({
             }
           }
           const ok = steps.every((s) => s.ok) && diagnosis.ok
-          if (ok) {
+          if (ok && clearUnschedulable) {
             patchVmRecord(projectRoot, id, (record) => {
               applyClearUnschedulable(record, { by: 'recover_ok' })
             })
           }
-          return { ok: true, report: { vm_id: id, ok, duration_ms: now() - started, steps, diagnosis } }
+          let postVerify = null
+          if (ok && typeof verifyAfter === 'function') {
+            postVerify = await verifyAfter(getVm(projectRoot, id) || current)
+          }
+          return {
+            ok: true,
+            report: { vm_id: id, ok, duration_ms: now() - started, steps, diagnosis },
+            ...(postVerify !== null ? { post_verify: postVerify } : {}),
+          }
         }),
     })
   } finally {

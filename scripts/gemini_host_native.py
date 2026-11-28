@@ -327,27 +327,74 @@ class _UnixHTTPConnection:
             self.sock = None
 
 
+CONTROL_CONN_POOL_MAX_PER_PATH = 8
+CONTROL_CONN_POOL_MAX_IDLE_GLOBAL = 128
+CONTROL_CONN_POOL_IDLE_TTL = 30.0
+
+
 class _UnixConnectionPool:
     """Thread-safe HTTP/1.1 keep-alive pool for short JSON control calls to craggemini."""
 
-    def __init__(self, max_per_path=8, idle_ttl=30.0):
+    def __init__(
+        self,
+        max_per_path=CONTROL_CONN_POOL_MAX_PER_PATH,
+        max_idle_global=CONTROL_CONN_POOL_MAX_IDLE_GLOBAL,
+        idle_ttl=CONTROL_CONN_POOL_IDLE_TTL,
+    ):
         self._lock = threading.Lock()
         self._idle = {}
         self._max_per_path = max_per_path
+        self._max_idle_global = max_idle_global
         self._idle_ttl = idle_ttl
+
+    def _close_sock(self, sock):
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+    def _sweep_idle_locked(self, now_t):
+        for path, bucket in list(self._idle.items()):
+            kept = []
+            for sock, stored_at in bucket:
+                if now_t - stored_at <= self._idle_ttl:
+                    kept.append((sock, stored_at))
+                else:
+                    self._close_sock(sock)
+            if kept:
+                self._idle[path] = kept
+            else:
+                self._idle.pop(path, None)
+
+    def _enforce_global_cap_locked(self):
+        entries = []
+        for path, bucket in self._idle.items():
+            for sock, stored_at in bucket:
+                entries.append((stored_at, path, sock))
+        excess = len(entries) - self._max_idle_global
+        if excess <= 0:
+            return
+        entries.sort(key=lambda item: item[0])
+        for _, _, sock in entries[:excess]:
+            self._close_sock(sock)
+        kept = entries[excess:]
+        rebuilt = {}
+        for stored_at, path, sock in kept:
+            rebuilt.setdefault(path, []).append((sock, stored_at))
+        self._idle = rebuilt
 
     def acquire(self, path):
         now_t = time.monotonic()
         with self._lock:
+            self._sweep_idle_locked(now_t)
             bucket = self._idle.get(path)
             while bucket:
                 sock, stored_at = bucket.pop()
                 if now_t - stored_at <= self._idle_ttl:
+                    if not bucket:
+                        self._idle.pop(path, None)
                     return sock
-                try:
-                    sock.close()
-                except OSError:
-                    pass
+                self._close_sock(sock)
             if bucket is not None and not bucket:
                 self._idle.pop(path, None)
         return None
@@ -355,15 +402,15 @@ class _UnixConnectionPool:
     def release(self, path, sock):
         if sock is None:
             return
+        now_t = time.monotonic()
         with self._lock:
+            self._sweep_idle_locked(now_t)
             bucket = self._idle.setdefault(path, [])
             if len(bucket) >= self._max_per_path:
-                try:
-                    sock.close()
-                except OSError:
-                    pass
+                self._close_sock(sock)
                 return
-            bucket.append((sock, time.monotonic()))
+            bucket.append((sock, now_t))
+            self._enforce_global_cap_locked()
 
 
 _CONTROL_CONN_POOL = _UnixConnectionPool()
@@ -478,6 +525,45 @@ LICENSE_ERROR_CODES = frozenset(
     }
 )
 
+_UPSTREAM_403_REASON_TOKENS = (
+    "TOS_VIOLATION",
+    "UNSUPPORTED_REGION",
+    "VALIDATION_REQUIRED",
+    "UNSUPPORTED_CLIENT",
+)
+
+
+def _payload_upstream_reason(payload):
+    if not isinstance(payload, dict):
+        return None
+    raw = payload.get("upstream_reason")
+    if isinstance(raw, str):
+        token = raw.strip()
+        if len(token) > 0:
+            upper = token.upper()
+            if upper in _UPSTREAM_403_REASON_TOKENS:
+                return upper
+            return upper
+    for key in ("message", "error"):
+        val = payload.get(key)
+        if not isinstance(val, str):
+            continue
+        text = val.strip()
+        if len(text) == 0:
+            continue
+        upper = text.upper()
+        for token in _UPSTREAM_403_REASON_TOKENS:
+            if token in upper:
+                return token
+    return None
+
+
+def _map_effective_403(payload, message):
+    reason = _payload_upstream_reason(payload)
+    if reason == "TOS_VIOLATION":
+        return NativeFailure("gemini_account_ineligible", 403, message)
+    return NativeFailure("gemini_location_unsupported", 403, message)
+
 
 def _map_worker_error(http_status, payload):
     code = payload.get("code") if isinstance(payload, dict) else None
@@ -528,7 +614,7 @@ def _map_worker_error(http_status, payload):
     if effective_status == 401:
         return NativeFailure("gemini_oauth_required", 401, message)
     if effective_status == 403:
-        return NativeFailure("gemini_location_unsupported", 403, message)
+        return _map_effective_403(payload, message)
     if effective_status == 404:
         return NativeFailure("gemini_model_unavailable", 404, message)
     if code == "upstream_unavailable" or effective_status == 503:

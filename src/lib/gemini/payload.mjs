@@ -6,6 +6,8 @@ import { Transform } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 
 export const AGY_SHA256 = '39816d49d5ab92229952987225c23ea3fed7580699dcb4a444e0388e0ac1ce43'
+export const AGY_PATCHED_SHA256 = 'bca88dab4d2b921d95e1228326631837ff468efef505088d9ab5dbb057f26157'
+export const AGY_ALLOWED_SHA256S = new Set([AGY_SHA256, AGY_PATCHED_SHA256])
 export const CRAG_GEMINI_PRODUCT = 'craggemini'
 const PAYLOAD_DOMAIN = Buffer.from('CRAG-PAYLOAD-V1\0')
 const GEMINI_PAYLOAD_VERSIONS = new Set(['0.3.0-rc.1', '0.3.0-rc.2', '0.3.0-rc.3', '0.3.0'])
@@ -151,7 +153,7 @@ function parseCragGeminiManifest(manifest, expectedPublicKey) {
     if (!Object.hasOwn(shaMap, requiredName)) reject('gemini_payload_invalid_manifest')
     const digest = shaMap[requiredName]
     if (!HEX64.test(digest || '')) reject('gemini_payload_invalid_manifest')
-    if (requiredName === 'agy' && digest !== AGY_SHA256) reject('gemini_payload_invalid_manifest')
+    if (requiredName === 'agy' && !AGY_ALLOWED_SHA256S.has(digest)) reject('gemini_payload_invalid_manifest')
     if (requiredName === 'craggemini.payload.enc' && digest !== payload.ciphertext_sha256) {
       reject('gemini_payload_invalid_manifest')
     }
@@ -224,7 +226,7 @@ export async function readSignedGeminiManifest(source, publicKey) {
       file.size < 1 ||
       file.size > 512 * 1024 * 1024 ||
       !HEX64.test(file.sha256) ||
-      (file.name === 'agy' && file.sha256 !== AGY_SHA256)
+      (file.name === 'agy' && !AGY_ALLOWED_SHA256S.has(file.sha256))
     ) {
       reject('gemini_payload_invalid_manifest')
     }
@@ -263,7 +265,9 @@ async function checkMember(source, file, destination) {
         digest.update(chunk)
       }
     }
-    if ((file.size != null && bytes !== file.size) || digest.digest('hex') !== file.sha256) {
+    const actualSha = digest.digest('hex')
+    const agyPatchedUpgrade = file.name === 'agy' && file.sha256 === AGY_SHA256 && actualSha === AGY_PATCHED_SHA256
+    if ((file.size != null && bytes !== file.size) || (actualSha !== file.sha256 && !agyPatchedUpgrade)) {
       reject('gemini_payload_member_mismatch')
     }
   } finally {

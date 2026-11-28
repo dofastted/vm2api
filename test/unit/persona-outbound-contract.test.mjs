@@ -13,6 +13,7 @@ import {
   validateCacheBreakpoints,
 } from '../../src/lib/protocol/cache-ttl.mjs'
 import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs'
+import { createFailoverMockSchedulerRuntime, createMockSchedulerRuntime } from '../helpers/mock-scheduler-runtime.mjs'
 import { OFFICIAL_CLAUDE_CLI_UA } from '../../src/lib/identity/vm-identity.mjs'
 import { clearCachePrefixSessions } from '../../src/lib/protocol/cache-prefix.mjs'
 
@@ -84,16 +85,25 @@ async function outbound(
     t.after(() => new Promise((resolve) => kernel.close(resolve)))
   }
   const vm = { id: 'fixture-slot', persona_preset: preset, official_cc_inference: 'cli-hop' }
-  const runner = new FailoverRunner({
-    scheduler: {
-      async selectAndReserve() {
-        return { ok: true, vmId: vm.id, accountId: vm.id, vm, exec: { vmId: vm.id, vm, homeDir: root }, release() {} }
-      },
-      markSuccess() {},
-      markCooldown() {},
-      releaseAccountSessions() {},
+  const scheduler = {
+    async selectAndReserve() {
+      return { ok: true, vmId: vm.id, accountId: vm.id, vm, exec: { vmId: vm.id, vm, homeDir: root }, release() {} }
     },
+    markSuccess() {},
+    markCooldown() {},
+    releaseAccountSessions() {},
+  }
+  const runner = new FailoverRunner({
+    scheduler,
+    schedulerRuntime: createFailoverMockSchedulerRuntime({ scheduler }),
     config: { max_same_account_retries: 0 },
+  })
+  const apiRt = createMockSchedulerRuntime()
+  const pickApi = () => ({
+    ok: true,
+    endpoint: { id: 'fixture', kind: 'claude', protocol: 'anthropic', base_url: 'https://upstream.invalid' },
+    upstream_model: incoming.model,
+    key: { id: 'fixture', api_key: 'fixture-not-secret' },
   })
   const response = { headersSent: false, on() {}, once() {}, off() {}, write() {}, end() {} }
   const handler = createHandleProtocol({
@@ -116,13 +126,31 @@ async function outbound(
     stickyRouter: { extractPoolKey: () => null, collectPoolKeys: () => [] },
     accountQuota: { ingestHeaders() {} },
     apiKeyStore: { acquire: () => ({ ok: true }), release() {}, recordUsage() {} },
+    ...(backend === 'api' ? { schedulerRuntime: apiRt } : {}),
     apiScheduler: {
-      pick: () => ({
-        ok: true,
-        endpoint: { id: 'fixture', kind: 'claude', protocol: 'anthropic', base_url: 'https://upstream.invalid' },
-        upstream_model: incoming.model,
-        key: { id: 'fixture', api_key: 'fixture-not-secret' },
-      }),
+      pick: pickApi,
+      async acquire(requestedModel, opts = {}) {
+        const picked = pickApi()
+        const acquired = await (opts.schedulerRuntime || apiRt).acquireNode({
+          ...opts,
+          nodeTypes: ['api_endpoint'],
+          allowedNodeKeys: [`api_endpoint:${picked.endpoint.id}`],
+          model: requestedModel,
+        })
+        return {
+          ...picked,
+          leaseId: acquired.lease_id,
+          leaseTtlMs: acquired.lease_ttl_ms,
+          nodeKey: acquired.selected_node.node_key,
+          resolvedPoolId: acquired.resolved_pool_id,
+        }
+      },
+      async commitLease(leaseId, opts = {}) {
+        return (opts.schedulerRuntime || apiRt).commitLease(leaseId)
+      },
+      async releaseLease(leaseId, payload = {}, opts = {}) {
+        return (opts.schedulerRuntime || apiRt).releaseLease(leaseId, payload)
+      },
     },
     apiEndpointStore: {},
     stats: { errors: 0, requests: 0, by_route: {}, passthrough: 0, rewrite: 0, convert: 0 },
@@ -252,10 +280,7 @@ for (const backend of ['cli', 'api']) {
               ['1h', shortTtl ?? '1h'],
             )
             for (const source of system) assert.equal(JSON.stringify(out).split(source.text).length - 1, 1)
-            if (backend === 'cli') {
-              // Relocated in caller order, so the template placements do not apply.
-              assert.deepEqual(leadingUserBlocks(out, system.length), sent(system))
-            } else if (placement === 'agent-first') {
+            if (placement === 'agent-first') {
               assert.ok(
                 out.system.findIndex((block) => block.text === system[1].text) <
                   out.system.findIndex((block) => block.text === system[0].text),
@@ -361,7 +386,7 @@ for (const backend of ['cli', 'api']) {
       })
       const markers = listCacheMarkers(out)
       assert.equal(markers.length, 1)
-      assert.equal(markers[0].section, backend === 'cli' ? 'messages' : 'system')
+      assert.equal(markers[0].section, 'system')
       assert.equal(markers[0].ttl, ttl ?? '1h')
       assert.ok(JSON.stringify(out).includes('BUSINESS_RULE'))
     })
@@ -387,11 +412,11 @@ for (const backend of ['cli', 'api']) {
             input: { messages },
           })
           assert.deepEqual(
-            backend === 'cli' ? leadingUserBlocks(out, 1)[0] : out.system.find((item) => item.text === block.text),
+            out.system.find((item) => item.text === block.text),
             sent([block])[0],
           )
           assert.equal(listCacheMarkers(out).length, 1)
-          assert.equal(messageMarkers(out).length, backend === 'cli' ? 1 : 0)
+          assert.equal(messageMarkers(out).length, 0)
         })
       }
     }
@@ -423,9 +448,9 @@ for (const preset of ['zero', 'official', 'official_full', 'custom']) {
 }
 
 for (const preset of ['zero', 'official', 'official_full', 'custom']) {
-  // zero keeps Environment at the tail, so caller indexes stay put. Other presets
-  // insert it after the first user and shift every later message by one.
-  const shift = preset === 'zero' ? 0 : 1
+  // zero and Mode 1 (official, env off by default) do not insert an Environment message;
+  // official_full and custom (falls back to official_full/env on) insert it after the first user.
+  const shift = preset === 'zero' || preset === 'official' ? 0 : 1
   for (const ttl of [undefined, '5m']) {
     test(`CLI ${preset} retains caller 1h and ${ttl ?? 'missing TTL'} through session history edits`, async (t) => {
       clearCachePrefixSessions()
@@ -545,7 +570,9 @@ for (const preset of ['official', 'official_full', 'custom']) {
   for (const ttl of [undefined, '5m', '1h']) {
     unixTest(`API ${preset} respects preceding tool TTL ${ttl ?? 'missing TTL'}`, async (t) => {
       const tool = { name: 'Read', input_schema: { type: 'object' }, cache_control: control(ttl) }
-      const out = await outbound(t, { preset, backend: 'api', input: { tools: [tool] } })
+      const compatibility =
+        preset === 'official' ? { persona_block_presets: { official: { harness: true } } } : undefined
+      const out = await outbound(t, { preset, backend: 'api', compatibility, input: { tools: [tool] } })
       assert.deepEqual(out.tools[0].cache_control, control(ttl ?? '1h'))
       const markers = listCacheMarkers(out).filter((marker) => marker.section === 'system')
       assert.ok(markers.length > 0)
@@ -698,7 +725,7 @@ for (const [name, compatibility] of billingCases) {
       input: { system },
       compatibility: { persona_preset: 'official', ...compatibility },
     })
-    assert.deepEqual(leadingUserBlocks(out, system.length), system)
+    assert.deepEqual(out.system.slice(-system.length), system)
     assert.equal(listCacheMarkers(out).length, 2)
     assert.equal(JSON.stringify(out).split('CALLER_RULE_MUST_SURVIVE').length - 1, 1)
   })
@@ -708,7 +735,7 @@ for (const [name, compatibility] of billingCases) {
       input: { system: 'CALLER_RULE_MUST_SURVIVE' },
       compatibility: { persona_preset: 'official', cache_ttl: '5m', ...compatibility },
     })
-    assert.equal(leadingUserBlocks(out, 1)[0].text, 'CALLER_RULE_MUST_SURVIVE')
+    assert.equal(out.system.at(-1).text, 'CALLER_RULE_MUST_SURVIVE')
     const markers = listCacheMarkers(out)
     assert.equal(markers.length, 1)
     assert.equal(markers[0].section, 'messages')
@@ -730,7 +757,7 @@ test('zero without billing preserves caller boundary text and fills omitted tool
     input: { system, tools: [tool] },
     compatibility: { persona_block_presets: { zero: { billing: false } } },
   })
-  assert.deepEqual(leadingUserBlocks(out, system.length), system)
+  assert.deepEqual(out.system.slice(-system.length), system)
   assert.deepEqual(out.tools[0].cache_control, control('1h'))
   assert.equal(listCacheMarkers(out).length, 1)
 })
@@ -834,7 +861,7 @@ for (const ttl of [undefined, '5m', '1h']) {
       const system = [text('Caller hour prefix', '1h')]
       const out = await outbound(t, { preset: 'zero', input: { system, messages, cache_control: control(ttl) } })
       assert.equal(out.cache_control, undefined)
-      assert.deepEqual(leadingUserBlocks(out, system.length), system)
+      assert.deepEqual(out.system.slice(1), system)
       const message = out.messages.findLast((message) => message.role === tail)
       assert.deepEqual(message.content.at(-1).cache_control, control(ttl ?? '1h'))
       assert.equal(listCacheMarkers(out).length, 2)
@@ -850,7 +877,7 @@ test('CLI zero translates automatic cache within a full caller budget', async (t
     compatibility: { persona_templates: { zero: [...DEFAULT_PERSONA_TEMPLATES.zero, text('Template rule', '1h')] } },
   })
   assert.deepEqual(out.system[1], text('Template rule', null))
-  assert.deepEqual(leadingUserBlocks(out, system.length), system)
+  assert.deepEqual(out.system.slice(2), system)
   assert.equal(listCacheMarkers(out).length, 4)
   assert.deepEqual(out.messages[0].content.at(-1).cache_control, control('5m'))
 })
@@ -863,14 +890,14 @@ test('CLI zero advances an automatic breakpoint as conversation history grows', 
       preset: 'zero',
       input: { system: [text('Stable caller prefix', '1h')], messages, cache_control: control('5m') },
     })
-    const markers = listCacheMarkers(out).filter((marker) => marker.section === 'messages')
-    // The relocated caller prefix keeps its own marker at the head of the first user turn.
-    assert.deepEqual(leadingUserBlocks(out, 1), [text('Stable caller prefix', '1h')])
+    const markers = listCacheMarkers(out)
+    // Mode 3 (zero) preserves caller system prefix in system[] (never relocated into messages[0]).
+    assert.deepEqual(out.system.slice(1), [text('Stable caller prefix', '1h')])
     assert.deepEqual(
-      markers.map((marker) => [marker.index, marker.blockIndex]),
+      markers.map((marker) => [marker.section, marker.index]),
       [
-        [0, 0],
-        [messages.length - 1, out.messages[messages.length - 1].content.length - 1],
+        ['system', 1],
+        ['messages', messages.length - 1],
       ],
     )
     assert.deepEqual(out.messages.at(-1).content.at(-1), text(`Question ${turn}`, '5m'))

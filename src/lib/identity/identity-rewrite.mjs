@@ -58,6 +58,15 @@ export const REBUILD_SESSION_SEED = 'kin-rebuild-session:'
 /** Prefix so a sub-agent session cannot collide with any other derived id. */
 export const AGENT_SESSION_SEED = 'kin-claude-code-agent:'
 
+/** Prefix so multi-turn headless scheduler sessions stay isolated from other derived ids. */
+export const SCHEDULER_SESSION_SEED = 'kin-scheduler-session:'
+
+/** Precedence order for inbound machine_id headers (never forged from IP/UA). */
+export const MACHINE_ID_HEADER_KEYS = Object.freeze(['x-machine-id', 'x-kin-machine-id', 'x-kin-device-id'])
+
+/** Transient per-request headers that must never act as a session_id. */
+const EPHEMERAL_SESSION_HEADER_KEYS = new Set(['x-request-id', 'x-client-request-id'])
+
 const SESSION_UA_PRODUCT = /([A-Za-z0-9._-]+)\/[A-Za-z0-9._-]+/g
 const SESSION_UA_VERSION = /\bv?\d+(?:\.\d+){1,3}\b/g
 
@@ -163,11 +172,14 @@ export function uuidFromSeed(seed) {
 export function parseUserId(raw) {
   if (!raw) return null
   if (typeof raw === 'object') {
+    const machineId =
+      cleanIdentityValue(raw.machine_id) ||
+      cleanIdentityValue(raw.machineId) ||
+      cleanIdentityValue(raw.meachine_id) ||
+      cleanIdentityValue(raw.meachineId)
     return {
       device_id: raw.device_id || raw.deviceId || '',
-      ...(raw.machine_id || raw.machineId || raw.meachine_id
-        ? { machine_id: raw.machine_id || raw.machineId || raw.meachine_id }
-        : {}),
+      ...(machineId ? { machine_id: machineId } : {}),
       account_uuid: raw.account_uuid || raw.accountUuid || '',
       session_id: raw.session_id || raw.sessionId || '',
       parent_session_id: raw.parent_session_id || raw.parentSessionId || '',
@@ -199,13 +211,89 @@ function cleanIdentityValue(value) {
   return String(value || '').trim()
 }
 
+function firstMachineField(obj) {
+  if (!obj || typeof obj !== 'object') return ''
+  return (
+    cleanIdentityValue(obj.machine_id) ||
+    cleanIdentityValue(obj.machineId) ||
+    cleanIdentityValue(obj.meachine_id) ||
+    cleanIdentityValue(obj.meachineId)
+  )
+}
+
+function firstDeviceField(obj) {
+  if (!obj || typeof obj !== 'object') return ''
+  return cleanIdentityValue(obj.device_id) || cleanIdentityValue(obj.deviceId)
+}
+
+/**
+ * Extract inbound machine_id in strict priority order (never forged from IP/UA/API key):
+ * 1. HTTP Headers: x-machine-id > x-kin-machine-id > x-kin-device-id
+ * 2. metadata.user_id (via parseUserId): machine_id/machineId/meachine_id > device_id/deviceId
+ *    (followed by direct metadata.{machine_id,...} > metadata.{device_id,...})
+ * 3. Top-level body: machine_id/machineId/meachine_id > device_id/deviceId
+ * @returns {{ machineId: string, machineSource: string }}
+ */
+export function extractMachineIdentity({ inbound = {}, body = {}, headers = {} } = {}) {
+  for (const key of MACHINE_ID_HEADER_KEYS) {
+    const value = cleanIdentityValue(headerValue(headers, key))
+    if (value) return { machineId: value, machineSource: `header:${key}` }
+  }
+
+  const parsedUserIds = [inbound?.metadata?.user_id, body?.metadata?.user_id]
+    .map((raw) => parseUserId(raw))
+    .filter(Boolean)
+  for (const parsed of parsedUserIds) {
+    const mid = cleanIdentityValue(parsed.machine_id)
+    if (mid) return { machineId: mid, machineSource: 'metadata:machine_id' }
+  }
+  for (const parsed of parsedUserIds) {
+    const did = cleanIdentityValue(parsed.device_id)
+    if (did) return { machineId: did, machineSource: 'metadata:device_id' }
+  }
+
+  const metadataSources = [inbound?.metadata, body?.metadata]
+  for (const meta of metadataSources) {
+    const mid = firstMachineField(meta)
+    if (mid) return { machineId: mid, machineSource: 'metadata:machine_id' }
+  }
+  for (const meta of metadataSources) {
+    const did = firstDeviceField(meta)
+    if (did) return { machineId: did, machineSource: 'metadata:device_id' }
+  }
+
+  const bodySources = [inbound, body]
+  for (const src of bodySources) {
+    const mid = firstMachineField(src)
+    if (mid) return { machineId: mid, machineSource: 'body:machine_id' }
+  }
+  for (const src of bodySources) {
+    const did = firstDeviceField(src)
+    if (did) return { machineId: did, machineSource: 'body:device_id' }
+  }
+
+  return { machineId: '', machineSource: 'none' }
+}
+
+function attachMachineIdentity(base, machineId, machineSource) {
+  // Defined non-enumerably so legacy strict deepEqual checks on
+  // { sessionId, deviceId, source } remain 100% compatible while callers
+  // directly read or destructure .machineId and .machineSource.
+  return Object.defineProperties(base, {
+    machineId: { value: machineId, enumerable: false, configurable: true },
+    machineSource: { value: machineSource, enumerable: false, configurable: true },
+  })
+}
+
 /**
  * Trusted inbound identity for pool routing. Priority:
  * metadata.user_id.session_id/device_id > explicit inbound device_id field/header.
+ * Also attaches non-enumerable machineId & machineSource (header > metadata > body).
  * Never falls back to API key, IP, UA, or content fingerprint.
- * @returns {{ sessionId: string, deviceId: string, source: 'metadata'|'explicit-device'|'none' }}
+ * @returns {{ sessionId: string, deviceId: string, source: 'metadata'|'explicit-device'|'none', machineId: string, machineSource: string }}
  */
 export function resolveInboundIdentity({ inbound = {}, body = {}, headers = {} } = {}) {
+  const { machineId, machineSource } = extractMachineIdentity({ inbound, body, headers })
   let sessionId = ''
   let deviceId = ''
   for (const raw of [inbound?.metadata?.user_id, body?.metadata?.user_id]) {
@@ -217,16 +305,22 @@ export function resolveInboundIdentity({ inbound = {}, body = {}, headers = {} }
   }
   // A sub-agent hop keeps the main session_id; it is its own session.
   sessionId = agentSessionId(sessionId, claudeCodeAgentId(headers))
-  if (deviceId) return { sessionId, deviceId, source: 'metadata' }
+  if (deviceId) return attachMachineIdentity({ sessionId, deviceId, source: 'metadata' }, machineId, machineSource)
 
   const explicitDevice =
     cleanIdentityValue(inbound?.device_id) ||
     cleanIdentityValue(body?.device_id) ||
     headerValue(headers, 'x-kin-device-id').trim()
-  if (explicitDevice) return { sessionId, deviceId: explicitDevice, source: 'explicit-device' }
+  if (explicitDevice) {
+    return attachMachineIdentity(
+      { sessionId, deviceId: explicitDevice, source: 'explicit-device' },
+      machineId,
+      machineSource,
+    )
+  }
   // A metadata session_id without any device still pins its own session.
-  if (sessionId) return { sessionId, deviceId: '', source: 'metadata' }
-  return { sessionId: '', deviceId: '', source: 'none' }
+  if (sessionId) return attachMachineIdentity({ sessionId, deviceId: '', source: 'metadata' }, machineId, machineSource)
+  return attachMachineIdentity({ sessionId: '', deviceId: '', source: 'none' }, machineId, machineSource)
 }
 
 function seatHash(parts) {
@@ -336,18 +430,177 @@ export function extractCallerSession({ inbound = {}, body = {}, headers = {} } =
 }
 
 function rootCallerSession({ inbound, body, headers }) {
-  const raw = inbound?.metadata?.user_id || body?.metadata?.user_id
-  const parsed = parseUserId(raw) || {}
-  if (parsed.session_id) return String(parsed.session_id)
+  for (const raw of [inbound?.metadata?.user_id, body?.metadata?.user_id]) {
+    const parsed = parseUserId(raw)
+    const sid = cleanIdentityValue(parsed?.session_id)
+    if (sid) return sid
+  }
   for (const key of CALLER_SESSION_HEADER_KEYS) {
-    const v = headerValue(headers, key)
+    if (EPHEMERAL_SESSION_HEADER_KEYS.has(String(key).toLowerCase())) continue
+    const v = cleanIdentityValue(headerValue(headers, key))
     if (v) return v
   }
   const src = inbound && typeof inbound === 'object' && Object.keys(inbound).length ? inbound : body
   for (const key of CALLER_SESSION_BODY_KEYS) {
-    if (src?.[key]) return String(src[key])
+    const v = cleanIdentityValue(src?.[key])
+    if (v) return v
   }
   return ''
+}
+
+function extractFirstUserIdentityFromInput(input) {
+  if (!Array.isArray(input)) return ''
+  const user = input.find((item) => typeof item === 'string' || String(item?.role || '').toLowerCase() === 'user')
+  if (!user) return ''
+  if (typeof user === 'string') return firstUserIdentityText([user])
+  const content = user.content ?? user.text
+  if (typeof content === 'string') return firstUserIdentityText([content])
+  if (!Array.isArray(content)) return ''
+  return firstUserIdentityText(
+    content.map((part) => {
+      if (typeof part === 'string') return part
+      if ((part?.type === 'text' || part?.type === 'input_text') && typeof part.text === 'string') return part.text
+      return ''
+    }),
+  )
+}
+
+function extractFirstUserIdentityFromGemini(contents) {
+  if (!Array.isArray(contents)) return ''
+  const user = contents.find((item) => {
+    if (typeof item === 'string') return true
+    if (!item || typeof item !== 'object') return false
+    const role = String(item.role || '')
+      .trim()
+      .toLowerCase()
+    return !role || role === 'user'
+  })
+  if (!user) return ''
+  if (typeof user === 'string') return firstUserIdentityText([user])
+  if (Array.isArray(user.parts)) {
+    return firstUserIdentityText(
+      user.parts.map((part) => (typeof part === 'string' ? part : typeof part?.text === 'string' ? part.text : '')),
+    )
+  }
+  if (typeof user.text === 'string') return firstUserIdentityText([user.text])
+  return ''
+}
+
+function extractMultiTurnFirstUserAnchor(src) {
+  if (!src || typeof src !== 'object') return { isMultiTurn: false, anchor: '' }
+  let isMultiTurn = false
+  let raw = ''
+  if (Array.isArray(src.messages) && src.messages.length > 0) {
+    isMultiTurn = src.messages.length >= 2
+    if (isMultiTurn) raw = extractFirstUserIdentity(src.messages)
+  } else if (Array.isArray(src.input) && src.input.length > 0) {
+    isMultiTurn = src.input.length >= 2
+    if (isMultiTurn) raw = extractFirstUserIdentityFromInput(src.input)
+  } else if (Array.isArray(src.contents) && src.contents.length > 0) {
+    isMultiTurn = src.contents.length >= 2
+    if (isMultiTurn) raw = extractFirstUserIdentityFromGemini(src.contents)
+  }
+  const anchor = cleanIdentityValue(raw)
+  if (!anchor || isSystemReminderOnly(anchor)) return { isMultiTurn, anchor: '' }
+  return { isMultiTurn, anchor }
+}
+
+function extractExplicitParentSession({ inbound = {}, body = {}, headers = {} } = {}) {
+  for (const raw of [inbound?.metadata?.user_id, body?.metadata?.user_id]) {
+    const parsed = parseUserId(raw)
+    const parent = cleanIdentityValue(parsed?.root_session_id || parsed?.parent_session_id)
+    if (parent) return parent
+  }
+  for (const meta of [inbound?.metadata, body?.metadata]) {
+    if (!meta || typeof meta !== 'object' || Array.isArray(meta)) continue
+    const parent = cleanIdentityValue(meta.root_session_id || meta.parent_session_id)
+    if (parent) return parent
+  }
+  return cleanIdentityValue(headerValue(headers, 'x-kin-root-session') || headerValue(headers, 'x-kin-parent-session'))
+}
+
+/**
+ * Unified scheduler inbound identity (PRD v4 §4.2 / D3):
+ * - Extracts machine_id with strict priority (header > metadata > body), never forged from IP/UA.
+ * - Extracts official Claude Code session_id via parseUserId / extractCallerSession,
+ *   excluding transient headers (x-request-id, x-client-request-id).
+ * - Derives sub-agent session via agentSessionId(root, agentId) (pure RFC-4122 UUIDv4)
+ *   and returns parentSessionId = root.
+ * - When absent, generates a pure RFC-4122 UUIDv4 internally: deterministic seed
+ *   mixing poolId/apiKeyId/machineId/firstUserAnchor for multi-turn conversations
+ *   (Anthropic/OpenAI messages, Responses input, Gemini contents), or crypto.randomUUID()
+ *   for single-turn / anchorless requests. Zero custom prefixes/suffixes or response headers.
+ * - Flags ephemeral short probes via isShortProbeRequest.
+ */
+export function resolveSchedulerIdentity({ inbound = {}, body = {}, headers = {}, poolId = '', apiKeyId = '' } = {}) {
+  const primaryBody = inbound && typeof inbound === 'object' && Object.keys(inbound).length ? inbound : body
+  const { machineId: rawMachineId, machineSource } = extractMachineIdentity({ inbound, body, headers })
+  const machineId = rawMachineId || null
+  const baseInbound = resolveInboundIdentity({ inbound, body, headers })
+  const deviceId = baseInbound.deviceId || null
+
+  const agentId = claudeCodeAgentId(headers) || null
+  const explicitRoot =
+    rootCallerSession({ inbound, body, headers }) ||
+    cleanIdentityValue(primaryBody?.previous_response_id) ||
+    cleanIdentityValue(body?.previous_response_id)
+
+  let sessionId = ''
+  let parentSessionId = null
+  let sessionSource = 'generated_random'
+  let generated = false
+
+  if (explicitRoot) {
+    if (agentId) {
+      sessionId = agentSessionId(explicitRoot, agentId)
+      parentSessionId = explicitRoot
+      sessionSource = 'subagent'
+    } else {
+      sessionId = explicitRoot
+      const explicitParent = extractExplicitParentSession({ inbound, body, headers })
+      parentSessionId = explicitParent && explicitParent !== sessionId ? explicitParent : null
+      sessionSource = 'explicit'
+    }
+  } else {
+    generated = true
+    const { isMultiTurn, anchor } = extractMultiTurnFirstUserAnchor(primaryBody)
+    let baseSession = ''
+    if (isMultiTurn && anchor) {
+      const seed = [
+        SCHEDULER_SESSION_SEED,
+        cleanIdentityValue(poolId),
+        cleanIdentityValue(apiKeyId),
+        machineId || '',
+        anchor,
+      ].join('\u0000')
+      baseSession = uuidFromSeed(seed)
+      sessionSource = 'derived_multi_turn'
+    } else {
+      baseSession = crypto.randomUUID()
+      sessionSource = 'generated_random'
+    }
+    if (agentId) {
+      sessionId = agentSessionId(baseSession, agentId)
+      parentSessionId = isMultiTurn && anchor ? baseSession : null
+      sessionSource = 'subagent'
+    } else {
+      sessionId = baseSession
+    }
+  }
+
+  const isEphemeralProbe = isShortProbeRequest(primaryBody)
+
+  return Object.freeze({
+    sessionId,
+    parentSessionId,
+    sessionSource,
+    generated,
+    machineId,
+    machineSource,
+    deviceId,
+    agentId,
+    isEphemeralProbe,
+  })
 }
 
 export function sessionIdFromOutboundBody(body = {}) {
@@ -435,6 +688,12 @@ export function applyCrsIdentityReplace(body, identity, inbound = {}, reqHeaders
   delete out.env
   delete out.user
   delete out.user_id
+  delete out.machine_id
+  delete out.machineId
+  delete out.meachine_id
+  delete out.meachineId
+  delete out.device_id
+  delete out.deviceId
 
   const raw = inbound?.metadata?.user_id || body?.metadata?.user_id
   const parsed = parseUserId(raw) || {}
@@ -463,7 +722,7 @@ export function applyCrsIdentityReplace(body, identity, inbound = {}, reqHeaders
   const md = {}
   if (out.metadata && typeof out.metadata === 'object') {
     for (const [k, v] of Object.entries(out.metadata)) {
-      if (/user|machine|device|host|tz|timezone|locale|setting|session_source|email/i.test(k)) continue
+      if (/user|me?achine|device|host|tz|timezone|locale|setting|session_source|email/i.test(k)) continue
       md[k] = v
     }
   }
