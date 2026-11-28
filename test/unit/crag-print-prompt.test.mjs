@@ -1,3 +1,5 @@
+import { sanitizeCragBodyWhitelist } from '../../src/lib/protocol/crag-whitelist.mjs'
+import { relocateThirdPartySystem } from '../../src/lib/protocol/third-party-system.mjs'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -742,4 +744,107 @@ test('automatic caching still converts at the four-breakpoint budget', () => {
   )
   assert.equal('cache_control' in out, false)
   assert.deepEqual(out.messages[0].content[0].cache_control, mark)
+})
+
+test('CRAG V4 official_full reserves 2 template cache_control breakpoints so caller 4 breakpoints do not become 6 (#2016)', () => {
+  const countCacheControls = (obj) => {
+    let n = 0
+    const walk = (v) => {
+      if (Array.isArray(v)) v.forEach(walk)
+      else if (v && typeof v === 'object') {
+        if (v.cache_control != null) n += 1
+        Object.values(v).forEach(walk)
+      }
+    }
+    walk(obj)
+    return n
+  }
+
+  const caps = ['headless_claude_bridge_v1', 'generation_controls_v3', 'prompt_append', 'system_text_cache_v3']
+  const inbound = {
+    model: 'claude-opus-5-5',
+    max_tokens: 64,
+    stream: true,
+    system: [
+      { type: 'text', text: 'You are a concise assistant.', cache_control: { type: 'ephemeral', ttl: '1h' } },
+      {
+        type: 'text',
+        text: "Follow the user's requested answer format.",
+        cache_control: { type: 'ephemeral', ttl: '1h' },
+      },
+      {
+        type: 'text',
+        text: 'Do not call tools or perform any actions.',
+        cache_control: { type: 'ephemeral', ttl: '1h' },
+      },
+    ],
+    messages: [
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'text',
+            text: 'Reply with exactly OK, nothing else.',
+            cache_control: { type: 'ephemeral', ttl: '1h' },
+          },
+        ],
+      },
+    ],
+  }
+  const relocated = relocateThirdPartySystem(inbound, { onlyForeign: false })
+  const prepared = prepareCragPrintBody(relocated.body, {
+    preset: 'official_full',
+    officialPassthrough: false,
+    capabilities: caps,
+    cacheTtl: '1h',
+  })
+  assert.equal(prepared.crag_persona_preset, 'official_full')
+  assert.equal(prepared.system, undefined)
+  assert.equal(countCacheControls(prepared), 2)
+  assert.equal(prepared.messages[0].content[0].cache_control, undefined)
+  assert.equal(prepared.messages[0].content[1].cache_control, undefined)
+  assert.deepEqual(prepared.messages[0].content[2].cache_control, { type: 'ephemeral', ttl: '1h' })
+  assert.deepEqual(prepared.messages[0].content[3].cache_control, { type: 'ephemeral', ttl: '1h' })
+
+  const direct = sanitizeCragBodyWhitelist(
+    {
+      model: 'claude-opus-5-5',
+      max_tokens: 64,
+      crag_persona_preset: 'official_full',
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'a', cache_control: { type: 'ephemeral', ttl: '1h' } },
+            { type: 'text', text: 'b', cache_control: { type: 'ephemeral', ttl: '1h' } },
+            { type: 'text', text: 'c', cache_control: { type: 'ephemeral', ttl: '1h' } },
+            { type: 'text', text: 'd', cache_control: { type: 'ephemeral', ttl: '1h' } },
+          ],
+        },
+      ],
+    },
+    { capabilities: caps },
+  ).body
+  assert.equal(countCacheControls(direct), 2)
+  assert.deepEqual(direct.messages[0].content[2].cache_control, { type: 'ephemeral', ttl: '1h' })
+  assert.deepEqual(direct.messages[0].content[3].cache_control, { type: 'ephemeral', ttl: '1h' })
+
+  // Controls: zero preset and officialPassthrough keep all 4 caller breakpoints.
+  const zeroPrepared = prepareCragPrintBody(inbound, {
+    preset: 'zero',
+    capabilities: caps,
+    cacheTtl: '1h',
+  })
+  assert.equal(zeroPrepared.crag_persona_preset, 'zero')
+  assert.equal(countCacheControls(zeroPrepared), 4)
+  assert.equal(countCacheControls(sanitizeCragBodyWhitelist(zeroPrepared, { capabilities: caps }).body), 4)
+
+  const passthroughPrepared = prepareCragPrintBody(inbound, {
+    preset: 'official_full',
+    officialPassthrough: true,
+    capabilities: caps,
+    cacheTtl: '1h',
+  })
+  assert.equal(countCacheControls(passthroughPrepared), 4)
+  assert.equal(countCacheControls(sanitizeCragBodyWhitelist(passthroughPrepared, { capabilities: caps }).body), 4)
 })

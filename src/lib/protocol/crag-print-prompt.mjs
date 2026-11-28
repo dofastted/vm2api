@@ -15,8 +15,12 @@ import {
 } from '../vm/slot-engine.mjs'
 import { CRS_OFFICIAL_CLI_SYSTEM, renderCragCustomSystemBlocks } from '../identity/crs-persona.mjs'
 import { canonicalPersonaCompat, normalizePersonaPreset, templatePresetFor } from '../identity/persona-template.mjs'
-import { materializeAutomaticCache } from './cache-ttl.mjs'
-import { isOnlyOfficialCliIdentitySystem, sanitizeSafeguardsForCrag } from './crag-whitelist.mjs'
+import { DEFAULT_CACHE_TTL, materializeAutomaticCache, repairCacheBreakpoints } from './cache-ttl.mjs'
+import {
+  cragV4TemplateCacheBreakpoints,
+  isOnlyOfficialCliIdentitySystem,
+  sanitizeSafeguardsForCrag,
+} from './crag-whitelist.mjs'
 import { normalizeImageContentBlocks } from './images.mjs'
 import { needsCragProviderCompatibility } from './kernel-request.mjs'
 import { isEmptyEffortValue } from './log-fields.mjs'
@@ -559,6 +563,17 @@ function applyPoolSystemForCrag(callerSystem, promptPolicy, officialPassthrough)
  * @param {object} body caller body, before cli-node persona injection
  * @param {{ preset?: 'official_full' | 'zero', officialPassthrough?: boolean, capabilities?: string[], health?: object | null, promptPolicy?: object | null, agentSummary?: boolean, foldSystemMessages?: boolean }} [options]
  */
+function budgetCragV4OfficialTemplateCache(body, capabilities, { routing = null, cacheTtl = null } = {}) {
+  const reserved = cragV4TemplateCacheBreakpoints(body, capabilities)
+  if (reserved <= 0) return body
+  const totalLimit = Number(routing?.compatibility?.cache_control_limit) || 4
+  return repairCacheBreakpoints(body, {
+    limit: Math.max(0, totalLimit - reserved),
+    fallbackTtl: cacheTtl || body?.cache_ttl || DEFAULT_CACHE_TTL,
+    fillMissing: false,
+  })
+}
+
 export function prepareCragPrintBody(
   body,
   {
@@ -667,7 +682,7 @@ export function prepareCragPrintBody(
           return out
         }
         out.crag_persona_preset = 'official_full'
-        return out
+        return budgetCragV4OfficialTemplateCache(out, capabilities, { routing, cacheTtl })
       }
     }
     // Priority 1: Native CC passthrough never touches system[] or injects persona/prompt/env controls.
@@ -710,7 +725,7 @@ export function prepareCragPrintBody(
     // (`!caller_starts_with_official_identity`) actually prepends tui_system_template.
     if (isOnlyOfficialCliIdentitySystem(out.system)) delete out.system
     out.crag_persona_preset = 'official_full'
-    return out
+    return budgetCragV4OfficialTemplateCache(out, capabilities, { routing, cacheTtl })
   }
   if (needsCragProviderCompatibility(out, capabilities)) {
     if (poolApplied && (promptPolicy.mode === 'override' || promptPolicy.mode === 'append')) {

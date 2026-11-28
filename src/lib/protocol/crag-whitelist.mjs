@@ -255,6 +255,42 @@ function isCleanCragCacheControl(control) {
 }
 
 /** True when system only carries the placeholder CLI identity left by third-party relocation. */
+export const CRAG_V4_OFFICIAL_TEMPLATE_BREAKPOINTS = 2
+
+function systemStartsWithOfficialIdentity(system) {
+  if (system == null) return false
+  const blocks =
+    typeof system === 'string' ? [{ type: 'text', text: system }] : Array.isArray(system) ? system : [system]
+  for (const block of blocks) {
+    const raw =
+      typeof block === 'string' ? block : block?.type === 'text' && typeof block.text === 'string' ? block.text : ''
+    const cleaned = raw
+      .split('\n')
+      .filter((line) => !BILLING_LINE_RE.test(line.trim()))
+      .join('\n')
+      .trim()
+    if (!cleaned) continue
+    return cleaned.startsWith(CRS_OFFICIAL_CLI_SYSTEM)
+  }
+  return false
+}
+
+/**
+ * CRAG V4 (headless_claude_bridge_v1) prepends its probed tui_system_template
+ * (carrying 2 cache_control breakpoints) when crag_persona_preset === 'official_full',
+ * crag_prompt.mode !== 'replace', and the caller's system does not already begin with
+ * the official CLI identity. Reserve those breakpoints from the caller's 4-block budget
+ * so the combined outbound request never exceeds Anthropic's 4-block limit (#2016).
+ */
+export function cragV4TemplateCacheBreakpoints(body, capabilities) {
+  const caps = Array.isArray(capabilities) ? capabilities : null
+  if (!caps || !caps.includes('headless_claude_bridge_v1')) return 0
+  if (body?.crag_persona_preset !== 'official_full') return 0
+  if (body?.crag_prompt?.mode === 'replace') return 0
+  if (systemStartsWithOfficialIdentity(body?.system)) return 0
+  return CRAG_V4_OFFICIAL_TEMPLATE_BREAKPOINTS
+}
+
 export function isOnlyOfficialCliIdentitySystem(system) {
   if (system == null) return false
   const blocks =
@@ -752,10 +788,11 @@ function sanitizeCragPrompt(value) {
   return out
 }
 
-function repairCragCacheBreakpoints(body) {
+function repairCragCacheBreakpoints(body, capabilities = null) {
   const fallbackTtl = body.cache_ttl || body.crag_options?.cache_ttl || DEFAULT_CACHE_TTL
+  const reserved = cragV4TemplateCacheBreakpoints(body, capabilities)
   return repairCacheBreakpoints(body, {
-    limit: 4,
+    limit: Math.max(0, 4 - reserved),
     fallbackTtl,
     fillMissing: false,
     stripExtraFields: true,
@@ -1020,7 +1057,7 @@ export function sanitizeCragBodyWhitelist(
     out[key] = value
   }
 
-  const finalBody = validateCacheBudget ? repairCragCacheBreakpoints(out) : out
+  const finalBody = validateCacheBudget ? repairCragCacheBreakpoints(out, caps) : out
 
   return { body: finalBody, strippedFields, strippedSafeguards }
 }
