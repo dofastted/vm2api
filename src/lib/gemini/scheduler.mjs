@@ -338,9 +338,9 @@ function known(error) {
     if (Number.isFinite(error.retryAfterMs) && error.retryAfterMs > 0) out.retryAfterMs = error.retryAfterMs
     if (error.retryAfter != null) out.retryAfter = error.retryAfter
     if (typeof error.upstreamReason === 'string' && error.upstreamReason) out.upstreamReason = error.upstreamReason
-    if (typeof error.upstreamCode === 'string' && error.upstreamCode) out.upstreamCode = error.upstreamCode
     if (error.contentRejected === true) out.contentRejected = true
     if (typeof error.workerCode === 'string' && error.workerCode) out.workerCode = error.workerCode
+    if (typeof error.upstreamCode === 'string' && error.upstreamCode) out.upstreamCode = error.upstreamCode
     if (error.bridgeDisconnected === true) out.bridgeDisconnected = true
     if (error.timing) out.timing = error.timing
     if (error.usage) out.usage = error.usage
@@ -509,10 +509,10 @@ async function consumeStreamResponse(
                   : 'gemini_inference_failed'
     const err = fail(streamError.status || FAILURES[code][0], code, streamError.message)
     if (Number.isInteger(streamError.status)) err.upstreamStatus = streamError.status
-    if (streamError.reason) err.upstreamReason = streamError.reason
-    if (streamError.code) err.upstreamCode = streamError.code
     err.timing = timing.snapshot()
     err.usage = result.usage
+    if (streamError.reason && !err.upstreamReason) err.upstreamReason = streamError.reason
+    if (streamError.code) err.upstreamCode = streamError.code
     throw err
   }
   if (!result.sawFinish && !result.text && !result.toolCalls.length && !result.images.length) {
