@@ -856,6 +856,8 @@ export class SchedulerRuntime {
   #telemetryTimer = null
   #syncInFlight = null
   #syncPending = false
+  #penaltyRepo = null
+  #penaltyRepoDb = null
   #started = false
 
   constructor(options = {}) {
@@ -2316,6 +2318,37 @@ export class SchedulerRuntime {
 
   explain(params = {}, opts = {}) {
     return this.explainDispatch(params, opts)
+  }
+
+  /**
+   * Active node-level cooldowns (`node_cooldown`) of Claude slots, keyed by vm id.
+   *
+   * Rust owns the cooldown and persists it to `scheduler_node_penalties`; the panel
+   * reads that table instead of asking the daemon, so a slot the scheduler excludes
+   * stops showing as available. Model-scoped and permanent penalties are skipped:
+   * the former are per-model gates, the latter are not a timed cooldown. Read-only.
+   */
+  activeNodePenalties(nowMs = Date.now()) {
+    const out = new Map()
+    const db = this.#resolveDb()
+    if (!db) return out
+    try {
+      if (this.#penaltyRepoDb !== db) {
+        this.#penaltyRepo = new SchedulerPoolsRepo(db)
+        this.#penaltyRepoDb = db
+      }
+      for (const row of this.#penaltyRepo.listActiveNodePenalties(nowMs)) {
+        if (row.node_type !== 'claude_vm' || (row.model_scope || '*') !== '*') continue
+        const until = Number(row.cooldown_until_ms) || 0
+        if (until <= nowMs || until >= PERMANENT_PENALTY_THRESHOLD_MS) continue
+        const id = String(row.node_id)
+        if (out.get(id)?.until >= until) continue
+        out.set(id, { until, reason: row.reason || 'cooldown', ladder_step: Number(row.ladder_step) || 0 })
+      }
+    } catch (err) {
+      this.#onError?.(err, { phase: 'active_node_penalties' })
+    }
+    return out
   }
 
   async unrestNode(nodeKey, opts = {}) {

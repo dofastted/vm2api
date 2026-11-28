@@ -5145,6 +5145,7 @@ export function createPanelHandler(ctx) {
           baseUrl: `http://127.0.0.1:${cfg.port}`,
           apiKey: cfg.api_key,
           accountQuota,
+          nodePenalty: ctx.poolScheduler?.nodePenalties?.()?.get(id) || null,
         })
         return json(res, 200, panel.ok(result))
       }
