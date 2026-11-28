@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.4.267 — 2026-11-28 · 优化 Claude Code ↔ CRAGGemini 原生边界并钉选 `0.5.5` 签名载荷
+
+- **优化 Claude Code 与 CRAGGemini 边界并钉选 `payload-2026.11.28-gemini-0.5.5`（#2121，配套 `antigravity-cli-proxy#25`）**：围绕 Claude Code 稳定直连原生 Gemini（如 `gemini-vm/gemini-4-hydrogen-high`），系统性收敛跨仓协议契约、空转容错、会话粘性与工具历史保真：
+  - **跨仓能力协商与无损直传**：`/infer-target` 与 `direct-client.mjs` 同时协商 `/internal/health` 的 `capabilities` 数组与 `protocol_capabilities` 对象（旧内核自动兼容回退）；新增 `X-Craggemini-Wire-Protocol`（`anthropic` 零转换直传、`/v1beta` `gemini` 无损保留 `thought`）、`X-Craggemini-Provider-Result: 1`（消费并严格剥离 `event: kin_provider_result` / `x-kin-provider-result`，统一 uncached `input_tokens` 与 `total_tokens = in + cache + out` 计费口径）及 `X-Craggemini-Session-Reset: 1`；直传路径剥离客户端可控内部字段并锁定网关配置的 `system_prompt_mode`。
+  - **空转拦截、预提交缓冲与 409 恢复**：延迟 `message_start` 并引入 15s thinking 预提交缓冲（提交后才发保活心跳，切号前重置缓冲防串帧）；拦截空可见输出、`provider_complete=false` 与异常 `finishReason`（`MALFORMED_FUNCTION_CALL`/`UNEXPECTED_TOOL_CALL`/`TOO_MANY_TOOL_CALLS`/`OTHER`，已见有效工具调用时保持 `'tool'`）为可切换 502 且不误触发 `unschedulable_on_502`；全量 409 冲突码归类为 `gemini_session_conflict`；提升默认 `timeout_ms=300000`、`idle_timeout_ms=180000`、`TURN_TIMEOUT=305`、`shm.request_mb=16` 与请求体上限 `64 MiB`。
+  - **会话粘性与多租户隔离**：修复无头 `/v1beta` 非探测首轮 T1→T2 `identity_id` 漂移（短探测/纯 `<system-reminder>` 维持随机 UUIDv4）；出站 `conversation_id` 改为按租户、分组池与 API 密钥隔离的确定性 `cs_<sha256>`（故障/409 恢复派生 `:r<epoch>`，`derived_*` 并发 409 隔离至独立随机会话且不发 reset）；全量扫描尾部 `user` 消息提取 `continuationCallIds` 并通过 `pinNodeKey` 钉入 Rust 调度器。
+  - **工具历史保真与 CC 路由放行**：能力门控去 `\u200B`（旧内核默认维持 `sanitizeNativeTuiText`，新内核关闭斜杠转义）；保留 `tool_result.is_error`、`/v1beta` 原始 `functionResponse` 键、`[tool_result, text]` 单 `user` turn、跨文本 `thoughtSignature`、附件归属与 `anyOf`/`oneOf` 说明；`/v1/messages` 与 `/v1/messages/count_tokens` 放行任意 `<prefix>/` Gemini 模型、`master` 密钥及绑定含 Gemini 成员分组池的受管密钥，修复 `targetPlatform === null` 误判 `hasOwnedVm=true`。
+  - **载荷钉选与文档同步**：`deploy/payload.json` 的 `geminiDefaultLinuxAmd64` 更新至 `payload-2026.11.28-gemini-0.5.5`（CRAGGemini `0.5.5`，零密钥轮换，公钥 `f6e3ef3a...` 与官方 `agy` 摘要不变），同步更新 `docs/gemini-host.md`。
+- 部署说明：本次改动相对 `1.4.266` 零数据库迁移、零 Rust 变更；更新了 `deploy/payload.json` 中的 `geminiDefaultLinuxAmd64`（`payload-2026.11.28-gemini-0.5.5`）及宿主脚本 `scripts/gemini*.py`，升级时需同步更新控制面镜像、宿主脚本与 CRAGGemini `0.5.5` 签名载荷（若暂未同步新载荷，vm2api 能力门控自动兼容旧版 `0.5.4` 载荷）。
+
 ## 1.4.266 — 2026-11-28 · 修复 PG 18 账单批写类型冲突、恢复清全缓存与断连在飞孤儿，新增 20K 回放基准套件
 
 - **修复 PostgreSQL 18 + Redis 8 真实闭环验证暴露的 3 项缺陷（#2119）**：承接 `1.4.264`（#2102）后的真库端到端与压测验证，根治以下 3 个问题：
