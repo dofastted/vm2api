@@ -210,6 +210,19 @@ export type VmPatch = {
   machine?: { memory?: string }
 }
 
+export function startVmWarmup<T = unknown>(id: string, body?: { target_rpm?: number }) {
+  return api<T>(`/api/panel/vms/${encodeURIComponent(id)}/warmup`, {
+    method: 'POST',
+    body: JSON.stringify(body ?? {}),
+  })
+}
+
+export function graduateVmWarmup<T = unknown>(id: string) {
+  return api<T>(`/api/panel/vms/${encodeURIComponent(id)}/warmup/graduate`, {
+    method: 'POST',
+  })
+}
+
 export function patchVm<T = unknown>(id: string, body: VmPatch) {
   return api<T>(`/api/panel/vms/${encodeURIComponent(id)}`, {
     method: 'PATCH',

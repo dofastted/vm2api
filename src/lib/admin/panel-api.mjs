@@ -52,6 +52,7 @@ import { nodePlatform } from '../cluster/placement.mjs'
 import { computeWeeklySplit, publicWeeklySplit, weeklySplitConfig } from '../pool/weekly-split.mjs'
 import { proxyBlockedReason } from '../vm/proxy-policy.mjs'
 import { pickScheduleFields } from '../pool/schedule-state.mjs'
+import { warmupSummary } from '../pool/account-warmup.mjs'
 import { socksProxyFamily, normalizeSocksHost } from '../vm/socks-address.mjs'
 import { accountTierKey, isNearLimit, normalizeTiers, resolveTierPolicy } from '../pool/quota-tiers.mjs'
 import { isOrganizationDisabledUsageResult } from '../pool/upstream-error-policy.mjs'
@@ -2331,6 +2332,12 @@ function enrichVm(v, accountQuota, active, extras = {}) {
       max_primary_sessions: limits?.inheritedPrimary ?? null,
       max_subagents_per_session: limits?.inheritedSubagents ?? null,
     },
+    warmup: isCodex
+      ? null
+      : warmupSummary(policy, {
+          schedulable: v.schedulable !== false,
+          fatalWindowHours: extras.routingConfig?.warmup?.fatal_window_hours ?? 0,
+        }),
     quota_override: quotaOverride,
     quota_policy: isCodex ? null : vmQuotaView(policy, vmQuotaConfig),
     quota_inherited: isCodex ? null : vmQuotaView(inheritedPolicy, globalQuotaConfig),

@@ -12,6 +12,7 @@ import {
   startWarmup,
   warmupOf,
   warmupPhase,
+  warmupSummary,
 } from '../../src/lib/pool/account-warmup.mjs'
 import { withVmLock } from '../../src/lib/vm/vm-file.mjs'
 
@@ -234,4 +235,44 @@ test('fatal error predicate covers credential, risk and org classes', () => {
   ]) {
     assert.ok(FATAL_ERROR_SQL.includes(frag), frag)
   }
+})
+
+test('warmupSummary exposes the segment plus a cheap phase', () => {
+  const vm = freshVm()
+  assert.equal(warmupSummary(vm.policy), null)
+  startWarmup(vm, { targetRpm: 30, now: '2026-11-27T00:00:00Z' })
+  vm.policy.warmup.accumulated_minutes = 90
+  const sum = warmupSummary(vm.policy, { schedulable: true, fatalWindowHours: 6 })
+  assert.equal(sum.phase, 'warming')
+  assert.equal(sum.started_at, '2026-11-27T00:00:00Z')
+  assert.equal(sum.accumulated_minutes, 90)
+  assert.equal(sum.target_rpm, 30)
+  assert.equal(sum.last_fatal_at, null)
+  assert.equal(warmupSummary(vm.policy, { schedulable: false }).phase, 'paused')
+})
+
+test('warmupPhase flags abnormal from a fresh last_fatal_at inside the window', () => {
+  const vm = freshVm()
+  startWarmup(vm, { targetRpm: 30 })
+  vm.policy.warmup.last_fatal_at = new Date(Date.now() - 3600_000).toISOString()
+  assert.equal(warmupPhase(vm, { fatalWindowMs: 6 * 3600_000 }), 'abnormal')
+  vm.policy.warmup.last_fatal_at = new Date(Date.now() - 7 * 3600_000).toISOString()
+  assert.equal(warmupPhase(vm, { fatalWindowMs: 6 * 3600_000 }), 'warming')
+})
+
+test('hold_fatal persists last_fatal_at and an audit event', async () => {
+  const store = new Map()
+  const vm = freshVm()
+  startWarmup(vm, { targetRpm: 30 })
+  store.set('vm-1', vm)
+  const load = async (id) => store.get(id)
+  const save = async (v) => store.set(v.id, v)
+  const r = await applyWarmupAction('vm-1', { action: 'hold_fatal', recentFatal: 2 }, {
+    load, save, now: '2026-11-27T05:00:00Z',
+  })
+  assert.equal(r.applied, 'hold_fatal')
+  const w = store.get('vm-1').policy.warmup
+  assert.equal(w.last_fatal_at, '2026-11-27T05:00:00Z')
+  assert.equal(w.events.at(-1).kind, 'hold_fatal')
+  assert.equal(w.events.at(-1).count, 2)
 })

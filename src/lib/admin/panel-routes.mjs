@@ -251,6 +251,8 @@ import { makeError, ErrorType, ErrorCode } from '../core/errors.mjs'
 import * as panel from './panel-api.mjs'
 import { GATEWAY_CAPABILITIES } from '../vm/execution-context.mjs'
 import { withVmLock, atomicWriteJson, isValidVmId, invalidateVmSlotReadCache } from '../vm/vm-file.mjs'
+import { graduateWarmup, normalizeWarmupConfig, startWarmup, warmupOf, warmupSummary } from '../pool/account-warmup.mjs'
+import { successCountSince } from '../pool/warmup-monitor.mjs'
 import { snapshotDatabaseMetricsAsync } from '../db/database-metrics.mjs'
 import { queryActiveUsage } from '../oauth/active-usage-query.mjs'
 import { getUsageCache } from '../oauth/usage-cache.mjs'
@@ -5474,6 +5476,55 @@ export function createPanelHandler(ctx) {
         })
         return json(res, result.status, result.body)
       }
+      // POST /api/panel/vms/:id/warmup — start (or restart) the ramp manually.
+      // body { target_rpm? } optional; codex slots are out of scope.
+      if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/warmup$/.test(p)) {
+        if (!requireAuth(req, res)) return
+        const id = p.split('/')[4]
+        const body = await readBody(req).catch(() => ({}))
+        if (isCodexVm(getVm(cfg.paths.project, id) || { id })) return json(res, 400, { ok: false, error: { message: 'warmup 仅支持 Claude 槽位' } })
+        const cfg2 = normalizeWarmupConfig(ctx.routingConfig?.warmup)
+        const targetRpm = body?.target_rpm != null ? Number(body.target_rpm) : undefined
+        const vmPath = path.join(cfg.paths.project, 'vms', `${id}.json`)
+        const result = await withVmLock(vmPath, async () => {
+          const vm = getVm(cfg.paths.project, id)
+          if (!vm) return { status: 404, body: { ok: false, error: { message: 'vm not found' } } }
+          let base = 0
+          try {
+            base = successCountSince(getDb(), id, vm.policy?.warmup?.started_at || null) || 0
+          } catch {}
+          const segment = startWarmup(vm, {
+            targetRpm: Number.isFinite(targetRpm) ? targetRpm : cfg2.target_rpm,
+            baseSuccessRequests: vm.policy?.warmup ? 0 : base,
+            config: cfg2,
+          })
+          atomicWriteJson(vmPath, vm, { mode: 0o600 })
+          accountQuota.setMaxRpmForVm(id, segment.target_rpm, { override: true })
+          return { status: 200, body: { ok: true, warmup: warmupSummary(vm.policy, { schedulable: vm.schedulable !== false, fatalWindowHours: cfg2.fatal_window_hours }) } }
+        })
+        return json(res, result.status, result.body)
+      }
+
+      // POST /api/panel/vms/:id/warmup/graduate — drop the ramp now (operator override).
+      if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/warmup\/graduate$/.test(p)) {
+        if (!requireAuth(req, res)) return
+        const id = p.split('/')[4]
+        const vmPath = path.join(cfg.paths.project, 'vms', `${id}.json`)
+        const result = await withVmLock(vmPath, async () => {
+          const vm = getVm(cfg.paths.project, id)
+          if (!vm) return { status: 404, body: { ok: false, error: { message: 'vm not found' } } }
+          if (!warmupOf(vm)) return { status: 409, body: { ok: false, error: { message: '该槽位不在预热中' } } }
+          const record = graduateWarmup(vm)
+          atomicWriteJson(vmPath, vm, { mode: 0o600 })
+          // Same path as the automatic graduation: restore tier/default RPM
+          // (never write 0/unlimited) and sync the scheduler runtime.
+          inheritVmScheduling(id, { rpm: true })
+          notifySchedulerConfigChanged('warmup_graduate')
+          return { status: 200, body: { ok: true, graduated: record } }
+        })
+        return json(res, result.status, result.body)
+      }
+
       // POST /api/panel/vms/:id/probe
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/probe$/.test(p)) {
         const id = p.split('/')[4]
