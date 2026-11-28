@@ -1,4 +1,5 @@
 import crypto from 'node:crypto'
+import { isLocalCragEmptyReplaceUnsupportedError } from '../protocol/crag-print-prompt.mjs'
 import {
   classifyUpstreamResult,
   isFableModel,
@@ -412,7 +413,10 @@ function buildRustFailureReport(result, policy, error = null) {
     httpStatus === 408
   const isTransport = Boolean(result?.transportError) || httpStatus === 0
   let errorClass
-  if (isCredentialDeath(policy)) {
+  if (isLocalCragEmptyReplaceUnsupportedError(error)) {
+    // Pre-dispatch capability rejection says nothing about node health.
+    errorClass = 'request_protocol'
+  } else if (isCredentialDeath(policy)) {
     errorClass = 'permanent_ban'
   } else if (policy?.reason === 'account_quota_exhausted' || policy?.reason === 'fable_rate_limited') {
     errorClass = 'quota_exhausted'
@@ -1918,7 +1922,7 @@ export class FailoverRunner {
           result = {
             ok: false,
             status: isCragEmptyReplaceUnsupported ? error.status || 503 : 0,
-            transportError: true,
+            transportError: !isLocalCragEmptyReplaceUnsupportedError(error),
             committed,
             terminalState: committed ? 'incomplete' : isCragEmptyReplaceUnsupported ? 'rejected' : 'transport_error',
             body:
