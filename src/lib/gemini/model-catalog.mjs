@@ -45,9 +45,12 @@ export function parseAntigravityModelSpec(rawId) {
   if (!raw) return { raw: '', cleaned: '', base: '', impliedEffort: '', hadDecorations: false }
   let hadDecorations = false
   let work = raw
-  if (/^models\//i.test(work)) {
-    work = work.replace(/^models\//i, '')
-    hadDecorations = true
+  if (work.includes('/')) {
+    const tail = work.split('/').filter(Boolean).pop()
+    if (tail && tail !== work) {
+      work = tail
+      hadDecorations = true
+    }
   }
   if (/\[1m\]$/i.test(work)) {
     work = work.replace(/\[1m\]$/i, '')
@@ -115,10 +118,8 @@ export function stripAntigravityPrefix(model) {
  */
 export function isAntigravityRoutedModel(model) {
   if (typeof model !== 'string') return false
-  const lower = model
-    .trim()
-    .replace(/^models\//i, '')
-    .toLowerCase()
+  const stripped = model.trim().split('/').filter(Boolean).pop() || ''
+  const lower = stripped.toLowerCase()
   return lower.startsWith('gemini-') || lower.startsWith(ANTIGRAVITY_PREFIX)
 }
 

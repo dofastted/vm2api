@@ -999,7 +999,7 @@ function passesCragValidText(text) {
   return !text.split(/\p{White_Space}+/u).some((word) => word.startsWith('/'))
 }
 
-test('antigravity target sanitizes CLI slash tokens, control chars, billing headers, and empty turns', () => {
+test('antigravity target sanitizes CLI slash tokens by default for legacy kernels and preserves raw paths when escapeSlashes=false', () => {
   assert.equal(stripIllegalControlChars('\x1b[31mFAIL\x1b[0m\x00\x08\x7f\u0085\nok\t!'), 'FAIL\nok\t!')
   assert.equal(escapeNativeTuiSlashes('https://example.test/a foo/bar'), 'https://example.test/a foo/bar')
   assert.ok(
@@ -1088,7 +1088,17 @@ test('antigravity target sanitizes CLI slash tokens, control chars, billing head
     }
   }
   const frTurn = agReq.contents.find((c) => c.parts.some((p) => p.functionResponse))
-  assert.equal(frTurn.parts[1].functionResponse.response.result, 'Tool execution failed with no output.')
+  assert.deepEqual(frTurn.parts[1].functionResponse.response, {
+    error: 'Tool execution failed with no output.',
+    is_error: true,
+  })
+  assert.equal(frTurn.parts[0].functionResponse.response.result, 'OK at \u200B/mnt/x/vm2api/src/server.mjs')
+
+  // When target declares new ACP wire capability (escapeSlashes: false), literal paths stay ZWSP-free.
+  const cleanAgReq = buildGeminiRequest(anthIr, { target: 'antigravity', escapeSlashes: false })
+  const cleanFrTurn = cleanAgReq.contents.find((c) => c.parts.some((p) => p.functionResponse))
+  assert.equal(cleanFrTurn.parts[0].functionResponse.response.result, 'OK at /mnt/x/vm2api/src/server.mjs')
+  assert.equal(cleanFrTurn.parts[0].functionResponse.response.result.includes('\u200B'), false)
 
   // Billing-only or whitespace/placeholder-only user turn normalizes to fallback '.' instead of empty text.
   const emptyIr = parseInboundToGemini('anthropic', {

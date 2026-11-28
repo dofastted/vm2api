@@ -559,6 +559,7 @@ async function commitImportedCodexVm({
   account,
   catalogClientVersion = 'auto',
   routingConfig = {},
+  poolScheduler = null,
 }) {
   const wasCodex = isCodexVm(existing)
   const previousPolicy = existing.policy && typeof existing.policy === 'object' ? existing.policy : {}
@@ -610,6 +611,8 @@ async function commitImportedCodexVm({
     // 凭证换新同时清进程内存 hold（含 grant-death 的 MAX_SAFE_INTEGER 永久占位），
     // 否则复活号磁盘健康但调度层恒 cooldown，直到进程重启才回池。
     clearOpenAIAccountHold(existing.id)
+    // The Rust scheduler keeps its own penalty for a revoked grant; clear it too (#2086).
+    poolScheduler?.unrestCodexNode?.(existing.id)
   }
   let catalog = null
   try {
@@ -7248,6 +7251,7 @@ export function createPanelHandler(ctx) {
               account,
               catalogClientVersion: ctx.routingConfig.codex?.catalog_client_version,
               routingConfig: ctx.routingConfig,
+              poolScheduler: ctx.poolScheduler,
             })
             return json(res, 200, panel.ok(committed))
           }
@@ -7474,6 +7478,7 @@ export function createPanelHandler(ctx) {
               existing,
               catalogClientVersion: ctx.routingConfig.codex?.catalog_client_version,
               routingConfig: ctx.routingConfig,
+              poolScheduler: ctx.poolScheduler,
               account: {
                 access_token: oauth.access_token,
                 refresh_token: oauth.refresh_token,
@@ -7796,6 +7801,7 @@ export function createPanelHandler(ctx) {
           // upsert 已在锁内完成（并发轮换时采用对方新票）；成功=活票：
           // 清掉 grant-death 内存 hold 与陈旧吊销标。
           clearOpenAIAccountHold(id)
+          ctx.poolScheduler?.unrestCodexNode?.(id)
           try {
             persistCodexCredentialState(cfg.paths.project, id, { error: null })
           } catch {}

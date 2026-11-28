@@ -23,8 +23,10 @@ test('routing-config defaults, validation, merge, and protocol gating', () => {
   assert.equal(def.pool.max_concurrency_per_account, 20)
   assert.equal(def.pool.max_sessions_per_account, 20)
   assert.equal(def.pool.eligibility_probe_interval_secs, 180)
+  assert.equal(def.pool.timeout_ms, 300_000)
+  assert.equal(def.pool.idle_timeout_ms, 180_000)
   assert.equal(def.shm.require_shm, true)
-  assert.equal(def.shm.request_mb, 4)
+  assert.equal(def.shm.request_mb, 16)
   assert.equal(def.shm.response_mb, 16)
 
   assert.throws(() => validateGeminiRoutingPatch({ gemini: { pool: { max_sessions_per_account: 0 } } }), {

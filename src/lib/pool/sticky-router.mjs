@@ -114,27 +114,51 @@ export function isPersistableEnvelope(body = {}, inbound = null) {
  */
 export function firstUserFingerprint(body = {}) {
   const msgs = Array.isArray(body?.messages) ? body.messages : Array.isArray(body?.input) ? body.input : []
-  const user = msgs.find((m) => String(m?.role || m?.type || '').toLowerCase() === 'user') || msgs[0]
   let text = ''
-  if (user) {
-    const c = user.content ?? user.text ?? user.input
-    if (typeof c === 'string') text = c
-    else if (Array.isArray(c)) {
+  if (msgs.length) {
+    const user = msgs.find((m) => String(m?.role || m?.type || '').toLowerCase() === 'user') || msgs[0]
+    if (user) {
+      const c = user.content ?? user.text ?? user.input
+      if (typeof c === 'string') text = firstUserIdentityText([c])
+      else if (Array.isArray(c)) {
+        text = firstUserIdentityText(
+          c.map((part) =>
+            typeof part === 'string'
+              ? part
+              : (part?.type === 'text' || part?.type === 'input_text') && typeof part.text === 'string'
+                ? part.text
+                : '',
+          ),
+        )
+      }
+    }
+  } else if (Array.isArray(body?.contents) && body.contents.length) {
+    const user =
+      body.contents.find((item) => {
+        if (typeof item === 'string') return true
+        if (!item || typeof item !== 'object') return false
+        const role = String(item.role || '')
+          .trim()
+          .toLowerCase()
+        return !role || role === 'user'
+      }) || body.contents[0]
+    if (typeof user === 'string') {
+      text = firstUserIdentityText([user])
+    } else if (Array.isArray(user?.parts)) {
       text = firstUserIdentityText(
-        c.map((part) =>
-          typeof part === 'string' ? part : part?.type === 'text' && typeof part.text === 'string' ? part.text : '',
-        ),
+        user.parts.map((part) => (typeof part === 'string' ? part : typeof part?.text === 'string' ? part.text : '')),
       )
+    } else if (typeof user?.text === 'string') {
+      text = firstUserIdentityText([user.text])
     }
   } else if (typeof body?.input === 'string') {
-    text = body.input
+    text = firstUserIdentityText([body.input])
   } else if (typeof body?.prompt === 'string') {
-    text = body.prompt
+    text = firstUserIdentityText([body.prompt])
   }
   text = String(text || '')
     .replace(/\s+/g, ' ')
     .trim()
-    .slice(0, 4000)
   if (!text) return ''
   return crypto.createHash('sha256').update(text).digest('hex').slice(0, 24)
 }
@@ -186,22 +210,67 @@ export const SHORT_PROBE_MAX_CHARS = 64
  * conversation, they must not hold a session seat or move a sticky pin.
  */
 export function isShortProbeRequest(body = {}) {
-  const msgs = Array.isArray(body?.messages) ? body.messages : []
-  if (msgs.length !== 1 || String(msgs[0]?.role || '').toLowerCase() !== 'user') return false
   const tools = body?.tools
   if (Array.isArray(tools) ? tools.length > 0 : !!tools) return false
-  const content = msgs[0].content
-  let text = ''
-  if (typeof content === 'string') text = content
-  else if (Array.isArray(content)) {
-    for (const part of content) {
-      if (typeof part === 'string') text += part
-      else if (part?.type === 'text' && typeof part.text === 'string') text += part.text
-      else return false
+  if (Array.isArray(body?.messages)) {
+    const msgs = body.messages
+    if (msgs.length !== 1 || String(msgs[0]?.role || '').toLowerCase() !== 'user') return false
+    const content = msgs[0].content
+    let text = ''
+    if (typeof content === 'string') text = content
+    else if (Array.isArray(content)) {
+      for (const part of content) {
+        if (typeof part === 'string') text += part
+        else if (part?.type === 'text' && typeof part.text === 'string') text += part.text
+        else return false
+      }
+    } else return false
+    text = text.trim()
+    return text.length > 0 && text.length <= SHORT_PROBE_MAX_CHARS
+  }
+  if (Array.isArray(body?.contents)) {
+    const contents = body.contents
+    if (contents.length !== 1) return false
+    const first = contents[0]
+    if (!first || typeof first !== 'object') {
+      if (typeof first === 'string') {
+        const t = first.trim()
+        return t.length > 0 && t.length <= SHORT_PROBE_MAX_CHARS
+      }
+      return false
     }
-  } else return false
-  text = text.trim()
-  return text.length > 0 && text.length <= SHORT_PROBE_MAX_CHARS
+    const role = String(first.role || 'user')
+      .trim()
+      .toLowerCase()
+    if (role !== 'user') return false
+    const parts = first.parts
+    if (!Array.isArray(parts) || parts.length === 0) return false
+    let text = ''
+    for (const part of parts) {
+      if (typeof part === 'string') {
+        text += part
+      } else if (
+        part &&
+        typeof part === 'object' &&
+        typeof part.text === 'string' &&
+        !part.functionCall &&
+        !part.function_call &&
+        !part.functionResponse &&
+        !part.function_response &&
+        !part.inlineData &&
+        !part.inline_data &&
+        !part.fileData &&
+        !part.file_data
+      ) {
+        text += part.text
+      } else {
+        return false
+      }
+    }
+    text = text.trim()
+    return text.length > 0 && text.length <= SHORT_PROBE_MAX_CHARS
+  }
+  return false
 }
 
 export function explicitParentSessionId(body = {}, headers = {}) {

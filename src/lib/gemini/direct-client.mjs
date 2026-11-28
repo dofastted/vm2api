@@ -5,8 +5,9 @@ import { GEMINI_LICENSE_MESSAGES } from './subscription.mjs'
 const TOKEN_RE = /^[!-~]{24,4096}$/
 const MODEL_RE = /^[a-z0-9][a-z0-9._-]{0,99}$/
 const REQUEST_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
-const CONV_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
-const MAX_ENVELOPE_BYTES = 12 * 1024 * 1024
+const CONV_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
+const VALID_WIRE_PROTOCOLS = new Set(['raw', 'gemini', 'anthropic'])
+const MAX_ENVELOPE_BYTES = 64 * 1024 * 1024
 const MAX_ERROR_BODY_BYTES = 64 * 1024
 const DEFAULT_TARGET_TTL_MS = 30_000
 const UNSUPPORTED_RETRY_MS = 5 * 60_000
@@ -68,11 +69,24 @@ const ALLOWED_TOOL_KEYS = new Set([
   'google_search_retrieval',
   'urlContext',
   'url_context',
-  'codeExecution',
-  'code_execution',
 ])
 
-const VALID_ASPECT_RATIOS = new Set(['1:1', '3:4', '4:3', '9:16', '16:9', '2:3', '3:2', '4:5', '5:4', '21:9'])
+const VALID_ASPECT_RATIOS = new Set([
+  '1:1',
+  '1:4',
+  '4:1',
+  '1:8',
+  '8:1',
+  '3:4',
+  '4:3',
+  '9:16',
+  '16:9',
+  '2:3',
+  '3:2',
+  '4:5',
+  '5:4',
+  '21:9',
+])
 
 const VALID_IMAGE_SIZES = new Set(['1K', '2K', '4K'])
 const VALID_THINKING_LEVELS = new Set(['minimal', 'low', 'medium', 'high', 'xhigh', 'extra_high', 'none'])
@@ -104,7 +118,7 @@ const TRANSPORT_FALLBACK_CODES = new Set([
  * `/internal/v1/accounts/{id}/messages` or `/internal/v1/messages` Unix socket,
  * matching `scripts/gemini-host.py::_extract_native_turn_body` semantics.
  */
-export function prepareDirectNativeTurnBody(model, bodyObj) {
+export function prepareDirectNativeTurnBody(model, bodyObj, { preserveThought = false } = {}) {
   if (!bodyObj || typeof bodyObj !== 'object' || Array.isArray(bodyObj)) return null
   for (const key of Object.keys(bodyObj)) {
     if (!ALLOWED_TOP_KEYS.has(key)) return null
@@ -149,7 +163,7 @@ export function prepareDirectNativeTurnBody(model, bodyObj) {
           }
         }
       }
-      if (part.thought === true) continue
+      if (part.thought === true && !preserveThought) continue
       const fd =
         part.fileData && typeof part.fileData === 'object' && !Array.isArray(part.fileData)
           ? part.fileData
@@ -294,7 +308,15 @@ export function prepareDirectNativeTurnBody(model, bodyObj) {
   return forwarded
 }
 
-export function buildDirectEnvelope({ model, requestId, bodyObj, gatewayPolicy = null, restartResume = false }) {
+export function buildDirectEnvelope({
+  model,
+  requestId,
+  bodyObj,
+  gatewayPolicy = null,
+  restartResume = false,
+  wireProtocol = null,
+  conversationId = null,
+}) {
   if (
     typeof model !== 'string' ||
     !MODEL_RE.test(model) ||
@@ -303,13 +325,32 @@ export function buildDirectEnvelope({ model, requestId, bodyObj, gatewayPolicy =
   ) {
     return null
   }
-  const nativeBody = prepareDirectNativeTurnBody(model, bodyObj)
-  if (!nativeBody) return null
-  let wireBody = nativeBody
-  const mode = nativeBody.system_prompt_mode
-  if (mode !== undefined) {
-    wireBody = { ...nativeBody }
+  if (wireProtocol != null && !VALID_WIRE_PROTOCOLS.has(wireProtocol)) {
+    return null
+  }
+  let wireBody
+  let mode
+  if (wireProtocol === 'anthropic') {
+    if (!bodyObj || typeof bodyObj !== 'object' || Array.isArray(bodyObj) || !Array.isArray(bodyObj.messages)) {
+      return null
+    }
+    mode = bodyObj.system_prompt_mode
+    if (mode !== undefined && mode !== null && mode !== 'official_full' && mode !== 'zero') {
+      return null
+    }
+    wireBody = { ...bodyObj, model }
     delete wireBody.system_prompt_mode
+  } else {
+    const nativeBody = prepareDirectNativeTurnBody(model, bodyObj, {
+      preserveThought: wireProtocol === 'gemini',
+    })
+    if (!nativeBody) return null
+    wireBody = nativeBody
+    mode = nativeBody.system_prompt_mode
+    if (mode !== undefined) {
+      wireBody = { ...nativeBody }
+      delete wireBody.system_prompt_mode
+    }
   }
   const envelope = {
     request_id: requestId,
@@ -317,7 +358,7 @@ export function buildDirectEnvelope({ model, requestId, bodyObj, gatewayPolicy =
     body: wireBody,
   }
   if (mode === 'zero') envelope.system_prompt_mode = 'zero'
-  const convId = wireBody.conversation_id || wireBody.conversationId
+  const convId = conversationId || wireBody.conversation_id || wireBody.conversationId
   if (typeof convId === 'string' && CONV_ID_RE.test(convId)) {
     envelope.conversation_id = convId
   }
@@ -381,7 +422,12 @@ export function mapCragWorkerError(httpStatus, payload) {
   }
   const effectiveStatus = upstream ?? httpStatus
   if (code === 'unsupported_turn') return makeErr(400, 'gemini_unsupported_turn', message)
-  if (code === 'invalid_envelope' || code === 'invalid_json') return makeErr(400, 'gemini_invalid_request', message)
+  if (code === 'invalid_envelope' || code === 'invalid_json' || code === 'invalid_wire_protocol') {
+    return makeErr(400, 'gemini_invalid_request', message)
+  }
+  if (code === 'empty_upstream_stream' || code === 'acp_executor_error' || code === 'acp_model_unspecified') {
+    return makeErr(502, 'gemini_inference_invalid_output', message)
+  }
   if (
     code === 'queue_full' ||
     code === 'native_unavailable' ||
@@ -408,7 +454,15 @@ export function mapCragWorkerError(httpStatus, payload) {
     if (contentRejected) err.contentRejected = true
     return err
   }
-  if (code === 'tool_continuation_aborted' || code === 'gemini_session_conflict') {
+  if (
+    code === 'tool_continuation_aborted' ||
+    code === 'gemini_session_conflict' ||
+    code === 'session_conflict' ||
+    code === 'tool_continuation_already_settled' ||
+    code === 'duplicate_request' ||
+    code === 'session_busy' ||
+    effectiveStatus === 409
+  ) {
     return makeErr(409, 'gemini_session_conflict', message)
   }
   if (effectiveStatus === 401) return makeErr(401, 'gemini_oauth_required', message)
@@ -433,6 +487,53 @@ export function mapCragWorkerError(httpStatus, payload) {
   )
 }
 
+export function targetSupportsWireProtocol(target, wireProtocol) {
+  if (!target || typeof wireProtocol !== 'string' || !wireProtocol) return false
+  const protoCaps = target.protocolCapabilities
+  if (Array.isArray(protoCaps?.internal_wire_protocols)) {
+    return protoCaps.internal_wire_protocols.includes(wireProtocol)
+  }
+  const caps = Array.isArray(target.capabilities) ? target.capabilities : []
+  if (wireProtocol === 'anthropic') return caps.includes('internal_anthropic_wire_v1')
+  if (wireProtocol === 'gemini') return caps.includes('internal_gemini_wire_v1')
+  if (wireProtocol === 'raw') return true
+  return false
+}
+
+export function targetSupportsProviderResult(target) {
+  if (!target) return false
+  if (target.protocolCapabilities?.provider_result_v2 === true) return true
+  return Array.isArray(target.capabilities) && target.capabilities.includes('provider_result_v2')
+}
+
+export function targetSupportsCleanAcpText(target) {
+  if (!target || typeof target !== 'object') return false
+  const protoCaps = target.protocolCapabilities
+  if (Array.isArray(protoCaps?.internal_wire_protocols) && protoCaps.internal_wire_protocols.length > 0) {
+    return true
+  }
+  const caps = Array.isArray(target.capabilities) ? target.capabilities : []
+  return (
+    caps.includes('internal_wire_protocol_v1') ||
+    caps.includes('internal_anthropic_wire_v1') ||
+    caps.includes('internal_gemini_wire_v1')
+  )
+}
+
+function normalizeTargetCapabilities(rawCaps, rawProtoCaps) {
+  const capabilities = Array.isArray(rawCaps) ? rawCaps.filter((c) => typeof c === 'string' && c.trim()) : []
+  const pc = rawProtoCaps && typeof rawProtoCaps === 'object' && !Array.isArray(rawProtoCaps) ? rawProtoCaps : {}
+  const internalWireProtocols = Array.isArray(pc.internal_wire_protocols)
+    ? pc.internal_wire_protocols.filter((p) => typeof p === 'string' && VALID_WIRE_PROTOCOLS.has(p))
+    : []
+  const protocolCapabilities = {
+    ...(internalWireProtocols.length ? { internal_wire_protocols: internalWireProtocols } : {}),
+    ...(pc.provider_result_v2 === true ? { provider_result_v2: true } : {}),
+    ...(pc.per_session_mcp === true ? { per_session_mcp: true } : {}),
+  }
+  return { capabilities, protocolCapabilities }
+}
+
 function validTarget(raw) {
   if (!raw || raw.direct !== true) return null
   if (typeof raw.socket_path !== 'string' || !path.isAbsolute(raw.socket_path)) return null
@@ -446,6 +547,10 @@ function validTarget(raw) {
         : '/internal/v1/cancel'
   const ttlMs =
     Number.isInteger(raw.ttl_ms) && raw.ttl_ms >= 1000 && raw.ttl_ms <= 120_000 ? raw.ttl_ms : DEFAULT_TARGET_TTL_MS
+  const { capabilities, protocolCapabilities } = normalizeTargetCapabilities(
+    raw.capabilities,
+    raw.protocol_capabilities,
+  )
   return {
     socketPath: raw.socket_path,
     token: raw.token,
@@ -453,6 +558,8 @@ function validTarget(raw) {
     cancelPath,
     accountId: typeof raw.account_id === 'string' ? raw.account_id : null,
     epoch: typeof raw.epoch === 'string' ? raw.epoch : '',
+    capabilities,
+    protocolCapabilities,
     ttlMs,
   }
 }
@@ -545,9 +652,29 @@ export function createDirectCragClient({ callHost, now = () => Date.now() }) {
 
   const openDirectStream = (
     target,
-    { model, requestId, bodyObj, gatewayPolicy = null, restartResume = false, signal, timeoutMs = 300_000 },
+    {
+      model,
+      requestId,
+      bodyObj,
+      gatewayPolicy = null,
+      restartResume = false,
+      wireProtocol = null,
+      providerResult = false,
+      sessionReset = false,
+      conversationId = null,
+      signal,
+      timeoutMs = 300_000,
+    },
   ) => {
-    const envelope = buildDirectEnvelope({ model, requestId, bodyObj, gatewayPolicy, restartResume })
+    const envelope = buildDirectEnvelope({
+      model,
+      requestId,
+      bodyObj,
+      gatewayPolicy,
+      restartResume,
+      wireProtocol,
+      conversationId,
+    })
     if (!envelope) {
       const err = new Error('The selected Gemini environment does not support the requested turn.')
       err.status = 400
@@ -560,6 +687,22 @@ export function createDirectCragClient({ callHost, now = () => Date.now() }) {
       err.status = 413
       err.code = 'gemini_inference_output_limit'
       return Promise.resolve({ ok: false, fallback: false, error: err })
+    }
+    const headers = {
+      Host: 'localhost',
+      'X-Kin-Internal-Token': target.token,
+      'Content-Type': 'application/json',
+      'Content-Length': bodyBuf.length,
+      Connection: 'close',
+    }
+    if (wireProtocol && VALID_WIRE_PROTOCOLS.has(wireProtocol)) {
+      headers['X-Craggemini-Wire-Protocol'] = wireProtocol
+    }
+    if (providerResult === true) {
+      headers['X-Craggemini-Provider-Result'] = '1'
+    }
+    if (sessionReset === true) {
+      headers['X-Craggemini-Session-Reset'] = '1'
     }
     return new Promise((resolve) => {
       let settled = false
@@ -576,13 +719,7 @@ export function createDirectCragClient({ callHost, now = () => Date.now() }) {
           method: 'POST',
           path: target.messagePath,
           agent: false,
-          headers: {
-            Host: 'localhost',
-            'X-Kin-Internal-Token': target.token,
-            'Content-Type': 'application/json',
-            'Content-Length': bodyBuf.length,
-            Connection: 'close',
-          },
+          headers,
         },
         async (res) => {
           const contentType = String(res.headers['content-type'] || '')
