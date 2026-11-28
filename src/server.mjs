@@ -561,6 +561,7 @@ routingConfig.tiers = normalizeTiers(routingConfig.tiers, routingConfig.quota, r
 syncTierDefaultsIntoRouting()
 warmupMonitor = createWarmupMonitor({
   config: routingConfig.warmup,
+  projectRoot: cfg.paths.project,
   listVms: () => listVms(cfg.paths.project),
   getVm: (id) => getVm(cfg.paths.project, id),
   loadVm: async (id) => getVm(cfg.paths.project, id),
@@ -568,7 +569,8 @@ warmupMonitor = createWarmupMonitor({
     const file = path.join(cfg.paths.project, 'vms', `${vm.id}.json`)
     atomicWriteJson(file, vm, { mode: 0o600 })
   },
-  setPin: (id, n, opts2) => accountQuota.setMaxRpmForVm(id, n, opts2),
+  inheritRpm: (id) => inheritVmScheduling(id, { rpm: true }),
+  syncScheduler: (reason) => schedulerRuntime?.syncConfigNow?.(reason),
 })
 stickyRouter = new StickyRouter({ dataDir, config: routingConfig })
 accountQuota = new AccountQuota({
@@ -986,6 +988,7 @@ backupService.onRestored(async (db) => {
   }
   routingConfig.health_probe = normalizeHealthProbeConfig(routingConfig.health_probe)
   routingConfig.usage_probe = normalizeUsageProbeConfig(routingConfig.usage_probe)
+  routingConfig.warmup = normalizeWarmupConfig(routingConfig.warmup)
   routingConfig.crag_zombie_guard = normalizeCragZombieGuardConfig(routingConfig.crag_zombie_guard)
   routingConfig.notify = normalizeNotifyConfig(routingConfig.notify)
   routingConfig.tiers = normalizeTiers(routingConfig.tiers, routingConfig.quota, routingConfig.concurrency)
@@ -1258,6 +1261,10 @@ const importCommit = createImportCommit({
   },
   get proxyPool() {
     return proxyPool
+  },
+  getSchedulerRuntime: () => schedulerRuntime,
+  get schedulerRuntime() {
+    return schedulerRuntime
   },
   applyVmConcurrency,
 })
@@ -1792,6 +1799,9 @@ function stopLeaderJobs() {
   } catch {}
   try {
     usageProbeMonitor?.stop?.()
+  } catch {}
+  try {
+    warmupMonitor?.stop?.()
   } catch {}
   try {
     catalogMonitor?.stop?.()

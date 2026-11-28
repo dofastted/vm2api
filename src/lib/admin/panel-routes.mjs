@@ -1795,6 +1795,7 @@ export function createPanelHandler(ctx) {
     ctx.routingConfig = previous
     ctx.healthMonitor?.setConfig(ctx.routingConfig.health_probe)
     ctx.usageProbeMonitor?.setConfig(ctx.routingConfig.usage_probe)
+    ctx.warmupMonitor?.setConfig(ctx.routingConfig.warmup)
     ctx.cragZombieGuard?.setConfig(ctx.routingConfig.crag_zombie_guard)
     ctx.notifyMonitor?.setConfig(ctx.routingConfig.notify)
     if (ctx.routingConfig.logging) {

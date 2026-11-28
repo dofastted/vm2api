@@ -236,6 +236,8 @@ export function createImportCommit(ctx) {
         },
       }
     }
+    let warmupStarted = false
+    const prevUuid = existing.claude?.account_uuid || null
     await withVmLock(vmPath, () => {
       const mode = importedCredential.mode || credentialModeFromOauth(oauth)
       const setupRegistration =
@@ -258,24 +260,26 @@ export function createImportCommit(ctx) {
         ctx.poolScheduler?.clearAuthCooldownFor?.(vmId, accountId)
         ctx.poolScheduler?.clearGrantRevokeCooldownFor?.(vmId, accountId)
       } catch {}
-      // Warm-up onboarding: a fresh (or swapped) account starts the rpm ramp
-      // when routing.warmup is enabled. Operator-imported same-account grants
-      // (credential refresh flows) never touch an in-flight warm-up.
       try {
-        const warmupCfg = normalizeWarmupConfig(routing().warmup)
-        const prevUuid = existing.claude?.account_uuid || null
+        rebindOauthAccount({ ...existing, ...JSON.parse(fs.readFileSync(vmPath, 'utf8')), id: vmId })
+      } catch {}
+      // Warm-up onboarding: a fresh or swapped Claude account starts (or restarts)
+      // the rpm ramp when routing.warmup.enabled is true. Same-account credential
+      // refreshes (nextUuid === prevUuid) leave an in-flight warm-up untouched.
+      try {
+        const warmupCfg = normalizeWarmupConfig(routing()?.warmup)
         const nextUuid = importedCredential.account_uuid || null
         if (warmupCfg.enabled && nextUuid && nextUuid !== prevUuid && !isCodexVm(existing)) {
           const vmRecord = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
-          if (!vmRecord.policy?.warmup) {
-            startWarmup(vmRecord, { targetRpm: warmupCfg.target_rpm, config: warmupCfg })
-            atomicWriteJson(vmPath, vmRecord, { mode: 0o600 })
+          startWarmup(vmRecord, { targetRpm: warmupCfg.target_rpm, config: warmupCfg })
+          atomicWriteJson(vmPath, vmRecord, { mode: 0o600 })
+          if (typeof ctx.accountQuota?.setMaxRpm === 'function') {
+            ctx.accountQuota.setMaxRpm(nextUuid, warmupCfg.target_rpm, { override: true })
+          } else {
             ctx.accountQuota?.setMaxRpmForVm?.(vmId, warmupCfg.target_rpm, { override: true })
           }
+          warmupStarted = true
         }
-      } catch {}
-      try {
-        rebindOauthAccount({ ...existing, ...JSON.parse(fs.readFileSync(vmPath, 'utf8')), id: vmId })
       } catch {}
       const refreshed = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
       if (name && refreshed.name !== name) {
@@ -285,6 +289,12 @@ export function createImportCommit(ctx) {
         Object.assign(existing, refreshed)
       }
     })
+    if (warmupStarted) {
+      try {
+        const rt = typeof ctx.getSchedulerRuntime === 'function' ? ctx.getSchedulerRuntime() : ctx.schedulerRuntime
+        await rt?.syncConfigNow?.('warmup_start')
+      } catch {}
+    }
     const clientSync = await syncClaudeClientCredentials(workerExec)
     if (!clientSync.ok) return clientSync
     const mode = importedCredential.mode || credentialModeFromOauth(oauth)

@@ -14,10 +14,11 @@
  *
  * All writes happen under withVmLock by the caller; this module stays pure.
  */
+import path from 'node:path'
 import { withVmLock } from '../vm/vm-file.mjs'
 
 export const DEFAULT_WARMUP = Object.freeze({
-  enabled: true,
+  enabled: false,
   target_rpm: 30,
   min_hours: 24,
   min_requests: 100,
@@ -77,11 +78,13 @@ function pushEvent(w, event, now, maxEvents) {
 
 /**
  * Enter (or restart) warm-up for a slot. Caller must hold the vm lock via
- * {@link applyWarmupAction}; the pin is stored on vm.policy so the existing
- * rpmLimitFor() gate enforces it with zero scheduler changes.
+ * `withVmLock(vmPath)` and sync the updated policy to the scheduler runtime.
  */
-export function startWarmup(vm, { targetRpm, baseSuccessRequests = 0, now = new Date().toISOString(), config = DEFAULT_WARMUP } = {}) {
-  const policy = vm.policy = vm.policy || {}
+export function startWarmup(
+  vm,
+  { targetRpm, baseSuccessRequests = 0, now = new Date().toISOString(), config = DEFAULT_WARMUP } = {},
+) {
+  const policy = (vm.policy = vm.policy || {})
   const target = clampNum(targetRpm ?? config.target_rpm, 1, 200, config.target_rpm)
   const restarted = warmupOf(vm) !== null
   policy.warmup = {
@@ -107,9 +110,12 @@ export function clearWarmup(vm, reason, now = new Date().toISOString(), config =
 }
 
 /**
- * Graduate: drop the pin and clear the segment in one locked write.
+ * Graduate: clear the warm-up segment and drop the manual override flag.
+ * Never writes `maxRpm = null` (which would bypass tier/default RPM limits);
+ * callers pass `inheritedRpm` or immediately invoke `inheritVmScheduling(id, { rpm: true })`
+ * under the same vm lock to restore the slot's tier/default RPM cap.
  */
-export function graduateWarmup(vm, now = new Date().toISOString()) {
+export function graduateWarmup(vm, now = new Date().toISOString(), { inheritedRpm } = {}) {
   const w = warmupOf(vm)
   if (!w) return null
   const record = {
@@ -119,7 +125,11 @@ export function graduateWarmup(vm, now = new Date().toISOString()) {
     target_rpm: w.target_rpm,
   }
   delete vm.policy.warmup
-  vm.policy.maxRpm = null
+  if (inheritedRpm != null && Number.isFinite(Number(inheritedRpm))) {
+    vm.policy.maxRpm = Math.max(0, Math.min(1e6, Number(inheritedRpm) || 0))
+  } else {
+    delete vm.policy.maxRpm
+  }
   vm.policy.rpmOverride = false
   return record
 }
@@ -169,12 +179,19 @@ export function warmupPhase(vm, { schedulable = true, recentFatal = 0 } = {}) {
 }
 
 /**
- * Apply a monitor decision under the vm lock. `save` persists vm.json.
- * Returns the applied action for logging.
+ * Apply a monitor decision under the vm path lock (`withVmLock(vmPath)`).
+ * `save` persists vm.json; `onGraduate` runs inside the same lock after saving
+ * so inherited tier RPM restoration stays atomic with clearing `policy.warmup`.
  */
-export async function applyWarmupAction(vmId, decision, { load, save, intervalMinutes, now, config } = {}) {
-  return withVmLock(vmId, async () => {
-    const vm = await load(vmId)
+export async function applyWarmupAction(
+  vmPath,
+  decision,
+  { vmId = null, load, save, onGraduate = null, intervalMinutes, now, config } = {},
+) {
+  const lockKey = String(vmPath || '')
+  const id = vmId || path.basename(lockKey, '.json')
+  return withVmLock(lockKey, async () => {
+    const vm = await load(id)
     if (!vm) return { applied: 'skip_missing' }
     const w = warmupOf(vm)
     if (!w) return { applied: 'skip_gone' }
@@ -201,6 +218,9 @@ export async function applyWarmupAction(vmId, decision, { load, save, intervalMi
       case 'graduate': {
         const record = graduateWarmup(vm, stamp)
         await save(vm)
+        if (typeof onGraduate === 'function') {
+          await onGraduate(vm, record)
+        }
         return { applied: 'graduate', record }
       }
 
