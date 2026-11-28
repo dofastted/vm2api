@@ -74,7 +74,7 @@ import { isCodexVm } from '../vm/vm-kind.mjs'
 import { getVm, listVms } from '../vm/vm-registry.mjs'
 import { readWorkerEgressMode, readWorkerProxyEndpoint } from '../vm/vm-runtime.mjs'
 import { kernelFaults } from '../transport/rust-kernel-client.mjs'
-import { accountIdOf } from '../pool/pool-scheduler.mjs'
+import { MODEL_GATE_REASONS, MODEL_WAIT_REASONS, accountIdOf } from '../pool/pool-scheduler.mjs'
 import { claudeNodeGate, claudeModelWaitGate } from './node-gates.mjs'
 
 export { SchedulerApiError, SchedulerUnavailableError }
@@ -2096,6 +2096,16 @@ export class SchedulerRuntime {
       exclude_nodes: Array.isArray(params.excludeNodes ?? params.exclude_nodes)
         ? [...new Set((params.excludeNodes ?? params.exclude_nodes).map(String).filter(Boolean))]
         : [],
+    }
+    // 238 keep_pin_on_model_gate: tell Rust which nodes were dropped only for
+    // this model, so a session whose home is among them borrows and keeps its pin.
+    if (this.#getRoutingConfig()?.pool?.keep_pin_on_model_gate === true) {
+      req.keep_pin_on_model_gate = true
+      const gated = new Set()
+      for (const [reason, nodes] of Object.entries(gate.denied || {})) {
+        if (MODEL_GATE_REASONS.has(reason) || MODEL_WAIT_REASONS.has(reason)) for (const k of nodes) gated.add(k)
+      }
+      if (gated.size) req.model_gated_node_keys = [...gated]
     }
     // Out-of-band (non-enumerable, never serialized): which nodes the JS gate dropped and why.
     Object.defineProperty(req, JS_GATE, { value: gate, enumerable: false })

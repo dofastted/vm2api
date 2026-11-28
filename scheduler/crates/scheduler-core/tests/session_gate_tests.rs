@@ -107,6 +107,8 @@ fn make_req(req_id: &str, pool_id: &str, family: ModelFamily, sid: &str) -> Acqu
         is_admin_diagnostic: false,
         pin_node_key: None,
         exclude_nodes: vec![],
+        keep_pin_on_model_gate: false,
+        model_gated_node_keys: vec![],
     }
 }
 

@@ -211,6 +211,15 @@ pub struct AcquireRequest {
     pub pin_node_key: Option<NodeKey>,
     #[serde(default)]
     pub exclude_nodes: Vec<NodeKey>,
+    /// 238 `pool.keep_pin_on_model_gate`: when the session's pinned node is out
+    /// only because it cannot serve this model, the request borrows another node
+    /// and the session / machine pins stay home.
+    #[serde(default)]
+    pub keep_pin_on_model_gate: bool,
+    /// Nodes the caller dropped from `allowed_node_keys` for a model reason
+    /// (plan gate, per-model wait). Rust cannot tell these from scope filtering.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_gated_node_keys: Vec<NodeKey>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

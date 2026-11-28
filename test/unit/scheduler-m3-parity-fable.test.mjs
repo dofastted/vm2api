@@ -286,3 +286,25 @@ test('model wait gate: the only Max cooling is not reported as fable_requires_ma
     return true
   })
 })
+
+async function turn(runtime, model, sessionId) {
+  const res = await runtime.acquireNode({ ...acquireParams(model), sessionId, machineId: 'machine-1' })
+  await runtime.commitLease(res.lease_id)
+  await runtime.releaseLease(res.lease_id, 'ok')
+  return res.selected_node.node_key
+}
+
+for (const keepPin of [true, false]) {
+  test(`keep_pin_on_model_gate=${keepPin}: a Fable turn borrows Max; the next opus turn ${keepPin ? 'goes home' : 'stays on Max'} (238 reconcileSticky borrowed)`, async (t) => {
+    const { runtime } = setup(t, {
+      vms: MIXED(),
+      routing: { pool: { fable_requires_max: true, keep_pin_on_model_gate: keepPin } },
+    })
+    await runtime.start({ waitMs: 5_000, startLoops: false })
+    await runtime.pushTelemetryNow()
+    const sid = '00000000-0000-4000-8000-00000000beef'
+    assert.equal(await turn(runtime, 'claude-opus-4-6', sid), 'claude_vm:pro-a')
+    assert.equal(await turn(runtime, 'claude-fable-5-1', sid), 'claude_vm:max-a')
+    assert.equal(await turn(runtime, 'claude-opus-4-6', sid), keepPin ? 'claude_vm:pro-a' : 'claude_vm:max-a')
+  })
+}

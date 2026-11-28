@@ -38,6 +38,9 @@ pub struct ActiveLease {
     pub is_probe_one: bool,
     pub stood_in: bool,
     pub preserve_machine_home: bool,
+    /// Borrowed for one request because the session home was model-gated:
+    /// commit must not move the session pin.
+    pub keep_session_pin: bool,
     pub committed: bool,
     pub strict_session_overflow: bool,
     /// Immutable `(gate_key, gate_token)` frozen at `acquire()`.
