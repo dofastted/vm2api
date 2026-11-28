@@ -296,7 +296,7 @@ export function VmListPage() {
                   poolQueue.global_queue_depth > 0 &&
                     'text-[color:var(--status-warn)]'
                 )}
-                title='还没落到任何 VM、在等新席位的 Claude 请求数 / 允许排队数量（上限按全部排队请求计，含各 VM 上的排队，见状态列）'
+                title='还没落到任何 VM、在等空闲执行位的 Claude 请求数 / 允许排队数量（上限按全部排队请求计，含各 VM 上的排队，见状态列）'
               >
                 全局排队 {poolQueue.global_queue_depth}/{poolQueue.queue_max}
               </span>
