@@ -35,6 +35,8 @@ const KEY_PREFIX = 'sk-vm-'
 const HASH_MARKER = 'hmac:'
 const DEFAULT_USAGE_FLUSH_INTERVAL_MS = 1_500
 const DEFAULT_USAGE_FLUSH_BATCH_SIZE = 200
+const DEFAULT_USAGE_FLUSH_MAX_BATCHES_PER_TICK = 16
+const USAGE_FLUSH_ERROR_LOG_THROTTLE_MS = 30_000
 // USD spend windows open on the first spend recorded by ApiKeysRepo.
 const RATE_WINDOWS = [
   { name: '5h', limit: 'rate_limit_5h', usage: 'usage_5h', start: 'window_5h_start', ms: 5 * 3600_000 },
@@ -223,6 +225,11 @@ export class ApiKeyStore {
     this._pgPool = pgPool || null
     this._usageTimer = null
     this._usageFlusherActive = false
+    this._usageTickInFlight = false
+    this._usageFlushFailures = 0
+    this._lastUsageFlushError = null
+    this._lastUsageFlushErrorAt = 0
+    this._lastUsageFlushWarnAt = 0
     this._flushChain = Promise.resolve()
     this._keySnapshots = new Map() // keyId → latest known record snapshot
     this._pendingUsage = new Map() // keyId → local unflushed delta overlay
@@ -286,9 +293,34 @@ export class ApiKeyStore {
     this._usageFlusherActive = true
     if (this._usageTimer) return
     this._usageTimer = setInterval(() => {
-      this.flushPendingUsage().catch(() => {})
+      this._drainUsageTick().catch(() => {})
     }, ms)
     if (typeof this._usageTimer.unref === 'function') this._usageTimer.unref()
+  }
+
+  async _drainUsageTick(maxBatches = DEFAULT_USAGE_FLUSH_MAX_BATCHES_PER_TICK) {
+    if (this._usageTickInFlight) return 0
+    this._usageTickInFlight = true
+    let totalFlushed = 0
+    try {
+      const limit = Math.max(1, Number(maxBatches) || DEFAULT_USAGE_FLUSH_MAX_BATCHES_PER_TICK)
+      for (let i = 0; i < limit; i += 1) {
+        const res = await this.flushPendingUsage(DEFAULT_USAGE_FLUSH_BATCH_SIZE)
+        totalFlushed += res.flushed
+        if (res.flushed === 0 || res.failed > 0) break
+      }
+    } finally {
+      this._usageTickInFlight = false
+    }
+    return totalFlushed
+  }
+
+  usageFlushStats() {
+    return {
+      failures: this._usageFlushFailures,
+      lastError: this._lastUsageFlushError,
+      lastErrorAt: this._lastUsageFlushErrorAt || null,
+    }
   }
 
   stopUsageFlusher() {
@@ -1563,38 +1595,38 @@ export class ApiKeyStore {
         quota_used = COALESCE(k.quota_used, 0) + v.cost,
         usage_5h = CASE
           WHEN k.window_5h_start IS NULL OR k.window_5h_start = ''
-            OR (EXTRACT(EPOCH FROM ($1::timestamptz - k.window_5h_start::timestamptz)) * 1000) >= 18000000
+            OR (EXTRACT(EPOCH FROM (($1::text)::timestamptz - NULLIF(k.window_5h_start, '')::timestamptz)) * 1000) >= 18000000
           THEN v.cost
           ELSE COALESCE(k.usage_5h, 0) + v.cost
         END,
         window_5h_start = CASE
           WHEN k.window_5h_start IS NULL OR k.window_5h_start = ''
-            OR (EXTRACT(EPOCH FROM ($1::timestamptz - k.window_5h_start::timestamptz)) * 1000) >= 18000000
-          THEN $1
+            OR (EXTRACT(EPOCH FROM (($1::text)::timestamptz - NULLIF(k.window_5h_start, '')::timestamptz)) * 1000) >= 18000000
+          THEN $1::text
           ELSE k.window_5h_start
         END,
         usage_1d = CASE
           WHEN k.window_1d_start IS NULL OR k.window_1d_start = ''
-            OR (EXTRACT(EPOCH FROM ($1::timestamptz - k.window_1d_start::timestamptz)) * 1000) >= 86400000
+            OR (EXTRACT(EPOCH FROM (($1::text)::timestamptz - NULLIF(k.window_1d_start, '')::timestamptz)) * 1000) >= 86400000
           THEN v.cost
           ELSE COALESCE(k.usage_1d, 0) + v.cost
         END,
         window_1d_start = CASE
           WHEN k.window_1d_start IS NULL OR k.window_1d_start = ''
-            OR (EXTRACT(EPOCH FROM ($1::timestamptz - k.window_1d_start::timestamptz)) * 1000) >= 86400000
-          THEN $1
+            OR (EXTRACT(EPOCH FROM (($1::text)::timestamptz - NULLIF(k.window_1d_start, '')::timestamptz)) * 1000) >= 86400000
+          THEN $1::text
           ELSE k.window_1d_start
         END,
         usage_7d = CASE
           WHEN k.window_7d_start IS NULL OR k.window_7d_start = ''
-            OR (EXTRACT(EPOCH FROM ($1::timestamptz - k.window_7d_start::timestamptz)) * 1000) >= 604800000
+            OR (EXTRACT(EPOCH FROM (($1::text)::timestamptz - NULLIF(k.window_7d_start, '')::timestamptz)) * 1000) >= 604800000
           THEN v.cost
           ELSE COALESCE(k.usage_7d, 0) + v.cost
         END,
         window_7d_start = CASE
           WHEN k.window_7d_start IS NULL OR k.window_7d_start = ''
-            OR (EXTRACT(EPOCH FROM ($1::timestamptz - k.window_7d_start::timestamptz)) * 1000) >= 604800000
-          THEN $1
+            OR (EXTRACT(EPOCH FROM (($1::text)::timestamptz - NULLIF(k.window_7d_start, '')::timestamptz)) * 1000) >= 604800000
+          THEN $1::text
           ELSE k.window_7d_start
         END,
         status = CASE
@@ -1605,9 +1637,9 @@ export class ApiKeyStore {
         last_used_at = CASE
           WHEN v.last_used_at IS NOT NULL AND v.last_used_at <> '' AND (k.last_used_at IS NULL OR v.last_used_at > k.last_used_at)
           THEN v.last_used_at
-          ELSE COALESCE(k.last_used_at, $1)
+          ELSE COALESCE(k.last_used_at, $1::text)
         END,
-        updated_at = $1
+        updated_at = $1::text
       FROM (VALUES ${tuples.join(', ')}) AS v(id, requests, quota_requests_used, tokens_in, tokens_out, cache_read_tokens, cache_creation_tokens, cost, last_used_at)
       WHERE k.id = v.id AND k.deleted_at IS NULL
       RETURNING k.*
@@ -1699,9 +1731,21 @@ export class ApiKeyStore {
           notifyDbTablesMutated(['api_keys:usage'])
         }
         return { flushed: entries.length, failed: 0 }
-      } catch {
+      } catch (err) {
+        const errMsg = err?.message ? String(err.message) : String(err || 'unknown error')
+        const failedAt = Date.now()
+        this._usageFlushFailures += 1
+        this._lastUsageFlushError = errMsg
+        this._lastUsageFlushErrorAt = failedAt
+        if (failedAt - this._lastUsageFlushWarnAt >= USAGE_FLUSH_ERROR_LOG_THROTTLE_MS) {
+          this._lastUsageFlushWarnAt = failedAt
+          console.error(
+            `[api-keys] usage batch flush failed (${entries.length} keys, failures=${this._usageFlushFailures}):`,
+            errMsg,
+          )
+        }
         await cache.billing.readdDirtyKeyUsage(entries).catch(() => {})
-        return { flushed: 0, failed: entries.length }
+        return { flushed: 0, failed: entries.length, error: errMsg }
       }
     }
     const next = this._flushChain.then(run, run)

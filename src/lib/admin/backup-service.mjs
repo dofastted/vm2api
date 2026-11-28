@@ -44,7 +44,7 @@ import { Worker } from 'node:worker_threads'
 import { getDb, getDbEngine, getDbPath, getPgConfig, getPgPool, closeDatabase, openDatabase } from '../db/database.mjs'
 import { buildPgConnectionString } from '../db/pg/config.mjs'
 import { pgRestoreAvailable, queryPgServerMajorVersion, sha256File } from './backup-core.mjs'
-import { getCacheRuntime } from '../cache/index.mjs'
+import { invalidateAllCaches } from '../cache/index.mjs'
 import { SettingsRepo } from '../db/repos/settings-repo.mjs'
 import { BackupRepo } from '../db/repos/backup-repo.mjs'
 import { reconcileVms } from '../vm/vm-db-sync.mjs'
@@ -519,7 +519,7 @@ export class BackupService {
       let db
       if (isPg) {
         await this._restorePostgresSnapshot(dbFile)
-        await getCacheRuntime().client.invalidate({ prefixes: ['apikey:', 'billing:', 'sched:', 'dash:'] })
+        await invalidateAllCaches()
         db = getDb()
       } else {
         const dbPath = getDbPath()
@@ -541,6 +541,7 @@ export class BackupService {
           fs.chmodSync(dbPath, 0o600)
         } catch {}
         db = openDatabase({ dataDir: this.dataDir, dbPath })
+        await invalidateAllCaches()
       }
 
       // 3. restore vm + config files from the archive (tar flavor only)

@@ -17,7 +17,28 @@ import { DashboardCache } from './dashboard-cache.mjs'
 import { EntityCache } from './entity-cache.mjs'
 import { LiveLogCache } from './live-log-cache.mjs'
 
+export const ALL_CACHE_PREFIXES = ['apikey:', 'billing:', 'sched:', 'dash:', 'entity:', 'risk:', 'live:']
+
 let runtime = null
+const localCacheClearers = new Set()
+
+/**
+ * Register a process-local snapshot clearer (e.g. RefusalGuardsRepo) to run
+ * whenever `invalidateAllCaches()` executes locally or via cluster broadcast.
+ */
+export function registerLocalCacheClearer(fn) {
+  if (typeof fn !== 'function') return () => {}
+  localCacheClearers.add(fn)
+  return () => localCacheClearers.delete(fn)
+}
+
+function runLocalCacheClearers(ctx) {
+  for (const clearer of localCacheClearers) {
+    try {
+      clearer(ctx)
+    } catch {}
+  }
+}
 
 function createRuntime({ redisConfig, cacheConfig, pgPool = null } = {}) {
   const cfg = cacheConfig || resolveCacheConfig()
@@ -36,11 +57,22 @@ function createRuntime({ redisConfig, cacheConfig, pgPool = null } = {}) {
   const entity = new EntityCache(client)
   const liveLogs = new LiveLogCache(client)
 
-  // Keep local scheduler revision coherent when another instance broadcasts invalidation
+  // Keep local domain caches & snapshots coherent when another instance broadcasts invalidation
   client.onInvalidate((payload) => {
-    if (payload?.prefixes?.some((p) => p.startsWith('sched:'))) {
+    const prefixes = Array.isArray(payload?.prefixes) ? payload.prefixes : []
+    if (!prefixes.length) return
+    if (prefixes.some((p) => p.startsWith('sched:'))) {
       scheduler.revision += 1
       scheduler.snapshots.clear()
+    }
+    if (prefixes.some((p) => p === 'dash:' || 'dash:'.startsWith(p))) {
+      dashboard.snapshotCache.clear()
+    }
+    if (prefixes.some((p) => p === 'live:' || 'live:'.startsWith(p))) {
+      liveLogs.clearLocal()
+    }
+    if (prefixes.some((p) => p === 'risk:' || 'risk:'.startsWith(p))) {
+      runLocalCacheClearers({ db: null, prefixes, reason: 'invalidate' })
     }
   })
 
@@ -142,6 +174,20 @@ function createRuntime({ redisConfig, cacheConfig, pgPool = null } = {}) {
     }
   }
 
+  async function invalidateAllCaches({ db = null, broadcast = true } = {}) {
+    dashboard.snapshotCache.clear()
+    liveLogs.clearLocal()
+    scheduler.revision += 1
+    scheduler.snapshots.clear()
+    apiKeys.negCache?.clear?.()
+    if (apiKeys._inflight) {
+      for (const inf of apiKeys._inflight.values()) inf.invalidated = true
+      apiKeys._inflight.clear()
+    }
+    runLocalCacheClearers({ db, prefixes: ALL_CACHE_PREFIXES, reason: 'invalidate_all' })
+    await client.invalidate({ prefixes: ALL_CACHE_PREFIXES, broadcast })
+  }
+
   return {
     client,
     apiKeys,
@@ -155,6 +201,8 @@ function createRuntime({ redisConfig, cacheConfig, pgPool = null } = {}) {
     onDbTablesMutated,
     /** Explicit invalidation entry (consistent across PostgreSQL and SQLite modes). */
     notifyTablesMutated: onDbTablesMutated,
+    /** SSOT full cache invalidation (all prefixes, snapshotCache, liveLogs, and local snapshots). */
+    invalidateAllCaches,
     stats() {
       return client.stats()
     },
@@ -202,6 +250,18 @@ export function snapshotCacheMetrics() {
 export function notifyDbTablesMutated(tables) {
   if (!runtime) return
   runtime.onDbTablesMutated(tables)
+}
+
+/**
+ * SSOT full cache invalidation across L1, Redis L2 (via O(1) prefix epochs),
+ * dashboard snapshot cache, local live-log maps, and registered in-process snapshots.
+ */
+export async function invalidateAllCaches(opts = {}) {
+  if (!runtime) {
+    runLocalCacheClearers({ db: opts?.db ?? null, prefixes: ALL_CACHE_PREFIXES, reason: 'invalidate_all' })
+    return
+  }
+  await runtime.invalidateAllCaches(opts)
 }
 
 export {

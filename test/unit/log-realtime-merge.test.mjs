@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict'
+import { EventEmitter } from 'node:events'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 import { RequestLogStore } from '../../src/lib/admin/request-log.mjs'
+import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs'
 import { DashboardCache, EntityCache, LiveLogCache, MultiTierCacheClient } from '../../src/lib/cache/index.mjs'
 import { createDatabase } from '../../src/lib/db/database.mjs'
 import { PgLogWriter, getPgLogWriter, setPgLogWriter } from '../../src/lib/db/pg/pg-log-writer.mjs'
@@ -1027,4 +1029,163 @@ test('merge_into_request_id flushes pending PgLogWriter queue before merging con
     ['pg_flush', 'merge'],
   )
   assert.equal(events[1].parentId, 'req-pg-parent')
+})
+
+test('client disconnect, premature close, and handler errors clean up live:inflight and sess:conc with zero orphans', async (t) => {
+  const { dir, db } = createFixtureDb(t)
+  const cache = createIsolatedCache()
+  const store = new RequestLogStore({ dataDir: dir, db, mode: 'normal', cache })
+
+  const makeReq = (id) => {
+    const req = new EventEmitter()
+    req.method = 'POST'
+    req.url = '/v1/messages'
+    req.headers = { 'x-request-id': id }
+    req.socket = { remoteAddress: '127.0.0.1' }
+    req.complete = false
+    req.aborted = false
+    req.destroyed = false
+    return req
+  }
+  const makeRes = () => {
+    const res = new EventEmitter()
+    res.statusCode = 200
+    res.headersSent = false
+    res.writableEnded = false
+    res.writableFinished = false
+    res.destroyed = false
+    res.closed = false
+    res.setHeader = () => {}
+    res.end = function end() {
+      this.writableEnded = true
+      this.writableFinished = true
+      this.emit('finish')
+      this.closed = true
+      this.emit('close')
+    }
+    return res
+  }
+
+  // 1. Normal req 'close' after body read (req.complete=true) MUST NOT drop inflight;
+  //    premature res 'close' without 'finish' MUST drop inflight and decrement sess:conc to 0.
+  const req1 = makeReq('req-abort-res-close')
+  const res1 = makeRes()
+  const ctx1 = store.start(req1, { pathName: '/v1/messages', session_id: 'sess-orphan-1', res: res1 })
+  assert.equal(await cache.liveLogs.getInflightCount(), 1)
+  assert.equal((await cache.liveLogs.getActiveSessionCounts(['sess-orphan-1'])).get('sess-orphan-1'), 1)
+
+  req1.complete = true
+  req1.emit('close')
+  assert.equal(
+    await cache.liveLogs.getInflightCount(),
+    1,
+    'normal req close after body read must keep request inflight',
+  )
+
+  res1.closed = true
+  res1.emit('close')
+  await Promise.resolve()
+  assert.equal(await cache.liveLogs.getInflightCount(), 0, 'premature res close must remove inflight orphan')
+  assert.equal((await cache.liveLogs.getActiveSessionCounts(['sess-orphan-1'])).get('sess-orphan-1'), 0)
+  // Idempotent guard: repeat abort must return false and never go negative
+  assert.equal(store.abort(ctx1), false)
+  assert.equal((await cache.liveLogs.getActiveSessionCounts(['sess-orphan-1'])).get('sess-orphan-1'), 0)
+
+  // 2. req 'aborted' mid-request cleans up inflight & sess:conc
+  const req2 = makeReq('req-abort-event')
+  const res2 = makeRes()
+  store.start(req2, { pathName: '/v1/messages', session_id: 'sess-orphan-2', res: res2 })
+  assert.equal(await cache.liveLogs.getInflightCount(), 1)
+  req2.aborted = true
+  req2.emit('aborted')
+  await Promise.resolve()
+  assert.equal(await cache.liveLogs.getInflightCount(), 0)
+  assert.equal((await cache.liveLogs.getActiveSessionCounts(['sess-orphan-2'])).get('sess-orphan-2'), 0)
+
+  // 3. Premature req 'close' while req.complete === false cleans up inflight & sess:conc
+  const req3 = makeReq('req-premature-close')
+  const res3 = makeRes()
+  store.start(req3, { pathName: '/v1/messages', session_id: 'sess-orphan-3', res: res3 })
+  req3.complete = false
+  req3.emit('close')
+  await Promise.resolve()
+  assert.equal(await cache.liveLogs.getInflightCount(), 0)
+  assert.equal((await cache.liveLogs.getActiveSessionCounts(['sess-orphan-3'])).get('sess-orphan-3'), 0)
+
+  // 4. Pre-aborted request before start() never enters live:inflight
+  const req4 = makeReq('req-pre-aborted')
+  req4.aborted = true
+  const ctx4 = store.start(req4, { pathName: '/v1/messages', session_id: 'sess-orphan-4' })
+  assert.equal(ctx4._liveSettled, true)
+  assert.equal(await cache.liveLogs.getInflightCount(), 0)
+
+  // 5. handleProtocol early return (auth returns false without ending res) & thrown exception both leave 0 orphans
+  const proto = createHandleProtocol({
+    json: (res, status) => {
+      res.statusCode = status
+      res.end()
+    },
+    writeSSEHeaders() {},
+    readBody: async () => {
+      throw new Error('unexpected read crash')
+    },
+    requireAuth: (req) => req.headers['x-pass-auth'] === '1',
+    cfg: {
+      rewrite: { enabled: false },
+      intercept: { rules: [] },
+      distill: { enabled: false },
+      limits: { max_body_bytes: 1024 * 1024, upstream_timeout_ms: 2000 },
+      paths: { data: dir },
+    },
+    requestLog: store,
+    stickyRouter: {},
+    accountQuota: {},
+    apiKeyStore: { acquire: () => ({ ok: true }), release() {} },
+    apiScheduler: {},
+    apiEndpointStore: {},
+    stats: { errors: 0, requests: 0, by_route: {}, passthrough: 0, rewrite: 0, convert: 0 },
+    routingConfig: { failover: {} },
+    groupsRepo: { rateMultiplier: () => 1 },
+  })
+
+  // 5a: auth returns false without ending res (simulating already-dead socket)
+  const reqAuthDrop = makeReq('req-proto-auth-drop')
+  const resAuthDrop = makeRes()
+  await proto.handleProtocol(reqAuthDrop, resAuthDrop, 'anthropic.messages', '/v1/messages')
+  await Promise.resolve()
+  assert.equal(await cache.liveLogs.getInflightCount(), 0, 'unended early return must not leak live:inflight')
+
+  // 5b: unexpected exception thrown from requireAuth before res.end()
+  const protoThrow = createHandleProtocol({
+    json: () => {},
+    writeSSEHeaders() {},
+    readBody: async () => ({}),
+    requireAuth: () => {
+      throw new Error('boom before response')
+    },
+    cfg: {
+      rewrite: { enabled: false },
+      intercept: { rules: [] },
+      distill: { enabled: false },
+      limits: { max_body_bytes: 1024 * 1024, upstream_timeout_ms: 2000 },
+      paths: { data: dir },
+    },
+    requestLog: store,
+    stickyRouter: {},
+    accountQuota: {},
+    apiKeyStore: { acquire: () => ({ ok: true }), release() {} },
+    apiScheduler: {},
+    apiEndpointStore: {},
+    stats: { errors: 0, requests: 0, by_route: {}, passthrough: 0, rewrite: 0, convert: 0 },
+    routingConfig: { failover: {} },
+    groupsRepo: { rateMultiplier: () => 1 },
+  })
+  const reqBoom = makeReq('req-proto-throw')
+  const resBoom = makeRes()
+  await assert.rejects(
+    () => protoThrow.handleProtocol(reqBoom, resBoom, 'anthropic.messages', '/v1/messages'),
+    /boom before response/,
+  )
+  await Promise.resolve()
+  assert.equal(await cache.liveLogs.getInflightCount(), 0, 'uncaught handler throw must not leak live:inflight')
 })
