@@ -9,6 +9,7 @@ import {
 } from '../core/errors.mjs'
 import {
   blockedRiskTool,
+  classifyUpstream400,
   classifyUpstreamError,
   DEFAULT_BAN_STEPS,
   isUpstream400Reason,
@@ -206,35 +207,57 @@ export function recordUpstream400SessionBlock({
   classifier = null,
   now = Date.now(),
 } = {}) {
-  if (
-    !result ||
-    result.ok === true ||
-    result.upstreamExecutions === 0 ||
-    result.transportError === true ||
-    result.credential_ensure_failed === true ||
-    result.via === 'kernel-preflight'
-  ) {
+  const verdict = classifyUpstream400(result, {
+    phrases: policy?.risk_audit?.upstream_policy_phrases,
+    classifier,
+  })
+  if (!verdict) return null
+  if (!verdict.blockSession) {
+    if (logBag) logBag.risk_session_block_skipped = verdict.skipReason || verdict.category
+    mergeLogErrorDetails(logBag, {
+      upstream_400_category: verdict.category,
+      upstream_400_action: 'skipped',
+    })
     return null
   }
-  if (policy?.session_block_enabled === false) return null
-  if (classifier?.purpose === 'auto_mode_classifier') {
-    if (logBag) logBag.risk_session_block_skipped = 'auto_mode_classifier'
+  if (policy?.session_block_enabled === false) {
+    mergeLogErrorDetails(logBag, {
+      upstream_400_category: verdict.category,
+      upstream_400_action: 'skipped',
+    })
     return null
   }
-  const status = Number(result?.providerResult?.http_status ?? result?.upstreamStatus ?? result?.status) || 0
-  if (status !== 400) return null
   const effectiveIdentity = resolveAuditSessionIdentity({ inbound, body, headers, identity })
-  if (!effectiveIdentity.sessionId) return null
+  if (!effectiveIdentity.sessionId) {
+    mergeLogErrorDetails(logBag, {
+      upstream_400_category: verdict.category,
+      upstream_400_action: 'no_session',
+    })
+    return null
+  }
   try {
     const ban =
       devices?.blockSession?.(effectiveIdentity, {
         requestId,
-        reason: UPSTREAM_400_SESSION_REASON,
+        reason: verdict.reason || UPSTREAM_400_SESSION_REASON,
         ttlMs: UPSTREAM_400_SESSION_BLOCK_MS,
         now,
       }) || null
     if (ban && ban.expires_at) {
-      mergeLogErrorDetails(logBag, { punishment: 'session_10m_400' })
+      mergeLogErrorDetails(logBag, {
+        upstream_400_category: verdict.category,
+        upstream_400_action: 'session_10m',
+        punishment: 'session_10m_400',
+      })
+    } else if (ban && !ban.expires_at) {
+      mergeLogErrorDetails(logBag, {
+        upstream_400_category: verdict.category,
+        upstream_400_action: 'permanent_kept',
+      })
+    } else {
+      mergeLogErrorDetails(logBag, {
+        upstream_400_category: verdict.category,
+      })
     }
     return ban
   } catch {
@@ -354,10 +377,15 @@ export function observeUpstreamRisk({
     console.warn('[risk-audit] failed to persist upstream refusal')
   }
   if (reason !== 'upstream:billing_refusal' && !suspectOverRefusal) {
-    recordBan(
+    const escalated = recordBan(
       { identity: effectiveIdentity, fingerprint, reason, banDevice: true },
       { devices, policy, requestId, now },
     )
+    if (isBadRequest && blockSessionOn400 && escalated && logBag?.error_details) {
+      const nextDetails = { ...logBag.error_details, upstream_400_action: 'permanent_kept' }
+      delete nextDetails.punishment
+      logBag.error_details = nextDetails
+    }
   }
   return reason
 }

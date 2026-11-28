@@ -213,7 +213,7 @@ export function RiskStatus({
 
       <AuditFeed
         title='上游 4xx 错误与风控复核'
-        hint='涵盖上游 400 / 401 / 403 / 422；参数错误记为 protocol 不计违规，高危 401/403 附带 JEV 送审正文与分数。'
+        hint='涵盖上游 400 / 401 / 403 / 422；上游 400 按错误类型清洗分类，账号/额度/凭据/模型类跳过，其余会话级 400 临时封锁 10 分钟并计次。'
         rows={upstream400.data?.logs ?? []}
         loading={stats.isLoading || upstream400.isLoading}
         error={stats.error || upstream400.error}

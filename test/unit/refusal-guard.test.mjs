@@ -315,7 +315,7 @@ test('post-hop warms the right front rule and blocks the session for 10m on upst
     assert.equal(devices.findBan(deviceOnly, start), null)
     const protocol400Ban = devices.findBan(identity, start)
     assert.equal(protocol400Ban.subject_kind, 'session')
-    assert.equal(protocol400Ban.reason, 'upstream_400')
+    assert.equal(protocol400Ban.reason, 'upstream_400:unknown')
     assert.equal(protocol400Ban.expires_at, '2026-11-17T00:10:00.000Z')
     const thirdParty503Identity = {
       deviceId: 'installation-id',
@@ -351,7 +351,7 @@ test('post-hop warms the right front rule and blocks the session for 10m on upst
     )
     assert.equal(repo.count(), 0)
     assert.equal(devices.findBan(deviceOnly, start), null)
-    assert.equal(devices.findBan(thirdParty400Identity, start).reason, 'upstream_400')
+    assert.equal(devices.findBan(thirdParty400Identity, start).reason, 'upstream_400:third_party_client')
     assert.equal(
       observeUpstreamRisk({ ...opts, result: upstream('API Error: this session has been flagged') }),
       'upstream:flagged_session',
@@ -797,7 +797,7 @@ test('observeUpstreamRisk promotes gate-miss JEV evidence and guards MinHash aga
     assert.equal(devices.findBan({ ...identity, sessionId: '' }, start), null)
     const tempSessionBan = devices.findBan(identity, start)
     assert.equal(tempSessionBan.subject_kind, 'session')
-    assert.equal(tempSessionBan.reason, 'upstream_400')
+    assert.equal(tempSessionBan.reason, 'upstream_400:policy_refusal')
     assert.equal(tempSessionBan.expires_at, '2026-11-17T01:10:00.000Z')
 
     // Repeat refusal of the same exact prompt promotes to full policy + device ban and upgrades session ban to permanent.
