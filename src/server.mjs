@@ -944,6 +944,10 @@ catalogMonitor = createCatalogMonitor({
     const ownerUserId = geminiOwnersRepo?.getOwner?.(envId) ?? null
     return geminiProxyFor(proxyPool, proxyId, { ownerUserId })
   },
+  resolveGeminiProxyEgressOptions: (proxyId, envId) => {
+    const ownerUserId = geminiOwnersRepo?.getOwner?.(envId) ?? null
+    return geminiProxyEgressOptionsFor(proxyPool, proxyId, { ownerUserId })
+  },
   getApiEndpointStore: () => apiEndpointStore,
   cfg,
   log: (event) => console.log(JSON.stringify(event)),
@@ -1585,7 +1589,7 @@ const handleGeminiCragShop = createGeminiCragShopHandler({
   isCurrentAdmin: (req) => isCragShopAdmin(req.panelBuyerOwner),
   isActivationAdmin: isCragShopAdmin,
 })
-const geminiTerminal = createGeminiTerminal({ proxyPool: () => proxyPool })
+const geminiTerminal = createGeminiTerminal({ proxyPool: () => proxyPool, geminiOwnersRepo: geminiOwnersProxy })
 const geminiSlotPrefs = createGeminiSlotPrefs({
   settingsRepo: {
     get: (key, fallback) => new SettingsRepo().get(key, fallback),
@@ -2674,6 +2678,7 @@ server.listen(cfg.port, cfg.host, () => {
           await warmGeminiEnvironments({
             callHost: callGeminiHost,
             proxyPool: () => proxyPool,
+            geminiOwnersRepo: geminiOwnersProxy,
           })
         } catch {
           // Host daemon may be absent on non-Gemini installs; stay silent.

@@ -169,7 +169,7 @@ function kernelVm(exec) {
   return vm || {}
 }
 
-function kernelCapacityOptions(exec, vm, health = null) {
+export function kernelCapacityOptions(exec, vm, health = null) {
   const healthCaps = health?.capabilities || exec?.workerStatus?.capabilities
   if (Array.isArray(healthCaps) && healthCaps.length) return { capabilities: healthCaps }
   if (health?.transport === 'headless_bridge' || exec?.workerStatus?.transport === 'headless_bridge') {

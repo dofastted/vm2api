@@ -83,7 +83,12 @@ export function isHeadlessBridgeSlot(vm = null, options = null) {
   ) {
     return true
   }
-  return vm.workerStatus?.transport === 'headless_bridge' || vm.runtime?.transport === 'headless_bridge'
+  return (
+    vm.workerStatus?.transport === 'headless_bridge' ||
+    vm.runtime?.transport === 'headless_bridge' ||
+    vm.kernel_installation?.transport === 'headless_bridge' ||
+    Number(vm.kernel_installation?.kernel_generation) >= 4
+  )
 }
 
 export function normalizeSlotCapacityConfig(raw, { headlessBridge = false } = {}) {

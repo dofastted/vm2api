@@ -28,7 +28,7 @@ import { isCodexVm } from '../vm/vm-kind.mjs'
 import { setResetPriorityEnabled } from './credential-weight.mjs'
 import { PLATFORM_SCOPE } from '../admin/resource-owner.mjs'
 import { rustKernelBusy } from '../transport/rust-kernel-client.mjs'
-import { resolveSessionSlots } from '../vm/slot-engine.mjs'
+import { activeCragManifestForSlot, resolveKernelDataplane, resolveSessionSlots } from '../vm/slot-engine.mjs'
 import { vmNodeDataPath } from '../cluster/placement.mjs'
 import { GATE_DIAL_TIMEOUT_MS } from '../cluster/direct-link.mjs'
 import { KernelLeaseStats, normalizeKernelLeaseMode } from './kernel-lease.mjs'
@@ -296,8 +296,11 @@ function maxConcurrencyOf(vm, fallback = 2) {
   return parseConcurrency(vm?.policy?.maxConcurrency, fallback)
 }
 
-function seatCapOf(vm, fallback = 20) {
-  return Math.min(resolveSessionSlots(vm, { inference: { session_slots: fallback } }), effectiveSlotCount(vm))
+export function seatCapOf(vm, fallback = 20, options = null, routing = undefined) {
+  return Math.min(
+    resolveSessionSlots(vm, { inference: { session_slots: fallback } }),
+    effectiveSlotCount(vm, routing, options),
+  )
 }
 
 export function familyLimitsOf(vm, pool = {}, physical = seatCapOf(vm, pool.default_session_slots)) {
@@ -427,6 +430,35 @@ export class PoolScheduler extends EventEmitter {
       })
     }
     return rt
+  }
+
+  capacityOptionsForVm(vm, routing = null) {
+    if (!vm) return null
+    const cached = this.healthCache?.get?.(vm.id)?.value
+    const healthCaps = cached?.capabilities || cached?.worker_status?.capabilities
+    if (Array.isArray(healthCaps) && healthCaps.length) return { capabilities: healthCaps }
+    if (cached?.transport === 'headless_bridge') return { headlessBridge: true }
+    const effectiveRouting =
+      routing && typeof routing === 'object'
+        ? routing
+        : typeof this.getRouting === 'function'
+          ? this.getRouting() || {}
+          : {}
+    if (
+      this.projectRoot &&
+      (resolveKernelDataplane(vm, effectiveRouting) === 'crag' ||
+        vm.kernel_installation?.kernel === 'crag' ||
+        vm.runtime?.runtime_variant === 'crag-v2')
+    ) {
+      const manifest = activeCragManifestForSlot(this.projectRoot, vm, vmCliHomePath(this.projectRoot, vm.id))
+      if (manifest?.capabilities) return { capabilities: manifest.capabilities }
+    }
+    return null
+  }
+
+  seatCapForVm(vm) {
+    const routing = typeof this.getRouting === 'function' ? this.getRouting() || {} : {}
+    return seatCapOf(vm, this.config.default_session_slots, this.capacityOptionsForVm(vm, routing), routing)
   }
 
   executionContext(vm, accountId) {
@@ -1181,7 +1213,7 @@ export class PoolScheduler extends EventEmitter {
       let limits = null
       try {
         const vm = this.projectRoot ? getVm(this.projectRoot, vmId) : null
-        limits = vm ? familyLimitsOf(vm, this.config) : null
+        limits = vm ? familyLimitsOf(vm, this.config, this.seatCapForVm(vm)) : null
       } catch {}
       seats[vmId] = {
         seats_used: count,

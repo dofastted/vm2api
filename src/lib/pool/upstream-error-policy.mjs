@@ -669,6 +669,13 @@ function classifyUpstreamResultRaw(
       retrySameAccount: true,
     })
   }
+  if (code === 'crag_prompt_replace_empty_unsupported' || workerCode === 'crag_prompt_replace_empty_unsupported') {
+    return continueWithoutCooldown({
+      scope: 'worker',
+      reason: 'crag_prompt_replace_empty_unsupported',
+      retrySameAccount: false,
+    })
+  }
   if (result.transportError || status === 0) {
     if (isProxyFailure(workerCode, message)) return proxyTransportFailure(now)
     return continueWithoutCooldown({

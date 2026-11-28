@@ -22,7 +22,8 @@ import { getVm, listVms, patchVmRecord, vmHasSchedulableCredential, waitForSlotD
 import { isCodexVm } from './vm-kind.mjs'
 import { isKvmRuntime } from './runtime-kind.mjs'
 import { slotExec, startSlotReady, stopSlot } from './slot-runtime.mjs'
-import { resolveKernelDataplane } from './slot-engine.mjs'
+import { activeCragManifestForSlot, resolveKernelDataplane } from './slot-engine.mjs'
+import { vmCliHomePath } from './execution-context.mjs'
 import { withCragRuntimeAdmission } from './slot-runtime-admission.mjs'
 import { inspectInstalledCragEntry, officialCcUidGid, suspendVmRuntimeRestart } from './vm-runtime.mjs'
 import { isCustomKvmMode, isCustomOsSlot, resolveHostSharedStoreDir } from './custom-os-runtime.mjs'
@@ -715,6 +716,21 @@ export async function installKernelTargets({
             if (!config?.configPath) return failure(target, phase, '内核配置生成失败', true)
             if (target.kernel === 'crag' && !baked) prepareNativeDirectories(config.runDir, owner)
             phase = 'kernel_selection_persist_failed'
+            const installedManifest =
+              target.kernel === 'crag'
+                ? activeCragManifestForSlot(projectRoot, candidate, vmCliHomePath(projectRoot, target.id))
+                : null
+            const installedCaps =
+              Array.isArray(installedProduct.capabilities) && installedProduct.capabilities.length
+                ? installedProduct.capabilities
+                : Array.isArray(installedManifest?.capabilities) && installedManifest.capabilities.length
+                  ? installedManifest.capabilities
+                  : null
+            const installedGen = Number.isInteger(installedProduct.kernel_generation)
+              ? installedProduct.kernel_generation
+              : Number.isInteger(installedManifest?.kernel_generation)
+                ? installedManifest.kernel_generation
+                : null
             const saved = patchVmRecord(projectRoot, target.id, (record) => {
               if (!updateExisting) {
                 record.dataplane = candidate.dataplane
@@ -725,6 +741,9 @@ export async function installKernelTargets({
                 kernel: target.kernel,
                 version: installedProduct.version ?? null,
                 ...(installedProduct.payload_tag ? { payload_tag: installedProduct.payload_tag } : {}),
+                ...(installedCaps ? { capabilities: [...installedCaps] } : {}),
+                ...(installedGen != null ? { kernel_generation: installedGen } : {}),
+                ...(installedCaps?.includes('headless_claude_bridge_v1') ? { transport: 'headless_bridge' } : {}),
                 installed_at: new Date().toISOString(),
               }
             })

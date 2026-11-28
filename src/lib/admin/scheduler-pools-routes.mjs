@@ -24,7 +24,9 @@ import {
   parseNodeKey,
   resolveVirtualPoolId,
 } from '../scheduler/scheduler-runtime.mjs'
-import { resolveKernelDataplane } from '../vm/slot-engine.mjs'
+import { vmCliHomePath } from '../vm/execution-context.mjs'
+import { effectiveSlotCount } from '../vm/slot-capacity.mjs'
+import { activeCragManifestForSlot, resolveKernelDataplane } from '../vm/slot-engine.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
 import { listVms } from '../vm/vm-registry.mjs'
 import { resolvePoolAccessForKey } from './key-scope.mjs'
@@ -201,11 +203,12 @@ export function validateFallbackChain({ poolId, nextFallbackId, sourcePool, allP
   return warnings
 }
 
-function runtimeKindOfVm(vm) {
+export function runtimeKindOfVm(vm, routing = {}) {
   if (!vm) return null
   if (isCodexVm(vm)) return 'codex'
   if (vm.runtime_kind === 'crag' || vm.runtime_kind === 'cli-node') return vm.runtime_kind
-  const dp = resolveKernelDataplane(vm)
+  if (vm.kernel_installation?.kernel === 'crag' || vm.runtime?.runtime_variant === 'crag-v2') return 'crag'
+  const dp = resolveKernelDataplane(vm, routing)
   if (dp === 'crag') return 'crag'
   return 'cli-node'
 }
@@ -217,7 +220,7 @@ function runtimeKindOfVm(vm) {
  * - Anthropic CRAG VM across enabled pools with different `system_prompt_mode` -> ALLOWED (D1) with warning.
  * - `codex_vm` / `gemini_env` -> no prompt conflict.
  */
-export function evaluatePoolMemberConflicts({ targetPool, members, allPools, vmById }) {
+export function evaluatePoolMemberConflicts({ targetPool, members, allPools, vmById, routing = {} }) {
   const warnings = []
   const enabledMembers = (members || []).filter((m) => m.enabled !== false)
 
@@ -260,7 +263,7 @@ export function evaluatePoolMemberConflicts({ targetPool, members, allPools, vmB
       )
       if (promptConflicts.length > 0) {
         const vm = vmById?.get(cand.node_id)
-        const kind = runtimeKindOfVm(vm)
+        const kind = runtimeKindOfVm(vm, routing)
         const isCrag = kind === 'crag'
         const conflictSummary = promptConflicts.map((p) => ({
           id: p.id,
@@ -543,7 +546,18 @@ function normalizeMemberListInput(rawMembers, { vmById, epById } = {}) {
 
 function buildEnrichedMember(
   member,
-  { vmById, epById, accountQuota, accountSnap, poolSnap, geminiById, geminiPrefs, penaltiesByNode },
+  {
+    vmById,
+    epById,
+    accountQuota,
+    accountSnap,
+    poolSnap,
+    geminiById,
+    geminiPrefs,
+    penaltiesByNode,
+    routing = {},
+    projectRoot = null,
+  },
 ) {
   const node_key = `${member.node_type}:${member.node_id}`
   const penalty = penaltiesByNode.get(node_key) || null
@@ -563,7 +577,9 @@ function buildEnrichedMember(
     const rawWeight = Number(vm?.policy?.weight ?? vm?.weight)
     const baseSub = rawWeight > 0 ? rawWeight : 10
     const effective_sub_weight = member.sub_weight_override ?? baseSub
+    const seatSnap = poolSnap?.seats?.[member.node_id] || null
     const slotSnap =
+      seatSnap ||
       poolSnap?.slots?.find?.((s) => s.id === member.node_id || s.vm_id === member.node_id) ||
       poolSnap?.vms?.find?.((s) => s.id === member.node_id) ||
       null
@@ -577,9 +593,22 @@ function buildEnrichedMember(
           4,
       ) || 4
     const active_sessions = Number(slotSnap?.active_sessions ?? slotSnap?.seats_used ?? 0) || 0
+    let capacityOptions = null
+    if (
+      vm &&
+      projectRoot &&
+      (resolveKernelDataplane(vm, routing) === 'crag' ||
+        vm.kernel_installation?.kernel === 'crag' ||
+        vm.runtime?.runtime_variant === 'crag-v2')
+    ) {
+      const manifest = activeCragManifestForSlot(projectRoot, vm, vmCliHomePath(projectRoot, vm.id))
+      if (manifest?.capabilities) capacityOptions = { capabilities: manifest.capabilities }
+    }
     const max_sessions =
       Number(
-        slotSnap?.max_sessions ??
+        slotSnap?.seats_max ??
+          slotSnap?.max_sessions ??
+          (vm ? effectiveSlotCount(vm, routing, capacityOptions) : null) ??
           vm?.policy?.session_slots ??
           vm?.policy?.sessionSlots ??
           vm?.session_slots ??
@@ -605,8 +634,8 @@ function buildEnrichedMember(
       provider: member.node_type === 'codex_vm' ? 'openai' : 'anthropic',
       plan_tier: vm?.claude?.account_tier || vm?.account_tier || vm?.codex?.plan_type || vm?.plan_type || null,
       protocol: member.node_type === 'codex_vm' ? 'openai' : 'anthropic',
-      dataplane: vm ? resolveKernelDataplane(vm) : null,
-      runtime_kind: runtimeKindOfVm(vm),
+      dataplane: vm ? resolveKernelDataplane(vm, routing) : null,
+      runtime_kind: runtimeKindOfVm(vm, routing),
       weight_tier_mode: schedInfo.mode === 'auto' ? 'auto_7d_reset' : 'manual',
       base_weight_tier,
       effective_weight_tier,
@@ -878,6 +907,7 @@ export function syncVmPoolToSchedulerPool(db, action, pool, vms = null) {
 export function createSchedulerPoolsHandler({
   getDb,
   getVms = null,
+  getRouting = null,
   cfg = null,
   apiKeyStore = null,
   apiEndpointStore = null,
@@ -892,6 +922,7 @@ export function createSchedulerPoolsHandler({
   readBody,
 }) {
   const resolveDb = () => (typeof getDb === 'function' ? getDb() : apiKeyStore?.db)
+  const resolveRouting = () => (typeof getRouting === 'function' ? getRouting() || {} : {})
   const resolveRuntime = () => (typeof schedulerRuntime === 'function' ? schedulerRuntime() : schedulerRuntime)
   const syncRuntimeConfig = async (reason) => {
     const rt = resolveRuntime()
@@ -930,6 +961,7 @@ export function createSchedulerPoolsHandler({
   }
 
   function buildLiveContext(repo) {
+    const routing = resolveRouting()
     const vms = loadVms()
     const vmById = new Map(vms.map((v) => [v.id, v]))
     const endpoints = apiEndpointStore?.listRaw?.() || []
@@ -952,7 +984,19 @@ export function createSchedulerPoolsHandler({
         penaltiesByNode.set(nk, pen)
       }
     }
-    return { vms, vmById, epById, accountQuota, accountSnap, poolSnap, geminiById, geminiPrefs, penaltiesByNode }
+    return {
+      vms,
+      vmById,
+      epById,
+      accountQuota,
+      accountSnap,
+      poolSnap,
+      geminiById,
+      geminiPrefs,
+      penaltiesByNode,
+      routing,
+      projectRoot: cfg?.paths?.project || schedObj?.projectRoot || null,
+    }
   }
 
   return async function handleSchedulerPoolsRoute(req, res, p, url) {
@@ -1026,6 +1070,7 @@ export function createSchedulerPoolsHandler({
               members: memberList,
               allPools,
               vmById: liveCtx.vmById,
+              routing: liveCtx.routing,
             }),
           )
         }
@@ -1103,6 +1148,7 @@ export function createSchedulerPoolsHandler({
               members: existing.members || [],
               allPools,
               vmById: liveCtx.vmById,
+              routing: liveCtx.routing,
             }),
           )
         }
@@ -1187,6 +1233,7 @@ export function createSchedulerPoolsHandler({
           members,
           allPools: repo.list(),
           vmById: liveCtx.vmById,
+          routing: liveCtx.routing,
         })
         const updated = repo.setMembers(id, members)
         const enriched = enrichPoolView(updated, repo.listBoundKeySummariesByPool(id), liveCtx)

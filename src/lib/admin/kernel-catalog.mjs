@@ -409,6 +409,8 @@ function publicProduct(id, ready, meta = {}, code) {
       ? { release_options: CRAG_PINNED_RELEASES.filter(({ label }) => label).map(({ tag, label }) => ({ tag, label })) }
       : {}),
     ...(isCragPayloadTag(meta.payload_tag) ? { payload_tag: meta.payload_tag } : {}),
+    ...(Array.isArray(meta.capabilities) && meta.capabilities.length ? { capabilities: [...meta.capabilities] } : {}),
+    ...(Number.isInteger(meta.kernel_generation) ? { kernel_generation: meta.kernel_generation } : {}),
     ...(!ready
       ? {
           code,
@@ -483,7 +485,17 @@ export function describeKernelCatalog(projectRoot, runtimeOptions) {
       'crag',
       verified.ok,
       {
-        ...(verified.ok ? { version: verified.manifest.version } : {}),
+        ...(verified.ok
+          ? {
+              version: verified.manifest.version,
+              ...(Array.isArray(verified.manifest.capabilities) && verified.manifest.capabilities.length
+                ? { capabilities: verified.manifest.capabilities }
+                : {}),
+              ...(Number.isInteger(verified.manifest.kernel_generation)
+                ? { kernel_generation: verified.manifest.kernel_generation }
+                : {}),
+            }
+          : {}),
         ...release,
       },
       verified.code,
