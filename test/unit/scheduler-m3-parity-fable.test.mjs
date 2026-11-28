@@ -239,3 +239,50 @@ test('panel badge and dispatch share one predicate', () => {
   assert.equal(slotDeniesFableForPlan({ vm: { id: 'x', kind: 'codex' }, fableRequiresMax: on }), false)
   assert.equal(slotDeniesFableForPlan({ vm: MIXED()[0], fableRequiresMax: false }), false)
 })
+
+function runtimeRepoWith(states) {
+  return {
+    schedulingSnapshot: (ids) => new Map(ids.filter((id) => states[id]).map((id) => [id, { state: states[id] }])),
+  }
+}
+
+test('model wait gate: Fable family cooldown on one Max sends Fable to the other Max; opus cooldown skips that slot (238 markWait)', async (t) => {
+  const until = Date.now() + 3_600_000
+  const { runtime, accountQuota } = setup(t, {
+    vms: [...MIXED(), claudeVm('max-b', 'max', 0)],
+    routing: { pool: { fable_requires_max: true } },
+  })
+  accountQuota.runtimeRepo = runtimeRepoWith({
+    'acct-max-a': { model_states: { fable: { cooldown_until: until, reason: 'fable_credits_required' } } },
+    'acct-pro-a': { model_states: { 'claude-opus-4-6': { cooldown_until: until } } },
+  })
+  await runtime.start({ waitMs: 5_000, startLoops: false })
+  await runtime.pushTelemetryNow()
+  for (const model of FABLE_MODELS) {
+    const res = await runtime.acquireNode(acquireParams(model))
+    assert.equal(res.selected_node.node_key, 'claude_vm:max-b', `${model} skips the cooling Max`)
+    await runtime.releaseLease(res.lease_id, 'ok')
+  }
+  const opus = await runtime.acquireNode(acquireParams('claude-opus-4-6'))
+  assert.equal(opus.selected_node.node_key, 'claude_vm:pro-b')
+  await runtime.releaseLease(opus.lease_id, 'ok')
+  const sonnet = await runtime.acquireNode(acquireParams('claude-sonnet-4-6'))
+  assert.equal(sonnet.selected_node.node_key, 'claude_vm:pro-a', 'cooldown is per model')
+  await runtime.releaseLease(sonnet.lease_id, 'ok')
+})
+
+test('model wait gate: the only Max cooling is not reported as fable_requires_max', async (t) => {
+  const { runtime, accountQuota } = setup(t, { vms: MIXED(), routing: { pool: { fable_requires_max: true } } })
+  accountQuota.runtimeRepo = runtimeRepoWith({
+    'acct-max-a': {
+      model_states: { fable: { cooldown_until: Date.now() + 3_600_000, reason: 'fable_credits_required' } },
+    },
+  })
+  await runtime.start({ waitMs: 5_000, startLoops: false })
+  await runtime.pushTelemetryNow()
+  await assert.rejects(runtime.acquireNode(acquireParams('claude-fable-5')), (err) => {
+    assert.ok(err instanceof SchedulerApiError)
+    assert.notEqual(err.code, 'fable_requires_max')
+    return true
+  })
+})

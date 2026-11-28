@@ -73,6 +73,7 @@ import { activeCragManifestForSlot, resolveKernelDataplane } from '../vm/slot-en
 import { isCodexVm } from '../vm/vm-kind.mjs'
 import { getVm, listVms } from '../vm/vm-registry.mjs'
 import { accountIdOf } from '../pool/pool-scheduler.mjs'
+import { claudeModelWaitGate } from './node-gates.mjs'
 
 export { SchedulerApiError, SchedulerUnavailableError }
 
@@ -782,6 +783,9 @@ const JS_GATE = Symbol('jsGate')
 function fableRequiresMaxFromExhausted(explain, gate) {
   const denied = gate?.denied?.fable_requires_max
   if (!denied || denied.size === 0) return false
+  // A Max slot that only waits (model cooldown, Fable window) is not "no Max":
+  // 238 queued on it instead of answering fable_requires_max.
+  if (gate.waited === true) return false
   const excluded = Array.isArray(explain?.excluded) ? explain.excluded : null
   if (!excluded) return gate.matchedNone === true
   if (excluded.some((e) => e?.reason === 'node_cooldown')) return false
@@ -1818,6 +1822,7 @@ export class SchedulerRuntime {
     // master pin.
     const routing = this.#getRoutingConfig() || {}
     const fableRequiresMax = fableRequiresMaxEnabled(routing)
+    const gateNow = Date.now()
     const runtimeRepo = this.#accountQuota?.runtimeRepo || this.#resolvePoolScheduler()?.runtimeRepo || null
     const snapshotCache = new Map()
     const runtimeSnapshot = (accountId) => {
@@ -1880,6 +1885,21 @@ export class SchedulerRuntime {
             const verdict = slotAllowsModel({ vm: raw, account, model, fableRequiresMax })
             if (!verdict.ok) {
               denyNode(verdict.reason, nodeKey)
+              continue
+            }
+            // 238 checkEligibility markWait: per-model cooldown (incl. the
+            // Fable family key), Fable 7d_oi window, weekly split.
+            const wait = claudeModelWaitGate({
+              accountId,
+              account,
+              state: snapshot?.state || null,
+              model,
+              accountQuota: this.#accountQuota,
+              now: gateNow,
+            })
+            if (wait) {
+              if (gate) gate.waited = true
+              denyNode(wait, nodeKey)
               continue
             }
           }
