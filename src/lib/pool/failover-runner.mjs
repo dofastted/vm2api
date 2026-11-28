@@ -196,6 +196,25 @@ const DEFAULTS = {
   same_account_retry_delay_ms: 500,
   same_account_retry_max_hop_ms: 10_000,
   signature_repair: false,
+  // A conversation that already had a session pin when the request arrived
+  // stays on the node its first attempt ran on: a failed attempt retries that
+  // node or returns its error, it never replays the transcript elsewhere.
+  keep_session_home: false,
+  // keep_session_home: pause between retries of a home kernel that had no free slot.
+  home_slot_busy_retry_ms: 2000,
+  // keep_session_home: once the request has run this long, a busy home kernel
+  // answers 529 session_home_slot_busy. 0 keeps waiting until the deadline.
+  home_slot_busy_max_wait_ms: 0,
+}
+
+const SESSION_PIN_WHY = new Set(['session_hit', 'session_hit_after_wait'])
+const SESSION_PIN_NOTES = new Set(['session_spill_busy', 'session_node_unavailable'])
+
+/** The Rust decision found a live session pin for this request (hit or spill). */
+function acquiredWithSessionPin(acquired) {
+  const affinity = acquired?.explain?.affinity
+  if (SESSION_PIN_WHY.has(affinity?.why)) return true
+  return Array.isArray(affinity?.notes) && affinity.notes.some((n) => SESSION_PIN_NOTES.has(n?.why))
 }
 
 function clone(value) {
@@ -1110,6 +1129,16 @@ export class FailoverRunner {
 
     let activeLeaseId = acquired.lease_id
     let activeSelected = this.#resolveSelected(acquired, { model, quotaRequest })
+
+    // 238 keep_session_home: a continuing conversation's home for this request
+    // is the node its first attempt ran on. Subagents and batch members excluded.
+    const keepHome = this.config.keep_session_home === true && !pinVmId && !!stickyKey && batchMember !== true
+    const subagentRequest = !!(inboundIdentity?.parentSessionId || rootSessionId)
+    const homeNodeKey =
+      keepHome && !subagentRequest && acquiredWithSessionPin(acquired)
+        ? acquired?.selected_node?.node_key || null
+        : null
+    const isHome = (sel) => !!homeNodeKey && (sel?.nodeKey || formatNodeKey('claude_vm', sel?.vmId)) === homeNodeKey
     let activeCommitted = false
     let commitPromise = null
     let activeInflightCounted = false
@@ -1145,6 +1174,57 @@ export class FailoverRunner {
         budget.allowSameUnit(selected.accountId, policy, hopMs, this.config.same_account_retry_max_hop_ms) &&
         budget.hops < maxTotalAttempts &&
         Date.now() < deadline
+
+      const failedRelease = () => ({
+        outcome: failureReport.error_class === 'timeout' ? 'timeout' : 'error',
+        http_status: failureReport.http_status || undefined,
+        error_class: failureReport.error_class,
+        error_signature: failureReport.error_signature,
+        error_message: failureReport.error_message,
+        retry_after_sec: failureReport.retry_after_sec,
+      })
+
+      // keep_session_home: the home never hands the transcript to another node.
+      if (!committedNow && isHome(selected)) {
+        if (policy?.reason === 'slot_busy') {
+          // Nothing ran: wait for the home kernel instead of spilling.
+          const maxWait = Number(this.config.home_slot_busy_max_wait_ms) || 0
+          const waitedOut = maxWait > 0 && Date.now() - startedAt >= maxWait
+          if (allowQueue === false || waitedOut || Date.now() >= deadline) {
+            await releaseActiveLeaseNow(failedRelease())
+            return {
+              done: true,
+              result: {
+                ...poolOverloadedError({ reason: 'session_home_slot_busy', attempt_count: budget.hops }),
+                ...attribution(),
+              },
+            }
+          }
+          try {
+            const waitMs = Number(this.config.home_slot_busy_retry_ms ?? 2000)
+            await sleepWithSignal(Math.max(0, Math.min(waitMs, deadline - Date.now())), signal)
+          } catch {
+            await releaseActiveLeaseNow({ outcome: 'aborted' })
+            return { done: true, result: { ...clientCancelledResult(), via: 'rust-scheduler', ...attribution() } }
+          }
+          return { done: false }
+        }
+        if (canSameUnit) {
+          budget.noteSameUnit(selected.accountId)
+          try {
+            await sleepWithSignal(this.config.same_account_retry_delay_ms, signal)
+          } catch {
+            await releaseActiveLeaseNow({ outcome: 'aborted' })
+            return { done: true, result: { ...clientCancelledResult(), via: 'rust-scheduler', ...attribution() } }
+          }
+          return { done: false }
+        }
+        await releaseActiveLeaseNow(failedRelease())
+        return {
+          done: true,
+          result: preferLastResult(lastResult, lastPolicy, null, { ...attribution(), session_home_kept: true }),
+        }
+      }
 
       // Pinned VM or freshly refreshed OAuth credential stays on the current lease directly.
       if (canSameUnit && (pinVmId || policy?.reason === 'oauth_refresh_required')) {
