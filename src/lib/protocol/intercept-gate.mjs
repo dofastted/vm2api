@@ -11,6 +11,7 @@ import {
   blockedRiskTool,
   classifyUpstreamError,
   DEFAULT_BAN_STEPS,
+  isUpstream400Reason,
   matchRefusalSession,
   matchStoredRefusal,
   refusalFingerprint,
@@ -18,8 +19,9 @@ import {
   refusalPreview,
   refusalPromptSignature,
   refusalAuditIdentity,
-  refusalSessionId,
-  upstreamRiskReason,
+  resolveAuditSessionIdentity,
+  UPSTREAM_400_SESSION_BLOCK_MS,
+  UPSTREAM_400_SESSION_REASON,
 } from '../core/refusal-guard.mjs'
 import {
   HARD_POLICY_RULES,
@@ -92,7 +94,7 @@ function retryAfterFromExpiry(expiresAt, now, fallbackSec = 600) {
 }
 
 function enforcesBan(policy, row) {
-  if (isJevReason(row?.reason)) {
+  if (isJevReason(row?.reason) || isUpstream400Reason(row?.reason)) {
     if (row?.subject_kind === 'session' && policy?.session_block_enabled === false) return false
     return true
   }
@@ -191,7 +193,71 @@ function mergeLogErrorDetails(logBag, patch) {
   logBag.error_details = { ...(logBag.error_details || {}), ...patch }
 }
 
-export function observeUpstreamRisk({ inbound, body, identity, result, logBag, requestId, policy, repo, devices }) {
+export function recordUpstream400SessionBlock({
+  inbound,
+  body = inbound,
+  headers,
+  identity,
+  result,
+  logBag = null,
+  requestId = null,
+  policy = null,
+  devices = null,
+  classifier = null,
+  now = Date.now(),
+} = {}) {
+  if (
+    !result ||
+    result.ok === true ||
+    result.upstreamExecutions === 0 ||
+    result.transportError === true ||
+    result.credential_ensure_failed === true ||
+    result.via === 'kernel-preflight'
+  ) {
+    return null
+  }
+  if (policy?.session_block_enabled === false) return null
+  if (classifier?.purpose === 'auto_mode_classifier') {
+    if (logBag) logBag.risk_session_block_skipped = 'auto_mode_classifier'
+    return null
+  }
+  const status = Number(result?.providerResult?.http_status ?? result?.upstreamStatus ?? result?.status) || 0
+  if (status !== 400) return null
+  const effectiveIdentity = resolveAuditSessionIdentity({ inbound, body, headers, identity })
+  if (!effectiveIdentity.sessionId) return null
+  try {
+    const ban =
+      devices?.blockSession?.(effectiveIdentity, {
+        requestId,
+        reason: UPSTREAM_400_SESSION_REASON,
+        ttlMs: UPSTREAM_400_SESSION_BLOCK_MS,
+        now,
+      }) || null
+    if (ban && ban.expires_at) {
+      mergeLogErrorDetails(logBag, { punishment: 'session_10m_400' })
+    }
+    return ban
+  } catch {
+    console.warn('[risk-audit] failed to persist upstream 400 session block')
+    return null
+  }
+}
+
+export function observeUpstreamRisk({
+  inbound,
+  body = inbound,
+  headers,
+  identity,
+  result,
+  logBag,
+  requestId,
+  policy,
+  repo,
+  devices,
+  classifier = null,
+  blockSessionOn400 = true,
+  now = Date.now(),
+}) {
   if (!result || result.upstreamExecutions === 0 || result.transportError === true) return ''
   const rawMessage =
     result.upstreamError?.message ||
@@ -199,7 +265,7 @@ export function observeUpstreamRisk({ inbound, body, identity, result, logBag, r
     result.body?.message ||
     (typeof result.body === 'string' ? result.body : '')
   const classified = classifyUpstreamError(result, policy?.risk_audit?.upstream_policy_phrases)
-  const isBadRequest = classified.status === 400
+  const isBadRequest = classified.status === 400 && result.ok !== true
   const reason = classified.bucket === 'policy' ? classified.reason : ''
   if (
     !isBadRequest &&
@@ -209,10 +275,26 @@ export function observeUpstreamRisk({ inbound, body, identity, result, logBag, r
   ) {
     return ''
   }
+  const effectiveIdentity = resolveAuditSessionIdentity({ inbound, body, headers, identity })
   const message = JSON.parse(redactSecrets(String(rawMessage))).slice(0, 500)
   if (isBadRequest) {
     logBag.audit_upstream_400 = true
     logBag.audit_upstream_400_message ||= message
+    if (blockSessionOn400) {
+      recordUpstream400SessionBlock({
+        inbound,
+        body,
+        headers,
+        identity: effectiveIdentity,
+        result,
+        logBag,
+        requestId,
+        policy,
+        devices,
+        classifier,
+        now,
+      })
+    }
   }
   if (classified.bucket === 'protocol') {
     mergeLogErrorDetails(logBag, { risk_bucket: 'protocol' })
@@ -272,7 +354,10 @@ export function observeUpstreamRisk({ inbound, body, identity, result, logBag, r
     console.warn('[risk-audit] failed to persist upstream refusal')
   }
   if (reason !== 'upstream:billing_refusal' && !suspectOverRefusal) {
-    recordBan({ identity, fingerprint, reason, banDevice: true }, { devices, policy, requestId })
+    recordBan(
+      { identity: effectiveIdentity, fingerprint, reason, banDevice: true },
+      { devices, policy, requestId, now },
+    )
   }
   return reason
 }
@@ -464,9 +549,8 @@ export async function evaluateProtocolIntercept({
   const profile = normalizeJevProfile(jevProfile)
   const audit = policy?.risk_audit
   const isAutoModeClassifier = classifier?.purpose === 'auto_mode_classifier'
-  const rootSessionId = refusalSessionId({ inbound, body, headers }) || identity.sessionId || ''
-  const effectiveIdentity =
-    rootSessionId && rootSessionId !== identity.sessionId ? { ...identity, sessionId: rootSessionId } : identity
+  const effectiveIdentity = resolveAuditSessionIdentity({ inbound, body, headers, identity })
+  const rootSessionId = effectiveIdentity.sessionId || ''
   const reject = (fields) => block({ deviceId: effectiveIdentity.deviceId, identity: effectiveIdentity, ...fields })
   const interceptOpts = { interceptSession, ctx: bodyCtx }
   let rawDocument
@@ -510,6 +594,7 @@ export async function evaluateProtocolIntercept({
         error,
         logErrorCode: 'refusal_guard',
         errorMessage,
+        errorDetails: error.body?.error?.details || null,
         intercept: gateVerdict({ kind: 'block', by: 'refusal', keyword: banned.subject_kind }),
       })
     }

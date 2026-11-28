@@ -273,15 +273,27 @@ test('normal 2.1.321-style system context passes; the release probe is not a nor
   }
 })
 
-test('post-hop warms the right front rule without treating ordinary HTTP 400 as abuse', async () => {
+test('post-hop warms the right front rule and blocks the session for 10m on upstream 400 without device/cache pollution', async () => {
   const db = createDatabase({ dbPath: ':memory:' })
   try {
     const devices = new RefusalDeviceBlocksRepo(db)
     const repo = new RefusalGuardsRepo(db)
     const policy = refusalGuardPolicy()
+    const start = Date.parse('2026-11-17T00:00:00Z')
     const identity = { deviceId: 'installation-id', sessionId: 'original-session', principal: 'user:a' }
+    const deviceOnly = { ...identity, sessionId: '' }
     const inbound = body('Example prompt')
-    const opts = { inbound, body: inbound, identity, logBag: {}, requestId: 'upstream-request', policy, repo, devices }
+    const opts = {
+      inbound,
+      body: inbound,
+      identity,
+      logBag: {},
+      requestId: 'upstream-request',
+      policy,
+      repo,
+      devices,
+      now: start,
+    }
     const upstream = (message, status = 400) => ({ status, body: { error: { type: 'api_error', message } } })
     assert.equal(observeUpstreamRisk({ ...opts, result: { ...upstream('Usage Policy'), upstreamExecutions: 0 } }), '')
     assert.equal(observeUpstreamRisk({ ...opts, result: { status: 200, body: { message: 'Usage Policy' } } }), '')
@@ -290,41 +302,66 @@ test('post-hop warms the right front rule without treating ordinary HTTP 400 as 
       '',
     )
     assert.equal(opts.logBag.audit_upstream_400, undefined)
+    assert.equal(devices.count(), 0)
     assert.equal(
       observeUpstreamRisk({ ...opts, result: upstream('API Error: invalid tokens. Bearer SENTINEL_SECRET') }),
       '',
     )
     assert.equal(opts.logBag.audit_upstream_400, true)
     assert.equal(opts.logBag.audit_upstream_400_message, 'API Error: invalid tokens. Bearer ***REDACTED***')
+    assert.equal(opts.logBag.error_details.punishment, 'session_10m_400')
     assert.equal(repo.count(), 0)
-    assert.equal(devices.count(), 0)
+    assert.equal(devices.count(), 1)
+    assert.equal(devices.findBan(deviceOnly, start), null)
+    const protocol400Ban = devices.findBan(identity, start)
+    assert.equal(protocol400Ban.subject_kind, 'session')
+    assert.equal(protocol400Ban.reason, 'upstream_400')
+    assert.equal(protocol400Ban.expires_at, '2026-11-17T00:10:00.000Z')
+    const thirdParty503Identity = {
+      deviceId: 'installation-id',
+      sessionId: 'third-party-503-sess',
+      principal: 'user:a',
+    }
     assert.equal(
       observeUpstreamRisk({
         ...opts,
+        identity: thirdParty503Identity,
+        logBag: {},
+        result: upstream('Third-party apps now draw from your extra usage', 503),
+      }),
+      '',
+    )
+    assert.equal(devices.findBan(thirdParty503Identity, start), null)
+    const thirdParty400Identity = {
+      deviceId: 'installation-id',
+      sessionId: 'third-party-400-sess',
+      principal: 'user:a',
+    }
+    assert.equal(
+      observeUpstreamRisk({
+        ...opts,
+        identity: thirdParty400Identity,
+        logBag: {},
         result: upstream(
           'Third-party apps now draw from your extra usage, not your plan limits. Add more at claude.ai/settings/usage and keep going.',
+          400,
         ),
       }),
       '',
     )
     assert.equal(repo.count(), 0)
-    assert.equal(devices.count(), 0)
-    assert.equal(
-      observeUpstreamRisk({ ...opts, result: upstream('Third-party apps now draw from your extra usage', 503) }),
-      '',
-    )
-    assert.equal(
-      observeUpstreamRisk({ ...opts, result: upstream('Third-party apps now draw from your extra usage', 400) }),
-      '',
-    )
-    assert.equal(repo.count(), 0)
-    assert.equal(devices.count(), 0)
+    assert.equal(devices.findBan(deviceOnly, start), null)
+    assert.equal(devices.findBan(thirdParty400Identity, start).reason, 'upstream_400')
     assert.equal(
       observeUpstreamRisk({ ...opts, result: upstream('API Error: this session has been flagged') }),
       'upstream:flagged_session',
     )
     assert.equal(repo.count(), 0)
-    assert.equal(devices.findBan(identity).subject_kind, 'session')
+    const flaggedBan = devices.findBan(identity, start)
+    assert.equal(flaggedBan.subject_kind, 'session')
+    assert.equal(flaggedBan.reason, 'upstream:flagged_session')
+    assert.equal(flaggedBan.expires_at, null)
+    assert.equal(devices.findBan(deviceOnly, start).subject_kind, 'device')
     assert.equal(
       observeUpstreamRisk({ ...opts, result: upstream('API Error: this request violates our Usage Policy') }),
       'upstream:usage_policy',
@@ -731,7 +768,8 @@ test('observeUpstreamRisk promotes gate-miss JEV evidence and guards MinHash aga
     const identity = { deviceId: 'dev-over-refusal-01', sessionId: 'sess-over-01', principal: 'user:a' }
     const inbound = body('Explain how to tune a bearing assembly in a CNC milling machine with proper tolerances.')
 
-    // First refusal after JEV scored all questions >= 0.85: exact fingerprint only, no device ban, gate_miss recorded.
+    // First refusal after JEV scored all questions >= 0.85: exact fingerprint only, 10m session cooldown, no device strike yet.
+    const start = Date.parse('2026-11-17T01:00:00Z')
     const logBag1 = {
       _jevPassed: true,
       _jevPassState: '[user message 1]\nExplain how to tune a bearing assembly',
@@ -747,16 +785,22 @@ test('observeUpstreamRisk promotes gate-miss JEV evidence and guards MinHash aga
       policy,
       repo,
       devices,
+      now: start,
     })
     assert.equal(r1, 'upstream:usage_policy')
     assert.equal(logBag1.jev_state, '[user message 1]\nExplain how to tune a bearing assembly')
     assert.equal(logBag1.error_details.gate_miss, true)
     assert.equal(logBag1.error_details.risk_bucket, 'policy_suspect')
+    assert.equal(logBag1.error_details.punishment, 'session_10m_400')
     assert.equal(logBag1.error_details.jev_score_usage_policy, 0.96)
     assert.equal(repo.count(), 1)
-    assert.equal(devices.count(), 0)
+    assert.equal(devices.findBan({ ...identity, sessionId: '' }, start), null)
+    const tempSessionBan = devices.findBan(identity, start)
+    assert.equal(tempSessionBan.subject_kind, 'session')
+    assert.equal(tempSessionBan.reason, 'upstream_400')
+    assert.equal(tempSessionBan.expires_at, '2026-11-17T01:10:00.000Z')
 
-    // Repeat refusal of the same exact prompt promotes to full policy + device ban.
+    // Repeat refusal of the same exact prompt promotes to full policy + device ban and upgrades session ban to permanent.
     const logBag2 = {
       _jevPassed: true,
       _jevPassState: '[user message 1]\nExplain how to tune a bearing assembly',
@@ -772,9 +816,14 @@ test('observeUpstreamRisk promotes gate-miss JEV evidence and guards MinHash aga
       policy,
       repo,
       devices,
+      now: start + 1_000,
     })
     assert.equal(logBag2.error_details.risk_bucket, 'policy')
-    assert.ok(devices.findBan(identity))
+    const upgradedSession = devices.findBan(identity, start + 1_000)
+    assert.equal(upgradedSession.subject_kind, 'session')
+    assert.equal(upgradedSession.reason, 'upstream:usage_policy')
+    assert.equal(upgradedSession.expires_at, null)
+    assert.equal(devices.findBan({ ...identity, sessionId: '' }, start + 1_000).subject_kind, 'device')
 
     // Auth-ban 401 suspect promotes JEV evidence without banning the caller device.
     const logBagAuth = {

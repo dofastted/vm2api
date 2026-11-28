@@ -28,6 +28,15 @@ export const REFUSAL_SESSION_BLOCK_SETTING = 'refusal_session_block_enabled'
 export const REFUSAL_SIMILARITY_CHOICES = Object.freeze([80, 85, 90, 95])
 export const RISK_AUDIT_SETTING = 'risk_audit_policy'
 export const DEFAULT_BAN_STEPS = Object.freeze([10, 10, 0])
+export const UPSTREAM_400_SESSION_BLOCK_MS = 10 * 60_000
+export const UPSTREAM_400_SESSION_REASON = 'upstream_400'
+
+export function isUpstream400Reason(reason) {
+  return (
+    typeof reason === 'string' &&
+    (reason === UPSTREAM_400_SESSION_REASON || reason.startsWith(`${UPSTREAM_400_SESSION_REASON}:`))
+  )
+}
 const DEFAULT_RISK_POLICY = Object.freeze({
   ban_steps: DEFAULT_BAN_STEPS,
   blocked_tools: [],
@@ -279,12 +288,13 @@ function refusalBlockSuffix(match) {
     const expiresAt = match.row?.expires_at
     const session = match.row?.subject_kind === 'session'
     if (session || expiresAt || (match.row?.identity_value && match.row.identity_value !== match.row.device_id)) {
+      const sessionMessage = expiresAt
+        ? isUpstream400Reason(ban)
+          ? `此会话因上游 400 错误已临时封禁至 ${expiresAt}，请开启新会话或稍后再试。`
+          : `此会话已临时封禁至 ${expiresAt}，请开启新会话或稍后再试。`
+        : '此会话已封禁，请勿继续使用此会话。'
       return {
-        message: session
-          ? '此会话已封禁，请勿继续使用此会话。'
-          : expiresAt
-            ? `此设备已封禁至 ${expiresAt}。`
-            : '此设备已永久封禁。',
+        message: session ? sessionMessage : expiresAt ? `此设备已封禁至 ${expiresAt}。` : '此设备已永久封禁。',
         standalone: true,
         details: {
           reason: session ? 'session' : 'device',
@@ -334,9 +344,11 @@ function refusalBlockSuffix(match) {
 /** Original sentence stays; a match only appends why this call was blocked. */
 export function refusalGuardError(requestId, match) {
   const extra = refusalBlockSuffix(match)
+  const blockedBy =
+    match?.kind === 'device' && match?.row?.subject_kind === 'session' ? 'session' : match?.kind || 'exact'
   return makeRefusalGuardError({
     requestId,
-    blockedBy: match?.kind || 'exact',
+    blockedBy,
     sourceRequestId: match?.row?.source_request_id,
     message: extra?.standalone ? extra.message : REFUSAL_GUARD_MESSAGE + (extra?.message || ''),
     details: extra?.details,
@@ -345,6 +357,20 @@ export function refusalGuardError(requestId, match) {
 
 const DEVICE_ID_MIN = 8
 const DEVICE_ID_MAX = 200
+
+function headerValueOf(headers, name) {
+  if (!headers || typeof headers !== 'object') return ''
+  if (Object.hasOwn(headers, name) && headers[name] != null) {
+    const raw = headers[name]
+    return Array.isArray(raw) ? String(raw[0] ?? '') : String(raw)
+  }
+  const want = String(name).toLowerCase()
+  for (const [k, v] of Object.entries(headers)) {
+    if (String(k).toLowerCase() !== want || v == null) continue
+    return Array.isArray(v) ? String(v[0] ?? '') : String(v)
+  }
+  return ''
+}
 
 /** Inbound client device. Never the slot's rewritten outbound id, and never IP/UA/API key. */
 export function inboundRefusalDeviceId({ inbound, body, headers } = {}) {
@@ -364,27 +390,63 @@ export function refusalAuditIdentity({ inbound, body = inbound, headers = {}, pr
     [
       ...decoded.map((value) => value?.device_id),
       ...sources.flatMap((source) => [source?.device_id, source?.deviceId]),
-      headers['x-kin-device-id'],
+      headerValueOf(headers, 'x-kin-device-id'),
     ],
     DEVICE_ID_MIN,
   )
   const machine = first(
     [
       ...sources.flatMap((source) => [source?.machine_id, source?.machineId, source?.meachine_id]),
-      headers['x-kin-machine-id'],
-      headers['x-machine-id'],
+      headerValueOf(headers, 'x-kin-machine-id'),
+      headerValueOf(headers, 'x-machine-id'),
     ],
     DEVICE_ID_MIN,
   )
+  const agentRoot = claudeCodeAgentRootSession({ inbound: inbound || {}, body: body || {}, headers: headers || {} })
   const sessionId = first([
+    agentRoot,
     ...decoded.map((value) => value?.session_id),
-    ...sources.flatMap((source) => [source?.session_id, source?.sessionId, source?.session]),
-    headers['x-claude-code-session-id'],
-    headers['x-session-id'],
-    headers['session-id'],
-    headers.session_id,
+    ...sources.flatMap((source) => [
+      source?.session_id,
+      source?.sessionId,
+      source?.session,
+      source?.conversation_id,
+      source?.conversationId,
+      source?.thread_id,
+      source?.prompt_cache_key,
+    ]),
+    headerValueOf(headers, 'x-claude-code-session-id'),
+    headerValueOf(headers, 'x-session-id'),
+    headerValueOf(headers, 'x-conversation-id'),
+    headerValueOf(headers, 'x-opencode-session'),
+    headerValueOf(headers, 'x-opencode-session-id'),
+    headerValueOf(headers, 'session-id'),
+    headerValueOf(headers, 'session_id'),
+    headerValueOf(headers, 'thread-id'),
   ])
   return { deviceId: device || machine, machineId: machine, sessionId, principal }
+}
+
+/**
+ * SSOT audit identity shared by pre-dispatch enforcement and post-hop recording.
+ * Preserves an explicit caller-supplied identity while normalizing any root
+ * session from inbound/body/headers (including Claude Code sub-agents and Codex
+ * conversation/cache keys).
+ */
+export function resolveAuditSessionIdentity({
+  inbound,
+  body = inbound,
+  headers = {},
+  identity = null,
+  principal = '',
+} = {}) {
+  const base = identity || refusalAuditIdentity({ inbound, body, headers, principal })
+  const extracted =
+    refusalSessionId({ inbound, body, headers }) ||
+    refusalAuditIdentity({ inbound, body, headers, principal: base?.principal || principal }).sessionId
+  const rootSessionId = extracted || base?.sessionId || ''
+  if (!base) return { deviceId: '', machineId: '', sessionId: rootSessionId, principal }
+  return rootSessionId && rootSessionId !== base.sessionId ? { ...base, sessionId: rootSessionId } : base
 }
 
 export function riskPrincipal(req) {

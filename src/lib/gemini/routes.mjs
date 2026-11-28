@@ -40,6 +40,8 @@ import { createGeminiSlotPrefs, parseGeminiDisplayName, parseGeminiScheduleLevel
 import { resolveCragGeminiPromptPolicy } from './system-prompt.mjs'
 import { configuredDnsUpstream, proxyDnsEmptyTypes } from '../vm/egress.mjs'
 import { compileWithProtoFront, protoFrontMode } from '../transport/proto-front-client.mjs'
+import { resolveAuditSessionIdentity, riskPrincipal } from '../core/refusal-guard.mjs'
+import { observeUpstreamRisk } from '../protocol/intercept-gate.mjs'
 import {
   clientBlockErrorOf,
   isTrustedGateDecision,
@@ -2730,10 +2732,20 @@ export function createGeminiPublicHandler({
 
     // Bypasses #1-#4 closed: every public Gemini inference call must clear the
     // unified pre-dispatch JEV gate BEFORE any Gemini account/slot reservation.
+    const geminiRiskState = resolveRiskRepos({ settings, refusalGuards, refusalDevices, refusalSessions })
+    const baseGeminiIdentity = resolveAuditSessionIdentity({
+      inbound: body,
+      body,
+      headers: req.headers,
+      principal: riskPrincipal(req),
+    })
+    const geminiIdentity =
+      !baseGeminiIdentity.sessionId && stickyHeader
+        ? { ...baseGeminiIdentity, sessionId: stickyHeader }
+        : baseGeminiIdentity
     const existingDecision = preDispatchDecision || req._preDispatchDecision || null
     let gateDecision = isTrustedGateDecision(existingDecision) ? existingDecision : null
     if (!gateDecision) {
-      const riskState = resolveRiskRepos({ settings, refusalGuards, refusalDevices, refusalSessions })
       const preDispatchInput = {
         req,
         inbound: body,
@@ -2742,12 +2754,13 @@ export function createGeminiPublicHandler({
             ? { ...body, model: targetModel }
             : body,
         headers: req.headers,
+        identity: geminiIdentity,
         distillRules: cfg?.distill,
-        policy: riskState.policy,
+        policy: geminiRiskState.policy,
         settings,
-        repo: riskState.repo,
-        devices: riskState.devices,
-        sessions: riskState.sessions,
+        repo: geminiRiskState.repo,
+        devices: geminiRiskState.devices,
+        sessions: geminiRiskState.sessions,
         requestId: activeLogCtx?.request_id || '',
         poolJevProfile:
           poolAccess.effectivePool?.jev_profile || req.poolJevProfile || req.apiKeyRecord?.jev_profile || null,
@@ -2776,6 +2789,7 @@ export function createGeminiPublicHandler({
       const retryAfter = gateDecision.retry_after_sec || gateDecision.error?.retryAfterSec
       if (retryAfter) res.setHeader?.('Retry-After', String(retryAfter))
       const clientErr = clientBlockErrorOf(gateDecision)
+      if (clientErr.details?.retryable === false) res.setHeader?.('x-should-retry', 'false')
       return respondJson(
         clientErr.status,
         protocolErrorBody(protocol, clientErr.status, clientErr.code, clientErr.message, clientErr.details),
@@ -2957,6 +2971,32 @@ export function createGeminiPublicHandler({
       }
     }
 
+    const observeGeminiError = (error) => {
+      if (!error || controller.signal.aborted) return
+      const upstreamStatus = Number(error.upstreamStatus) || 0
+      if (upstreamStatus !== 400) return
+      observeUpstreamRisk({
+        ...geminiRiskState,
+        inbound: body,
+        body,
+        headers: req.headers,
+        identity: geminiIdentity,
+        result: {
+          ok: false,
+          status: upstreamStatus,
+          upstreamStatus,
+          body: {
+            error: {
+              code: typeof error.code === 'string' ? error.code : 'gemini_upstream_error',
+              message: String(error.message || ''),
+            },
+          },
+        },
+        logBag,
+        requestId: activeLogCtx?.request_id || '',
+      })
+    }
+
     const inboundIdentity = resolveSchedulerIdentity({
       inbound: body,
       headers: req.headers,
@@ -3042,6 +3082,7 @@ export function createGeminiPublicHandler({
           finishOwnLog(499)
           return
         }
+        observeGeminiError(error)
         const mapped = publicError(error)
         logBag.error_code = mapped.body.error.code
         logBag.error_message = mapped.body.error.message
@@ -3237,6 +3278,7 @@ export function createGeminiPublicHandler({
         finishOwnLog(499)
         return
       }
+      observeGeminiError(error)
       const mapped = publicError(error)
       logBag.error_code = mapped.body.error.code
       logBag.error_message = mapped.body.error.message

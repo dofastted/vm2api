@@ -11,7 +11,7 @@ import { RefusalSessionBlocksRepo } from '../db/repos/refusal-session-blocks-rep
 import { SettingsRepo } from '../db/repos/settings-repo.mjs'
 import { findAccount } from '../admin/panel-api.mjs'
 import { readJevConfig, scopeAccountFromVm } from './jev-intercept.mjs'
-import { runProtocolIntercept } from './intercept-gate.mjs'
+import { recordUpstream400SessionBlock, runProtocolIntercept } from './intercept-gate.mjs'
 import { inboundBodyLimit, readRoutingConfigFile } from '../core/config.mjs'
 import { verifyOfficialClaudeCode } from '../identity/official-cc-verifier.mjs'
 import {
@@ -484,6 +484,23 @@ export async function handleUserCountTokens(req, res, deps) {
       return json(res, again.error.status, again.error.body)
     }
   }
+  const observeCountTokens400 = (hop) => {
+    if (!hop || hop.ok === true) return
+    recordUpstream400SessionBlock({
+      inbound,
+      body: parsed.body,
+      headers: req?.headers,
+      identity: refusalAuditIdentity({
+        inbound,
+        body: parsed.body,
+        headers: req?.headers,
+        principal: riskPrincipal(req),
+      }),
+      result: hop,
+      policy: refusalPolicy(deps),
+      devices: deviceRepo(deps),
+    })
+  }
   const outboundBody = officialTraffic ? parsed.body : sanitizeThirdPartyCountTokensBody(parsed.body, { routing })
   const caps = slotCapabilitiesForCountTokens(peeked, deps)
   if (caps.includes('count_tokens_v1')) {
@@ -499,6 +516,7 @@ export async function handleUserCountTokens(req, res, deps) {
       headers: kernelHeaders,
       timeoutMs: 45000,
     })
+    observeCountTokens400(hop)
     return sendCountTokensHopResult(res, json, hop, { preserveOfficialErrors: true })
   }
   const mode = credentialModeOfVm(peeked.vm)
@@ -523,6 +541,7 @@ export async function handleUserCountTokens(req, res, deps) {
     },
     timeoutMs: 45000,
   })
+  observeCountTokens400(hop)
   return sendCountTokensHopResult(res, json, hop)
 }
 
