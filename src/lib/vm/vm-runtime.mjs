@@ -37,7 +37,14 @@ import {
 } from './slot-engine.mjs'
 import { profileForPreset } from '../identity/official-profiles.mjs'
 import { ensureSlotClaudeOwnership, chownSlotRuntimeFile, replaceSlotOwnedFile } from '../oauth/oauth-credentials.mjs'
-import { cragV2KernelWrapperScript, installedCragV2Root, materializeResolvedKernel } from './wrap-cli-runtime.mjs'
+import {
+  cragSlotArch,
+  cragV2KernelWrapperScript,
+  installedCragV2Root,
+  materializeResolvedKernel,
+  resolveSharedStoreCragCurrentDir,
+  syncSharedStoreCrag,
+} from './wrap-cli-runtime.mjs'
 import { ensureGuestMachineIdFile } from '../identity/workstation-fingerprint.mjs'
 import {
   ensureDockerSlotPasswdFiles,
@@ -577,6 +584,12 @@ export function cragCustomOsDockerMountArgs(
     if (projectRoot && fs.existsSync(storeDir)) {
       try {
         syncSharedStoreGuestBins(projectRoot, { sharedStoreHostDir: storeDir })
+      } catch {}
+      try {
+        syncSharedStoreCrag(projectRoot, {
+          sharedStoreHostDir: storeDir,
+          arch: cragSlotArch(projectRoot, vm),
+        })
       } catch {}
     }
     args.push('--mount', `type=bind,source=${hostOf(storeDir)},target=${CUSTOM_OS_STORE_GUEST_DIR},readonly`)
@@ -1581,6 +1594,12 @@ export function buildKvmRunArgs({
             ...(workerBin ? { workerBin } : {}),
           })
         } catch {}
+        try {
+          syncSharedStoreCrag(projectRoot, {
+            sharedStoreHostDir: storeHost,
+            arch: cragSlotArch(projectRoot, vm),
+          })
+        } catch {}
       }
       customMounts.push('-v', `${hostOf(storeHost)}:${CUSTOM_OS_STORE_GUEST_DIR}:ro`)
     }
@@ -1767,6 +1786,22 @@ async function startVmRuntimeAdmitted(
   if (preserveCrag) {
     const installed = inspectInstalledCragEntry(projectRoot, vm)
     if (!installed.ok) return installed
+    if (isKvmRuntime(vm) && isCustomKvmMode({ vm })) {
+      const storeHost = resolveHostSharedStoreDir(projectRoot)
+      if (storeHost && fs.existsSync(storeHost) && !resolveSharedStoreCragCurrentDir(storeHost)) {
+        const installedDir = installedCragV2Root(projectRoot, vm)
+        if (installedDir) {
+          const seeded = syncSharedStoreCrag(projectRoot, {
+            sharedStoreHostDir: storeHost,
+            arch: cragSlotArch(projectRoot, vm),
+            srcDir: installedDir,
+            allowUnbundledStore: true,
+            allowPreviousClaude: true,
+          })
+          if (!seeded.ok) return seeded
+        }
+      }
+    }
   }
   const licensed = checkCragLicense(projectRoot, vm, resolvedRouting)
   if (!licensed.ok) return licensed

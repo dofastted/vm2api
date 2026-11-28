@@ -25,12 +25,14 @@ import { slotExec, startSlotReady, stopSlot } from './slot-runtime.mjs'
 import { resolveKernelDataplane } from './slot-engine.mjs'
 import { withCragRuntimeAdmission } from './slot-runtime-admission.mjs'
 import { inspectInstalledCragEntry, officialCcUidGid, suspendVmRuntimeRestart } from './vm-runtime.mjs'
+import { isCustomKvmMode, isCustomOsSlot, resolveHostSharedStoreDir } from './custom-os-runtime.mjs'
 import {
   cragSlotArch,
   cragV2PackageRoot,
   installedCragV2Root,
   materializeResolvedKernel,
   stageCragV2Tree,
+  syncSharedStoreCrag,
   verifyCragV2Tree,
 } from './wrap-cli-runtime.mjs'
 import { initializeSlotSeedFiles } from './slot-seed.mjs'
@@ -133,11 +135,21 @@ function manifestDigest(root) {
     .digest('hex')
 }
 
+function cragVerifyOptsForVm(projectRoot, vm, slotArch) {
+  const customOs = isCustomOsSlot(vm)
+  const storeRoot = customOs ? resolveHostSharedStoreDir(projectRoot) : ''
+  return {
+    arch: slotArch,
+    ...(customOs ? { allowUnbundledStore: true, sharedClaudeStoreRoot: storeRoot } : {}),
+  }
+}
+
 function prepareCragRollback(projectRoot, vm, routing, licenseCheck) {
   const dest = installedCragV2Root(projectRoot, vm)
   if (!dest && vm.kernel_installation?.kernel !== 'crag') return null
   const slotArch = cragSlotArch(projectRoot, vm)
-  const verified = dest && verifyCragV2Tree(dest, { arch: slotArch, allowPreviousClaude: true })
+  const verifyOpts = cragVerifyOptsForVm(projectRoot, vm, slotArch)
+  const verified = dest && verifyCragV2Tree(dest, { ...verifyOpts, allowPreviousClaude: true })
   const grant = licenseCheck(projectRoot, vm, routing, { preferInstalled: true })
   if (!verified?.ok || !grant.ok || !inspectInstalledCragEntry(projectRoot, vm).ok) {
     throw Object.assign(new Error('Previous CRAG payload is not a verified rollback source'), {
@@ -154,7 +166,7 @@ function prepareCragRollback(projectRoot, vm, routing, licenseCheck) {
       fs.mkdirSync(path.dirname(out), { recursive: true })
       fs.copyFileSync(path.join(dest, rel), out)
     }
-    if (manifestDigest(pkg) !== digest || !verifyCragV2Tree(pkg, { arch: slotArch }).ok) {
+    if (manifestDigest(pkg) !== digest || !verifyCragV2Tree(pkg, verifyOpts).ok) {
       throw Object.assign(new Error('CRAG rollback copy failed verification'), { code: 'crag_rollback_unverified' })
     }
     return { backup, pkg, dest, digest }
@@ -174,11 +186,23 @@ async function restoreCragRollback({ projectRoot, vm, rollback, routing, ops, bo
     if (!policy?.ok) return null
   }
   const slotArch = cragSlotArch(projectRoot, vm)
-  if (!verifyCragV2Tree(rollback.pkg, { arch: slotArch }).ok || manifestDigest(rollback.pkg) !== rollback.digest)
-    return null
-  const tree = stageCragV2Tree(rollback.pkg, rollback.dest, { arch: slotArch })
+  const verifyOpts = cragVerifyOptsForVm(projectRoot, vm, slotArch)
+  if (!verifyCragV2Tree(rollback.pkg, verifyOpts).ok || manifestDigest(rollback.pkg) !== rollback.digest) return null
+  const tree = stageCragV2Tree(rollback.pkg, rollback.dest, verifyOpts)
   if (!tree.ok) return null
   tree.commit()
+  if (isCustomOsSlot(vm) && !vm.node_id) {
+    const storeHost = resolveHostSharedStoreDir(projectRoot)
+    if (storeHost && fs.existsSync(storeHost)) {
+      const storeRestored = syncSharedStoreCrag(projectRoot, {
+        sharedStoreHostDir: storeHost,
+        arch: slotArch,
+        srcDir: rollback.pkg,
+        allowUnbundledStore: true,
+      })
+      if (!storeRestored.ok && isCustomKvmMode({ vm })) return null
+    }
+  }
   const checked = (ops.checkCragLicense || checkCragLicense)(projectRoot, vm, routing, { preferInstalled: true })
   if (!checked.ok || manifestDigest(rollback.dest) !== rollback.digest) return null
 
@@ -423,7 +447,15 @@ export async function installKernelTargets({
             active.releaseCache = releaseCache
           }
           const desired = desiredVm(vm, target.kernel)
-          const catalog = (ops.describeKernelCatalog || describeKernelCatalog)(projectRoot)
+          const catalogOpts =
+            target.kernel === 'crag' && isCustomOsSlot(desired)
+              ? cragVerifyOptsForVm(projectRoot, desired, cragSlotArch(projectRoot, desired))
+              : null
+          const readCatalog = () =>
+            catalogOpts
+              ? (ops.describeKernelCatalog || describeKernelCatalog)(projectRoot, catalogOpts)
+              : (ops.describeKernelCatalog || describeKernelCatalog)(projectRoot)
+          const catalog = readCatalog()
           const product = catalog.find((item) => item.id === target.kernel)
           if (!product?.ready)
             return failure(target, product?.code || 'kernel_package_missing', product?.error || '请先拉取所选内核')
@@ -448,7 +480,7 @@ export async function installKernelTargets({
                 hasAmd64 ? '当前发行包仅支持 amd64' : '请先拉取所选内核',
               )
             }
-            const verifiedSlot = verifyCragV2Tree(slotRoot, { arch: slotArch })
+            const verifiedSlot = verifyCragV2Tree(slotRoot, cragVerifyOptsForVm(projectRoot, desired, slotArch))
             if (!verifiedSlot.ok) {
               return failure(
                 target,
@@ -539,10 +571,7 @@ export async function installKernelTargets({
               }
             }
 
-            const currentProduct = () =>
-              (ops.describeKernelCatalog || describeKernelCatalog)(projectRoot).find(
-                (item) => item.id === target.kernel,
-              )
+            const currentProduct = () => readCatalog().find((item) => item.id === target.kernel)
             const verifyPin = () => {
               if (!target.expected_tag && !target.payload_tag) return
               const current = currentProduct()

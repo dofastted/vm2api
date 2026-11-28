@@ -85,6 +85,8 @@ import { slotExec } from './lib/vm/slot-runtime.mjs'
 import { fillVmTimezoneFromExit } from './lib/vm/proxy-timezone.mjs'
 import { releaseKernelInstallSafetyHold, resumePendingKernelInstalls } from './lib/vm/kernel-install.mjs'
 import { createUsageProbeMonitor, normalizeUsageProbeConfig } from './lib/oauth/usage-probe-monitor.mjs'
+import { createWarmupMonitor } from './lib/pool/warmup-monitor.mjs'
+import { normalizeWarmupConfig } from './lib/pool/account-warmup.mjs'
 import { createCatalogMonitor } from './lib/admin/catalog-monitor.mjs'
 import { normalizeOfficialCcConfig } from './lib/oauth/official-cc-bootstrap.mjs'
 import { invalidateLiveCredentialCache } from './lib/admin/panel-live-credentials.mjs'
@@ -170,7 +172,7 @@ import { ClusterError } from './lib/cluster/ssh-link.mjs'
 import { nodeEgressProxyUrl, startNodeEgressSocks } from './lib/cluster/node-egress-socks.mjs'
 import { createSlotShell } from './lib/vm/slot-shell.mjs'
 import { createSlotDesktop } from './lib/vm/slot-desktop.mjs'
-import { vmLockBusy, withVmLock } from './lib/vm/vm-file.mjs'
+import { atomicWriteJson, vmLockBusy, withVmLock } from './lib/vm/vm-file.mjs'
 import { slotImageSpec } from './lib/cluster/slot-image.mjs'
 import { OS_CATALOG } from './lib/vm/os-catalog.mjs'
 import { isKvmRuntime } from './lib/vm/runtime-kind.mjs'
@@ -431,6 +433,7 @@ let kernelWatchdog = null
 let cliNodeGuard = null
 let cragZombieGuard = null
 let usageProbeMonitor = null
+let warmupMonitor = null
 let catalogMonitor = null
 let notifyMonitor = null
 
@@ -491,6 +494,9 @@ const routingRt = createRoutingRuntime({
   get usageProbeMonitor() {
     return usageProbeMonitor
   },
+  get warmupMonitor() {
+    return warmupMonitor
+  },
   get cragZombieGuard() {
     return cragZombieGuard
   },
@@ -548,10 +554,24 @@ if (routingConfig.official_cc) {
 }
 routingConfig.health_probe = normalizeHealthProbeConfig(routingConfig.health_probe)
 routingConfig.usage_probe = normalizeUsageProbeConfig(routingConfig.usage_probe)
+routingConfig.warmup = normalizeWarmupConfig(routingConfig.warmup)
 routingConfig.crag_zombie_guard = normalizeCragZombieGuardConfig(routingConfig.crag_zombie_guard)
 routingConfig.notify = normalizeNotifyConfig(routingConfig.notify)
 routingConfig.tiers = normalizeTiers(routingConfig.tiers, routingConfig.quota, routingConfig.concurrency)
 syncTierDefaultsIntoRouting()
+warmupMonitor = createWarmupMonitor({
+  config: routingConfig.warmup,
+  projectRoot: cfg.paths.project,
+  listVms: () => listVms(cfg.paths.project),
+  getVm: (id) => getVm(cfg.paths.project, id),
+  loadVm: async (id) => getVm(cfg.paths.project, id),
+  saveVm: async (vm) => {
+    const file = path.join(cfg.paths.project, 'vms', `${vm.id}.json`)
+    atomicWriteJson(file, vm, { mode: 0o600 })
+  },
+  inheritRpm: (id) => inheritVmScheduling(id, { rpm: true }),
+  syncScheduler: (reason) => schedulerRuntime?.syncConfigNow?.(reason),
+})
 stickyRouter = new StickyRouter({ dataDir, config: routingConfig })
 accountQuota = new AccountQuota({
   dataDir,
@@ -968,6 +988,7 @@ backupService.onRestored(async (db) => {
   }
   routingConfig.health_probe = normalizeHealthProbeConfig(routingConfig.health_probe)
   routingConfig.usage_probe = normalizeUsageProbeConfig(routingConfig.usage_probe)
+  routingConfig.warmup = normalizeWarmupConfig(routingConfig.warmup)
   routingConfig.crag_zombie_guard = normalizeCragZombieGuardConfig(routingConfig.crag_zombie_guard)
   routingConfig.notify = normalizeNotifyConfig(routingConfig.notify)
   routingConfig.tiers = normalizeTiers(routingConfig.tiers, routingConfig.quota, routingConfig.concurrency)
@@ -989,6 +1010,7 @@ backupService.onRestored(async (db) => {
   cragZombieGuard?.setConfig(routingConfig.crag_zombie_guard)
   configureSlotCapacity(routingConfig.slot_capacity)
   usageProbeMonitor?.setConfig(routingConfig.usage_probe)
+  warmupMonitor?.setConfig(routingConfig.warmup)
   notifyMonitor?.setConfig(routingConfig.notify)
 
   initPoolRuntime()
@@ -1239,6 +1261,10 @@ const importCommit = createImportCommit({
   },
   get proxyPool() {
     return proxyPool
+  },
+  getSchedulerRuntime: () => schedulerRuntime,
+  get schedulerRuntime() {
+    return schedulerRuntime
   },
   applyVmConcurrency,
 })
@@ -1667,6 +1693,9 @@ const handlePanel = createPanelHandler({
   get usageProbeMonitor() {
     return usageProbeMonitor
   },
+  get warmupMonitor() {
+    return warmupMonitor
+  },
   get cragZombieGuard() {
     return cragZombieGuard
   },
@@ -1770,6 +1799,9 @@ function stopLeaderJobs() {
   } catch {}
   try {
     usageProbeMonitor?.stop?.()
+  } catch {}
+  try {
+    warmupMonitor?.stop?.()
   } catch {}
   try {
     catalogMonitor?.stop?.()
@@ -2726,6 +2758,11 @@ server.listen(cfg.port, cfg.host, () => {
       usageProbeMonitor?.start?.({ immediate: true })
     } catch (e) {
       console.warn('[usage-probe] start failed', e?.message || e)
+    }
+    try {
+      warmupMonitor?.start?.()
+    } catch (e) {
+      console.warn('[warmup] start failed', e?.message || e)
     }
     // The KIN_CRS_MOCK harness promises no outbound network; catalogs stay on builtin data there.
     if (process.env.KIN_CRS_MOCK !== '1') {
