@@ -183,7 +183,7 @@ function makeMockFailoverRuntime({ scheduler, config = {} } = {}) {
       return leases.get(leaseId)?.candidate || null
     },
     async acquireNode(params, { signal } = {}) {
-      const lockKey = params.isEphemeralProbe ? '' : String(params.sessionId || '')
+      const lockKey = params.isEphemeralProbe || params.skipSessionGate ? '' : String(params.sessionId || '')
       const releaseLock = await acquireSessionLock(lockKey, config.session_queue_timeout_ms, signal)
       try {
         const selected = await selectCandidate(params)
