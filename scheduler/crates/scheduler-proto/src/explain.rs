@@ -10,6 +10,9 @@ pub enum AffinityWhy {
     SessionSpillBusy,
     SessionNodeUnavailable,
     SubagentFollowParent,
+    /// Summary fork / seatless probe placed on its session's (or parent's) pinned
+    /// node without touching any stick (238 summary + seatless reconcileSticky).
+    EphemeralFollowSession,
     MachineHomeHit,
     MachineHomeCapacitySpill,
     MachineHomeUnavailable,

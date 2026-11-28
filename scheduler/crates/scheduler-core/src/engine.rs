@@ -686,6 +686,51 @@ impl SchedulerEngine {
                 let mut machine_home_node_key: Option<NodeKey> = None;
                 let mut borrow_session_pin = false;
 
+                // Ephemeral (summary fork, seatless probe): read-only follow of the
+                // session's pin, else the parent's. No stick, gate or session count.
+                if req.is_ephemeral_probe && cur_pool.session_sticky_enabled {
+                    let pinned =
+                        affinity::get_live_session_stick(&self.session_sticks, &s_key, now)
+                            .map(|s| s.pinned_node)
+                            .or_else(|| {
+                                let pid =
+                                    req.parent_session_id.as_deref().filter(|s| !s.is_empty())?;
+                                let p_key =
+                                    ScopedSessionKey::new(&cur_pool.id, req.model_family, pid);
+                                affinity::get_live_session_stick(&self.session_sticks, &p_key, now)
+                                    .map(|s| s.pinned_node)
+                            });
+                    if let Some(cand) = pinned
+                        .as_ref()
+                        .and_then(|p| admitted.iter().find(|c| &c.node_key == p))
+                    {
+                        if let Some(lease) = self.try_reserve_node(
+                            cand,
+                            cur_pool,
+                            req,
+                            &s_key,
+                            true,
+                            true,
+                            &mut gate_guard,
+                            dry_run,
+                        ) {
+                            explain
+                                .set_affinity(AffinityWhy::EphemeralFollowSession, &cand.node_key);
+                            return Ok(self.finalize_acquire(
+                                lease,
+                                cand,
+                                snap,
+                                cur_pool,
+                                gate_wait_ms,
+                                explain,
+                                dry_run,
+                                t_total,
+                                event_kind,
+                            ));
+                        }
+                    }
+                }
+
                 // Stage 1: L1 session_id 1:1 stickiness
                 if cur_pool.session_sticky_enabled && !req.is_ephemeral_probe {
                     if let Some(stick) =

@@ -308,3 +308,37 @@ for (const keepPin of [true, false]) {
     assert.equal(await turn(runtime, 'claude-opus-4-6', sid), keepPin ? 'claude_vm:pro-a' : 'claude_vm:max-a')
   })
 }
+
+test('summary fork and seatless probe follow the conversation pin without sticking (238 summary familyVm / seatless reconcileSticky)', async (t) => {
+  const { runtime } = setup(t, { vms: MIXED(), routing: { pool: {} } })
+  await runtime.start({ waitMs: 5_000, startLoops: false })
+  await runtime.pushTelemetryNow()
+  const sid = '00000000-0000-4000-8000-00000000cafe'
+  // Pin the conversation to pro-b (pro-a out of scope for that one turn).
+  const first = await runtime.acquireNode({
+    ...acquireParams('claude-opus-4-6'),
+    sessionId: sid,
+    allowedNodeKeys: ['claude_vm:pro-b'],
+  })
+  assert.equal(first.selected_node.node_key, 'claude_vm:pro-b')
+  await runtime.commitLease(first.lease_id)
+  await runtime.releaseLease(first.lease_id, 'ok')
+
+  const summary = await runtime.acquireNode({
+    ...acquireParams('claude-opus-4-6'),
+    sessionId: `${sid}:summary`,
+    parentSessionId: sid,
+    isEphemeralProbe: true,
+  })
+  assert.equal(summary.selected_node.node_key, 'claude_vm:pro-b')
+  assert.equal(summary.explain?.affinity?.why, 'ephemeral_follow_session')
+  await runtime.releaseLease(summary.lease_id, 'ok')
+
+  const probe = await runtime.acquireNode({
+    ...acquireParams('claude-opus-4-6'),
+    sessionId: sid,
+    isEphemeralProbe: true,
+  })
+  assert.equal(probe.selected_node.node_key, 'claude_vm:pro-b')
+  await runtime.releaseLease(probe.lease_id, 'ok')
+})

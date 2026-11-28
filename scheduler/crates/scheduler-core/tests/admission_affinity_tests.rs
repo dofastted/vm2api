@@ -2655,3 +2655,75 @@ async fn keep_pin_on_model_gate_does_not_cover_scope_filtering() {
         .unwrap();
     assert_eq!(r3.selected_node.node_key, "claude_vm:vm2");
 }
+
+/// 238: a summary fork (own session id, parent = conversation) and a seatless
+/// probe (conversation's own session id) land on the conversation's pinned
+/// node, and leave no stick of their own.
+#[tokio::test]
+async fn ephemeral_summary_and_probe_follow_session_pin_without_sticking() {
+    let eng = two_node_engine();
+    // Pin s1 to vm2 by letting vm1 be unavailable for one committed turn.
+    let mut first = base_req(
+        "r1",
+        "pool_1",
+        "claude-opus-4-6",
+        ModelFamily::Claude,
+        "s1",
+        None,
+    );
+    first.api_key_scope.allowed_node_keys = vec![CompactString::const_new("claude_vm:vm2")];
+    let r1 = eng.acquire(first).await.unwrap();
+    assert_eq!(r1.selected_node.node_key, "claude_vm:vm2");
+    eng.commit(CommitRequest {
+        lease_id: r1.lease_id.clone(),
+    });
+    release_ok(&eng, &r1.lease_id);
+
+    let mut summary = base_req(
+        "r2",
+        "pool_1",
+        "claude-opus-4-6",
+        ModelFamily::Claude,
+        "sum-1",
+        None,
+    );
+    summary.is_ephemeral_probe = true;
+    summary.parent_session_id = Some(CompactString::const_new("s1"));
+    let r2 = eng.acquire(summary).await.unwrap();
+    assert_eq!(r2.selected_node.node_key, "claude_vm:vm2");
+    assert_eq!(
+        r2.explain.affinity.why,
+        Some(AffinityWhy::EphemeralFollowSession)
+    );
+    eng.commit(CommitRequest {
+        lease_id: r2.lease_id.clone(),
+    });
+    release_ok(&eng, &r2.lease_id);
+
+    let mut probe = base_req(
+        "r3",
+        "pool_1",
+        "claude-opus-4-6",
+        ModelFamily::Claude,
+        "s1",
+        None,
+    );
+    probe.is_ephemeral_probe = true;
+    let r3 = eng.acquire(probe).await.unwrap();
+    assert_eq!(r3.selected_node.node_key, "claude_vm:vm2");
+    release_ok(&eng, &r3.lease_id);
+
+    // The summary session left no stick: a non-ephemeral request on it ranks fresh.
+    let r4 = eng
+        .acquire(base_req(
+            "r4",
+            "pool_1",
+            "claude-opus-4-6",
+            ModelFamily::Claude,
+            "sum-1",
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r4.selected_node.node_key, "claude_vm:vm1");
+}
