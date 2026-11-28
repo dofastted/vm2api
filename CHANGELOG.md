@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.4.250 — 2026-11-28 · 热修：钉选 CRAG `3.1.29` 修复 V4 工具续接 `409` 死锁与 `inline-tools-2026-09-15` 缺失 `400`
+
+- **CRAG V4 内核双项热修并钉选 `3.1.29` 延续载荷（`dofastted/crag#41`、`payload-2026.11.28-crag-3.1.29`）**：
+  - **修复 `409 tool_result submission conflicts with accepted results` 死锁**：修复自 `v1.4.240`（CRAG V4 `69b9cd0`）引入的 `prepare_claim_validated` 回归——原 V3 `claim_batch_with_digest` 的 `ToolTombstone::Replay => 409` 被误并入全历史快照续接路径，导致已认领的 `tool_use_id` 在首次提交因 `499`/断流/升级失败后，只要后续重试触发 `submitted_digest` 变化（如官方 Claude Code 降级非流式并下调 `max_tokens` `128000 → 64000`、CRAG 滚动升级切换 `crag_prompt` / `crag_prompt_spec`、网关重写消息或独立分支续接）即永久死锁在 `409`。现恢复 `3.1.25` 既有全历史快照续接语义：精确摘要重放仍走 `joined_replay` 幂等复用，非精确提交创建独立快照交付，完整保留跨租户隔离（400）、`NotResumable`（400）、`Cancelled`（410）、`account_changed`（409）与 `partial_provider_output_nonretryable` 冷却（409）。
+  - **修复 `400 messages.0.content.0.tool_addition.tool: a tool_definition requires anthropic-beta: inline-tools-2026-09-15`**：CRAG V4 `bridge/wire.rs`（`scan_content_block` / `synthesize_betas`，覆盖 `/v1/messages` 与 `/v1/messages/count_tokens`）与 `runtime.rs`（`collect_body_feature_betas`）复用 `prompt::is_inline_tool_addition` 按需追加 `inline-tools-2026-09-15`（仅在消息携带 `tool_addition` 且 `tool.type == "tool_definition"` 时注入，且永不进入 `sticky_rejected_betas`），对齐 `v1.4.239` 及之前行为。
+  - **零生产密钥轮换**：沿用生产公钥 `9dbb4bc2…` / 载荷密钥 `835451e2…`；`deploy/payload.json` 的 `crag_release` 升级至 `payload-2026.11.28-crag-3.1.29`，并在 `src/lib/admin/kernel-catalog.mjs` 注册 `3.1.29`（保留 `3.1.27` / `3.1.26` / `3.1.25` 可回退）。
+- 部署说明：本次热修仅更新 CRAG V4 签名载荷清单与内核目录，零数据库迁移、零前端或 `bin/` 变更；升级后在宿主刷新 `share/crag/kernels/v2/amd64/` 与共享仓 `store/crag/current -> versions/3.1.29` 并滚动重拉 CRAG 槽即可生效。
+
 ## 1.4.249 — 2026-11-28 · `/system` 系统提示词页面重构为 Anthropic / Google 品牌口径
 
 - **`/system` 页面简化重构与按需 JSON 预览（#2051）**：
