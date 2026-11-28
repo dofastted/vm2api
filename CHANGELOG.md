@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.4.249 — 2026-11-28 · `/system` 系统提示词页面重构为 Anthropic / Google 品牌口径
+
+- **`/system` 页面简化重构与按需 JSON 预览（#2051）**：
+  - `web/src/features/system/**` 与 `web/src/styles/index.css`：顶部品牌切换仅区分 **Anthropic** 与 **Google**，面板可见文案中不再出现内部内核代号；保存提示改为「已保存 · Anthropic/Google · …」，Google 零注入模式文案由「0提示词」改为「0注入」
+  - 新增 `sliding-tabs.tsx`、`raw-json-panel.tsx`、`raw-json.ts`、`google-prompt.ts`：出站 JSON 仅在用户点击「加载 JSON 原始内容」时惰性构造，0注入模式下禁用；`cragGeminiPersonaFromCompat` 等 Google 提示词辅助函数迁入 `google-prompt.ts`
+  - 仅前端改动：后端接口与 `craggemini_persona_preset` / `craggemini_system_prompt` 等字段名保持不变
+- 部署说明：本次改动零数据库迁移、零后端运行时变更，仅前端静态资源；升级无需额外操作。
+
 ## 1.4.248 — 2026-11-28 · 面板「席位」统一更名为「执行位」
 
 - **面板文案：`session_slots`「席位」统一更名为「执行位」（#2043，拆自 #1970）**：
