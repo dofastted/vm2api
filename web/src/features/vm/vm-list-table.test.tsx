@@ -75,7 +75,7 @@ describe('VM scheduling priority', () => {
       )
       expect(list).not.toMatch(/等级|权重/)
 
-      const detail = renderToStaticMarkup(<VmSchedulingBlock vm={vm} />)
+      const detail = renderToStaticMarkup(<QueryClientProvider client={new QueryClient()}><VmSchedulingBlock vm={vm} /></QueryClientProvider>)
       expect(detail).toContain('>调度优先级</span>')
       expect(detail).toContain('>8 · 手动</span>')
 
@@ -116,12 +116,12 @@ describe('VM row interaction and health', () => {
         },
       ],
     }
-    const block = renderToStaticMarkup(<VmSchedulingBlock vm={vm} />)
+    const block = renderToStaticMarkup(<QueryClientProvider client={new QueryClient()}><VmSchedulingBlock vm={vm} /></QueryClientProvider>)
     expect(block).toContain('主会话上限')
     expect(block).toContain('子代理 0/0 · 排队 2')
     expect(block).toContain('本槽钉住；全局 关闭')
     expect(
-      renderToStaticMarkup(<VmSchedulingBlock vm={{ id: 'legacy' }} />)
+      renderToStaticMarkup(<QueryClientProvider client={new QueryClient()}><VmSchedulingBlock vm={{ id: 'legacy' }} /></QueryClientProvider>)
     ).toContain('关闭(子代理各占一个执行位)')
     const editor = renderToStaticMarkup(
       <QueryClientProvider client={new QueryClient()}>

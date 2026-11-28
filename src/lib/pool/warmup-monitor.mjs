@@ -186,10 +186,7 @@ export function createWarmupMonitor(opts = {}) {
           successRequests: Math.max(0, successTotal - Number(w.base_success_requests || 0)),
         }
         const decision = evaluateWarmup(vm, snapshot, config)
-        if (decision.action === 'none' || decision.action === 'pause' || decision.action === 'hold_fatal') {
-          if (decision.action === 'hold_fatal') {
-            log(`warmup ${id}: holding, ${fatal} fatal error(s) in window`)
-          }
+        if (decision.action === 'none' || decision.action === 'pause') {
           continue
         }
         const lockPath = resolveVmPath(id)
@@ -222,6 +219,9 @@ export function createWarmupMonitor(opts = {}) {
         }
         if (result?.applied === 'exit') {
           log(`warmup ${id}: exited (${result.reason})`)
+        }
+        if (result?.applied === 'hold_fatal') {
+          log(`warmup ${id}: holding, ${fatal} fatal error(s) in window${result.deduped ? ' (already recorded)' : ''}`)
         }
         if (result?.applied === 'follow' || result?.applied === 'accumulate') {
           log(
