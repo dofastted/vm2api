@@ -12,6 +12,7 @@ import {
   type PresetFlagField,
   type RawBlock,
 } from '@/lib/persona-template'
+import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -68,17 +69,17 @@ function PromptDetail({
           type='button'
           variant='ghost'
           size='sm'
-          className='shrink-0 gap-1 text-muted-foreground hover:text-foreground'
+          className='h-7 shrink-0 gap-1 px-2 text-xs text-muted-foreground hover:text-foreground'
           aria-label={`${label}详情`}
         >
-          详情 <ArrowRight className='size-3.5' aria-hidden />
+          详情 <ArrowRight className='size-3' aria-hidden />
         </Button>
       </DialogTrigger>
       <DialogContent className='max-h-[90svh] gap-5 overflow-y-auto sm:max-w-2xl'>
         <DialogHeader>
           <DialogTitle>{label}</DialogTitle>
           <DialogDescription>
-            编辑提示词内容，动态变量在请求时填入。
+            编辑提示词内容，动态变量在请求时自动填入。
           </DialogDescription>
         </DialogHeader>
         <div className='space-y-2'>
@@ -164,21 +165,39 @@ export function PromptFields({
       const enabled = on && (!environment || envOn)
       const effectId = `prompt-effect-${preset}-${index}`
       return [
-        <li key={`${id}-${index}`} className='flex items-start gap-2 py-3'>
+        <li
+          key={`${id}-${index}`}
+          className='flex items-start gap-2.5 py-3 transition-colors duration-150'
+        >
           <span
-            className={`mt-2 size-1.5 shrink-0 rounded-full ${enabled ? 'bg-primary' : 'bg-muted-foreground/40'}`}
+            className={cn(
+              'mt-1.5 size-2 shrink-0 rounded-full transition-colors duration-150',
+              enabled ? 'bg-primary' : 'bg-muted-foreground/30'
+            )}
             aria-hidden
           />
-          <div className='min-w-0 flex-1 space-y-1'>
-            <div className='flex flex-wrap items-center gap-x-2 gap-y-1'>
-              <span className='text-sm font-medium'>{label}</span>
+          <div className='min-w-0 flex-1 space-y-0.5'>
+            <div className='flex flex-wrap items-center gap-x-2 gap-y-0.5'>
+              <span
+                className={cn(
+                  'text-sm font-medium transition-colors duration-150',
+                  enabled ? 'text-foreground' : 'text-muted-foreground'
+                )}
+              >
+                {label}
+              </span>
               {!enabled ? (
-                <span className='text-xs text-muted-foreground'>不发送</span>
+                <span className='rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground'>
+                  不发送
+                </span>
               ) : null}
             </div>
             <p
               id={effectId}
-              className={`text-xs leading-5 break-words text-muted-foreground ${controlled ? '' : 'line-clamp-2'}`}
+              className={cn(
+                'text-xs leading-5 break-words text-muted-foreground',
+                !controlled && 'line-clamp-2'
+              )}
             >
               {controlled
                 ? `${enabled ? '关闭将移除' : '不发送'}「${label}」段`
@@ -187,78 +206,92 @@ export function PromptFields({
                   : literal || description}
             </p>
           </div>
-          {controlled ? (
-            <Switch
-              className='mt-1.5'
-              aria-label={`加载${label}`}
-              aria-describedby={effectId}
-              checked={on}
-              disabled={environment && !envOn}
-              onCheckedChange={(checked) => {
-                const next = setTemplateBlock(
-                  compat,
-                  preset,
-                  id,
-                  checked,
-                  server
-                )
-                onCompatChange(
-                  flag
-                    ? setPresetFlag(next, flag, preset, checked, server)
-                    : next
-                )
-              }}
-            />
-          ) : !selected ? (
-            <Button
-              type='button'
-              size='sm'
-              variant='ghost'
-              onClick={() =>
-                onCompatChange(
-                  setTemplateBlock(compat, preset, id, true, server)
+          <div className='flex shrink-0 items-center gap-1 pt-0.5'>
+            {controlled ? (
+              <Switch
+                aria-label={`加载${label}`}
+                aria-describedby={effectId}
+                checked={on}
+                disabled={environment && !envOn}
+                onCheckedChange={(checked) => {
+                  const next = setTemplateBlock(
+                    compat,
+                    preset,
+                    id,
+                    checked,
+                    server
+                  )
+                  onCompatChange(
+                    flag
+                      ? setPresetFlag(next, flag, preset, checked, server)
+                      : next
+                  )
+                }}
+              />
+            ) : !selected ? (
+              <Button
+                type='button'
+                size='sm'
+                variant='ghost'
+                className='h-7 px-2 text-xs'
+                onClick={() =>
+                  onCompatChange(
+                    setTemplateBlock(compat, preset, id, true, server)
+                  )
+                }
+              >
+                启用
+              </Button>
+            ) : null}
+            <PromptDetail
+              label={label}
+              text={String(block.text ?? '')}
+              onSave={(text) =>
+                onBlocksChange(
+                  blocks.map((item, at) =>
+                    at === index ? { ...item, text } : item
+                  )
                 )
               }
-            >
-              启用
-            </Button>
-          ) : null}
-          <PromptDetail
-            label={label}
-            text={String(block.text ?? '')}
-            onSave={(text) =>
-              onBlocksChange(
-                blocks.map((item, at) =>
-                  at === index ? { ...item, text } : item
-                )
-              )
-            }
-          />
+            />
+          </div>
         </li>,
       ]
     })
 
   const environment = fields(true)
   return (
-    <div>
+    <div className='space-y-4'>
       <section aria-label='system'>
-        <div className='flex items-center gap-2 pt-1 pb-2 text-sm font-medium'>
-          <FileText className='size-4 text-muted-foreground' aria-hidden />
-          系统提示词
-          <span className='ml-auto font-mono text-xs font-normal text-muted-foreground'>
+        <div className='flex items-center gap-2 pb-1.5'>
+          <FileText className='size-3.5 text-muted-foreground' aria-hidden />
+          <h4 className='text-xs font-semibold tracking-wide text-muted-foreground'>
+            系统提示词
+          </h4>
+          <span className='ml-auto rounded bg-muted/70 px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground'>
             system
           </span>
         </div>
         <ul className='divide-y divide-border/50'>{fields(false)}</ul>
       </section>
+
       {environment.length ? (
         <section
-          className='mt-3 border-t border-border pt-5'
+          className='border-t border-border/70 pt-4'
           aria-label='环境注入'
         >
           <div className='flex items-center gap-2'>
-            <Globe2 className='size-4 text-muted-foreground' aria-hidden />
-            <h3 className='text-sm font-medium'>环境注入</h3>
+            <Globe2
+              className={cn(
+                'size-3.5 transition-colors duration-150',
+                envOn ? 'text-primary' : 'text-muted-foreground'
+              )}
+              aria-hidden
+            />
+            <h4 className='text-sm font-medium'>环境注入</h4>
+            <span className='rounded bg-muted/70 px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground'>
+              system 末尾
+            </span>
             <Switch
               className='ml-auto'
               aria-label='加载环境'
@@ -277,18 +310,24 @@ export function PromptFields({
               }
             />
           </div>
-          <p className='pt-2 font-mono text-[11px] break-all text-muted-foreground'>
-            system 末尾
-          </p>
           <p
             id={`prompt-environment-effect-${preset}`}
-            className='pt-1 pb-2 text-xs leading-5 text-muted-foreground'
+            className='pt-1.5 pb-2.5 text-xs leading-5 text-muted-foreground'
           >
             {envOn
               ? '关闭将移除环境注入段；其余 system 保留。'
               : '环境注入段已移除；其余 system 保留。'}
           </p>
-          <ul className='divide-y divide-border/50'>{environment}</ul>
+          <div
+            className={cn(
+              'rounded-xl border px-3 transition-all duration-200',
+              envOn
+                ? 'border-border/60 bg-muted/20'
+                : 'border-border/40 bg-muted/15 opacity-75'
+            )}
+          >
+            <ul className='divide-y divide-border/50'>{environment}</ul>
+          </div>
         </section>
       ) : null}
     </div>

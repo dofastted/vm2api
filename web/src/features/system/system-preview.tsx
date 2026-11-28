@@ -1,7 +1,14 @@
-import { useState, type ReactNode } from 'react'
+import { useEffect, useMemo, useState, type ReactNode } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import type { PersonaPreset } from '@/types/panel-routing'
-import { Copy, EyeOff, FileText } from 'lucide-react'
+import {
+  Check,
+  ChevronDown,
+  Copy,
+  EyeOff,
+  Layers,
+  ShieldCheck,
+} from 'lucide-react'
 import { toast } from 'sonner'
 import {
   CLI_IDENTITY,
@@ -15,10 +22,9 @@ import {
   estimateTokens,
   isPresetEnvEnabled,
   isPresetGuidanceEnabled,
-  personaHideEnabled,
-  personaPresetLabel,
-  presetFlagEnabled,
   migrateLegacyOfficialTemplate,
+  personaHideEnabled,
+  presetFlagEnabled,
   previewBillingVars,
   previewModelSentence,
   previewSystemBlocks,
@@ -26,10 +32,10 @@ import {
   templateBlockEnabled,
   type RawBlock,
 } from '@/lib/persona-template'
+import { cn } from '@/lib/utils'
 import { isCodexVm } from '@/lib/vm-kind'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import {
   Select,
   SelectContent,
@@ -40,8 +46,32 @@ import {
 import { Skeleton } from '@/components/ui/skeleton'
 import { Switch } from '@/components/ui/switch'
 import { dashboardQueryOptions } from '@/features/overview/queries'
-import { promptBlockLabel } from './prompt-presentation'
+import {
+  anthropicPresetLabel,
+  promptBlockCategory,
+  promptBlockLabel,
+  splitLongPreviewBlock,
+  type PromptLayerCategory,
+} from './prompt-presentation'
 import { personaPreviewVarsQueryOptions } from './queries'
+import {
+  buildAnthropicRawJsonPayload,
+  type RenderedPreviewBlock,
+} from './raw-json'
+import { RawJsonDisclosure } from './raw-json-panel'
+
+const LAYER_BADGE_STYLE: Record<PromptLayerCategory, string> = {
+  billing: 'bg-muted text-muted-foreground border-border/60',
+  identity: 'bg-ok-1 text-ok-5 border-ok-2/60 dark:bg-ok-1/70',
+  core: 'bg-select-surface text-select-fg border-select-border/40',
+  guidance:
+    'bg-(--tier-max-badge-bg) text-(--tier-max-fg) border-(--tier-max-border)/50',
+  environment:
+    'bg-(--tier-gemini-surface-hover) text-(--tier-gemini-fg) border-(--tier-gemini-border)/50',
+  caller:
+    'bg-caution-1 text-caution-5 border-caution-2/60 dark:bg-caution-1/75',
+  custom: 'bg-secondary text-secondary-foreground border-border/60',
+}
 
 /** 常驻约束与调用方占位高亮，其余原样。 */
 function highlight(text: string, marks: string[]): ReactNode[] {
@@ -67,7 +97,7 @@ function highlight(text: string, marks: string[]): ReactNode[] {
     out.push(
       <mark
         key={key++}
-        className='rounded-sm bg-primary/10 px-0.5 text-foreground ring-1 ring-primary/20'
+        className='rounded-sm bg-primary/12 px-0.5 text-foreground ring-1 ring-primary/25'
       >
         {hit}
       </mark>
@@ -75,6 +105,163 @@ function highlight(text: string, marks: string[]): ReactNode[] {
     rest = rest.slice(at + hit.length)
   }
   return out
+}
+
+function PreviewLayerCard({
+  block,
+  index,
+  isLast,
+  masked,
+  blockMasked,
+  marks,
+}: {
+  block: RenderedPreviewBlock
+  index: number
+  isLast: boolean
+  masked: boolean
+  blockMasked: boolean
+  marks: string[]
+}) {
+  const [expanded, setExpanded] = useState(false)
+  const [label] = promptBlockLabel(block.id)
+  const category = promptBlockCategory(block.id)
+  const split = useMemo(
+    () =>
+      block.placeholder
+        ? ({ kind: 'short', head: '' } as const)
+        : splitLongPreviewBlock(block.text),
+    [block.placeholder, block.text]
+  )
+  const isLong = split.kind !== 'short'
+  const delayMs = Math.min(index * 28, 140)
+
+  return (
+    <li
+      className='animate-prompt-layer-in relative flex gap-3'
+      style={{ animationDelay: `${delayMs}ms` }}
+    >
+      <div className='relative flex flex-col items-center pt-2.5'>
+        <span className='z-10 flex size-6 shrink-0 items-center justify-center rounded-full border border-border/80 bg-card font-mono text-[11px] font-medium text-muted-foreground tabular-nums'>
+          {index + 1}
+        </span>
+        {!isLast ? (
+          <span aria-hidden className='mt-1.5 w-px flex-1 bg-border/65' />
+        ) : null}
+      </div>
+
+      <div className='min-w-0 flex-1 overflow-hidden rounded-xl border border-border/70 bg-card transition-colors duration-150 hover:border-border'>
+        <div className='flex flex-wrap items-center gap-x-2 gap-y-1.5 border-b border-border/50 bg-muted/25 px-3.5 py-2'>
+          <span
+            className={cn(
+              'inline-flex items-center rounded-md border px-2 py-0.5 text-[11px] font-medium',
+              LAYER_BADGE_STYLE[category]
+            )}
+          >
+            {label}
+          </span>
+          <span className='font-mono text-[11px] text-muted-foreground'>
+            {block.region}
+          </span>
+          <span className='ml-auto flex flex-wrap items-center gap-1.5 font-mono text-[11px] text-muted-foreground'>
+            {block.ttl ? (
+              <span className='rounded bg-muted px-1.5 py-0.5 text-[10px]'>
+                ttl {block.ttl}
+              </span>
+            ) : null}
+            {block.scope ? (
+              <span className='rounded bg-muted px-1.5 py-0.5 text-[10px]'>
+                {block.scope}
+              </span>
+            ) : null}
+            {masked ? (
+              <span
+                className='inline-flex items-center gap-0.5 rounded bg-muted px-1.5 py-0.5 text-[10px]'
+                title={blockMasked ? '注入块不计 usage' : '常驻约束不计 usage'}
+              >
+                <EyeOff className='size-3' aria-hidden />
+                {blockMasked ? '遮罩' : '约束遮罩'}
+              </span>
+            ) : null}
+            <span className='tabular-nums'>
+              ≈{estimateTokens(block.text)} tok
+            </span>
+          </span>
+        </div>
+
+        {block.placeholder ? (
+          <p className='px-3.5 py-2.5 text-xs text-muted-foreground italic'>
+            零宽占位
+          </p>
+        ) : (
+          <div className='px-3.5 py-3'>
+            {split.kind === 'short' ? (
+              <pre className='font-mono text-xs leading-6 break-words whitespace-pre-wrap text-foreground/90'>
+                {highlight(split.head, marks)}
+              </pre>
+            ) : split.kind === 'lines' ? (
+              <>
+                <div className='relative'>
+                  <pre className='font-mono text-xs leading-6 break-words whitespace-pre-wrap text-foreground/90'>
+                    {highlight(split.head, marks)}
+                  </pre>
+                  {!expanded ? (
+                    <div
+                      aria-hidden
+                      className='pointer-events-none absolute inset-x-0 bottom-0 h-7 bg-gradient-to-t from-card via-card/75 to-transparent'
+                    />
+                  ) : null}
+                </div>
+                <div
+                  className='prompt-accordion'
+                  data-open={expanded ? 'true' : 'false'}
+                  aria-hidden={!expanded}
+                >
+                  <div className='prompt-accordion-inner'>
+                    <pre className='font-mono text-xs leading-6 break-words whitespace-pre-wrap text-foreground/90'>
+                      {highlight(split.tail, marks)}
+                    </pre>
+                  </div>
+                </div>
+              </>
+            ) : expanded ? (
+              <pre className='animate-prompt-pane-in font-mono text-xs leading-6 break-words whitespace-pre-wrap text-foreground/90'>
+                {highlight(split.full, marks)}
+              </pre>
+            ) : (
+              <div className='relative'>
+                <pre className='font-mono text-xs leading-6 break-words whitespace-pre-wrap text-foreground/90'>
+                  {highlight(split.excerpt, marks)}
+                </pre>
+                <div
+                  aria-hidden
+                  className='pointer-events-none absolute inset-x-0 bottom-0 h-7 bg-gradient-to-t from-card via-card/75 to-transparent'
+                />
+              </div>
+            )}
+            {isLong ? (
+              <button
+                type='button'
+                aria-expanded={expanded}
+                onClick={() => setExpanded((prev) => !prev)}
+                className='mt-2 inline-flex cursor-pointer items-center gap-1 rounded-md px-2 py-1 text-xs font-medium text-primary transition-colors duration-150 hover:bg-primary/10 focus-visible:ring-[3px] focus-visible:ring-ring/50 focus-visible:outline-none'
+              >
+                <ChevronDown
+                  className={cn(
+                    'size-3.5 transition-transform duration-200',
+                    expanded && 'rotate-180'
+                  )}
+                  aria-hidden
+                />
+                {expanded
+                  ? '收起内容'
+                  : `展开全文（${block.text.length} 字符）`}
+              </button>
+            ) : null}
+          </div>
+        )}
+      </div>
+    </li>
+  )
 }
 
 export function SystemPreview({
@@ -88,6 +275,7 @@ export function SystemPreview({
 }) {
   const dash = useQuery(dashboardQueryOptions())
   const [withCaller, setWithCaller] = useState(true)
+  const [copied, setCopied] = useState(false)
   const zones = [
     ...new Set(
       (dash.data?.vms || [])
@@ -98,6 +286,13 @@ export function SystemPreview({
   const [picked, setPicked] = useState('')
   const [previewModel, setPreviewModel] = useState('claude-sonnet-5-5')
   const timezone = zones.includes(picked) ? picked : zones[0] || 'UTC'
+
+  useEffect(() => {
+    if (!copied) return
+    const timer = window.setTimeout(() => setCopied(false), 1600)
+    return () => window.clearTimeout(timer)
+  }, [copied])
+
   // 等槽位列表回来再取常量，否则 env_official 会先按 UTC 渲染一遍。
   const vars = useQuery({
     ...personaPreviewVarsQueryOptions(timezone),
@@ -156,7 +351,7 @@ export function SystemPreview({
       )
     : null
   const source = dropLegacyAutoScope(preset, selected)
-  const rendered = previewVars
+  const rendered: RenderedPreviewBlock[] = previewVars
     ? previewSystemBlocks(source, previewVars, {
         preserveCallerSystem: preset === 'zero',
         includeBilling: true,
@@ -173,31 +368,44 @@ export function SystemPreview({
     : []
   const plain = rendered.map((block) => block.text).join('\n\n')
   const marks = [standing, PREVIEW_CALLER_AGENT, PREVIEW_CALLER_SYSTEM]
+  const totalTokens = estimateTokens(plain)
 
   return (
-    <Card className='h-[70svh] min-h-80 gap-3 overflow-hidden py-4 xl:h-[calc(100svh-11rem)] xl:max-h-[60rem]'>
-      <CardHeader className='space-y-2 px-4'>
-        <div className='flex items-center gap-2'>
-          <FileText className='size-4 text-muted-foreground' aria-hidden />
-          <CardTitle className='text-base'>出站预览</CardTitle>
+    <div className='flex flex-col overflow-hidden rounded-2xl border border-border/75 bg-card'>
+      <div className='space-y-3 border-b border-border/60 px-5 py-4'>
+        <div className='flex flex-wrap items-center gap-2'>
+          <Layers className='size-4 text-primary' aria-hidden />
+          <h3 className='text-base font-semibold tracking-tight'>出站预览</h3>
           <Badge variant='secondary' className='font-normal'>
-            {personaPresetLabel(preset)}
+            {anthropicPresetLabel(preset)}
           </Badge>
+          {rendered.length ? (
+            <span className='rounded-md bg-muted/70 px-2 py-0.5 font-mono text-[11px] text-muted-foreground tabular-nums'>
+              {rendered.length} 层 · ≈{totalTokens} tok
+            </span>
+          ) : null}
           <Button
             type='button'
-            size='icon'
+            size='sm'
             variant='ghost'
-            className='ml-auto size-7 cursor-pointer'
+            className='ml-auto h-7 gap-1 px-2 text-xs text-muted-foreground hover:text-foreground'
             aria-label='复制 system prompt'
             disabled={!plain}
             onClick={() => {
               void navigator.clipboard.writeText(plain)
+              setCopied(true)
               toast.success('已复制')
             }}
           >
-            <Copy />
+            {copied ? (
+              <Check className='size-3.5 text-primary' aria-hidden />
+            ) : (
+              <Copy className='size-3.5' aria-hidden />
+            )}
+            {copied ? '已复制' : '复制全文'}
           </Button>
         </div>
+
         <div className='flex flex-wrap items-center gap-x-3 gap-y-2'>
           {envOn ? (
             <Select value={timezone} onValueChange={setPicked}>
@@ -257,102 +465,122 @@ export function SystemPreview({
               </SelectContent>
             </Select>
           ) : null}
-          <label className='ml-auto flex cursor-pointer items-center gap-1.5 text-xs text-muted-foreground'>
+          <label className='ml-auto flex cursor-pointer items-center gap-2 text-xs text-muted-foreground'>
             <Switch
               aria-label='显示调用方示例（仅预览）'
               aria-describedby='preview-caller-effect'
               checked={withCaller}
               onCheckedChange={setWithCaller}
             />
-            调用方示例 · 仅预览
+            <span>调用方示例</span>
           </label>
         </div>
+
         {!withCaller ? (
           <p
             id='preview-caller-effect'
             className='text-xs text-muted-foreground'
           >
-            仅隐藏调用方提示词示例，不移除请求中的 system 内容。
+            仅隐藏预览中的调用方占位，不影响实际请求中的 system 透传。
           </p>
         ) : (
           <span id='preview-caller-effect' className='sr-only'>
             关闭仅隐藏调用方提示词示例，不修改实际请求。
           </span>
         )}
-      </CardHeader>
-      <CardContent className='min-h-0 flex-1 space-y-2 overflow-y-auto px-4'>
+      </div>
+
+      <div className='max-h-[68svh] min-h-64 flex-1 space-y-4 overflow-y-auto px-5 py-4'>
+        {preset === 'zero' ? (
+          <div
+            data-testid='zero-inject-callout'
+            className='animate-prompt-pane-in rounded-xl border border-ok-2/70 bg-ok-1/45 px-4 py-3 dark:bg-ok-1/30'
+          >
+            <div className='flex items-center gap-2 text-sm font-medium text-ok-5'>
+              <ShieldCheck className='size-4 shrink-0' aria-hidden />
+              <span>0 注入直通模式</span>
+            </div>
+            <div className='mt-2 grid gap-2 text-xs sm:grid-cols-3'>
+              <div className='rounded-lg bg-card/80 px-2.5 py-2'>
+                <span className='block text-[11px] text-muted-foreground'>
+                  计费归因
+                </span>
+                <span className='font-medium text-foreground'>
+                  prompt_version 携带身份
+                </span>
+              </div>
+              <div className='rounded-lg bg-card/80 px-2.5 py-2'>
+                <span className='block text-[11px] text-muted-foreground'>
+                  注入系统块
+                </span>
+                <span className='font-medium text-foreground'>
+                  0 块（无核心与环境）
+                </span>
+              </div>
+              <div className='rounded-lg bg-card/80 px-2.5 py-2'>
+                <span className='block text-[11px] text-muted-foreground'>
+                  业务 system
+                </span>
+                <span className='font-medium text-foreground'>
+                  调用方原样直通
+                </span>
+              </div>
+            </div>
+          </div>
+        ) : null}
+
         {vars.isLoading || dash.isLoading ? (
-          <div className='space-y-2'>
-            <Skeleton className='h-16 w-full' />
-            <Skeleton className='h-40 w-full' />
+          <div className='space-y-3'>
+            <Skeleton className='h-16 w-full rounded-xl' />
+            <Skeleton className='h-28 w-full rounded-xl' />
+            <Skeleton className='h-20 w-full rounded-xl' />
           </div>
         ) : vars.error ? (
-          <p className='text-xs text-destructive'>
+          <p className='rounded-xl border border-destructive/30 bg-destructive/5 px-3.5 py-2.5 text-xs text-destructive'>
             {(vars.error as Error).message}
           </p>
         ) : rendered.length ? (
-          <ol className='space-y-2'>
+          <ol key={preset} className='space-y-3'>
             {rendered.map((block, i) => {
               const blockMasked = blocksMasked && block.hide
               const masked =
                 blockMasked || (standingMasked && block.text.includes(standing))
               return (
-                <li
+                <PreviewLayerCard
                   key={`${block.id}-${i}`}
-                  className='overflow-hidden rounded-md border border-border/60'
-                >
-                  <div className='flex flex-wrap items-center gap-x-2 gap-y-1 border-b border-border/40 bg-muted/30 px-3 py-2 font-mono text-[10px] text-muted-foreground'>
-                    <span className='tabular-nums'>{i + 1}</span>
-                    <span className='truncate'>
-                      {promptBlockLabel(block.id)[0]}
-                    </span>
-                    <span className='break-all'>{block.region}</span>
-                    <span className='ml-auto flex items-center gap-1.5'>
-                      {block.ttl ? <span>{block.ttl}</span> : null}
-                      {block.scope ? <span>{block.scope}</span> : null}
-                      {masked ? (
-                        <span
-                          className='flex items-center gap-0.5'
-                          title={
-                            blockMasked
-                              ? '注入块不计 usage'
-                              : '常驻约束不计 usage'
-                          }
-                        >
-                          <EyeOff className='size-3' aria-hidden />
-                          {blockMasked ? '遮罩' : '约束遮罩'}
-                        </span>
-                      ) : null}
-                      <span className='tabular-nums'>
-                        ≈{estimateTokens(block.text)}
-                      </span>
-                    </span>
-                  </div>
-                  {block.placeholder ? (
-                    <p className='px-2.5 py-2 text-[11px] text-muted-foreground italic'>
-                      零宽占位
-                    </p>
-                  ) : (
-                    <pre className='px-3 py-3 font-mono text-xs leading-6 break-words whitespace-pre-wrap'>
-                      {highlight(block.text, marks)}
-                    </pre>
-                  )}
-                </li>
+                  block={block}
+                  index={i}
+                  isLast={i === rendered.length - 1}
+                  masked={masked}
+                  blockMasked={blockMasked}
+                  marks={marks}
+                />
               )
             })}
           </ol>
         ) : (
-          <p className='text-xs text-muted-foreground'>无 system 块</p>
+          <p className='rounded-xl border border-dashed border-border/70 px-4 py-6 text-center text-xs text-muted-foreground'>
+            当前配置无出站 system 块
+          </p>
         )}
-      </CardContent>
-      {rendered.length ? (
-        <div className='flex items-center justify-between border-t border-border/40 px-4 pt-3 font-mono text-[10px] text-muted-foreground tabular-nums'>
-          <span>{rendered.length} 块</span>
-          <span>
-            {plain.length} 字符 · ≈{estimateTokens(plain)} tok
-          </span>
-        </div>
-      ) : null}
-    </Card>
+      </div>
+
+      <div className='space-y-3 border-t border-border/60 bg-muted/20 px-5 py-3.5'>
+        {preset !== 'zero' ? (
+          <RawJsonDisclosure
+            mode={preset}
+            buildPayload={() => buildAnthropicRawJsonPayload(preset, rendered)}
+          />
+        ) : null}
+        {rendered.length ? (
+          <div className='flex items-center justify-between font-mono text-[11px] text-muted-foreground tabular-nums'>
+            <span>共 {rendered.length} 层</span>
+            <span>
+              {plain.length} 字符 · ≈{totalTokens} tok
+            </span>
+          </div>
+        ) : null}
+      </div>
+    </div>
   )
 }

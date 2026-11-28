@@ -1,30 +1,36 @@
 import {
   personaInjectFromPreset,
   personaPresetFromCompat,
-  protocolPersonaSaveToast,
 } from '@/lib/persona-template'
-import { cragGeminiPersonaFromCompat } from './craggemini-panel'
+import { cragGeminiPersonaFromCompat } from './google-prompt'
+import { anthropicPresetLabel } from './prompt-presentation'
 
 type Compat = Record<string, unknown>
-export type SystemPromptKernelSet = 'claude' | 'craggemini'
+export type SystemPromptBrand = 'anthropic' | 'google'
 
 export function systemPromptSaveToast(
-  kernelSet: SystemPromptKernelSet,
+  brand: SystemPromptBrand,
   compat: Compat | undefined,
-  kernel?: { updated?: number } | null
+  sync?: { updated?: number } | null
 ): string {
-  if (kernelSet === 'craggemini') {
+  if (brand === 'google') {
     const label =
-      cragGeminiPersonaFromCompat(compat) === 'zero' ? '0提示词' : '官方提示词'
-    return `已保存 · CRAGGemini · ${label}`
+      cragGeminiPersonaFromCompat(compat) === 'zero' ? '0注入' : '官方提示词'
+    return `已保存 · Google · ${label}`
   }
-  return protocolPersonaSaveToast(compat, kernel)
+  const label = anthropicPresetLabel(personaPresetFromCompat(compat))
+  if (sync && typeof sync.updated === 'number') {
+    const detail =
+      sync.updated > 0 ? `已热更新 ${sync.updated} 个槽` : '配置已同步'
+    return `已保存 · Anthropic · ${label} · ${detail}`
+  }
+  return `已保存 · Anthropic · ${label}`
 }
 
 /**
  * 系统提示词页保存体：只发 `compatibility` 里改过的键。PUT /routing 按段合并、
  * compatibility 内再浅合并，整份回写会把别处（设置页、其它标签）改过的值回滚。
- * persona_preset / persona_inject 照旧每次都带，后端据此统一同步到 cli-node 与 CRAG 内核。
+ * persona_preset / persona_inject 照旧每次都带，后端据此统一同步到各运行节点。
  */
 export function compatibilityPatch(
   draft: Compat,
