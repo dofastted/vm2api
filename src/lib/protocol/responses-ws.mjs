@@ -275,6 +275,7 @@ export function createSseJsonBridge() {
   let terminal = null
   let responseId = null
   let output = null
+  let incompleteReason = null
 
   function takeData() {
     if (!dataLines.length) return null
@@ -291,8 +292,10 @@ export function createSseJsonBridge() {
     if (Array.isArray(parsed.response?.output)) output = parsed.response.output
     if (type === 'response.completed') terminal = 'completed'
     else if (type === 'response.failed') terminal = 'failed'
-    else if (type === 'response.incomplete') terminal = 'incomplete'
-    else if (type === 'error') terminal = 'error'
+    else if (type === 'response.incomplete') {
+      terminal = 'incomplete'
+      incompleteReason = parsed.response?.incomplete_details?.reason || null
+    } else if (type === 'error') terminal = 'error'
     frames.push(parsed)
   }
 
@@ -341,7 +344,7 @@ export function createSseJsonBridge() {
     },
     snapshot() {
       if (!responseId) return null
-      return { id: responseId, output: Array.isArray(output) ? output : [] }
+      return { id: responseId, output: Array.isArray(output) ? output : [], incompleteReason }
     },
   }
 }
@@ -546,6 +549,7 @@ export function createResponsesWsHandler({
     let currentRes = null
     let activeResponseId = null
     let activeHopCompleted = false
+    let liveInterrupt = null
 
     const abortCurrent = () => {
       try {
@@ -605,7 +609,12 @@ export function createResponsesWsHandler({
           }
           activeResponseId = null
           activeHopCompleted = false
+          liveInterrupt = null
           const req = createProtocolReq(upgradeReq, hopBody)
+          req._responsesWsReplay = previousId ? { previous_response_id: previousId } : {}
+          req._onCodexInterruptReady = (info) => {
+            if (currentReq === req && !activeHopCompleted) liveInterrupt = info
+          }
           const activeRt = resolveSchedulerRuntime()
           if (activeRt) req._schedulerRuntime = activeRt
           currentReq = req
@@ -770,6 +779,7 @@ export function createResponsesWsHandler({
           } finally {
             currentReq = null
             currentRes = null
+            liveInterrupt = null
           }
           if (closed) return
           bridge.finish()
@@ -779,11 +789,13 @@ export function createResponsesWsHandler({
             sendFrame(ws, httpErrorToFrame(res.statusCode, jsonBody))
             continue
           }
-          if (bridge.terminal === 'completed') {
-            const snap = bridge.snapshot()
-            // A warmup settles with an id the client may continue from, so it
-            // enters the replay cache like any other hop. The cache still lives
-            // only on this connection: `store` never turns into persistence.
+          const snap = bridge.snapshot()
+          if (
+            bridge.terminal === 'completed' ||
+            (bridge.terminal === 'incomplete' && snap?.incompleteReason === 'interrupted')
+          ) {
+            // Completed turns and interrupted turns with final output enter the
+            // connection replay cache so follow-ups keep an exact verified prefix.
             if (snap) {
               replay.remember(snap.id, { input: hopBody.input, output: snap.output })
             }
@@ -839,6 +851,46 @@ export function createResponsesWsHandler({
         const targetId = interruptTargetResponseId(clientMessage.value)
         const shouldAbort =
           currentReq && !activeHopCompleted && (!targetId || (activeResponseId && targetId === activeResponseId))
+        if (shouldAbort && liveInterrupt && activeResponseId) {
+          const handle = liveInterrupt
+          const targetRespId = activeResponseId
+          const rawFrame = clientMessage.value
+          handle
+            .interrupt(targetRespId)
+            .then((outcome) => {
+              if (closed) return
+              if (
+                outcome?.accepted === true ||
+                (outcome?.ok && outcome?.accepted !== false && outcome?.status !== 409)
+              ) {
+                return
+              }
+              if (outcome?.status === 409) {
+                if (!activeHopCompleted && currentReq) {
+                  sendFrame(ws, {
+                    type: 'response.interrupt.failed',
+                    ...(rawFrame.previous_response_id
+                      ? { previous_response_id: rawFrame.previous_response_id }
+                      : { response_id: targetRespId }),
+                    error: {
+                      type: 'invalid_request_error',
+                      code: 'interrupt_unavailable',
+                      message: 'Active upstream WebSocket cannot forward interrupt',
+                    },
+                  })
+                }
+                return
+              }
+              if (!activeHopCompleted && currentReq) abortCurrent()
+              sendFrame(ws, responseInterruptAcceptedFrame(rawFrame))
+            })
+            .catch(() => {
+              if (closed) return
+              if (!activeHopCompleted && currentReq) abortCurrent()
+              sendFrame(ws, responseInterruptAcceptedFrame(rawFrame))
+            })
+          return
+        }
         if (shouldAbort) abortCurrent()
         sendFrame(ws, responseInterruptAcceptedFrame(clientMessage.value))
         return
