@@ -121,6 +121,7 @@ async function workerRequest(
     timeoutMode = 'overall',
     headers = {},
     maxRequestBytes = 0,
+    logicalSize = 0,
     inference = false,
     onRequestStarted,
     beforeInferencePost,
@@ -135,15 +136,18 @@ async function workerRequest(
   const payload =
     body == null
       ? null
-      : inference
-        ? await inferenceCodec.encode(body, { signal })
-        : Buffer.from(typeof body === 'string' ? body : JSON.stringify(body))
+      : Buffer.isBuffer(body)
+        ? body
+        : inference
+          ? await inferenceCodec.encode(body, { signal })
+          : Buffer.from(typeof body === 'string' ? body : JSON.stringify(body))
   // Non-managed inference may serialize on an async codec. Authorize after it, before opening HTTP.
   if (beforeInferencePost && !signal?.aborted) await checkInferencePost(beforeInferencePost)
   if (signal?.aborted) throw Object.assign(new Error('The operation was aborted'), { code: 'ABORT_ERR' })
   return new Promise((resolve, reject) => {
+    const checkedBytes = logicalSize > 0 ? logicalSize : payload?.length || 0
     // Include the headers, session metadata and request_id added around the caller's body.
-    if (maxRequestBytes > 0 && payload?.length > maxRequestBytes) {
+    if (maxRequestBytes > 0 && checkedBytes > maxRequestBytes) {
       reject(
         Object.assign(new Error(`Request envelope exceeds ${maxRequestBytes} bytes`), {
           status: 413,
@@ -159,7 +163,8 @@ async function workerRequest(
     }
     const requestHeaders = { ...headers }
     if (payload) {
-      requestHeaders['content-type'] = 'application/json'
+      const hasContentType = Object.keys(requestHeaders).some((key) => key.toLowerCase() === 'content-type')
+      if (!hasContentType) requestHeaders['content-type'] = 'application/json'
       requestHeaders['content-length'] = String(payload.length)
     }
     if (internalToken) {
@@ -284,6 +289,158 @@ async function inferenceRequest(
     timeoutMs,
     timeoutMode: stream ? 'first-byte' : 'overall',
   })
+}
+
+export async function interruptWorker(exec, { requestId, responseId, timeoutMs = 3000 } = {}) {
+  if (!requestId || !responseId) return { ok: false, status: 400 }
+  try {
+    const res = await workerRequest(exec, {
+      method: 'POST',
+      requestPath: '/internal/v1/interrupt',
+      body: { request_id: requestId, response_id: responseId },
+      requireInternalToken: true,
+      timeoutMs,
+    })
+    await readAll(res, 64 * 1024).catch(() => Buffer.alloc(0))
+    const status = res.statusCode || 0
+    return { ok: status === 204, status }
+  } catch (error) {
+    return { ok: false, status: 0, code: error?.code || 'interrupt_failed' }
+  }
+}
+
+function codexReceiptFromHeaders(headers = {}, trailers = {}) {
+  const pick = (name) => {
+    const raw = trailers?.[name] ?? headers?.[name]
+    if (raw == null) return null
+    const text = String(Array.isArray(raw) ? raw[0] : raw).trim()
+    return text || null
+  }
+  const jsonObj = (raw) => {
+    const parsed = raw ? parseJson(raw) : null
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null
+  }
+  const sentRaw = pick('x-kin-upstream-sent')
+  const interruptRaw = pick('x-tap-interrupt')
+  const udsRecvRaw = pick('x-kin-uds-received')
+  return {
+    turnTiming: jsonObj(pick('x-tap-turn-timing')),
+    interruptTransport: interruptRaw ? interruptRaw.toLowerCase() : null,
+    upstreamSent: sentRaw ? sentRaw.toLowerCase() : null,
+    upstreamError: jsonObj(pick('x-kin-upstream-error')),
+    modelsEtag: pick('x-models-etag'),
+    udsBase: pick('x-kin-uds-base'),
+    udsMiss: pick('x-kin-uds-miss') === '1',
+    udsReceived: udsRecvRaw != null && Number.isFinite(Number(udsRecvRaw)) ? Number(udsRecvRaw) : null,
+  }
+}
+
+async function sendPreparedInference(
+  exec,
+  {
+    envelope,
+    requestId,
+    gatewayRequestId = null,
+    stream,
+    deliveryMode,
+    managedCrag,
+    nativeHandoff = false,
+    tenantId,
+    slotWaitDeadlineMs,
+    timeoutMs,
+    idleTimeoutMs,
+    routing,
+    requestPath,
+    maxRequestBytes = 0,
+    beforeInferencePost,
+    packedCodec = null,
+    signal,
+    armAttemptCancel,
+    disarmAttemptCancel,
+  },
+) {
+  if (!packedCodec || typeof packedCodec.prepare !== 'function') {
+    const response = await inferenceRequest(exec, {
+      stream,
+      managedCrag,
+      nativeHandoff,
+      tenantId,
+      slotWaitDeadlineMs,
+      idleTimeoutMs,
+      routing,
+      requestPath,
+      envelope,
+      requestId,
+      gatewayRequestId,
+      maxRequestBytes,
+      inference: true,
+      beforeInferencePost,
+      onRequestStarted: armAttemptCancel,
+      signal,
+      timeoutMs,
+    })
+    return { response, packedMeta: null }
+  }
+  const rawBuf = await inferenceCodec.encode({ ...envelope, request_id: requestId }, { signal })
+  if (maxRequestBytes > 0 && rawBuf.length > maxRequestBytes) {
+    throw Object.assign(new Error(`Request envelope exceeds ${maxRequestBytes} bytes`), {
+      status: 413,
+      code: 'body_too_large',
+    })
+  }
+  const sessionId = envelope?.session?.session_id || envelope?.headers?.['session-id'] || ''
+  const baseHeaders = stream ? { te: 'trailers' } : {}
+  const safeGatewayRequestId = correlationIdForLog(gatewayRequestId)
+  if (safeGatewayRequestId) baseHeaders['x-gateway-request-id'] = safeGatewayRequestId
+  const sendPacked = (packed, gate) =>
+    workerRequest(exec, {
+      method: 'POST',
+      requestPath: '/internal/v1/codex/responses/packed',
+      body: packed.wireBody,
+      headers: { ...baseHeaders, ...packed.headers },
+      maxRequestBytes,
+      logicalSize: packed.rawBytes,
+      timeoutMs,
+      timeoutMode: stream ? 'first-byte' : 'overall',
+      signal,
+      beforeInferencePost: gate,
+      onRequestStarted: armAttemptCancel,
+    })
+  const first = packedCodec.prepare({ exec, rawBuf, sessionId })
+  let attempt = first
+  let response = await sendPacked(first, beforeInferencePost)
+  let cacheMissRetried = false
+  if (
+    first.baseSent &&
+    response.statusCode === 409 &&
+    String(response.headers?.['x-kin-uds-miss'] || '') === '1' &&
+    String(response.headers?.['x-kin-upstream-sent'] || '') === '0'
+  ) {
+    await readAll(response, 64 * 1024).catch(() => {})
+    disarmAttemptCancel?.()
+    packedCodec.evict?.(exec, first.baseSent)
+    attempt = packedCodec.prepareFull({ exec, rawBuf })
+    cacheMissRetried = true
+    response = await sendPacked(attempt, undefined)
+  }
+  const returnedBase = String(response.headers?.['x-kin-uds-base'] || '').trim()
+  if ((response.statusCode || 0) >= 200 && (response.statusCode || 0) < 300 && /^[0-9a-f]{64}$/.test(returnedBase)) {
+    packedCodec.remember?.(exec, { sessionId, baseSha: returnedBase, rawBuf })
+  }
+  const recv = response.headers?.['x-kin-uds-received']
+  return {
+    response,
+    packedMeta: {
+      endpoint: '/internal/v1/codex/responses/packed',
+      stored: attempt.stored === true,
+      delta: Boolean(attempt.baseSent),
+      cacheMissRetried,
+      baseSha: attempt.baseSent || returnedBase || null,
+      rawBytes: attempt.rawBytes,
+      wireBytes: attempt.wireBytes,
+      receivedBytes: recv != null && Number.isFinite(Number(recv)) ? Number(recv) : null,
+    },
+  }
 }
 
 function classifyManagedQueueRejection(result, managedCrag) {
@@ -455,18 +612,33 @@ async function readAll(stream, limit = MAX_BODY) {
   return Buffer.concat(chunks)
 }
 
+const INTERNAL_CODEX_HEADERS = new Set([
+  'x-tap-turn-timing',
+  'x-tap-interrupt',
+  'x-kin-upstream-error',
+  'x-kin-upstream-sent',
+  'x-kin-uds-base',
+  'x-kin-uds-miss',
+  'x-kin-uds-received',
+  'x-kin-uds-store',
+  'x-kin-uds-copy',
+])
+
 function publicHeaders(headers = {}) {
   const result = {}
   for (const [key, value] of Object.entries(headers || {})) {
     if (value == null) continue
     const lower = String(key).toLowerCase()
     if (lower === 'set-cookie' || lower === 'authorization' || lower === 'x-api-key') continue
-    if (lower === 'x-kin-provider-result') continue
+    if (lower === 'x-kin-provider-result' || INTERNAL_CODEX_HEADERS.has(lower)) continue
     if (lower === 'trailer') {
       const visible = String(value)
         .split(',')
         .map((name) => name.trim())
-        .filter((name) => name.toLowerCase() !== 'x-kin-provider-result')
+        .filter((name) => {
+          const item = name.toLowerCase()
+          return item !== 'x-kin-provider-result' && !INTERNAL_CODEX_HEADERS.has(item)
+        })
       if (visible.length) result[lower] = visible.join(', ')
       continue
     }
@@ -594,6 +766,7 @@ function nativeErrorStatus(handoff, body, { strictPassthrough = false } = {}) {
 export function restoreKernelErrorStatus(result = {}, { now = Date.now() } = {}) {
   if (!result || result.ok || Number(result.status) !== 502) return result
   if (result.providerResult?.schema_version === 2) return result
+  if (String(result.upstreamSent ?? result.headers?.['x-kin-upstream-sent'] ?? '') === 'unknown') return result
   const body = result.body
   if (!(body?.type === 'error' || body?.error)) return result
   const status = semanticStatusForStreamError(body)
@@ -1132,6 +1305,7 @@ async function callGoWorkerRaw({
   preserveCacheBreakpoints = null,
   requestPath = '/internal/v1/messages',
   envelope = null,
+  packedCodec = null,
   cliHop = false,
   cragPrint = null,
   promptSpec = null,
@@ -1187,12 +1361,19 @@ async function callGoWorkerRaw({
     }
   }
   const hopSignal = createHopAbortScope(signal)
-  let stopCancel = () => hopSignal.disarm()
+  let stopAttemptCancel = () => {}
+  const disarmAttemptCancel = () => {
+    stopAttemptCancel()
+    stopAttemptCancel = () => {}
+  }
+  let stopCancel = disarmAttemptCancel
   const clusterSlot = requestPath === '/internal/v1/messages' && !!vmNodeId(exec?.vm)
   let requestStarted = false
   let nativeHandoff = false
   let handoff = null
   let observedHeaders = {}
+  let observedReceipt = codexReceiptFromHeaders()
+  let packedMeta = null
   const nativeMetadata = () =>
     handoff ? { ...handoff.metadata, nativeHandoff } : { nativeHandoff: false, providerResult: null }
   try {
@@ -1242,7 +1423,16 @@ async function callGoWorkerRaw({
     if (useNativeHandoff || negotiateProviderResult(exec, { managedCrag, requestPath }))
       handoff = createNativeHandoffState({ nativeHandoff: useNativeHandoff, strictPassthrough })
     const resolvedCancelSessionId = resolveCancelSessionId(cancelSessionId, reqHeaders, prepared.envelope?.headers)
-    const response = await inferenceRequest(exec, {
+    const armAttemptCancel = () => {
+      requestStarted = true
+      nativeHandoff = useNativeHandoff
+      const stopRemoteCancel = cancelOnAbort(exec, hopSignal.signal, requestId, resolvedCancelSessionId)
+      stopAttemptCancel = () => {
+        hopSignal.disarm()
+        stopRemoteCancel()
+      }
+    }
+    const sent = await sendPreparedInference(exec, {
       stream: false,
       managedCrag,
       nativeHandoff: useNativeHandoff,
@@ -1255,24 +1445,22 @@ async function callGoWorkerRaw({
       requestId,
       gatewayRequestId,
       maxRequestBytes,
-      inference: true,
       beforeInferencePost,
-      onRequestStarted: () => {
-        requestStarted = true
-        nativeHandoff = useNativeHandoff
-        const stopRemoteCancel = cancelOnAbort(exec, hopSignal.signal, requestId, resolvedCancelSessionId)
-        stopCancel = () => {
-          hopSignal.disarm()
-          stopRemoteCancel()
-        }
-      },
+      packedCodec,
+      armAttemptCancel,
+      disarmAttemptCancel,
       signal: hopSignal.signal,
       timeoutMs,
     })
+    const response = sent.response
+    packedMeta = sent.packedMeta
+    observedReceipt = codexReceiptFromHeaders(response.headers)
     observedHeaders = mergeRateLimitHeaders(publicHeaders(response.headers))
     handoff?.observeHeaders(response.headers)
     const data = await readAll(response)
     stopCancel()
+    const receipt = codexReceiptFromHeaders(response.headers, response.trailers)
+    observedReceipt = receipt
     const parsedRaw = await inferenceCodec.decode(data, { status: response.statusCode, signal: hopSignal.signal })
     let parsed = handoff ? handoff.consumeBody(parsedRaw) : parsedRaw
     if (prepared.redaction) parsed = await restoreJsonValue(parsed, prepared.redaction)
@@ -1310,6 +1498,12 @@ async function callGoWorkerRaw({
       transportError: false,
       threadBetas: prepared.thread,
       hopRequestId: requestId,
+      ...(receipt.turnTiming ? { turnTiming: receipt.turnTiming } : {}),
+      ...(receipt.interruptTransport ? { interruptTransport: receipt.interruptTransport } : {}),
+      ...(receipt.upstreamSent ? { upstreamSent: receipt.upstreamSent } : {}),
+      ...(receipt.upstreamError ? { upstreamError: receipt.upstreamError } : {}),
+      ...(receipt.modelsEtag ? { modelsEtag: receipt.modelsEtag } : {}),
+      ...(packedMeta ? { udsPacked: packedMeta } : {}),
       ...nativeMetadata(),
     })
     return classifyManagedQueueRejection(result, managedCrag)
@@ -1319,7 +1513,15 @@ async function callGoWorkerRaw({
     if (error.code === 'invalid_kernel_request' || error.code === 'unsupported_capability')
       return { ...invalidKernelResult(error), hopRequestId: requestId, ...nativeMetadata() }
     if (hopSignal.signal?.aborted)
-      return clientCancelledResult({ via: 'go-worker', hopRequestId: requestId, ...nativeMetadata() })
+      return clientCancelledResult({
+        via: 'go-worker',
+        hopRequestId: requestId,
+        ...(observedReceipt.turnTiming ? { turnTiming: observedReceipt.turnTiming } : {}),
+        ...(observedReceipt.upstreamSent ? { upstreamSent: observedReceipt.upstreamSent } : {}),
+        ...(observedReceipt.upstreamError ? { upstreamError: observedReceipt.upstreamError } : {}),
+        ...(packedMeta ? { udsPacked: packedMeta } : {}),
+        ...nativeMetadata(),
+      })
     if (error instanceof InferencePostDenied) return error.result
     return {
       ok: false,
@@ -1344,6 +1546,10 @@ async function callGoWorkerRaw({
       headers: observedHeaders,
       clusterDeliveryUnconfirmed: clusterSlot && requestStarted,
       hopRequestId: requestId,
+      ...(observedReceipt.turnTiming ? { turnTiming: observedReceipt.turnTiming } : {}),
+      ...(observedReceipt.upstreamSent ? { upstreamSent: observedReceipt.upstreamSent } : {}),
+      ...(observedReceipt.upstreamError ? { upstreamError: observedReceipt.upstreamError } : {}),
+      ...(packedMeta ? { udsPacked: packedMeta } : {}),
       ...nativeMetadata(),
       terminalState:
         nativeHandoff && String(error.code).startsWith('native_handoff_')
@@ -1351,7 +1557,10 @@ async function callGoWorkerRaw({
           : error.status === 413
             ? 'rejected'
             : 'transport_error',
-      transportError: error.status !== 413 && !(nativeHandoff && String(error.code).startsWith('native_handoff_')),
+      transportError:
+        observedReceipt.upstreamSent !== 'unknown' &&
+        error.status !== 413 &&
+        !(nativeHandoff && String(error.code).startsWith('native_handoff_')),
     }
   } finally {
     stopCancel()
@@ -1380,6 +1589,8 @@ async function streamGoWorkerRaw({
   preserveCacheBreakpoints = null,
   requestPath = '/internal/v1/messages',
   envelope = null,
+  packedCodec = null,
+  onInterruptReady = null,
   cliHop = false,
   cragPrint = null,
   promptSpec = null,
@@ -1499,12 +1710,27 @@ async function streamGoWorkerRaw({
   let committed = false
   const timing = createStreamTiming()
   const hopSignal = createHopAbortScope(signal)
-  let stopCancel = () => hopSignal.disarm()
+  let stopAttemptCancel = () => {}
+  const disarmAttemptCancel = () => {
+    stopAttemptCancel()
+    stopAttemptCancel = () => {}
+  }
+  let stopCancel = disarmAttemptCancel
   const clusterSlot = requestPath === '/internal/v1/messages' && !!vmNodeId(exec?.vm)
   let requestStarted = false
   let nativeHandoff = false
   let handoff = null
   let observedHeaders = {}
+  let observedReceipt = codexReceiptFromHeaders()
+  let packedMeta = null
+  let firstGeneratedEventType = null
+  let firstReleaseType = null
+  let clientFirstWriteSourceType = null
+  const nodeTimingMeta = () => ({
+    firstGeneratedEventType,
+    firstReleaseType,
+    clientFirstWriteSourceType,
+  })
   const nativeMetadata = () =>
     handoff ? { ...handoff.metadata, nativeHandoff } : { nativeHandoff: false, providerResult: null }
   try {
@@ -1556,7 +1782,16 @@ async function streamGoWorkerRaw({
     if (useNativeHandoff || negotiateProviderResult(exec, { managedCrag, requestPath }))
       handoff = createNativeHandoffState({ nativeHandoff: useNativeHandoff, strictPassthrough })
     const resolvedCancelSessionId = resolveCancelSessionId(cancelSessionId, reqHeaders, prepared.envelope?.headers)
-    const response = await inferenceRequest(exec, {
+    const armAttemptCancel = () => {
+      requestStarted = true
+      nativeHandoff = useNativeHandoff
+      const stopRemoteCancel = cancelOnAbort(exec, hopSignal.signal, requestId, resolvedCancelSessionId)
+      stopAttemptCancel = () => {
+        hopSignal.disarm()
+        stopRemoteCancel()
+      }
+    }
+    const sent = await sendPreparedInference(exec, {
       stream: true,
       deliveryMode,
       managedCrag,
@@ -1570,28 +1805,42 @@ async function streamGoWorkerRaw({
       requestId,
       gatewayRequestId,
       maxRequestBytes,
-      inference: true,
       beforeInferencePost,
-      onRequestStarted: () => {
-        requestStarted = true
-        nativeHandoff = useNativeHandoff
-        const stopRemoteCancel = cancelOnAbort(exec, hopSignal.signal, requestId, resolvedCancelSessionId)
-        stopCancel = () => {
-          hopSignal.disarm()
-          stopRemoteCancel()
-        }
-      },
+      packedCodec,
+      armAttemptCancel,
+      disarmAttemptCancel,
       signal: hopSignal.signal,
       timeoutMs,
     })
+    const response = sent.response
+    packedMeta = sent.packedMeta
+    observedReceipt = codexReceiptFromHeaders(response.headers)
     const headers = mergeRateLimitHeaders(publicHeaders(response.headers))
     observedHeaders = headers
     handoff?.observeHeaders(response.headers)
+    const codexResponses =
+      requestPath === '/internal/v1/codex/responses' || requestPath === '/internal/v1/codex/responses/packed'
+    if (
+      codexResponses &&
+      response.statusCode === 200 &&
+      observedReceipt.interruptTransport === 'websocket' &&
+      typeof onInterruptReady === 'function'
+    ) {
+      try {
+        onInterruptReady({
+          requestId,
+          interruptMode: 'websocket',
+          interrupt: (responseId) => interruptWorker(exec, { requestId, responseId }),
+        })
+      } catch {}
+    }
     const claudeMessages = requestPath === '/internal/v1/messages'
     const jsonReply = claudeMessages && /^application\/json\b/i.test(response.headers['content-type'] || '')
     if (jsonReply || (response.statusCode || 0) < 200 || (response.statusCode || 0) >= 300) {
       const data = await readAll(response, handoff ? MAX_BODY : 1024 * 1024)
       stopCancel()
+      const receipt = codexReceiptFromHeaders(response.headers, response.trailers)
+      observedReceipt = receipt
       let decoded = await inferenceCodec.decode(data, { status: response.statusCode, signal: hopSignal.signal })
       if (handoff) decoded = handoff.consumeBody(decoded)
       if (prepared.redaction) decoded = await restoreJsonValue(decoded, prepared.redaction)
@@ -1611,6 +1860,13 @@ async function streamGoWorkerRaw({
         transportError: false,
         threadBetas: prepared.thread,
         hopRequestId: requestId,
+        ...(receipt.turnTiming ? { turnTiming: receipt.turnTiming } : {}),
+        ...(receipt.interruptTransport ? { interruptTransport: receipt.interruptTransport } : {}),
+        ...(receipt.upstreamSent ? { upstreamSent: receipt.upstreamSent } : {}),
+        ...(receipt.upstreamError ? { upstreamError: receipt.upstreamError } : {}),
+        ...(receipt.modelsEtag ? { modelsEtag: receipt.modelsEtag } : {}),
+        ...(packedMeta ? { udsPacked: packedMeta } : {}),
+        nodeTiming: nodeTimingMeta(),
         ...nativeMetadata(),
       })
       return classifyManagedQueueRejection(result, managedCrag)
@@ -1694,7 +1950,7 @@ async function streamGoWorkerRaw({
     let sseModel = null
     let sseStop = null
     let sseRateHeaders = {}
-    const codexResponses = requestPath === '/internal/v1/codex/responses'
+    let firstSeenEventType = null
     let responsesId = null
     let responsesTerminal = null
     const assembler = createClaudeMessageAssembler()
@@ -1708,9 +1964,16 @@ async function streamGoWorkerRaw({
         return null
       }
     }
-    const flushCommit = async () => {
+    const flushCommit = async (triggerEvent = null) => {
       if (committed) return
       committed = true
+      if (firstReleaseType == null) {
+        firstReleaseType = typeof triggerEvent?.type === 'string' && triggerEvent.type ? triggerEvent.type : null
+      }
+      if (clientFirstWriteSourceType == null) {
+        clientFirstWriteSourceType =
+          firstSeenEventType || (typeof triggerEvent?.type === 'string' && triggerEvent.type ? triggerEvent.type : null)
+      }
       if (typeof onCommit === 'function')
         onCommit(mergeRateLimitHeaders(publicHeaders({ ...sseRateHeaders, ...headers })))
       if (onEvent) {
@@ -1727,7 +1990,14 @@ async function streamGoWorkerRaw({
     }
     const observeSseEvent = (event) => {
       if (!event) return event
+      if (firstSeenEventType == null && typeof event.type === 'string' && event.type) {
+        firstSeenEventType = event.type
+      }
+      const hadToken = timing.snapshot().firstTokenAt != null
       timing.observe(event, receivedAt)
+      if (!hadToken && timing.snapshot().firstTokenAt != null && typeof event.type === 'string' && event.type) {
+        firstGeneratedEventType = event.type
+      }
       if (claudeMessages && isClaudeSlotOAuthError(event)) {
         lastError = slotOAuthUnavailable().body
         return lastError
@@ -1850,19 +2120,19 @@ async function streamGoWorkerRaw({
               dataBuf = dataBuf ? `${dataBuf}\n${piece}` : piece
               const event = observeSseEvent(takeSseEvent())
               line = publicSseLine(line, event)
-              if (shouldCommit(event)) await flushCommit()
+              if (shouldCommit(event)) await flushCommit(event)
             }
           } else if (line === '') {
             if (dataBuf) {
               const event = takeSseEvent()
               dataBuf = ''
               observeSseEvent(event)
-              if (shouldCommit(event)) await flushCommit()
+              if (shouldCommit(event)) await flushCommit(event)
             }
           } else if (dataBuf && !line.startsWith('event:') && !line.startsWith(':')) {
             dataBuf = `${dataBuf}\n${line}`
             const event = observeSseEvent(takeSseEvent())
-            if (shouldCommit(event)) await flushCommit()
+            if (shouldCommit(event)) await flushCommit(event)
           }
           await emitLine(line)
         }
@@ -1878,15 +2148,17 @@ async function streamGoWorkerRaw({
             dataBuf = dataBuf ? `${dataBuf}\n${piece}` : piece
             const event = observeSseEvent(takeSseEvent())
             buffer = publicSseLine(buffer, event)
-            if (shouldCommit(event)) await flushCommit()
+            if (shouldCommit(event)) await flushCommit(event)
           }
         }
         await emitLine(buffer)
       }
       if (dataBuf) {
         const event = observeSseEvent(takeSseEvent())
-        if (shouldCommit(event)) await flushCommit()
+        if (shouldCommit(event)) await flushCommit(event)
       }
+      const receipt = codexReceiptFromHeaders(response.headers, response.trailers)
+      observedReceipt = receipt
       const trailers = mergeRateLimitHeaders(publicHeaders(response.trailers))
       handoff?.observeHeaders(response.trailers)
       const meta = streamMetaFromHeaders({ ...headers, ...trailers })
@@ -1918,7 +2190,7 @@ async function streamGoWorkerRaw({
         (codexResponses
           ? !!responsesTerminal
           : isCompleteAssistantMessage({ body: assembled, stopReason, sawMessageStop }))
-      if (!committed && complete) await flushCommit()
+      if (!committed && complete) await flushCommit(responsesTerminal || null)
       const terminalState = complete && !incomplete ? 'verified' : 'incomplete'
       const rateHeaders = mergeProviderHeaders(
         mergeRateLimitHeaders({ ...sseRateHeaders, ...headers, ...trailers }),
@@ -1958,6 +2230,13 @@ async function streamGoWorkerRaw({
         transportError: false,
         threadBetas: prepared.thread,
         hopRequestId: requestId,
+        ...(receipt.turnTiming ? { turnTiming: receipt.turnTiming } : {}),
+        ...(receipt.interruptTransport ? { interruptTransport: receipt.interruptTransport } : {}),
+        ...(receipt.upstreamSent ? { upstreamSent: receipt.upstreamSent } : {}),
+        ...(receipt.upstreamError ? { upstreamError: receipt.upstreamError } : {}),
+        ...(receipt.modelsEtag ? { modelsEtag: receipt.modelsEtag } : {}),
+        ...(packedMeta ? { udsPacked: packedMeta } : {}),
+        nodeTiming: nodeTimingMeta(),
         ...nativeMetadata(),
       })
     } finally {
@@ -1980,6 +2259,11 @@ async function streamGoWorkerRaw({
         ...timing.snapshot(),
         committed,
         hopRequestId: requestId,
+        ...(observedReceipt.turnTiming ? { turnTiming: observedReceipt.turnTiming } : {}),
+        ...(observedReceipt.upstreamSent ? { upstreamSent: observedReceipt.upstreamSent } : {}),
+        ...(observedReceipt.upstreamError ? { upstreamError: observedReceipt.upstreamError } : {}),
+        ...(packedMeta ? { udsPacked: packedMeta } : {}),
+        nodeTiming: nodeTimingMeta(),
         ...nativeMetadata(),
       })
     }
@@ -2007,6 +2291,11 @@ async function streamGoWorkerRaw({
       headers: observedHeaders,
       clusterDeliveryUnconfirmed: clusterSlot && requestStarted,
       hopRequestId: requestId,
+      ...(observedReceipt.turnTiming ? { turnTiming: observedReceipt.turnTiming } : {}),
+      ...(observedReceipt.upstreamSent ? { upstreamSent: observedReceipt.upstreamSent } : {}),
+      ...(observedReceipt.upstreamError ? { upstreamError: observedReceipt.upstreamError } : {}),
+      ...(packedMeta ? { udsPacked: packedMeta } : {}),
+      nodeTiming: nodeTimingMeta(),
       ...nativeMetadata(),
       ...timing.snapshot(),
       committed,
@@ -2016,7 +2305,10 @@ async function streamGoWorkerRaw({
           : error.status === 413
             ? 'rejected'
             : 'transport_error',
-      transportError: error.status !== 413 && !(nativeHandoff && String(error.code).startsWith('native_handoff_')),
+      transportError:
+        observedReceipt.upstreamSent !== 'unknown' &&
+        error.status !== 413 &&
+        !(nativeHandoff && String(error.code).startsWith('native_handoff_')),
     }
   } finally {
     stopCancel()

@@ -166,6 +166,7 @@ export function codexMaxSessions(vm, policy = null) {
 
 export function isCodexFailoverError(result) {
   if (!result || result.ok === true || result.committed === true) return false
+  if (String(result.upstreamSent ?? result.headers?.['x-kin-upstream-sent'] ?? '') === 'unknown') return false
   const status = Number(result.status) || 0
   const code = String(result.body?.error?.code || result.error_code || '')
   const message = String(result.body?.error?.message || result.error || '')
