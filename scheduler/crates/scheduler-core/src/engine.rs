@@ -722,7 +722,7 @@ impl SchedulerEngine {
                             });
                     if let Some(cand) = pinned
                         .as_ref()
-                        .and_then(|p| admitted.iter().find(|c| &c.node_key == p))
+                        .and_then(|p| admitted.iter().find(|c| c.node_key == *p))
                     {
                         if let Some(lease) = self.try_reserve_node(
                             cand,
@@ -2091,7 +2091,7 @@ fn pinned_node_model_gated(
         return true;
     }
     let mut any = false;
-    for e in explain.excluded.iter().filter(|e| &e.node == pinned) {
+    for e in explain.excluded.iter().filter(|e| e.node == *pinned) {
         match e.reason {
             scheduler_proto::ExcludeReason::ModelCooldown
             | scheduler_proto::ExcludeReason::ModelUnsupported => any = true,
