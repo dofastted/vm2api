@@ -1590,6 +1590,7 @@ export function createHandleProtocol(deps) {
         logBag.via = healthDecision.via
         logBag.attempt_count = 0
         logBag.vm_id = healthDecision.snapshot?.vm_id || null
+        logBag.upstream_model = healthDecision.snapshot?.model || inbound?.model || null
         logBag.usage = healthDecision.snapshot?.body?.usage || { input_tokens: 0, output_tokens: 0 }
         logBag.stop_reason = healthDecision.snapshot?.body?.stop_reason || 'end_turn'
         logBag.final_state = healthDecision.via

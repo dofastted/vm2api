@@ -12,6 +12,7 @@ import {
   isHealthShape,
   isSnapshotValid,
   normalizeHealthProbeConfig,
+  resolvePlatformProbeModels,
   selectGeminiProbeModel,
   synthesizeProtocolResponse,
 } from '../../src/lib/admin/health-probe.mjs'
@@ -51,31 +52,36 @@ function sendJson(res, status, payload) {
   res.end(JSON.stringify(payload))
 }
 
-test('Gemini health probe defaults to 1-hour interval (3600s) and clamps bounds', () => {
-  assert.equal(DEFAULT_HEALTH_PROBE.gemini.enabled, true)
-  assert.equal(DEFAULT_HEALTH_PROBE.gemini.interval_sec, 3600)
-  assert.equal(DEFAULT_HEALTH_PROBE.gemini.cache_ttl_sec, 5400)
-  assert.equal(DEFAULT_HEALTH_PROBE.gemini.model, '')
+test('Google health probe defaults off with 1-hour interval (3600s), clamps bounds, and migrates legacy gemini block', () => {
+  assert.equal(DEFAULT_HEALTH_PROBE.google.enabled, false)
+  assert.equal(DEFAULT_HEALTH_PROBE.google.interval_sec, 3600)
+  assert.equal(DEFAULT_HEALTH_PROBE.google.cache_ttl_sec, 5400)
+  assert.deepEqual(DEFAULT_HEALTH_PROBE.google.models, [])
+  assert.equal(DEFAULT_HEALTH_PROBE.google.all_models, false)
 
+  // Legacy format { enabled: true, gemini: { ... } } migrates cleanly into google block.
   const normalized = normalizeHealthProbeConfig({
     enabled: true,
     gemini: { interval_sec: 10, cache_ttl_sec: 999999, model: ' gemini-3-flash ' },
   })
-  assert.equal(normalized.gemini.interval_sec, 60)
-  assert.equal(normalized.gemini.cache_ttl_sec, 172800)
+  assert.equal(normalized.google.enabled, true)
+  assert.equal(normalized.google.interval_sec, 60)
+  assert.equal(normalized.google.cache_ttl_sec, 172800)
+  assert.deepEqual(normalized.google.models, ['gemini-3-flash'])
   assert.equal(normalized.gemini.model, 'gemini-3-flash')
 
   // Raising interval above default TTL without explicit cache_ttl_sec auto-aligns TTL
   const longInterval = normalizeHealthProbeConfig({
-    gemini: { interval_sec: 7200 },
+    google: { enabled: true, interval_sec: 7200 },
   })
-  assert.equal(longInterval.gemini.interval_sec, 7200)
-  assert.equal(longInterval.gemini.cache_ttl_sec, 7200)
+  assert.equal(longInterval.google.interval_sec, 7200)
+  assert.equal(longInterval.google.cache_ttl_sec, 7200)
+  assert.equal(cacheTtlSec(longInterval, 'google'), 7200)
   assert.equal(cacheTtlSec(longInterval, 'gemini'), 7200)
   assert.equal(cacheTtlSec(longInterval, 'anthropic'), 900)
 })
 
-test('applyHealthProbeRoutingBody deep-merges health_probe.gemini without dropping siblings', () => {
+test('applyHealthProbeRoutingBody deep-merges google and legacy gemini patches without dropping siblings', () => {
   let routingConfig = {
     health_probe: normalizeHealthProbeConfig({
       enabled: true,
@@ -98,17 +104,28 @@ test('applyHealthProbeRoutingBody deep-merges health_probe.gemini without droppi
   runtime.applyHealthProbeRoutingBody({ health_probe: { gemini: { interval_sec: 1800 } } }, routingConfig.health_probe)
   assert.equal(routingConfig.health_probe.enabled, true)
   assert.equal(routingConfig.health_probe.real.openai_model, 'gpt-5.4')
+  assert.equal(routingConfig.health_probe.google.interval_sec, 1800)
+  assert.equal(routingConfig.health_probe.google.cache_ttl_sec, 5400)
+  assert.deepEqual(routingConfig.health_probe.google.models, ['gemini-3-flash'])
   assert.equal(routingConfig.health_probe.gemini.interval_sec, 1800)
-  assert.equal(routingConfig.health_probe.gemini.cache_ttl_sec, 5400)
-  assert.equal(routingConfig.health_probe.gemini.model, 'gemini-3-flash')
-  assert.equal(applied.gemini.interval_sec, 1800)
+  assert.equal(applied.google.interval_sec, 1800)
+
+  // New canonical google patch updates models & all_models while preserving anthropic/openai.
+  runtime.applyHealthProbeRoutingBody(
+    { health_probe: { google: { all_models: true, models: ['gemini-3-flash', 'gemini-3.1-pro'] } } },
+    routingConfig.health_probe,
+  )
+  assert.equal(routingConfig.health_probe.google.all_models, true)
+  assert.deepEqual(routingConfig.health_probe.google.models, ['gemini-3-flash', 'gemini-3.1-pro'])
+  assert.equal(routingConfig.health_probe.openai.enabled, true)
+  assert.deepEqual(routingConfig.health_probe.openai.models, ['gpt-5.4'])
 })
 
-test('healthPlatformOf and isHealthShape recognize Gemini series models and native payloads', () => {
-  const cfg = normalizeHealthProbeConfig({ enabled: true })
-  assert.equal(healthPlatformOf({ model: 'gemini-3-flash' }), 'gemini')
-  assert.equal(healthPlatformOf({ model: 'models/gemini-2.5-pro' }), 'gemini')
-  assert.equal(healthPlatformOf({}, 'gemini-4-neon'), 'gemini')
+test('healthPlatformOf and isHealthShape recognize Google Gemini models and native payloads', () => {
+  const cfg = normalizeHealthProbeConfig({ google: { enabled: true } })
+  assert.equal(healthPlatformOf({ model: 'gemini-3-flash' }), 'google')
+  assert.equal(healthPlatformOf({ model: 'models/gemini-2.5-pro' }), 'google')
+  assert.equal(healthPlatformOf({}, 'gemini-4-neon'), 'google')
   assert.equal(healthPlatformOf({ model: 'claude-sonnet-4-6' }), 'anthropic')
   assert.equal(healthPlatformOf({ model: 'gpt-5.4' }), 'openai')
 
@@ -164,11 +181,12 @@ test('healthPlatformOf and isHealthShape recognize Gemini series models and nati
   )
 })
 
-test('selectGeminiProbeModel respects explicit config or picks lightweight Gemini model', () => {
+test('selectGeminiProbeModel and Google all_models intersect enabled policy with online catalog', () => {
   const catalog = {
     models: [
       { id: 'ag-claude-sonnet-4-6-high' },
       { id: 'gemini-3.1-pro-high' },
+      { id: 'gemini-3.1-pro-low' },
       { id: 'gemini-3-flash' },
       { id: 'gemini-3.5-flash-lite' },
     ],
@@ -182,21 +200,37 @@ test('selectGeminiProbeModel respects explicit config or picks lightweight Gemin
     'gemini-3-flash',
   )
   assert.equal(
-    selectGeminiProbeModel(catalog, normalizeHealthProbeConfig({ gemini: { model: 'gemini-4-neon' } })),
+    selectGeminiProbeModel(catalog, normalizeHealthProbeConfig({ google: { models: ['gemini-4-neon'] } })),
     'gemini-4-neon',
   )
   assert.equal(
     selectGeminiProbeModel({ models: [{ id: 'ag-claude-sonnet-4-6-high' }] }, normalizeHealthProbeConfig()),
     null,
   )
+
+  const allCfg = normalizeHealthProbeConfig({ google: { enabled: true, all_models: true } })
+  const resolved = resolvePlatformProbeModels('google', allCfg, {
+    geminiCatalog: catalog,
+    listPlatformModels: () => [
+      { id: 'gemini-4-neon', enabled: true },
+      { id: 'gemini-3.1-pro', enabled: true },
+      { id: 'gemini-3-flash', enabled: true },
+      { id: 'gemini-3.5-flash-lite', enabled: false },
+    ],
+  })
+  // Only enabled policy models supported by live accounts are probed; effort variants deduplicate per base.
+  assert.deepEqual(resolved, ['gemini-3.1-pro-high', 'gemini-3-flash'])
 })
 
-test('monitor runs Gemini probe on independent 1-hour TTL and serves all Gemini models from cache', async () => {
+test('Google multi-model probe runs on independent 1-hour TTL with strict per-model isolation', async () => {
   let nowMs = Date.parse('2026-11-25T00:00:00.000Z')
-  let geminiCalls = 0
-  let probedModel = null
+  const probedModels = []
   const monitor = createHealthProbeMonitor({
-    config: { enabled: true, interval_sec: 600, cache_ttl_sec: 900, run_on_start: false },
+    config: {
+      run_on_start: false,
+      anthropic: { enabled: true, interval_sec: 600, cache_ttl_sec: 900, models: ['claude-haiku-4-5'] },
+      google: { enabled: true, interval_sec: 3600, cache_ttl_sec: 5400, models: ['gemini-3-flash', 'gemini-3.1-pro'] },
+    },
     now: () => nowMs,
     listTargets: () => [{ id: 'vm-01', platform: 'anthropic', schedulable: true, status: 'running', has_token: true }],
     runChat: async () => ({
@@ -216,12 +250,11 @@ test('monitor runs Gemini probe on independent 1-hour TTL and serves all Gemini 
       models: [{ id: 'gemini-3.1-pro-high' }, { id: 'gemini-3-flash' }],
     }),
     runGeminiProbe: async ({ model }) => {
-      geminiCalls += 1
-      probedModel = model
+      probedModels.push(model)
       return {
         ok: true,
         status: 200,
-        text: 'hello from gemini cache',
+        text: `hello from ${model}`,
         account_id: 'gem-env-1',
         model,
         usage: { input_tokens: 5, output_tokens: 4 },
@@ -230,61 +263,65 @@ test('monitor runs Gemini probe on independent 1-hour TTL and serves all Gemini 
   })
 
   await monitor.runRealProbe()
-  assert.equal(geminiCalls, 1)
-  assert.equal(probedModel, 'gemini-3-flash')
+  assert.deepEqual(probedModels, ['gemini-3-flash', 'gemini-3.1-pro'])
 
   const snaps = monitor.getSnapshots()
+  assert.equal(snaps.google.ok, true)
+  assert.equal(snaps.google.total_models, 2)
+  assert.equal(snaps.google.ok_models, 2)
+  assert.equal(snaps.google.cache_ttl_sec, 5400)
+  assert.equal(snaps.google.next_at, '2026-11-25T01:00:00.000Z')
   assert.equal(snaps.gemini.ok, true)
-  assert.equal(snaps.gemini.vm_id, 'gemini:gem-env-1')
-  assert.equal(snaps.gemini.model, 'gemini-3-flash')
-  assert.equal(snaps.gemini.cache_ttl_sec, 5400)
-  assert.equal(snaps.gemini.next_at, '2026-11-25T01:00:00.000Z')
   assert.equal(snaps.anthropic.next_at, '2026-11-25T00:10:00.000Z')
 
-  // After 45 minutes (2700s): Claude cache (900s) is stale, Gemini cache (5400s) is still valid!
+  // After 45 minutes (2700s): Claude cache (900s) is stale, Google cache (5400s) is still valid.
   nowMs += 2700_000
   assert.equal(isSnapshotValid(monitor.rawSnapshot('anthropic'), monitor.getConfig(), nowMs, 'anthropic'), false)
-  assert.equal(isSnapshotValid(monitor.rawSnapshot('gemini'), monitor.getConfig(), nowMs, 'gemini'), true)
+  assert.equal(
+    isSnapshotValid(monitor.rawSnapshot('google', 'gemini-3-flash'), monitor.getConfig(), nowMs, 'google'),
+    true,
+  )
 
-  const hitNative = monitor.decide(
+  // Effort variant `gemini-3.1-pro-high` matches its own base model snapshot `gemini-3.1-pro`.
+  const hitProVariant = monitor.decide(
     unofficial,
     { contents: [{ role: 'user', parts: [{ text: 'hi' }] }] },
     'google.gemini',
     { model: 'gemini-3.1-pro-high' },
   )
-  assert.equal(hitNative.action, 'cache')
-  assert.equal(hitNative.via, HEALTH_VIA_CACHE)
+  assert.equal(hitProVariant.action, 'cache')
+  assert.equal(hitProVariant.via, HEALTH_VIA_CACHE)
+  assert.equal(hitProVariant.snapshot.text, 'hello from gemini-3.1-pro')
 
   const googleResp = synthesizeProtocolResponse(
     'google.gemini',
     { model: 'gemini-3.1-pro-high' },
-    hitNative.snapshot,
+    hitProVariant.snapshot,
     monitor.getConfig(),
   )
   assert.equal(googleResp.modelVersion, 'gemini-3.1-pro-high')
-  assert.equal(googleResp.candidates[0].content.parts[0].text, 'hello from gemini cache')
+  assert.equal(googleResp.candidates[0].content.parts[0].text, 'hello from gemini-3.1-pro')
   assert.equal(googleResp.usageMetadata.totalTokenCount, 9)
 
   const googleSse = formatHealthSse(
     'google.gemini',
     { model: 'gemini-3.1-pro-high' },
-    hitNative.snapshot,
+    hitProVariant.snapshot,
     monitor.getConfig(),
   )
-  assert.match(googleSse, /^data: \{.*hello from gemini cache.*\}\n\n$/)
+  assert.match(googleSse, /^data: \{.*hello from gemini-3\.1-pro.*\}\n\n$/)
 
-  const chatResp = synthesizeProtocolResponse(
-    'openai.chat',
-    { model: 'gemini-4-neon' },
-    hitNative.snapshot,
-    monitor.getConfig(),
+  // Uncached Google model `gemini-4-neon` must NOT replay `gemini-3-flash` or `gemini-3.1-pro`.
+  assert.equal(
+    monitor.decide(unofficial, { contents: [{ role: 'user', parts: [{ text: 'hi' }] }] }, 'google.gemini', {
+      model: 'gemini-4-neon',
+    }).action,
+    'pass',
   )
-  assert.equal(chatResp.model, 'gemini-4-neon')
-  assert.equal(chatResp.choices[0].message.content, 'hello from gemini cache')
 
-  // Disabling Gemini health cache passes through
+  // Disabling Google health cache passes through even for previously cached models.
   monitor.setConfig(
-    { ...monitor.getConfig(), gemini: { ...monitor.getConfig().gemini, enabled: false } },
+    { ...monitor.getConfig(), google: { ...monitor.getConfig().google, enabled: false } },
     { restart: false },
   )
   assert.equal(
@@ -296,36 +333,47 @@ test('monitor runs Gemini probe on independent 1-hour TTL and serves all Gemini 
   monitor.stop()
 })
 
-test('createGeminiPublicHandler returns cached Gemini health response across protocols without calling scheduler', async () => {
+test('createGeminiPublicHandler replays per-model Google cache and passes uncached models to scheduler', async () => {
   let schedulerCalls = 0
   const finishedLogs = []
   const monitor = createHealthProbeMonitor({
-    config: { enabled: true, run_on_start: false },
+    config: {
+      run_on_start: false,
+      google: { enabled: true, all_models: true },
+    },
+    listPlatformModels: () => [
+      { id: 'gemini-3-flash', enabled: true },
+      { id: 'gemini-3.1-pro', enabled: true },
+    ],
     listGeminiTargets: async () => ({
-      accounts: [{ id: 'env-a', models: ['gemini-3-flash'] }],
-      models: [{ id: 'gemini-3-flash' }],
+      accounts: [{ id: 'env-a', models: ['gemini-3-flash', 'gemini-3.1-pro-high'] }],
+      models: [{ id: 'gemini-3-flash' }, { id: 'gemini-3.1-pro-high' }],
     }),
     runGeminiProbe: async ({ model }) => ({
       ok: true,
       status: 200,
-      text: 'pong-gemini',
+      text: `pong:${model}`,
       account_id: 'env-a',
       model,
       usage: { input_tokens: 4, output_tokens: 3 },
     }),
   })
-  await monitor.runRealProbe({ platform: 'gemini' })
+  await monitor.runRealProbe({ platform: 'google' })
 
   const handler = createGeminiPublicHandler({
     json: sendJson,
     readBody: async (req) => req.body,
     scheduler: {
-      catalog: async () => ({ accounts: [{ id: 'env-a' }], models: [{ id: 'gemini-3-flash' }] }),
+      catalog: async () => ({
+        accounts: [{ id: 'env-a' }],
+        models: [{ id: 'gemini-3-flash' }, { id: 'gemini-3.1-pro-high' }, { id: 'gemini-4-neon' }],
+      }),
       stream: async ({ model }) => {
         schedulerCalls += 1
         return {
-          text: 'live-upstream',
-          parts: [{ kind: 'text', text: 'live-upstream' }],
+          text: `live:${model}`,
+          parts: [{ kind: 'text', text: `live:${model}` }],
+          toolCalls: [],
           model,
           account_id: 'env-a',
           usage: { input_tokens: 10, output_tokens: 5 },
@@ -340,7 +388,7 @@ test('createGeminiPublicHandler returns cached Gemini health response across pro
     getHealthMonitor: () => monitor,
   })
 
-  // 1. Native non-stream generateContent -> cache hit
+  // 1. Native non-stream generateContent on cached model -> cache hit
   {
     const req = new EventEmitter()
     req.method = 'POST'
@@ -354,13 +402,13 @@ test('createGeminiPublicHandler returns cached Gemini health response across pro
     assert.equal(res.statusCode, 200)
     const data = res.bodyJson()
     assert.equal(data.modelVersion, 'gemini-3-flash')
-    assert.equal(data.candidates[0].content.parts[0].text, 'pong-gemini')
+    assert.equal(data.candidates[0].content.parts[0].text, 'pong:gemini-3-flash')
     assert.equal(schedulerCalls, 0)
     assert.equal(finishedLogs.at(-1).via, HEALTH_VIA_CACHE)
     assert.equal(finishedLogs.at(-1).attempt_count, 0)
   }
 
-  // 2. Native streamGenerateContent -> SSE cache hit
+  // 2. Native streamGenerateContent on cached pro model -> SSE cache hit with pro's own snapshot
   {
     const req = new EventEmitter()
     req.method = 'POST'
@@ -373,12 +421,30 @@ test('createGeminiPublicHandler returns cached Gemini health response across pro
     await handler(req, res)
     assert.equal(res.statusCode, 200)
     assert.match(res.headers['content-type'], /text\/event-stream/)
-    assert.match(res.bodyText(), /pong-gemini/)
-    assert.match(res.bodyText(), /gemini-3\.1-pro-high/)
+    assert.match(res.bodyText(), /pong:gemini-3\.1-pro-high/)
     assert.equal(schedulerCalls, 0)
   }
 
-  // 3. OpenAI Chat protocol with Gemini model -> cache hit
+  // 3. OpenAI Chat protocol on cached model -> cache hit
+  {
+    const req = new EventEmitter()
+    req.method = 'POST'
+    req.url = '/v1/chat/completions'
+    req.headers = { 'user-agent': 'curl/8.5.0' }
+    req.apiKeyKind = 'managed'
+    req.apiKeyRecord = { id: 'k1', group_type: 'gemini' }
+    req.body = { model: 'gemini-3-flash', messages: [{ role: 'user', content: 'hello' }] }
+    const res = makeRes()
+    await handler(req, res)
+    assert.equal(res.statusCode, 200)
+    const data = res.bodyJson()
+    assert.equal(data.object, 'chat.completion')
+    assert.equal(data.model, 'gemini-3-flash')
+    assert.equal(data.choices[0].message.content, 'pong:gemini-3-flash')
+    assert.equal(schedulerCalls, 0)
+  }
+
+  // 4. Uncached model `gemini-4-neon` passes through to live scheduler (strict per-model isolation)
   {
     const req = new EventEmitter()
     req.method = 'POST'
@@ -391,13 +457,11 @@ test('createGeminiPublicHandler returns cached Gemini health response across pro
     await handler(req, res)
     assert.equal(res.statusCode, 200)
     const data = res.bodyJson()
-    assert.equal(data.object, 'chat.completion')
-    assert.equal(data.model, 'gemini-4-neon')
-    assert.equal(data.choices[0].message.content, 'pong-gemini')
-    assert.equal(schedulerCalls, 0)
+    assert.equal(data.choices[0].message.content, 'live:gemini-4-neon')
+    assert.equal(schedulerCalls, 1)
   }
 
-  // 4. Bypass header hits live scheduler
+  // 5. Bypass header hits live scheduler even for a cached model
   {
     const req = new EventEmitter()
     req.method = 'POST'
@@ -409,13 +473,13 @@ test('createGeminiPublicHandler returns cached Gemini health response across pro
     const res = makeRes()
     await handler(req, res)
     assert.equal(res.statusCode, 200)
-    assert.equal(schedulerCalls, 1)
+    assert.equal(schedulerCalls, 2)
   }
 
   monitor.stop()
 })
 
-test('health probes never run concurrently across slots, platforms, or simultaneous triggers', async () => {
+test('health probes never run concurrently across models, slots, platforms, or simultaneous triggers', async () => {
   let active = 0
   let maxActive = 0
   const events = []
@@ -423,11 +487,20 @@ test('health probes never run concurrently across slots, platforms, or simultane
 
   const monitor = createHealthProbeMonitor({
     config: {
-      enabled: true,
-      probe_all_slots: true,
-      concurrency: 4,
       run_on_start: false,
-      real: { openai_model: 'gpt-5.4' },
+      anthropic: {
+        enabled: true,
+        probe_all_slots: true,
+        models: ['claude-haiku-4-5', 'claude-sonnet-4-6'],
+      },
+      openai: {
+        enabled: true,
+        models: ['gpt-5.4'],
+      },
+      google: {
+        enabled: true,
+        models: ['gemini-3-flash', 'gemini-3.1-pro'],
+      },
     },
     listTargets: () => [
       { id: 'vm-a', platform: 'anthropic', schedulable: true, status: 'running', has_token: true },
@@ -437,9 +510,9 @@ test('health probes never run concurrently across slots, platforms, or simultane
     runChat: async (vm, real) => {
       active += 1
       maxActive = Math.max(maxActive, active)
-      events.push(`start:${vm.id}`)
-      await delay(15)
-      events.push(`end:${vm.id}`)
+      events.push(`start:${vm.id}:${real.model}`)
+      await delay(10)
+      events.push(`end:${vm.id}:${real.model}`)
       active -= 1
       return {
         ok: true,
@@ -448,22 +521,22 @@ test('health probes never run concurrently across slots, platforms, or simultane
         vm_id: vm.id,
         model: real.model,
         body: {
-          id: `msg_${vm.id}`,
+          id: `msg_${vm.id}_${real.model}`,
           content: [{ type: 'text', text: vm.id }],
           usage: { input_tokens: 1, output_tokens: 1 },
         },
       }
     },
     listGeminiTargets: async () => ({
-      accounts: [{ id: 'gem-1', models: ['gemini-3-flash'] }],
-      models: [{ id: 'gemini-3-flash' }],
+      accounts: [{ id: 'gem-1', models: ['gemini-3-flash', 'gemini-3.1-pro'] }],
+      models: [{ id: 'gemini-3-flash' }, { id: 'gemini-3.1-pro' }],
     }),
     runGeminiProbe: async ({ model }) => {
       active += 1
       maxActive = Math.max(maxActive, active)
-      events.push('start:gemini')
-      await delay(15)
-      events.push('end:gemini')
+      events.push(`start:google:${model}`)
+      await delay(10)
+      events.push(`end:google:${model}`)
       active -= 1
       return {
         ok: true,
@@ -476,33 +549,34 @@ test('health probes never run concurrently across slots, platforms, or simultane
     },
   })
 
-  // Simultaneous fleet + gemini triggers must still execute strictly one after another.
-  await Promise.all([monitor.runRealProbe({ platform: 'fleet' }), monitor.runRealProbe({ platform: 'gemini' })])
+  // Simultaneous platform triggers must still execute strictly one after another.
+  await Promise.all([
+    monitor.runRealProbe({ platform: 'anthropic' }),
+    monitor.runRealProbe({ platform: 'openai' }),
+    monitor.runRealProbe({ platform: 'google' }),
+  ])
   assert.equal(maxActive, 1)
   assert.deepEqual(events, [
-    'start:vm-a',
-    'end:vm-a',
-    'start:vm-b',
-    'end:vm-b',
-    'start:vm-codex',
-    'end:vm-codex',
-    'start:gemini',
-    'end:gemini',
+    'start:vm-a:claude-haiku-4-5',
+    'end:vm-a:claude-haiku-4-5',
+    'start:vm-b:claude-haiku-4-5',
+    'end:vm-b:claude-haiku-4-5',
+    'start:vm-a:claude-sonnet-4-6',
+    'end:vm-a:claude-sonnet-4-6',
+    'start:vm-b:claude-sonnet-4-6',
+    'end:vm-b:claude-sonnet-4-6',
+    'start:vm-codex:gpt-5.4',
+    'end:vm-codex:gpt-5.4',
+    'start:google:gemini-3-flash',
+    'end:google:gemini-3-flash',
+    'start:google:gemini-3.1-pro',
+    'end:google:gemini-3.1-pro',
   ])
 
   // Full runRealProbe() must also execute strictly serially.
   events.length = 0
   await monitor.runRealProbe()
   assert.equal(maxActive, 1)
-  assert.deepEqual(events, [
-    'start:vm-a',
-    'end:vm-a',
-    'start:vm-b',
-    'end:vm-b',
-    'start:vm-codex',
-    'end:vm-codex',
-    'start:gemini',
-    'end:gemini',
-  ])
+  assert.equal(events.length, 14)
   monitor.stop()
 })

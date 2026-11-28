@@ -374,14 +374,69 @@ export function createRoutingRuntime(ctx) {
 
   function applyHealthProbeRoutingBody(body, previous = null) {
     if (!body || typeof body !== 'object' || body.health_probe == null) return
-    const prev = previous && typeof previous === 'object' ? previous : {}
+    const prev = normalizeHealthProbeConfig(previous && typeof previous === 'object' ? previous : {})
     const next = body.health_probe && typeof body.health_probe === 'object' ? body.health_probe : {}
     const routingConfig = getRouting()
+
+    const hasNextAnthropic = next.anthropic && typeof next.anthropic === 'object'
+    const hasNextOpenai = next.openai && typeof next.openai === 'object'
+    const hasNextGoogle = next.google && typeof next.google === 'object'
+    const hasNextReal = next.real && typeof next.real === 'object'
+    const hasNextGemini = next.gemini && typeof next.gemini === 'object'
+
+    const nextAnthropic = { ...prev.anthropic, ...(hasNextAnthropic ? next.anthropic : {}) }
+    const nextOpenai = { ...prev.openai, ...(hasNextOpenai ? next.openai : {}) }
+    const nextGoogle = { ...prev.google, ...(hasNextGoogle ? next.google : {}) }
+
+    if (!hasNextAnthropic) {
+      if (Object.prototype.hasOwnProperty.call(next, 'interval_sec')) nextAnthropic.interval_sec = next.interval_sec
+      if (Object.prototype.hasOwnProperty.call(next, 'cache_ttl_sec')) nextAnthropic.cache_ttl_sec = next.cache_ttl_sec
+      else if (Object.prototype.hasOwnProperty.call(next, 'max_stale_sec'))
+        nextAnthropic.cache_ttl_sec = next.max_stale_sec
+      if (Object.prototype.hasOwnProperty.call(next, 'probe_all_slots'))
+        nextAnthropic.probe_all_slots = next.probe_all_slots
+      if (hasNextReal) {
+        if (Object.prototype.hasOwnProperty.call(next.real, 'model')) {
+          nextAnthropic.models = next.real.model ? [next.real.model] : []
+        }
+        for (const k of ['prompt', 'max_tokens', 'timeout_ms', 'outbound_mode', 'vm_ids']) {
+          if (Object.prototype.hasOwnProperty.call(next.real, k)) nextAnthropic[k] = next.real[k]
+        }
+      }
+      if (!hasNextOpenai && !hasNextGoogle && Object.prototype.hasOwnProperty.call(next, 'enabled')) {
+        nextAnthropic.enabled = next.enabled
+      }
+    }
+
+    if (!hasNextOpenai && hasNextReal) {
+      if (Object.prototype.hasOwnProperty.call(next.real, 'openai_model')) {
+        nextOpenai.models = next.real.openai_model ? [next.real.openai_model] : []
+        if (!hasNextAnthropic && !hasNextGoogle && nextAnthropic.enabled) {
+          nextOpenai.enabled = nextOpenai.models.length > 0
+        }
+      }
+      for (const k of ['prompt', 'max_tokens', 'timeout_ms', 'vm_ids']) {
+        if (Object.prototype.hasOwnProperty.call(next.real, k)) nextOpenai[k] = next.real[k]
+      }
+    }
+
+    if (!hasNextGoogle && hasNextGemini) {
+      for (const k of ['enabled', 'interval_sec', 'cache_ttl_sec', 'all_models', 'prompt', 'timeout_ms']) {
+        if (Object.prototype.hasOwnProperty.call(next.gemini, k)) nextGoogle[k] = next.gemini[k]
+      }
+      if (Object.prototype.hasOwnProperty.call(next.gemini, 'models')) {
+        nextGoogle.models = next.gemini.models
+      } else if (Object.prototype.hasOwnProperty.call(next.gemini, 'model')) {
+        nextGoogle.models = next.gemini.model ? [next.gemini.model] : []
+      }
+    }
+
     routingConfig.health_probe = normalizeHealthProbeConfig({
       ...prev,
       ...next,
-      real: { ...(prev.real || {}), ...(next.real || {}) },
-      gemini: { ...(prev.gemini || {}), ...(next.gemini || {}) },
+      anthropic: nextAnthropic,
+      openai: nextOpenai,
+      google: nextGoogle,
       match: { ...(prev.match || {}), ...(next.match || {}) },
     })
     getHealth()?.setConfig(routingConfig.health_probe)
