@@ -229,6 +229,30 @@ fn telemetry_temp_fields_json_null_means_clear_not_missing() {
         serde_json::from_str(r#"{"node_key":"codex_vm:vm1","temp_unschedulable_until_ms":0}"#)
             .unwrap();
     assert_eq!(zero.temp_unschedulable_until_ms, Some(Some(0)));
+
+    // Round-trip: outer None omits keys so partial updates do not turn into explicit null clears.
+    let partial_val = serde_json::to_value(&partial).unwrap();
+    assert!(partial_val.get("unschedulable_reason").is_none());
+    assert!(partial_val.get("temp_unschedulable_until_ms").is_none());
+    assert!(partial_val.get("temp_unschedulable_reason").is_none());
+    let partial_rt: NodeTelemetryUpdate = serde_json::from_value(partial_val).unwrap();
+    assert_eq!(partial_rt.unschedulable_reason, None);
+    assert_eq!(partial_rt.temp_unschedulable_until_ms, None);
+    assert_eq!(partial_rt.temp_unschedulable_reason, None);
+
+    // Round-trip: Some(None) serializes explicit JSON null and deserializes back as Some(None).
+    let clear_val = serde_json::to_value(&upd).unwrap();
+    assert_eq!(
+        clear_val.get("temp_unschedulable_until_ms"),
+        Some(&serde_json::Value::Null)
+    );
+    assert_eq!(
+        clear_val.get("temp_unschedulable_reason"),
+        Some(&serde_json::Value::Null)
+    );
+    let clear_rt: NodeTelemetryUpdate = serde_json::from_value(clear_val).unwrap();
+    assert_eq!(clear_rt.temp_unschedulable_until_ms, Some(None));
+    assert_eq!(clear_rt.temp_unschedulable_reason, Some(None));
 }
 
 #[test]
