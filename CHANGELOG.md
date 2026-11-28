@@ -9,7 +9,7 @@
   - `src/lib/protocol/outbound-attempt.mjs`：第三方 `role: "system"` 折叠时保留相邻系统控制回合各自的消息级 `cache_control`，不再合并成一回合
   - `src/lib/protocol/anthropic-policy.mjs`：收紧内联 `tool_definition` 守卫（非数组、`name` 非空、未改动时不克隆、`tool_definition` 提前返回）
 - **CRAG `3.1.31` 载荷钉选（#2085，配套 `dofastted/crag#44`）**：`deploy/payload.json` 的 `crag_release` 升级至 `payload-2026.11.28-crag-3.1.31`，并在 `src/lib/admin/kernel-catalog.mjs` 注册 `3.1.31`（收口 `wire.rs` Beta SSOT、门控 diagnostics 注入、移除重复的 runtime beta 推导）；零密钥轮换，沿用现役 `issuer_public_key_id=9dbb4bc2…` / `payload_key_id=835451e2…`，CRAGGemini 载荷不变，`3.1.30` 及更早版本保留可回退
-- 部署说明：本次改动零数据库迁移、零 Rust 变更；`deploy/payload.json` 更新了 CRAG 载荷（`crag-v2` 三个资产与 `crag-v2-licensed-amd64.tar.gz`），升级后既有 CRAG 槽位按槽位同步策略更新内核，协议层改动随控制面重启生效。
+- 部署说明：本次改动零数据库迁移、零 Rust `kin-scheduler` 变更；`deploy/payload.json` 仅更新 CRAG 载荷（`crag-v2` 三个资产与 `crag-v2-licensed-amd64.tar.gz`），`kin-kernel` / `cli-node` / `wrap-cli` 与 CRAGGemini 字节未变，既有 `wrap` / Codex / 老 `kincli` 槽位预期 **`SLOT_SYNC=skip`**；需要在 CRAG 槽位使用 `3.1.31` 时，按内核目录单独安装或切换。协议层改动随控制面重启生效。
 
 ## 1.4.258 — 2026-11-28 · 控制面 Gemini 熔断改按 `gemini.pool.circuit_*` 生效
 
