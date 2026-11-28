@@ -123,7 +123,7 @@ export const UPSTREAM_ERROR_CATEGORIES = Object.freeze({
     group: 'skip',
   }),
   upstream_529_overloaded: Object.freeze({
-    label: '上游 529 过载限流',
+    label: '上游 529 / 过载或瞬时容量抖动',
     tier: 'skip',
     threshold: 0,
     statusFamily: '500',
@@ -542,7 +542,7 @@ const UPSTREAM_400_GATEWAY_LOCAL_CODES = new Set([
 const UPSTREAM_400_LICENSE_CODE_RE =
   /^license_(?:required|expired|not_yet_valid|invalid|binding_mismatch|unconfigured|crag_host_over_quota|crag_host_usage_unverified)$/i
 const UPSTREAM_400_ACCOUNT_DISABLED_RE =
-  /organization has been disabled|oauth authentication is currently not allowed|organization[^.\n]{0,60}(?:blocked|banned|disabled)|account[_\s-]?(?:disabled|suspended|banned|ineligible)|account has been (?:disabled|suspended|banned|terminated)|tos_violation|verification_required|location_unsupported|unsupported_region|country,\s*region,\s*or\s*territory\s*not\s*supported/i
+  /organization has been disabled|oauth authentication is currently not allowed|organization[^.\n]{0,60}(?:blocked|banned|disabled)|workspace[_\s-]?(?:deactivated|disabled|suspended)|deactivated_workspace|account[_\s-]?(?:disabled|suspended|banned|ineligible)|account has been (?:disabled|suspended|banned|terminated)|tos_violation|verification_required|identity verification is required|location_unsupported|unsupported_region|country,\s*region,\s*or\s*territory\s*not\s*supported/i
 const UPSTREAM_400_AUTH_CREDENTIAL_CODES = new Set([
   'authentication_error',
   'oauth_revoked',
@@ -636,7 +636,17 @@ const WORKER_LOCAL_5XX_CODES = new Set([
 ])
 const WORKER_LOCAL_5XX_RE =
   /native process exited|claude process exited|provider error:.*connection error|wrap cli connection error/i
-const UPSTREAM_529_CODES = new Set(['overloaded_error', 'provider_overloaded', 'pool_overloaded'])
+const UPSTREAM_529_CODES = new Set([
+  'overloaded_error',
+  'provider_overloaded',
+  'pool_overloaded',
+  'server_is_overloaded',
+  'slow_down',
+])
+const UPSTREAM_CAPACITY_OVERLOAD_RE =
+  /servers?\s+(?:is|are)(?:\s+currently)?\s+overloaded|selected model is at capacity/i
+const UPSTREAM_400_TRANSIENT_PROCESSING_RE =
+  /an error occurred while processing your request|you can retry your request[\s\S]{0,200}help\.openai\.com[\s\S]{0,200}request id/i
 const UPSTREAM_504_CODES = new Set(['upstream_timeout', 'gemini_inference_timeout', 'gateway_timeout'])
 const UPSTREAM_503_CODES = new Set([
   'slot_busy',
@@ -690,10 +700,13 @@ export function classifyUpstreamErrorForSessionBlock(result, { phrases = [], cla
     return null
   }
   const error = result?.body?.error
+  const responseError = result?.body?.response?.error
   const codes = [
     error?.code,
     error?.upstream_code,
     error?.type,
+    responseError?.code,
+    responseError?.type,
     result?.upstreamError?.code,
     result?.upstreamError?.type,
     result?.code,
@@ -705,6 +718,9 @@ export function classifyUpstreamErrorForSessionBlock(result, { phrases = [], cla
     error?.type,
     error?.code,
     error?.upstream_code,
+    responseError?.type,
+    responseError?.code,
+    responseError?.message,
     result?.upstreamError?.type,
     result?.upstreamError?.code,
     result?.upstreamError?.message,
@@ -737,7 +753,12 @@ export function classifyUpstreamErrorForSessionBlock(result, { phrases = [], cla
     if (codes.some((code) => WORKER_LOCAL_5XX_CODES.has(code)) || WORKER_LOCAL_5XX_RE.test(text)) {
       return makeUpstreamErrorVerdict('worker_local_5xx', status)
     }
-    if (status === 529 || codes.some((code) => UPSTREAM_529_CODES.has(code)) || /\boverloaded\b/i.test(text)) {
+    if (
+      status === 529 ||
+      codes.some((code) => UPSTREAM_529_CODES.has(code)) ||
+      /\boverloaded\b/i.test(text) ||
+      UPSTREAM_CAPACITY_OVERLOAD_RE.test(text)
+    ) {
       return makeUpstreamErrorVerdict('upstream_529_overloaded', status)
     }
     if (
@@ -776,6 +797,14 @@ export function classifyUpstreamErrorForSessionBlock(result, { phrases = [], cla
     UPSTREAM_400_AUTH_CREDENTIAL_RE.test(text)
   ) {
     return makeUpstreamErrorVerdict('auth_credential', status)
+  }
+  // OpenAI occasionally wraps transient capacity/server-overload failures in HTTP 400.
+  if (
+    codes.some((code) => UPSTREAM_529_CODES.has(code)) ||
+    UPSTREAM_CAPACITY_OVERLOAD_RE.test(text) ||
+    UPSTREAM_400_TRANSIENT_PROCESSING_RE.test(text)
+  ) {
+    return makeUpstreamErrorVerdict('upstream_529_overloaded', status)
   }
   // Check third-party extra-usage rejection BEFORE account billing_credit because its wording mentions "extra usage".
   if (isThirdPartyClientMessage(text)) {

@@ -917,6 +917,8 @@ test('classifyUpstreamErrorForSessionBlock enforces 3-tier classification across
   const skippedCases = [
     ['account_disabled', mk('This organization has been disabled.')],
     ['account_disabled', mk('OAuth authentication is currently not allowed for this organization.')],
+    ['account_disabled', mk('Identity verification is required before accessing this API.')],
+    ['account_disabled', mk('Workspace has been deactivated', { code: 'deactivated_workspace' })],
     ['account_disabled', mk('Country, region, or territory not supported')],
     ['auth_credential', mk('OAuth token has been revoked', { code: 'token_revoked' })],
     ['auth_credential', mk('Invalid x-api-key provided', { type: 'authentication_error' })],
@@ -928,6 +930,15 @@ test('classifyUpstreamErrorForSessionBlock enforces 3-tier classification across
     ['model_unavailable', mk('Unknown model id', { code: 'model_not_found' })],
     ['gateway_local', mk('Kernel rejected envelope', { code: 'invalid_kernel_request' })],
     ['gateway_local', mk('License expired', { code: 'license_expired' })],
+    ['upstream_529_overloaded', mk('The server is overloaded, please retry later', { code: 'server_is_overloaded' })],
+    ['upstream_529_overloaded', mk('Please slow down', { code: 'slow_down' })],
+    ['upstream_529_overloaded', mk('The selected model is at capacity. Please try again shortly.')],
+    [
+      'upstream_529_overloaded',
+      mk(
+        'An error occurred while processing your request. You can retry your request, or contact us through our help center at help.openai.com if the error persists. Please include the request ID req_123.',
+      ),
+    ],
     ['upstream_502_bad_gateway', mk('Bad gateway from upstream proxy', { status: 502 })],
     ['upstream_502_bad_gateway', mk('Stream cut short', { status: 500, code: 'incomplete_response' })],
     ['upstream_503_unavailable', mk('Service temporarily unavailable', { status: 503 })],
@@ -1247,9 +1258,17 @@ test('recordUpstreamErrorSessionBlock skips non-session 400s and infrastructure 
 
     for (const [expectedCategory, status, message, code] of [
       ['account_disabled', 400, 'This organization has been disabled.', undefined],
+      ['account_disabled', 400, 'Identity verification is required to continue.', undefined],
       ['billing_credit', 400, 'Your credit balance is too low to access the Anthropic API.', undefined],
       ['auth_credential', 400, 'OAuth token has been revoked', 'token_revoked'],
       ['model_unavailable', 400, "The model 'claude-unknown' does not exist.", undefined],
+      ['upstream_529_overloaded', 400, 'The server is overloaded, please retry later', 'server_is_overloaded'],
+      [
+        'upstream_529_overloaded',
+        400,
+        'An error occurred while processing your request. You can retry your request at help.openai.com with request id req_9.',
+        undefined,
+      ],
       ['upstream_502_bad_gateway', 502, 'Bad gateway', undefined],
       ['upstream_503_unavailable', 503, 'Service unavailable', 'slot_busy'],
       ['upstream_504_timeout', 504, 'Gateway timeout', 'upstream_timeout'],

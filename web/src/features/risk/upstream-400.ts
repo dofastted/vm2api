@@ -15,7 +15,7 @@ export const UPSTREAM_400_CATEGORY_LABELS: Record<string, string> = {
   upstream_502_bad_gateway: '上游 502 网关/代理或流中断',
   upstream_503_unavailable: '上游 503 服务不可用或调度繁忙',
   upstream_504_timeout: '上游 504 网关或推理超时',
-  upstream_529_overloaded: '上游 529 过载限流',
+  upstream_529_overloaded: '上游 529 / 过载或瞬时容量抖动',
   worker_local_5xx: '本地 Worker 进程异常或连接中断',
 
   // Tier 1: Immediate 10m session block (threshold = 1)
