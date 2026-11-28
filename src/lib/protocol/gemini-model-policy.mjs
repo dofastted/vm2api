@@ -10,13 +10,17 @@ import { SettingsRepo } from '../db/repos/settings-repo.mjs'
 
 const SETTINGS_KEY = 'gemini_model_policy'
 
-export const GEMINI_SEED_VERSION = 1
+export const GEMINI_SEED_VERSION = 2
 export const DEFAULT_GEMINI_EFFORT = 'medium'
 export const GEMINI_EFFORT_VALUES = Object.freeze(['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'])
 const GEMINI_EFFORT_SET = new Set(GEMINI_EFFORT_VALUES)
 
 const GEMINI_MODEL_RE = /^gemini-[a-z0-9][a-z0-9._-]{0,95}$/i
 const GEMINI_NON_CHAT_RE = /(?:^|[-_])(embedding|aqa|tts|live|audio|robotics|computer-use)(?:$|[-_])/i
+const GEMINI_BLOCKED_UPSTREAM_RE = /(?:^tab_|(?:-disabled)$)/i
+const GEMINI_DEFAULT_SUPPORTED_4_RE = /^gemini-4-(?:neon|hydrogen|argon|carbon)(?:-(?:low|medium|high|xhigh))?$/i
+const GEMINI_DEFAULT_SUPPORTED_38_RE = /^gemini-3\.8-flash(?:-(?:low|medium|high))?$/i
+const GEMINI_NANO_BANANA_2_IDS = new Set(['gemini-3.1-flash-image', 'nano-banana-2'])
 const GEMINI_VARIANT_SUFFIX_RE = /-(?:thinking|minimal|low|medium|high|xhigh|extra-high|max|latest)$/i
 const GEMINI_PREVIEW_SUFFIX_RE = /-preview(?:-\d{2}-\d{2})?$/i
 const MODEL_PAREN_EFFORT_RE = /\(([^()]+)\)$/
@@ -87,6 +91,13 @@ function bareModelId(raw) {
   return bare.trim()
 }
 
+function isBlockedUpstreamId(raw) {
+  const bare = bareModelId(raw)
+  if (!bare) return false
+  const stripped = bare.toLowerCase().startsWith('ag-') ? bare.slice(3) : bare
+  return GEMINI_BLOCKED_UPSTREAM_RE.test(bare) || GEMINI_BLOCKED_UPSTREAM_RE.test(stripped)
+}
+
 export function isGeminiSeriesId(id) {
   const bare = bareModelId(id)
   if (!bare) return false
@@ -94,8 +105,16 @@ export function isGeminiSeriesId(id) {
   return GEMINI_MODEL_RE.test(bare)
 }
 
+export function isDefaultSupportedGeminiModel(modelId) {
+  const bare = bareModelId(modelId).toLowerCase()
+  if (!bare || isBlockedUpstreamId(bare)) return false
+  if (GEMINI_NANO_BANANA_2_IDS.has(bare)) return true
+  return GEMINI_DEFAULT_SUPPORTED_4_RE.test(bare) || GEMINI_DEFAULT_SUPPORTED_38_RE.test(bare)
+}
+
 export function isSyncableGeminiCatalogId(id) {
   const bare = bareModelId(id)
+  if (isBlockedUpstreamId(bare)) return false
   if (!isGeminiSeriesId(bare)) return false
   if (GEMINI_NON_CHAT_RE.test(bare)) return false
   return true
@@ -148,16 +167,16 @@ export function seedGeminiPolicy() {
     ['gemini-4-hydrogen', { display_name: 'Gemini 4 Hydrogen', sort: 14 }],
     ['gemini-4-carbon', { display_name: 'Gemini 4 Carbon', sort: 15 }],
     ['gemini-3.8-flash', { display_name: 'Gemini 3.8 Flash', sort: 20 }],
-    ['gemini-3.5-flash-lite', { display_name: 'Gemini 3.5 Flash Lite', sort: 22 }],
-    ['gemini-3.1-pro', { display_name: 'Gemini 3.1 Pro', sort: 25 }],
-    ['gemini-3.1-flash-lite', { display_name: 'Gemini 3.1 Flash Lite', sort: 27 }],
-    ['gemini-3-pro', { display_name: 'Gemini 3 Pro', sort: 30 }],
-    ['gemini-3-flash', { display_name: 'Gemini 3 Flash', sort: 32 }],
-    ['gemini-2.5-pro', { display_name: 'Gemini 2.5 Pro', sort: 40 }],
-    ['gemini-2.5-flash', { display_name: 'Gemini 2.5 Flash', sort: 42 }],
-    ['gemini-2.5-flash-lite', { display_name: 'Gemini 2.5 Flash Lite', sort: 44 }],
-    ['gemini-2.0-flash', { display_name: 'Gemini 2.0 Flash', sort: 50 }],
-    ['gemini-2.0-flash-lite', { display_name: 'Gemini 2.0 Flash Lite', sort: 52 }],
+    [
+      'gemini-3.1-flash-image',
+      {
+        display_name: 'Nano Banana 2',
+        sort: 30,
+        aliases: ['nano-banana-2'],
+        capabilities: { supports_effort: false, thinking_mode: 'none' },
+        params: { default_effort: 'off' },
+      },
+    ],
   ]) {
     models[id] = entry(id, extra)
   }
@@ -167,6 +186,7 @@ export function seedGeminiPolicy() {
     updated_at: new Date().toISOString(),
     source: 'seed',
     platform: 'google',
+    allow_third_party_models: false,
     models,
   }
 }
@@ -205,13 +225,14 @@ function normalizeStoredModels(rawModels, { mergeSeed = true } = {}) {
   if (rawModels && typeof rawModels === 'object') {
     for (const [rawId, row] of Object.entries(rawModels)) {
       const id = bareModelId(rawId)
-      if (!isGeminiSeriesId(id) || !row || typeof row !== 'object') continue
+      if (!isGeminiSeriesId(id) || isBlockedUpstreamId(id) || !row || typeof row !== 'object') continue
       const base = out[id] || seed[id] || null
       const merged = entry(id, {
         ...(base || {}),
         ...row,
         capabilities: { ...(base?.capabilities || {}), ...(row.capabilities || {}) },
         params: { ...(base?.params || {}), ...(row.params || {}) },
+        aliases: Array.isArray(row.aliases) && row.aliases.length ? row.aliases : base?.aliases || [],
       })
       if (row.catalog && typeof row.catalog === 'object') merged.catalog = row.catalog
       out[id] = merged
@@ -225,15 +246,48 @@ export function loadGeminiModelPolicy({ force = false } = {}) {
   try {
     const stored = settingsRepo().get(SETTINGS_KEY, null)
     if (stored && typeof stored === 'object' && stored.models && typeof stored.models === 'object') {
-      const live = stored.source === 'google' && Object.keys(stored.models).length > 0
-      policy = {
-        ...seedGeminiPolicy(),
-        ...stored,
-        platform: 'google',
-        seed_version: GEMINI_SEED_VERSION,
-        models: normalizeStoredModels(stored.models, { mergeSeed: !live }),
+      const storedSeedVersion = Number(stored.seed_version) || 0
+      const shouldMigrateDefaults = storedSeedVersion < GEMINI_SEED_VERSION && stored.source !== 'panel'
+      if (shouldMigrateDefaults) {
+        const seed = seedGeminiPolicy()
+        const normalized = normalizeStoredModels(stored.models, { mergeSeed: true })
+        for (const [id, row] of Object.entries(normalized)) {
+          row.enabled = isDefaultSupportedGeminiModel(id)
+          const seedRow = seed.models[id]
+          if (seedRow) {
+            if (!row.aliases?.length && seedRow.aliases?.length) {
+              row.aliases = [...seedRow.aliases]
+            }
+            if (id === 'gemini-3.1-flash-image') {
+              row.display_name = row.display_name || seedRow.display_name
+              row.capabilities = { ...row.capabilities, ...seedRow.capabilities }
+              row.params = { ...row.params, default_effort: seedRow.params.default_effort }
+            }
+          }
+        }
+        policy = {
+          ...seed,
+          ...stored,
+          platform: 'google',
+          seed_version: GEMINI_SEED_VERSION,
+          allow_third_party_models: stored.allow_third_party_models === true,
+          models: normalized,
+          updated_at: new Date().toISOString(),
+        }
+        policy.source = policy.source || 'settings'
+        persist()
+      } else {
+        const live = (stored.source === 'google' || stored.source === 'panel') && Object.keys(stored.models).length > 0
+        policy = {
+          ...seedGeminiPolicy(),
+          ...stored,
+          platform: 'google',
+          seed_version: GEMINI_SEED_VERSION,
+          allow_third_party_models: stored.allow_third_party_models === true,
+          models: normalizeStoredModels(stored.models, { mergeSeed: !live }),
+        }
+        policy.source = policy.source || 'settings'
       }
-      policy.source = policy.source || 'settings'
     } else {
       policy = seedGeminiPolicy()
       persist()
@@ -258,7 +312,7 @@ export function saveGeminiModelPolicy(next) {
   const baseSource = Object.keys(incoming).length ? incoming : seed.models
   for (const [rawId, row] of Object.entries(baseSource)) {
     const id = bareModelId(rawId)
-    if (!isGeminiSeriesId(id) || !row || typeof row !== 'object') continue
+    if (!isGeminiSeriesId(id) || isBlockedUpstreamId(id) || !row || typeof row !== 'object') continue
     const { catalog: _drop, ...edits } = row
     const prev = policy.models?.[id] || seed.models[id] || null
     models[id] = entry(id, {
@@ -269,9 +323,14 @@ export function saveGeminiModelPolicy(next) {
     })
     if (prev?.catalog) models[id].catalog = prev.catalog
   }
+  const allowThirdParty =
+    next && typeof next === 'object' && Object.hasOwn(next, 'allow_third_party_models')
+      ? next.allow_third_party_models === true
+      : policy.allow_third_party_models === true
   policy = {
     ...seed,
     ...next,
+    allow_third_party_models: allowThirdParty,
     models,
     platform: 'google',
     seed_version: GEMINI_SEED_VERSION,
@@ -293,7 +352,7 @@ export function resetGeminiModelPolicy() {
 export function listGeminiPolicyModels() {
   if (!loaded) loadGeminiModelPolicy()
   return Object.entries(policy.models || {})
-    .filter(([id, cfg]) => isGeminiSeriesId(id) && cfg?.enabled !== false)
+    .filter(([id, cfg]) => isGeminiSeriesId(id) && !isBlockedUpstreamId(id) && cfg?.enabled !== false)
     .map(([id, cfg]) => ({ id, ...cfg, family: 'gemini' }))
     .sort((a, b) => (a.sort ?? 80) - (b.sort ?? 80) || String(a.id).localeCompare(String(b.id)))
 }
@@ -301,20 +360,34 @@ export function listGeminiPolicyModels() {
 export function getGeminiPolicyCatalogIds({ enabledOnly = false } = {}) {
   if (!loaded) loadGeminiModelPolicy()
   return Object.entries(policy.models || {})
-    .filter(([id, cfg]) => isGeminiSeriesId(id) && (!enabledOnly || cfg?.enabled !== false))
+    .filter(([id, cfg]) => isGeminiSeriesId(id) && !isBlockedUpstreamId(id) && (!enabledOnly || cfg?.enabled !== false))
     .map(([id]) => id)
 }
 
-function findPolicyRow(modelId) {
-  if (!loaded) loadGeminiModelPolicy()
+function findPolicyRow(modelId, activePolicy = null) {
+  const targetPolicy = activePolicy && typeof activePolicy === 'object' ? activePolicy : getGeminiModelPolicy()
   const bare = bareModelId(modelId)
-  if (!isGeminiSeriesId(bare)) return null
+  if (!bare || isBlockedUpstreamId(bare)) return null
   const lower = bare.toLowerCase()
-  const models = policy.models || {}
+  const models = targetPolicy.models || {}
   if (models[bare]) return models[bare]
   for (const [id, row] of Object.entries(models)) {
     if (id.toLowerCase() === lower) return row
   }
+  for (const row of Object.values(models)) {
+    if (!Array.isArray(row?.aliases)) continue
+    if (
+      row.aliases.some(
+        (alias) =>
+          String(alias || '')
+            .trim()
+            .toLowerCase() === lower,
+      )
+    ) {
+      return row
+    }
+  }
+  if (!isGeminiSeriesId(bare)) return null
   const stripped = stripVariantSuffixes(lower)
   if (stripped && stripped !== lower) {
     for (const [id, row] of Object.entries(models)) {
@@ -329,15 +402,46 @@ export function resolveGeminiPolicyEntry(modelId) {
 }
 
 /**
- * Only Gemini series models (`gemini-*`) are governed by `gemini_model_policy`.
- * Non-Gemini Antigravity models (`ag-claude-*`, `ag-gpt-*`) stay untouched here.
+ * Fail-closed gate for Gemini / Antigravity models.
+ * Accepts either `(modelId)` or `(policyObj, modelId)`.
+ *
+ * - Always rejects blocked upstream placeholders (`*-disabled`, `tab_*`).
+ * - Google Gemini models & configured aliases (`nano-banana-2` -> `gemini-3.1-flash-image`)
+ *   must be explicitly enabled in policy (unlisted legacy models fail closed).
+ * - Non-Google Antigravity 3P models (`ag-*`, `claude-*`, `gpt-*`) are rejected unless
+ *   `policy.allow_third_party_models === true` and not explicitly disabled.
  */
-export function isGeminiModelEnabled(modelId) {
-  const bare = bareModelId(modelId)
-  if (!isGeminiSeriesId(bare)) return true
-  const row = findPolicyRow(bare)
-  if (!row) return true
-  return row.enabled !== false
+export function isGeminiModelEnabled(policyOrModelId, maybeModelId) {
+  let activePolicy
+  let rawModelId
+  if (maybeModelId !== undefined || (policyOrModelId !== null && typeof policyOrModelId === 'object')) {
+    activePolicy =
+      policyOrModelId && typeof policyOrModelId === 'object' && policyOrModelId.models
+        ? policyOrModelId
+        : getGeminiModelPolicy()
+    rawModelId = maybeModelId
+  } else {
+    activePolicy = getGeminiModelPolicy()
+    rawModelId = policyOrModelId
+  }
+  const bare = bareModelId(rawModelId)
+  if (!bare || isBlockedUpstreamId(bare)) return false
+  const row = findPolicyRow(bare, activePolicy)
+  if (row) return row.enabled === true
+  if (isGeminiSeriesId(bare) || GEMINI_NANO_BANANA_2_IDS.has(bare.toLowerCase())) {
+    return false
+  }
+  if (activePolicy?.allow_third_party_models !== true) return false
+  const stripped = bare.toLowerCase().startsWith('ag-') ? bare.slice(3) : bare
+  const models = activePolicy.models || {}
+  const explicit =
+    models[bare] ||
+    models[stripped] ||
+    Object.entries(models).find(
+      ([id]) => id.toLowerCase() === bare.toLowerCase() || id.toLowerCase() === stripped.toLowerCase(),
+    )?.[1] ||
+    null
+  return explicit ? explicit.enabled !== false : true
 }
 
 /**
@@ -347,15 +451,19 @@ export function isGeminiModelEnabled(modelId) {
  */
 export function resolveGeminiDefaultEffort(modelId) {
   const bare = bareModelId(modelId)
-  if (!isGeminiSeriesId(bare)) return null
+  if (!bare || isBlockedUpstreamId(bare)) return null
   const row = findPolicyRow(bare)
-  return normalizeGeminiDefaultEffort(row?.params?.default_effort, DEFAULT_GEMINI_EFFORT)
+  if (row) {
+    return normalizeGeminiDefaultEffort(row?.params?.default_effort, DEFAULT_GEMINI_EFFORT)
+  }
+  if (!isGeminiSeriesId(bare)) return null
+  return DEFAULT_GEMINI_EFFORT
 }
 
 /**
  * Merge newly discovered Google Gemini models into `gemini_model_policy`.
  * Existing rows keep their operator edits (`enabled`, `default_effort`, etc.);
- * newly discovered Gemini models are added enabled with `default_effort: 'medium'`.
+ * newly discovered models outside `isDefaultSupportedGeminiModel` are added disabled by default.
  */
 export function syncGeminiIdsIntoPolicy(
   items = [],
@@ -385,7 +493,7 @@ export function syncGeminiIdsIntoPolicy(
   const next = {}
   // Keep existing entries first so operator toggles / custom models are never lost when a partial source syncs.
   for (const [id, row] of Object.entries(policy.models || {})) {
-    if (isGeminiSeriesId(id)) next[id] = entry(id, row)
+    if (isGeminiSeriesId(id) && !isBlockedUpstreamId(id)) next[id] = entry(id, row)
     if (row?.catalog && next[id]) next[id].catalog = row.catalog
   }
   const added = []
@@ -393,13 +501,19 @@ export function syncGeminiIdsIntoPolicy(
   for (const row of incoming) {
     const existingKey = Object.keys(next).find((k) => k.toLowerCase() === row.id.toLowerCase())
     const key = existingKey || row.id
-    const prev = next[key] || seed[row.id] || null
+    const seedRow = seed[row.id] || seed[row.id.toLowerCase()] || null
+    const prev = existingKey ? next[key] : seedRow
     if (!existingKey) added.push(row.id)
     const ctxWin = row.context || contextOf?.(row.id) || prev?.capabilities?.context_window || CAP_GEMINI.context_window
+    const enabled = existingKey
+      ? prev.enabled !== false
+      : seedRow
+        ? seedRow.enabled !== false
+        : isDefaultSupportedGeminiModel(row.id)
     next[key] = entry(key, {
       ...(prev || {}),
       display_name: row.display_name || prev?.display_name || displayNameOf?.(row.id) || key,
-      enabled: prev ? prev.enabled !== false : true,
+      enabled,
       capabilities: {
         ...(prev?.capabilities || CAP_GEMINI),
         context_window: ctxWin,
@@ -409,6 +523,7 @@ export function syncGeminiIdsIntoPolicy(
         ...(prev?.params || {}),
         default_effort: normalizeGeminiDefaultEffort(prev?.params?.default_effort, DEFAULT_GEMINI_EFFORT),
       },
+      aliases: prev?.aliases?.length ? prev.aliases : seedRow?.aliases || [],
     })
     const catalog = row.catalog
       ? { ...row.catalog, synced_at: nowIso }
@@ -419,6 +534,7 @@ export function syncGeminiIdsIntoPolicy(
   }
   policy = {
     ...policy,
+    allow_third_party_models: policy.allow_third_party_models === true,
     models: next,
     platform: 'google',
     seed_version: GEMINI_SEED_VERSION,

@@ -36,7 +36,7 @@ function sandboxEnv(code) {
     auth_method: 'oauth',
     auth_state: 'authorized',
     models_discovered: true,
-    models: ['gemini-2.5-flash'],
+    models: ['gemini-3.8-flash'],
     crag_license: { valid: false, code },
   }
 }
@@ -123,7 +123,7 @@ test('scheduler rejects stream with sandbox denial via checkAdmission (503, not 
   await assert.rejects(
     () =>
       scheduler.stream({
-        model: 'gemini-2.5-flash',
+        model: 'gemini-3.8-flash',
         geminiBody: { contents: [{ role: 'user', parts: [{ text: 'hi' }] }] },
       }),
     (err) =>

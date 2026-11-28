@@ -7,8 +7,14 @@ import { resolvePrice, setPriceCatalogTestHooks } from '../../src/lib/admin/pric
 import {
   classifyAntigravityModel,
   isAntigravityRoutedModel,
+  isBlockedUpstreamGeminiModel,
   resolveUpstreamModel,
 } from '../../src/lib/gemini/model-catalog.mjs'
+import {
+  getGeminiModelPolicy,
+  saveGeminiModelPolicy,
+  setGeminiModelPolicyTestHooks,
+} from '../../src/lib/protocol/gemini-model-policy.mjs'
 import { createGeminiPanelHandler, createGeminiPublicHandler } from '../../src/lib/gemini/routes.mjs'
 import { createGeminiScheduler } from '../../src/lib/gemini/scheduler.mjs'
 import { createMockSchedulerRuntime } from '../helpers/mock-scheduler-runtime.mjs'
@@ -103,15 +109,32 @@ test('model-catalog SSOT splits Google/Anthropic/OpenAI families and enforces ag
     quota_group: '3p',
   })
 
-  // Routing boundary for `all` keys: ONLY gemini-* and ag-* route to Antigravity.
+  // Routing boundary for `all` keys: ONLY gemini-*, ag-*, and known Gemini aliases (`nano-banana-2`) route to Antigravity.
   assert.equal(isAntigravityRoutedModel('gemini-4-neon'), true)
+  assert.equal(isAntigravityRoutedModel('nano-banana-2'), true)
   assert.equal(isAntigravityRoutedModel('ag-claude-sonnet-4-6-high'), true)
   assert.equal(isAntigravityRoutedModel('ag-gpt-oss-120b-medium'), true)
   assert.equal(isAntigravityRoutedModel('claude-sonnet-4-6'), false)
   assert.equal(isAntigravityRoutedModel('claude-opus-4-6'), false)
   assert.equal(isAntigravityRoutedModel('gpt-5.4'), false)
 
-  const rawModels = ['gemini-4-neon', 'claude-sonnet-4-6-high', 'gpt-oss-120b-medium']
+  assert.equal(isBlockedUpstreamGeminiModel('gemini-4-neon-disabled'), true)
+  assert.equal(isBlockedUpstreamGeminiModel('tab_flash_lite_preview'), true)
+  assert.equal(isBlockedUpstreamGeminiModel('gemini-3.1-flash-image'), false)
+
+  const rawModels = [
+    'gemini-4-neon',
+    'gemini-3.1-flash-image',
+    'gemini-4-neon-disabled',
+    'tab_flash_lite_preview',
+    'claude-sonnet-4-6-high',
+    'gpt-oss-120b-medium',
+  ]
+  const nb2Hit = resolveUpstreamModel('nano-banana-2', rawModels, { allowUnprefixedNonGemini: false })
+  assert.equal(nb2Hit?.publicId, 'gemini-3.1-flash-image')
+  assert.equal(nb2Hit?.upstreamModel, 'gemini-3.1-flash-image')
+  assert.equal(resolveUpstreamModel('gemini-4-neon-disabled', rawModels, { allowUnprefixedNonGemini: true }), null)
+  assert.equal(resolveUpstreamModel('tab_flash_lite_preview', rawModels, { allowUnprefixedNonGemini: true }), null)
   const hitPrefixed = resolveUpstreamModel('ag-claude-sonnet-4-6-high', rawModels, {
     allowUnprefixedNonGemini: false,
   })
@@ -127,195 +150,213 @@ test('model-catalog SSOT splits Google/Anthropic/OpenAI families and enforces ag
 })
 
 test('scheduler isolates 3p 429 cooldown from gemini quota group and automatically fails over across accounts', async () => {
-  let clock = 1_700_000_000_000
-  const calls = []
-  const envs = [
-    {
-      id: 'env-a',
-      proxy_id: 'px-1',
-      auth_state: 'authorized',
-      auth_method: 'oauth',
-      models_discovered: true,
-      models: ['gemini-4-neon', 'claude-sonnet-4-6-high'],
-      capabilities: [...NATIVE_TUI_CAPABILITIES],
-      account: {
-        state: 'ok',
-        model_catalog: [
-          { id: 'gemini-4-neon', provider: 'google', quota_group: 'gemini' },
-          { id: 'claude-sonnet-4-6-high', provider: 'anthropic', quota_group: '3p' },
-        ],
-        quotas: [],
-        quota_groups: [],
-      },
-    },
-    {
-      id: 'env-b',
-      proxy_id: 'px-2',
-      auth_state: 'authorized',
-      auth_method: 'oauth',
-      models_discovered: true,
-      models: ['gemini-4-neon', 'claude-sonnet-4-6-high'],
-      capabilities: [...NATIVE_TUI_CAPABILITIES],
-      account: {
-        state: 'ok',
-        model_catalog: [
-          { id: 'gemini-4-neon', provider: 'google', quota_group: 'gemini' },
-          { id: 'claude-sonnet-4-6-high', provider: 'anthropic', quota_group: '3p' },
-        ],
-        quotas: [],
-        quota_groups: [],
-      },
-    },
-  ]
-
-  const scheduler = createGeminiScheduler({
-    now: () => clock,
-    quotaCooldownMs: 60_000,
-    rateLimitRetryDelayMs: 0,
-    schedulerRuntime: createMockSchedulerRuntime({ now: () => clock, quotaCooldownMs: 60_000 }),
-    callHost: async (op, payload) => {
-      if (op === 'list') return { payload_state: 'installed', environments: envs }
-      if (op === 'get') return envs.find((e) => e.id === payload.id)
-      throw new Error(`unexpected op ${op}`)
-    },
-    callHostStream: async (_op, payload) => {
-      calls.push({ id: payload.id, model: payload.model })
-      // env-a returns 429 ONLY for claude-sonnet-4-6-high (3p bucket)
-      if (payload.id === 'env-a' && payload.model === 'claude-sonnet-4-6-high') {
-        return sseResponse([JSON.stringify({ code: 'gemini_quota_exhausted', message: '3p quota exhausted' })], {
-          statusCode: 429,
-          contentType: 'application/json',
-        })
-      }
-      return sseResponse([
-        `data: ${JSON.stringify({
-          candidates: [
-            { content: { role: 'model', parts: [{ text: `reply-from-${payload.id}` }] }, finishReason: 'STOP' },
+  const store = {}
+  setGeminiModelPolicyTestHooks({
+    settings: { get: (k, d = null) => (k in store ? store[k] : d), set: (k, v) => (store[k] = v) },
+  })
+  try {
+    saveGeminiModelPolicy({ ...getGeminiModelPolicy(), allow_third_party_models: true })
+    let clock = 1_700_000_000_000
+    const calls = []
+    const envs = [
+      {
+        id: 'env-a',
+        proxy_id: 'px-1',
+        auth_state: 'authorized',
+        auth_method: 'oauth',
+        models_discovered: true,
+        models: ['gemini-4-neon', 'claude-sonnet-4-6-high'],
+        capabilities: [...NATIVE_TUI_CAPABILITIES],
+        account: {
+          state: 'ok',
+          model_catalog: [
+            { id: 'gemini-4-neon', provider: 'google', quota_group: 'gemini' },
+            { id: 'claude-sonnet-4-6-high', provider: 'anthropic', quota_group: '3p' },
           ],
-          usageMetadata: { promptTokenCount: 100, candidatesTokenCount: 50, totalTokenCount: 150 },
-        })}\n\n`,
-      ])
-    },
-    resolveProxy: () => 'socks5h://192.0.2.10:1080',
-  })
+          quotas: [],
+          quota_groups: [],
+        },
+      },
+      {
+        id: 'env-b',
+        proxy_id: 'px-2',
+        auth_state: 'authorized',
+        auth_method: 'oauth',
+        models_discovered: true,
+        models: ['gemini-4-neon', 'claude-sonnet-4-6-high'],
+        capabilities: [...NATIVE_TUI_CAPABILITIES],
+        account: {
+          state: 'ok',
+          model_catalog: [
+            { id: 'gemini-4-neon', provider: 'google', quota_group: 'gemini' },
+            { id: 'claude-sonnet-4-6-high', provider: 'anthropic', quota_group: '3p' },
+          ],
+          quotas: [],
+          quota_groups: [],
+        },
+      },
+    ]
 
-  // Catalog splits models into Google vs ag- prefixed Anthropic with accurate owned_by.
-  const catalog = await scheduler.catalog()
-  assert.deepEqual(catalog.models, [
-    { id: 'gemini-4-neon', object: 'model', owned_by: 'google' },
-    { id: 'ag-claude-sonnet-4-6-high', object: 'model', owned_by: 'anthropic' },
-  ])
+    const scheduler = createGeminiScheduler({
+      now: () => clock,
+      quotaCooldownMs: 60_000,
+      rateLimitRetryDelayMs: 0,
+      schedulerRuntime: createMockSchedulerRuntime({ now: () => clock, quotaCooldownMs: 60_000 }),
+      callHost: async (op, payload) => {
+        if (op === 'list') return { payload_state: 'installed', environments: envs }
+        if (op === 'get') return envs.find((e) => e.id === payload.id)
+        throw new Error(`unexpected op ${op}`)
+      },
+      callHostStream: async (_op, payload) => {
+        calls.push({ id: payload.id, model: payload.model })
+        // env-a returns 429 ONLY for claude-sonnet-4-6-high (3p bucket)
+        if (payload.id === 'env-a' && payload.model === 'claude-sonnet-4-6-high') {
+          return sseResponse([JSON.stringify({ code: 'gemini_quota_exhausted', message: '3p quota exhausted' })], {
+            statusCode: 429,
+            contentType: 'application/json',
+          })
+        }
+        return sseResponse([
+          `data: ${JSON.stringify({
+            candidates: [
+              { content: { role: 'model', parts: [{ text: `reply-from-${payload.id}` }] }, finishReason: 'STOP' },
+            ],
+            usageMetadata: { promptTokenCount: 100, candidatesTokenCount: 50, totalTokenCount: 150 },
+          })}\n\n`,
+        ])
+      },
+      resolveProxy: () => 'socks5h://192.0.2.10:1080',
+    })
 
-  // 1. Call ag-claude-sonnet-4-6-high -> env-a hits 429 -> seamlessly fails over to env-b with stripped upstream slug!
-  const turn1 = await scheduler.stream({
-    model: 'ag-claude-sonnet-4-6-high',
-    geminiBody: { model: 'ag-claude-sonnet-4-6-high', contents: [{ role: 'user', parts: [{ text: 'hi' }] }] },
-    apiKeyRecord: { id: 'k-all', group_type: 'all' },
-  })
-  assert.equal(turn1.account_id, 'env-b')
-  assert.equal(turn1.model, 'ag-claude-sonnet-4-6-high')
-  assert.equal(turn1.upstream_model, 'claude-sonnet-4-6-high')
-  assert.equal(turn1.text, 'reply-from-env-b')
-  assert.deepEqual(calls, [
-    { id: 'env-a', model: 'claude-sonnet-4-6-high' },
-    { id: 'env-a', model: 'claude-sonnet-4-6-high' },
-    { id: 'env-b', model: 'claude-sonnet-4-6-high' },
-  ])
+    // Catalog splits models into Google vs ag- prefixed Anthropic with accurate owned_by.
+    const catalog = await scheduler.catalog()
+    assert.deepEqual(catalog.models, [
+      { id: 'gemini-4-neon', object: 'model', owned_by: 'google' },
+      { id: 'ag-claude-sonnet-4-6-high', object: 'model', owned_by: 'anthropic' },
+    ])
 
-  // 2. Second call to ag-claude-sonnet-4-6-high within 60s skips env-a completely (0 wasted 429 hits).
-  clock += 5_000
-  const turn2 = await scheduler.stream({
-    model: 'ag-claude-sonnet-4-6-high',
-    geminiBody: { contents: [{ role: 'user', parts: [{ text: 'hi 2' }] }] },
-    apiKeyRecord: { id: 'k-all', group_type: 'all' },
-  })
-  assert.equal(turn2.account_id, 'env-b')
-  assert.equal(calls.length, 4)
-  assert.equal(calls[3].id, 'env-b')
+    // 1. Call ag-claude-sonnet-4-6-high -> env-a hits 429 -> seamlessly fails over to env-b with stripped upstream slug!
+    const turn1 = await scheduler.stream({
+      model: 'ag-claude-sonnet-4-6-high',
+      geminiBody: { model: 'ag-claude-sonnet-4-6-high', contents: [{ role: 'user', parts: [{ text: 'hi' }] }] },
+      apiKeyRecord: { id: 'k-all', group_type: 'all' },
+    })
+    assert.equal(turn1.account_id, 'env-b')
+    assert.equal(turn1.model, 'ag-claude-sonnet-4-6-high')
+    assert.equal(turn1.upstream_model, 'claude-sonnet-4-6-high')
+    assert.equal(turn1.text, 'reply-from-env-b')
+    assert.deepEqual(calls, [
+      { id: 'env-a', model: 'claude-sonnet-4-6-high' },
+      { id: 'env-a', model: 'claude-sonnet-4-6-high' },
+      { id: 'env-b', model: 'claude-sonnet-4-6-high' },
+    ])
 
-  // 3. Call to gemini-4-neon within the same 60s window STILL schedules env-a because `gemini` quota group is NOT cooled!
-  const turn3 = await scheduler.stream({
-    model: 'gemini-4-neon',
-    geminiBody: { contents: [{ role: 'user', parts: [{ text: 'hi gemini' }] }] },
-    apiKeyRecord: { id: 'k-all', group_type: 'all' },
-  })
-  assert.equal(turn3.account_id, 'env-a')
-  assert.equal(turn3.model, 'gemini-4-neon')
-  assert.equal(turn3.upstream_model, 'gemini-4-neon')
+    // 2. Second call to ag-claude-sonnet-4-6-high within 60s skips env-a completely (0 wasted 429 hits).
+    clock += 5_000
+    const turn2 = await scheduler.stream({
+      model: 'ag-claude-sonnet-4-6-high',
+      geminiBody: { contents: [{ role: 'user', parts: [{ text: 'hi 2' }] }] },
+      apiKeyRecord: { id: 'k-all', group_type: 'all' },
+    })
+    assert.equal(turn2.account_id, 'env-b')
+    assert.equal(calls.length, 4)
+    assert.equal(calls[3].id, 'env-b')
+
+    // 3. Call to gemini-4-neon within the same 60s window STILL schedules env-a because `gemini` quota group is NOT cooled!
+    const turn3 = await scheduler.stream({
+      model: 'gemini-4-neon',
+      geminiBody: { contents: [{ role: 'user', parts: [{ text: 'hi gemini' }] }] },
+      apiKeyRecord: { id: 'k-all', group_type: 'all' },
+    })
+    assert.equal(turn3.account_id, 'env-a')
+    assert.equal(turn3.model, 'gemini-4-neon')
+    assert.equal(turn3.upstream_model, 'gemini-4-neon')
+  } finally {
+    setGeminiModelPolicyTestHooks(null)
+  }
 })
 
 test('scheduler skips proactively exhausted accounts and fails over on verification_required', async () => {
-  const futureReset = new Date(Date.now() + 3600_000).toISOString()
-  const envs = [
-    {
-      id: 'env-exhausted',
-      proxy_id: 'px-1',
-      auth_state: 'authorized',
-      auth_method: 'oauth',
-      models_discovered: true,
-      models: ['gemini-4-neon', 'claude-sonnet-4-6-high'],
-      capabilities: [...NATIVE_TUI_CAPABILITIES],
-      account: {
-        state: 'ok',
-        quotas: [{ model: 'claude-sonnet-4-6-high', remaining_fraction: 0, reset_at: futureReset }],
-        quota_groups: [],
+  const store = {}
+  setGeminiModelPolicyTestHooks({
+    settings: { get: (k, d = null) => (k in store ? store[k] : d), set: (k, v) => (store[k] = v) },
+  })
+  try {
+    saveGeminiModelPolicy({ ...getGeminiModelPolicy(), allow_third_party_models: true })
+    const futureReset = new Date(Date.now() + 3600_000).toISOString()
+    const envs = [
+      {
+        id: 'env-exhausted',
+        proxy_id: 'px-1',
+        auth_state: 'authorized',
+        auth_method: 'oauth',
+        models_discovered: true,
+        models: ['gemini-4-neon', 'claude-sonnet-4-6-high'],
+        capabilities: [...NATIVE_TUI_CAPABILITIES],
+        account: {
+          state: 'ok',
+          quotas: [{ model: 'claude-sonnet-4-6-high', remaining_fraction: 0, reset_at: futureReset }],
+          quota_groups: [],
+        },
       },
-    },
-    {
-      id: 'env-a-verify-fail',
-      proxy_id: 'px-2',
-      auth_state: 'authorized',
-      auth_method: 'oauth',
-      models_discovered: true,
-      models: ['gemini-4-neon', 'claude-sonnet-4-6-high'],
-      capabilities: [...NATIVE_TUI_CAPABILITIES],
-      account: { state: 'ok', quotas: [], quota_groups: [] },
-    },
-    {
-      id: 'env-b-healthy',
-      proxy_id: 'px-3',
-      auth_state: 'authorized',
-      auth_method: 'oauth',
-      models_discovered: true,
-      models: ['gemini-4-neon', 'claude-sonnet-4-6-high'],
-      capabilities: [...NATIVE_TUI_CAPABILITIES],
-      account: { state: 'ok', quotas: [], quota_groups: [] },
-    },
-  ]
+      {
+        id: 'env-a-verify-fail',
+        proxy_id: 'px-2',
+        auth_state: 'authorized',
+        auth_method: 'oauth',
+        models_discovered: true,
+        models: ['gemini-4-neon', 'claude-sonnet-4-6-high'],
+        capabilities: [...NATIVE_TUI_CAPABILITIES],
+        account: { state: 'ok', quotas: [], quota_groups: [] },
+      },
+      {
+        id: 'env-b-healthy',
+        proxy_id: 'px-3',
+        auth_state: 'authorized',
+        auth_method: 'oauth',
+        models_discovered: true,
+        models: ['gemini-4-neon', 'claude-sonnet-4-6-high'],
+        capabilities: [...NATIVE_TUI_CAPABILITIES],
+        account: { state: 'ok', quotas: [], quota_groups: [] },
+      },
+    ]
 
-  const attempted = []
-  const scheduler = createGeminiScheduler({
-    schedulerRuntime: createMockSchedulerRuntime(),
-    callHost: async (op, payload) => {
-      if (op === 'list') return { payload_state: 'installed', environments: envs }
-      if (op === 'get') return envs.find((e) => e.id === payload.id)
-      throw new Error(`unexpected op ${op}`)
-    },
-    callHostStream: async (_op, payload) => {
-      attempted.push(payload.id)
-      if (payload.id === 'env-a-verify-fail') {
-        return sseResponse([JSON.stringify({ code: 'gemini_account_verification_required' })], {
-          statusCode: 403,
-          contentType: 'application/json',
-        })
-      }
-      return sseResponse([
-        `data: ${JSON.stringify({
-          candidates: [{ content: { role: 'model', parts: [{ text: 'healthy-ok' }] }, finishReason: 'STOP' }],
-        })}\n\n`,
-      ])
-    },
-    resolveProxy: () => 'socks5h://192.0.2.10:1080',
-  })
+    const attempted = []
+    const scheduler = createGeminiScheduler({
+      schedulerRuntime: createMockSchedulerRuntime(),
+      callHost: async (op, payload) => {
+        if (op === 'list') return { payload_state: 'installed', environments: envs }
+        if (op === 'get') return envs.find((e) => e.id === payload.id)
+        throw new Error(`unexpected op ${op}`)
+      },
+      callHostStream: async (_op, payload) => {
+        attempted.push(payload.id)
+        if (payload.id === 'env-a-verify-fail') {
+          return sseResponse([JSON.stringify({ code: 'gemini_account_verification_required' })], {
+            statusCode: 403,
+            contentType: 'application/json',
+          })
+        }
+        return sseResponse([
+          `data: ${JSON.stringify({
+            candidates: [{ content: { role: 'model', parts: [{ text: 'healthy-ok' }] }, finishReason: 'STOP' }],
+          })}\n\n`,
+        ])
+      },
+      resolveProxy: () => 'socks5h://192.0.2.10:1080',
+    })
 
-  const turn = await scheduler.stream({
-    model: 'ag-claude-sonnet-4-6-high',
-    geminiBody: { contents: [{ role: 'user', parts: [{ text: 'hello' }] }] },
-    apiKeyRecord: { id: 'k-all', group_type: 'all' },
-  })
-  assert.equal(turn.account_id, 'env-b-healthy')
-  // env-exhausted was skipped proactively; env-a-verify-fail failed over cleanly to env-b-healthy!
-  assert.deepEqual(attempted, ['env-a-verify-fail', 'env-b-healthy'])
+    const turn = await scheduler.stream({
+      model: 'ag-claude-sonnet-4-6-high',
+      geminiBody: { contents: [{ role: 'user', parts: [{ text: 'hello' }] }] },
+      apiKeyRecord: { id: 'k-all', group_type: 'all' },
+    })
+    assert.equal(turn.account_id, 'env-b-healthy')
+    // env-exhausted was skipped proactively; env-a-verify-fail failed over cleanly to env-b-healthy!
+    assert.deepEqual(attempted, ['env-a-verify-fail', 'env-b-healthy'])
+  } finally {
+    setGeminiModelPolicyTestHooks(null)
+  }
 })
 
 test('Gemini builtin pricing & ag- prefix cost resolution cover Google, Anthropic, and OpenAI variants', () => {
@@ -443,24 +484,33 @@ test('Gemini public handler records requestLog once on direct calls and populate
   assert.equal(finished[0].extra.usage.output_tokens, 40)
 
   // 2. Delegated call (from handle-protocol.mjs with external logBag) populates logBag without calling requestLog.finish again.
-  const externalLogBag = {}
-  const res2 = makeRes()
-  await handler(
-    makeReq({
-      url: '/v1/messages',
-      groupType: 'all',
-      body: { model: 'ag-claude-sonnet-4-6-high', max_tokens: 64, messages: [{ role: 'user', content: 'hi' }] },
-    }),
-    res2,
-    { logBag: externalLogBag },
-  )
-  assert.equal(res2.statusCode, 200)
-  assert.equal(res2.jsonBody().model, 'ag-claude-sonnet-4-6-high')
-  assert.equal(started.length, 1)
-  assert.equal(finished.length, 1)
-  assert.equal(externalLogBag.model, 'ag-claude-sonnet-4-6-high')
-  assert.equal(externalLogBag.upstream_model, 'claude-sonnet-4-6-high')
-  assert.equal(externalLogBag.vm_id, 'gemini:env-1')
+  const store = {}
+  setGeminiModelPolicyTestHooks({
+    settings: { get: (k, d = null) => (k in store ? store[k] : d), set: (k, v) => (store[k] = v) },
+  })
+  try {
+    saveGeminiModelPolicy({ ...getGeminiModelPolicy(), allow_third_party_models: true })
+    const externalLogBag = {}
+    const res2 = makeRes()
+    await handler(
+      makeReq({
+        url: '/v1/messages',
+        groupType: 'all',
+        body: { model: 'ag-claude-sonnet-4-6-high', max_tokens: 64, messages: [{ role: 'user', content: 'hi' }] },
+      }),
+      res2,
+      { logBag: externalLogBag },
+    )
+    assert.equal(res2.statusCode, 200)
+    assert.equal(res2.jsonBody().model, 'ag-claude-sonnet-4-6-high')
+    assert.equal(started.length, 1)
+    assert.equal(finished.length, 1)
+    assert.equal(externalLogBag.model, 'ag-claude-sonnet-4-6-high')
+    assert.equal(externalLogBag.upstream_model, 'claude-sonnet-4-6-high')
+    assert.equal(externalLogBag.vm_id, 'gemini:env-1')
+  } finally {
+    setGeminiModelPolicyTestHooks(null)
+  }
 
   // 3. Panel handler exposes billing_ready ONLY when control plane enables it (still ignores untrusted host value).
   const panelWithBilling = createGeminiPanelHandler({

@@ -14,6 +14,10 @@ export const ANTIGRAVITY_PROVIDERS = new Set(['google', 'anthropic', 'openai'])
 export const ANTIGRAVITY_QUOTA_GROUPS = new Set(['gemini', 'gemini-argon-wtu', '3p'])
 
 const MODEL_SLUG_RE = /^[a-z0-9][a-z0-9._-]{0,99}$/
+const BLOCKED_UPSTREAM_MODEL_RE = /(?:^tab_|(?:-disabled)$)/i
+const GEMINI_MODEL_ALIASES = Object.freeze({
+  'nano-banana-2': 'gemini-3.1-flash-image',
+})
 const EFFORT_SUFFIX_RE = /-(minimal|low|medium|high|xhigh|extra-high|max)$/i
 const PAREN_EFFORT_RE = /\(([^()]+)\)$/
 
@@ -113,14 +117,42 @@ export function stripAntigravityPrefix(model) {
 }
 
 /**
+ * Upstream placeholder/internal slugs that must never be exposed or routed:
+ *   - `*-disabled` (e.g. `gemini-4-neon-disabled`, `gemini-4-argon-disabled`)
+ *   - `tab_*` (e.g. `tab_flash_lite_preview`, `tab_jump_flash_lite_preview`)
+ */
+export function isBlockedUpstreamGeminiModel(rawId) {
+  if (typeof rawId !== 'string') return false
+  const stripped = rawId.trim().split('/').filter(Boolean).pop() || ''
+  if (!stripped) return false
+  const cleaned = stripped
+    .replace(/\[1m\]$/i, '')
+    .replace(PAREN_EFFORT_RE, '')
+    .trim()
+  const unprefixed = stripAntigravityPrefix(cleaned)
+  return BLOCKED_UPSTREAM_MODEL_RE.test(cleaned) || BLOCKED_UPSTREAM_MODEL_RE.test(unprefixed)
+}
+
+export function resolveGeminiModelAlias(rawId) {
+  const s = String(rawId || '').trim()
+  if (!s) return ''
+  const tail = s.includes('/') ? s.split('/').filter(Boolean).pop() || s : s
+  const lower = tail.toLowerCase()
+  return Object.hasOwn(GEMINI_MODEL_ALIASES, lower) ? GEMINI_MODEL_ALIASES[lower] : s
+}
+
+/**
  * Whether `model` belongs to the Antigravity routing namespace for `all`-group keys.
- * Only `gemini-*` and `ag-*` match; bare `claude-*` / `gpt-*` stay on native VM pools.
+ * Only `gemini-*`, `ag-*`, and known Gemini aliases (`nano-banana-2`) match;
+ * bare `claude-*` / `gpt-*` stay on native VM pools.
  */
 export function isAntigravityRoutedModel(model) {
   if (typeof model !== 'string') return false
   const stripped = model.trim().split('/').filter(Boolean).pop() || ''
   const lower = stripped.toLowerCase()
-  return lower.startsWith('gemini-') || lower.startsWith(ANTIGRAVITY_PREFIX)
+  return (
+    lower.startsWith('gemini-') || lower.startsWith(ANTIGRAVITY_PREFIX) || Object.hasOwn(GEMINI_MODEL_ALIASES, lower)
+  )
 }
 
 export function quotaGroupForModel(rawId, providerHint = null) {
@@ -182,14 +214,19 @@ export function resolveUpstreamModel(
   { allowUnprefixedNonGemini = false, catalogIndex = null, requestedEffort = null, defaultEffort = null } = {},
 ) {
   if (typeof requestedId !== 'string' || !requestedId.trim()) return null
-  const wanted = requestedId.trim()
+  if (isBlockedUpstreamGeminiModel(requestedId)) return null
+  const rawSpec = parseAntigravityModelSpec(requestedId.trim())
+  const aliasedTarget = Object.hasOwn(GEMINI_MODEL_ALIASES, rawSpec.cleaned.toLowerCase())
+    ? GEMINI_MODEL_ALIASES[rawSpec.cleaned.toLowerCase()]
+    : null
+  const wanted = aliasedTarget || requestedId.trim()
   const wantedLower = wanted.toLowerCase()
   if (!Array.isArray(availableRawModels) || !availableRawModels.length) return null
 
   const rawByLower = new Map()
   const publicByLower = new Map()
   for (const raw of availableRawModels) {
-    if (typeof raw !== 'string' || !raw) continue
+    if (typeof raw !== 'string' || !raw || isBlockedUpstreamGeminiModel(raw)) continue
     const metaHint = catalogIndex?.get?.(raw) || null
     const classified = classifyAntigravityModel(raw, metaHint?.provider, metaHint?.quota_group)
     rawByLower.set(raw.toLowerCase(), classified)

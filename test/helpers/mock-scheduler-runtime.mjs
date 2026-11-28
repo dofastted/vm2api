@@ -246,7 +246,11 @@ export function createMockSchedulerRuntime({
     if (rec.nodeType === 'codex_vm' && (failure.http_status === 401 || failure.error_class === 'auth_error')) {
       heldVms.add(rec.nodeId)
     }
-    if (failure.error_class === 'rate_limit' || failure.error_class === 'quota_exhausted') {
+    if (
+      failure.error_class === 'rate_limit' ||
+      failure.error_class === 'rate_limit429' ||
+      failure.error_class === 'quota_exhausted'
+    ) {
       const waitMs =
         Number.isFinite(failure.retry_after_sec) && failure.retry_after_sec > 0
           ? failure.retry_after_sec * 1000

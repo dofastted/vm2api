@@ -74,7 +74,7 @@ test('per-run CLI eligibility survives native failure, host transport and public
     const response = await fetch(`http://127.0.0.1:${server.address().port}/v1/chat/completions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: 'gemini-test', messages: [{ role: 'user', content: 'hello' }] }),
+      body: JSON.stringify({ model: 'gemini-3.8-flash', messages: [{ role: 'user', content: 'hello' }] }),
       signal: AbortSignal.timeout(10_000),
     })
     const body = await response.json()

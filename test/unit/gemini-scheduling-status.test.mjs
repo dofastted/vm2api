@@ -82,7 +82,7 @@ function makeEnv(id, extra = {}) {
     models_discovered: true,
     max_concurrency: 4,
     capabilities: ['streaming', 'multi_turn'],
-    models: ['gemini-3-pro'],
+    models: ['gemini-4-neon-high'],
     account: { state: 'ok', checked_at: '2026-11-26T00:00:00Z', quotas: [], quota_groups: [] },
     ...extra,
   }
@@ -118,7 +118,7 @@ test('StickyRouter platform normalization supports gemini and routing-config val
   assert.equal(scopeStickyKey('k1:sess-1', 'gemini'), 'p:gemini:k1:sess-1')
 
   const def = normalizeGeminiRouting({})
-  assert.equal(def.failover.unschedulable_on_502, true)
+  assert.equal(def.failover.unschedulable_on_502, false)
   assert.equal(def.pool.account_check_interval_secs, 300)
 
   assert.throws(() => validateGeminiRoutingPatch({ gemini: { failover: { unschedulable_on_502: 'yes' } } }), {
@@ -219,7 +219,7 @@ test('Req 1: Gemini sticky session reuses Codex StickyRouter, retries 429 once w
 
   // Turn 1 pins sticky session to env-a in Rust scheduler runtime and remembers outbound conversation_id.
   const t1 = await scheduler.complete({
-    model: 'gemini-3-pro',
+    model: 'gemini-4-neon-high',
     text: 'first turn',
     stickyKey: 'k1:sess-429',
   })
@@ -232,7 +232,7 @@ test('Req 1: Gemini sticky session reuses Codex StickyRouter, retries 429 once w
   failAWith429 = true
   const beforeTurn2 = inferCalls.length
   const t2 = await scheduler.complete({
-    model: 'gemini-3-pro',
+    model: 'gemini-4-neon-high',
     text: 'second turn hits 429',
     stickyKey: 'k1:sess-429',
   })
@@ -255,20 +255,34 @@ test('Req 1: Gemini sticky session reuses Codex StickyRouter, retries 429 once w
     turn2Calls[0].conversation_id,
     'switching account must mint a new conversation_id',
   )
+  assert.equal(
+    turn2Calls[2].conversation_id.includes(':'),
+    false,
+    'switched recovery conversation_id must use _r<epoch> without colon',
+  )
   assert.equal(stickyBySession.get('k1:sess-429'), 'gemini_env:env-b', 'sticky binding migrated cleanly after failover')
 
-  // Verify buildDirectEnvelope forwards restart_resume: true when requested.
+  // Verify buildDirectEnvelope forwards restart_resume: true when requested and strips colon conv ids.
   const envPayload = buildDirectEnvelope({
-    model: 'gemini-3-pro',
+    model: 'gemini-4-neon-high',
     requestId: 'req-1',
     bodyObj: { contents: [{ role: 'user', parts: [{ text: 'hi' }] }] },
     restartResume: true,
+    conversationId: 'cs_abcd1234_r1',
   })
   assert.equal(envPayload.restart_resume, true)
+  assert.equal(envPayload.conversation_id, 'cs_abcd1234_r1')
+  const colonPayload = buildDirectEnvelope({
+    model: 'gemini-4-neon-high',
+    requestId: 'req-2',
+    bodyObj: { contents: [{ role: 'user', parts: [{ text: 'hi' }] }] },
+    conversationId: 'cs_abcd1234:r1',
+  })
+  assert.equal(colonPayload.conversation_id, undefined, 'colon conversation_id must be rejected before wire')
 })
 
-test('Req 2: 503 fails over without tripping circuit or unschedulable; 502 honors unschedulable_on_502 switch and prevents 502->503 loop', async () => {
-  // Verify distinct 503 mapping in direct-client.
+test('Req 2: 503/529/502/520/empty/HTML-403 inherit Anthropic failover without parking accounts unschedulable', async () => {
+  // Verify distinct 503, 529, 520, invalid_conversation, and HTML Cloudflare 403 mappings in direct-client.
   const err503 = mapCragWorkerError(503, {
     code: 'upstream_unavailable',
     upstream_status: 503,
@@ -278,20 +292,64 @@ test('Req 2: 503 fails over without tripping circuit or unschedulable; 502 honor
   assert.equal(err503.status, 503)
   assert.equal(err503.upstreamStatus, 503)
 
+  const err529 = mapCragWorkerError(529, {
+    code: 'upstream_overloaded',
+    upstream_status: 529,
+    error: 'overloaded',
+  })
+  assert.equal(err529.code, 'gemini_upstream_unavailable')
+  assert.equal(err529.status, 529)
+  assert.equal(err529.upstreamStatus, 529)
+
+  const err520 = mapCragWorkerError(502, {
+    code: 'upstream_error',
+    upstream_status: 520,
+    error: 'Cloudflare 520 origin error',
+  })
+  assert.equal(err520.code, 'gemini_inference_failed')
+  assert.equal(err520.status, 520)
+  assert.equal(err520.upstreamStatus, 520)
+
+  const errInvalidConv = mapCragWorkerError(400, {
+    code: 'invalid_conversation',
+    error: 'invalid conversation_id',
+  })
+  assert.equal(errInvalidConv.code, 'gemini_invalid_request')
+  assert.equal(errInvalidConv.status, 400)
+
+  const errCf403 = mapCragWorkerError(502, {
+    code: 'upstream_http',
+    upstream_status: 403,
+    error: '<html><title>Just a moment... Cloudflare</title></html>',
+  })
+  assert.equal(errCf403.code, 'gemini_proxy_error')
+  assert.equal(errCf403.upstreamStatus, 403)
+  assert.equal(errCf403.proxyEdgeForbidden, true)
+
   const envs = [makeEnv('env-a'), makeEnv('env-b')]
   const slotPrefs = createGeminiSlotPrefs()
   const pool = new PoolScheduler()
-  pool.unitCircuit.configure({ failureThreshold: 1, openMs: 30_000 })
+  pool.unitCircuit.configure({ failureThreshold: 3, openMs: 30_000 })
   const stickyRouter = makeMemoryStickyRouter()
-  let routing = { gemini: mergeGeminiRouting(DEFAULT_GEMINI_ROUTING, { failover: { unschedulable_on_502: true } }) }
+  const reportedFailures = []
+  const baseRt = makeMockGeminiRuntime()
+  const recordingRt = {
+    ...baseRt,
+    async switchNode(body) {
+      reportedFailures.push(body.failure)
+      return baseRt.switchNode(body)
+    },
+  }
+  const routing = { gemini: mergeGeminiRouting(DEFAULT_GEMINI_ROUTING, { failover: { unschedulable_on_502: true } }) }
   let mode = '503_on_a'
   const calls = []
 
   const scheduler = createGeminiScheduler({
-    schedulerRuntime: makeMockGeminiRuntime(),
+    schedulerRuntime: recordingRt,
     slotPrefs,
     poolScheduler: pool,
     stickyRouter,
+    sameAccountRetryDelayMs: 0,
     resolveProxy: () => 'socks5h://u:p@192.0.2.10:1080',
     callHost: async (op, payload) => {
       if (op === 'list') return { payload_state: 'installed', environments: envs }
@@ -312,43 +370,181 @@ test('Req 2: 503 fails over without tripping circuit or unschedulable; 502 honor
           contentType: 'application/json',
         })
       }
+      if (payload.id === 'env-a' && mode === '520_on_a') {
+        return sseResponse([JSON.stringify({ code: 'gemini_inference_failed', message: '520 origin error' })], {
+          statusCode: 520,
+          contentType: 'application/json',
+        })
+      }
+      if (payload.id === 'env-a' && mode === 'empty_on_a') {
+        return sseResponse([JSON.stringify({ code: 'empty_upstream_stream', message: 'empty stream' })], {
+          statusCode: 502,
+          contentType: 'application/json',
+        })
+      }
+      if (payload.id === 'env-a' && mode === 'cf403_on_a') {
+        return sseResponse([JSON.stringify({ message: '<html>Cloudflare 403</html>' })], {
+          statusCode: 403,
+          contentType: 'application/json',
+        })
+      }
       return okSse(`ok-${payload.id}`)
     },
     getRoutingConfig: () => routing,
   })
 
-  // 1. Upstream 503 on env-a -> switches to env-b, does NOT open circuit, does NOT mark unschedulable!
-  const r503 = await scheduler.complete({ model: 'gemini-3-pro', text: 'test 503', stickyKey: 'k1:s503' })
+  // 1. Upstream 503 on env-a -> switches to env-b, reports overloaded529, no circuit trip, no unschedulable.
+  const r503 = await scheduler.complete({ model: 'gemini-4-neon-high', text: 'test 503', stickyKey: 'k1:s503' })
   assert.equal(r503.account_id, 'env-b')
   assert.deepEqual(calls, ['env-a', 'env-b'])
+  assert.equal(reportedFailures.at(-1)?.error_class, 'overloaded529')
   assert.equal(pool.unitCircuit.inspect('gemini:env-a').ok, true, '503 must NOT trip circuit breaker')
   assert.equal(slotPrefs.resolved('env-a').unschedulable, null, '503 must NOT mark account unschedulable')
 
-  // Clear short 503 cooldown so env-a is eligible again, then trigger 502 with switch ON.
-  scheduler.clearRestriction('env-a')
+  // 2. Upstream 502 on env-a -> switches directly to env-b, NEVER marks unschedulable even with legacy config!
   mode = '502_on_a'
   calls.length = 0
-  const r502 = await scheduler.complete({ model: 'gemini-3-pro', text: 'test 502', stickyKey: 'k1:s502' })
+  const r502 = await scheduler.complete({ model: 'gemini-4-neon-high', text: 'test 502', stickyKey: 'k1:s502' })
   assert.equal(r502.account_id, 'env-b')
-  assert.equal(slotPrefs.resolved('env-a').unschedulable?.reason, 'upstream_502')
-  assert.equal(pool.unitCircuit.inspect('gemini:env-a').ok, true, '502 parked cleanly without 502->503 circuit loop')
+  assert.deepEqual(calls, ['env-a', 'env-b'])
+  assert.equal(reportedFailures.at(-1)?.error_class, 'server5xx')
+  assert.equal(slotPrefs.resolved('env-a').unschedulable, null, 'single 502 must NEVER mark account unschedulable')
 
-  // Next request skips env-a completely (no 502->503 loop!).
+  // 3. Upstream 520 on env-a -> switches directly to env-b with exact http_status 520, never unschedulable!
+  mode = '520_on_a'
   calls.length = 0
-  const rAfter = await scheduler.complete({ model: 'gemini-3-pro', text: 'after 502' })
-  assert.equal(rAfter.account_id, 'env-b')
-  assert.deepEqual(calls, ['env-b'])
-
-  // Recovering env-a clears unschedulable.
-  scheduler.clearRestriction('env-a')
+  const r520 = await scheduler.complete({ model: 'gemini-4-neon-high', text: 'test 520', stickyKey: 'k1:s520' })
+  assert.equal(r520.account_id, 'env-b')
+  assert.deepEqual(calls, ['env-a', 'env-b'])
+  assert.equal(reportedFailures.at(-1)?.http_status, 520)
+  assert.equal(reportedFailures.at(-1)?.error_class, 'server5xx')
   assert.equal(slotPrefs.resolved('env-a').unschedulable, null)
 
-  // Now toggle unschedulable_on_502 OFF -> 502 still fails over without persisting unschedulable.
-  routing = { gemini: mergeGeminiRouting(DEFAULT_GEMINI_ROUTING, { failover: { unschedulable_on_502: false } }) }
+  // 4. Empty upstream stream on env-a -> switches to env-b without incrementing unitCircuit.
+  pool.unitCircuit.reset('gemini:env-a')
+  mode = 'empty_on_a'
   calls.length = 0
-  const r502Off = await scheduler.complete({ model: 'gemini-3-pro', text: 'test 502 switch off' })
-  assert.equal(r502Off.account_id, 'env-b')
-  assert.equal(slotPrefs.resolved('env-a').unschedulable, null, 'switch OFF must not persist unschedulable')
+  const rEmpty = await scheduler.complete({ model: 'gemini-4-neon-high', text: 'test empty', stickyKey: 'k1:sempty' })
+  assert.equal(rEmpty.account_id, 'env-b')
+  assert.equal(
+    pool.unitCircuit.snapshot('gemini:env-a')?.failures || 0,
+    0,
+    'empty stream must NOT increment unitCircuit',
+  )
+
+  // 5. Cloudflare HTML 403 on env-a -> switches to env-b and reports transport (NOT permanent_ban).
+  mode = 'cf403_on_a'
+  calls.length = 0
+  const rCf403 = await scheduler.complete({ model: 'gemini-4-neon-high', text: 'test cf403', stickyKey: 'k1:scf403' })
+  assert.equal(rCf403.account_id, 'env-b')
+  assert.equal(reportedFailures.at(-1)?.error_class, 'transport', 'HTML/Cloudflare 403 must NOT report permanent_ban')
+  assert.equal(slotPrefs.resolved('env-a').unschedulable, null)
+})
+
+test('Req 2b: single-account transient 502/520 retries once with bounded backoff and public error never leaks Chinese ops copy', async () => {
+  const envs = [makeEnv('env-only', { capabilities: ['streaming', 'multi_turn', 'generation_config'] })]
+  let attempts = 0
+  const scheduler = createGeminiScheduler({
+    schedulerRuntime: makeMockGeminiRuntime(),
+    sameAccountRetryDelayMs: 0,
+    resolveProxy: () => 'socks5h://u:p@192.0.2.10:1080',
+    callHost: async (op, payload) => {
+      if (op === 'list') return { payload_state: 'installed', environments: envs }
+      if (op === 'get') return envs.find((e) => e.id === payload.id)
+      return {}
+    },
+    callHostStream: async () => {
+      attempts += 1
+      if (attempts === 1) {
+        return sseResponse([JSON.stringify({ code: 'gemini_inference_failed', message: 'origin 520' })], {
+          statusCode: 520,
+          contentType: 'application/json',
+        })
+      }
+      return okSse('recovered-same-account')
+    },
+    getRoutingConfig: () => ({ gemini: DEFAULT_GEMINI_ROUTING }),
+  })
+  const okRes = await scheduler.complete({ model: 'gemini-4-neon-high', text: 'retry once' })
+  assert.equal(okRes.text, 'recovered-same-account')
+  assert.equal(attempts, 2, 'single account must do 1 bounded transient retry on 520')
+
+  // When all attempts fail with 502/520, public protocol error must match Anthropic format and NEVER leak Chinese ops wording.
+  let failAttempts = 0
+  const failScheduler = createGeminiScheduler({
+    schedulerRuntime: makeMockGeminiRuntime(),
+    sameAccountRetryDelayMs: 0,
+    resolveProxy: () => 'socks5h://u:p@192.0.2.10:1080',
+    callHost: async (op, payload) => {
+      if (op === 'list') return { payload_state: 'installed', environments: envs }
+      if (op === 'get') return envs.find((e) => e.id === payload.id)
+      return {}
+    },
+    callHostStream: async () => {
+      failAttempts += 1
+      return sseResponse([JSON.stringify({ code: 'gemini_inference_failed', message: 'origin 520 error' })], {
+        statusCode: 520,
+        contentType: 'application/json',
+      })
+    },
+    getRoutingConfig: () => ({ gemini: DEFAULT_GEMINI_ROUTING }),
+  })
+  const handle = createGeminiPublicHandler({
+    json: (_res, status, body) => ({ status, body }),
+    readBody: async (req) => req.body,
+    scheduler: failScheduler,
+  })
+  const errRes = await handle(
+    {
+      method: 'POST',
+      url: '/v1/messages',
+      body: { model: 'gemini-4-neon-high', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] },
+      apiKeyKind: 'managed',
+      apiKeyRecord: { id: 'k1', group_type: 'gemini' },
+      headers: {},
+      once() {},
+    },
+    { setHeader() {}, once() {} },
+  )
+  assert.equal(failAttempts, 2)
+  assert.equal(errRes.status, 520)
+  assert.equal(errRes.body.type, 'error')
+  assert.equal(errRes.body.error.type, 'api_error')
+  assert.equal(errRes.body.error.code, 'upstream_error')
+  assert.doesNotMatch(errRes.body.error.message, /上游推理失败|Google 身份验证|风控|宿主服务日志/)
+
+  // OpenAI-chat & Gemini native protocols also format 502/520 cleanly without Chinese ops guidance.
+  const chatErr = await handle(
+    {
+      method: 'POST',
+      url: '/v1/chat/completions',
+      body: { model: 'gemini-4-neon-high', messages: [{ role: 'user', content: 'hi' }] },
+      apiKeyKind: 'managed',
+      apiKeyRecord: { id: 'k1', group_type: 'gemini' },
+      headers: {},
+      once() {},
+    },
+    { setHeader() {}, once() {} },
+  )
+  assert.equal(chatErr.status, 520)
+  assert.equal(chatErr.body.error.code, 'upstream_error')
+  assert.doesNotMatch(JSON.stringify(chatErr.body), /上游推理失败|Google 身份验证|风控|宿主服务日志/)
+
+  const nativeErr = await handle(
+    {
+      method: 'POST',
+      url: '/v1beta/models/gemini-4-neon-high:generateContent',
+      body: { contents: [{ role: 'user', parts: [{ text: 'hi' }] }] },
+      apiKeyKind: 'managed',
+      apiKeyRecord: { id: 'k1', group_type: 'gemini' },
+      headers: {},
+      once() {},
+    },
+    { setHeader() {}, once() {} },
+  )
+  assert.equal(nativeErr.status, 520)
+  assert.equal(nativeErr.body.error.status, 'UNAVAILABLE')
+  assert.doesNotMatch(JSON.stringify(nativeErr.body), /上游推理失败|Google 身份验证|风控|宿主服务日志/)
 })
 
 test('Req 3: All Gemini accounts unschedulable returns HTTP 429 High Load (gemini_pool_overloaded)', async () => {
@@ -379,7 +575,7 @@ test('Req 3: All Gemini accounts unschedulable returns HTTP 429 High Load (gemin
     {
       method: 'POST',
       url: '/v1/chat/completions',
-      body: { model: 'gemini-3-pro', messages: [{ role: 'user', content: 'hi' }] },
+      body: { model: 'gemini-4-neon-high', messages: [{ role: 'user', content: 'hi' }] },
       apiKeyKind: 'managed',
       apiKeyRecord: { id: 'k1', group_type: 'gemini' },
       headers: {},
@@ -399,7 +595,7 @@ test('Req 3: All Gemini accounts unschedulable returns HTTP 429 High Load (gemin
   assert.ok(Number(headers['retry-after']) >= 1)
 })
 
-test('Req 3b (#2049): a 502 mark ages out, so the same healthy account serves again instead of gemini_pool_overloaded', async () => {
+test('Req 3b (#2049): a legacy 502 mark ages out, so the same healthy account serves again without re-parking', async () => {
   const envs = [makeEnv('env-a')]
   const clock = { t: Date.parse('2026-11-28T06:24:57.670Z') }
   const slotPrefs = createGeminiSlotPrefs({ now: () => clock.t })
@@ -408,6 +604,7 @@ test('Req 3b (#2049): a 502 mark ages out, so the same healthy account serves ag
   const scheduler = createGeminiScheduler({
     schedulerRuntime: makeMockGeminiRuntime(),
     slotPrefs,
+    sameAccountRetryDelayMs: 0,
     resolveProxy: () => 'socks5h://u:p@192.0.2.10:1080',
     callHost: async (op) => {
       if (op === 'list') return { payload_state: 'installed', environments: envs }
@@ -425,7 +622,7 @@ test('Req 3b (#2049): a 502 mark ages out, so the same healthy account serves ag
       {
         method: 'POST',
         url: '/v1/chat/completions',
-        body: { model: 'gemini-3-pro', messages: [{ role: 'user', content: 'hi' }] },
+        body: { model: 'gemini-4-neon-high', messages: [{ role: 'user', content: 'hi' }] },
         apiKeyKind: 'managed',
         apiKeyRecord: { id: 'k1', group_type: 'gemini' },
         headers: {},
@@ -445,9 +642,8 @@ test('Req 3b (#2049): a 502 mark ages out, so the same healthy account serves ag
     'gemini_pool_overloaded',
     'expired 502 mark must not keep the pool overloaded',
   )
-  // The account was attempted again (the mock host then 502s on inference, which is
-  // marked afresh): the mark now carries the new timestamp, not the original one.
-  assert.equal(slotPrefs.resolved('env-a').unschedulable?.at, new Date(clock.t).toISOString())
+  // After expiry, a subsequent 502 does not re-park the account into unschedulable.
+  assert.equal(slotPrefs.resolved('env-a').unschedulable, null)
 })
 
 test('Req 4: Periodic account status checker updates unschedulable errors, replenishes recovered quotas, and projects fields in panel API', async () => {
@@ -638,7 +834,8 @@ test('local bridge_disconnected 502 does not mark accounts unschedulable or casc
   })
 
   await assert.rejects(
-    () => scheduler.complete({ model: 'gemini-3-pro', text: 'trigger bridge disconnect', stickyKey: 'k1:bridge' }),
+    () =>
+      scheduler.complete({ model: 'gemini-4-neon-high', text: 'trigger bridge disconnect', stickyKey: 'k1:bridge' }),
     (err) => err?.code === 'gemini_inference_failed',
   )
 

@@ -19,6 +19,8 @@ import {
 } from '../protocol/gemini-convert.mjs'
 import {
   extractImpliedModelEffort,
+  getGeminiModelPolicy,
+  isGeminiModelEnabled,
   isGeminiSeriesId,
   resolveGeminiDefaultEffort,
 } from '../protocol/gemini-model-policy.mjs'
@@ -31,7 +33,14 @@ import {
 import { createGeminiTerminalBridge } from './terminal.mjs'
 import { sameOriginPost } from '../admin/crag-shop.mjs'
 import { createGeminiMaintenanceHandler } from './maintenance.mjs'
-import { ANTIGRAVITY_PROVIDERS, ANTIGRAVITY_QUOTA_GROUPS, isAntigravityRoutedModel } from './model-catalog.mjs'
+import {
+  ANTIGRAVITY_PROVIDERS,
+  ANTIGRAVITY_QUOTA_GROUPS,
+  classifyAntigravityModel,
+  indexAccountModelCatalog,
+  isAntigravityRoutedModel,
+  isBlockedUpstreamGeminiModel,
+} from './model-catalog.mjs'
 import { normalizeGeminiOAuthImport } from './oauth-import.mjs'
 import { normalizeGeminiOutboundPrompt } from './prompt-normalizer.mjs'
 import { isGeminiProtocolAllowed } from './routing-config.mjs'
@@ -40,6 +49,14 @@ import { createGeminiSlotPrefs, parseGeminiDisplayName, parseGeminiScheduleLevel
 import { resolveCragGeminiPromptPolicy } from './system-prompt.mjs'
 import { configuredDnsUpstream, proxyDnsEmptyTypes } from '../vm/egress.mjs'
 import { compileWithProtoFront, protoFrontMode } from '../transport/proto-front-client.mjs'
+import {
+  CLIENT_POOL_BUSY_MESSAGE,
+  ErrorCode,
+  extractErrorLogFields,
+  mapUpstreamError,
+  resolveLoggedErrorCode,
+  rewritePoolErrorForClient,
+} from '../core/errors.mjs'
 import { resolveAuditSessionIdentity, riskPrincipal } from '../core/refusal-guard.mjs'
 import { observeUpstreamRisk } from '../protocol/intercept-gate.mjs'
 import {
@@ -129,10 +146,7 @@ const RUN_ERRORS = {
   ],
   gemini_inference_output_limit: [502, '模型单次回复超过测试输出上限，请精简提示词或限制回复长度后重试'],
   gemini_inference_tool_blocked: [502, '当前测试通道限制了该工具调用，请改用纯文本提示词重试'],
-  gemini_inference_failed: [
-    502,
-    '上游推理失败（502），请先刷新账号状态确认是否触发 Google 身份验证/风控，再检查绑定代理与宿主服务日志',
-  ],
+  gemini_inference_failed: [502, '上游推理暂时失败，请稍后重试或检查宿主服务日志'],
   gemini_native_tty_unavailable: [503, '宿主机没有可用的虚拟终端资源，请检查宿主机状态并重启 vm2api-gemini 服务'],
   gemini_native_worker_unavailable: [
     503,
@@ -769,6 +783,26 @@ function environmentView(
       : Number.isSafeInteger(value.active_slots) && value.active_slots >= 0
         ? value.active_slots
         : null
+  const rawModelsList = items(
+    Array.isArray(value.models) && value.models.length
+      ? value.models
+      : Array.isArray(value.call_models)
+        ? value.call_models
+        : value.models,
+    128,
+    modelName,
+  )
+  const rawCallModelsList = Array.isArray(value.call_models) ? items(value.call_models, 128, modelName) : null
+  const envCatalogIdx = indexAccountModelCatalog(value.account)
+  const activeModelPolicy = getGeminiModelPolicy()
+  const filterEnabledEnvModel = (rawId) => {
+    if (isBlockedUpstreamGeminiModel(rawId)) return false
+    const hint = envCatalogIdx.get(rawId) || null
+    const classified = classifyAntigravityModel(rawId, hint?.provider, hint?.quota_group)
+    return isGeminiModelEnabled(activeModelPolicy, classified.public_id)
+  }
+  const visibleModels = rawModelsList.filter(filterEnabledEnvModel)
+  const visibleCallModels = rawCallModelsList ? rawCallModelsList.filter(filterEnabledEnvModel) : null
   return {
     id: value.id,
     proxy_id: value.proxy_id,
@@ -804,18 +838,9 @@ function environmentView(
       ? { active_slots: value.active_slots }
       : {}),
     ...(resolvedInflight != null ? { inflight: resolvedInflight } : {}),
-    models: items(
-      Array.isArray(value.models) && value.models.length
-        ? value.models
-        : Array.isArray(value.call_models)
-          ? value.call_models
-          : value.models,
-      128,
-      modelName,
-    ),
-    ...(Array.isArray(value.call_models) ? { call_models: items(value.call_models, 128, modelName) } : {}),
-    ...((value.models_discovered === true ||
-      (Array.isArray(value.call_models) && items(value.call_models, 128, modelName).length > 0)) && {
+    models: visibleModels,
+    ...(visibleCallModels ? { call_models: visibleCallModels } : {}),
+    ...((value.models_discovered === true || (rawCallModelsList && rawCallModelsList.length > 0)) && {
       models_discovered: true,
     }),
     ...(Array.isArray(value.capabilities)
@@ -1948,6 +1973,71 @@ export function createGeminiPanelHandler({
   }
 }
 
+const PUBLIC_CLIENT_PASSTHROUGH_CODES = new Set([
+  'gemini_disabled',
+  'gemini_protocol_disabled',
+  'gemini_model_unavailable',
+  'gemini_unsupported_turn',
+  'gemini_invalid_request',
+  'gemini_inference_tool_blocked',
+  'gemini_inference_output_limit',
+  'gemini_session_conflict',
+  'gemini_content_rejected',
+  'gemini_subscription_sync_pending',
+  'gemini_tool_call_required',
+  'gemini_quota_exhausted',
+  'gemini_location_unsupported',
+  'gemini_account_ineligible',
+  'gemini_account_verification_required',
+  'api_key_disabled',
+  'api_key_expired',
+  'api_key_quota_exhausted',
+  'api_key_rate_limit',
+  'api_key_concurrency_limit',
+  'api_key_model_not_allowed',
+  'user_concurrency_limit',
+])
+
+const PUBLIC_CLIENT_NON_RETRYABLE_CODES = new Set([
+  'gemini_disabled',
+  'gemini_protocol_disabled',
+  'gemini_model_unavailable',
+  'gemini_unsupported_turn',
+  'gemini_invalid_request',
+  'gemini_inference_tool_blocked',
+  'gemini_content_rejected',
+  'gemini_location_unsupported',
+  'gemini_account_ineligible',
+  'gemini_account_verification_required',
+  'api_key_disabled',
+  'api_key_expired',
+  'api_key_model_not_allowed',
+])
+
+const PUBLIC_FIXED_MESSAGE_CODES = new Set([
+  'gemini_location_unsupported',
+  'gemini_account_ineligible',
+  'gemini_account_verification_required',
+])
+
+const PUBLIC_ENGLISH_DEFAULTS = Object.freeze({
+  gemini_disabled: [403, 'Gemini routing is disabled.'],
+  gemini_protocol_disabled: [403, 'Gemini protocol entry is disabled.'],
+  gemini_model_unavailable: [404, 'The requested model is not available.'],
+  gemini_unsupported_turn: [400, 'The requested turn parameters or capabilities are not supported.'],
+  gemini_invalid_request: [400, 'Invalid request payload.'],
+  gemini_inference_tool_blocked: [400, 'Tool calls are not supported on this route.'],
+  gemini_inference_output_limit: [413, 'Request or response exceeded the allowed limit.'],
+  gemini_session_conflict: [409, 'Outbound session conflict; retry with a new session or send tool results first.'],
+  gemini_content_rejected: [429, 'The request was rejected by upstream content policy.'],
+  gemini_subscription_sync_pending: [503, 'Upstream subscription sync is pending.'],
+  gemini_tool_call_required: [502, 'Upstream completed without calling a required function.'],
+  gemini_quota_exhausted: [429, 'Upstream quota or rate limit exceeded; please retry later.'],
+  gemini_location_unsupported: [403, 'The selected upstream account is not eligible in this region.'],
+  gemini_account_ineligible: [403, 'The selected upstream account is not eligible for this service.'],
+  gemini_account_verification_required: [403, 'The selected upstream account requires verification.'],
+})
+
 function publicError(error) {
   if (error instanceof SchedulerUnavailableError || error?.code === 'scheduler_unavailable') {
     return {
@@ -1964,14 +2054,17 @@ function publicError(error) {
   }
   if (error instanceof SchedulerApiError) {
     const formatted = formatSchedulerError(error)
+    const rewritten = rewritePoolErrorForClient(formatted, formatted.body)
+    const retryAfter = rewritten.retryAfterSec ?? formatted.retryAfterSec ?? undefined
     return {
-      status: formatted.status,
-      retryAfter: formatted.retryAfterSec ?? undefined,
+      status: rewritten.status,
+      retryAfter,
+      details: rewritten.body?.error?.details,
       body: {
         error: {
-          type: formatted.body?.error?.type || 'api_error',
-          code: formatted.code,
-          message: formatted.body?.error?.message || error.message || 'Scheduler rejected request',
+          type: rewritten.body?.error?.type || 'api_error',
+          code: rewritten.body?.error?.code || formatted.code,
+          message: rewritten.body?.error?.message || error.message || 'Scheduler rejected request',
         },
       },
     }
@@ -1992,29 +2085,137 @@ function publicError(error) {
         error: {
           type: 'rate_limit_error',
           code: 'gemini_pool_overloaded',
-          message: error?.message || '号池负载过高，请稍后再试',
+          message: error?.message || CLIENT_POOL_BUSY_MESSAGE,
         },
       },
     }
   }
-  const known = HOST_ERRORS[code]
-  const status = Number.isInteger(error?.status) ? error.status : known?.[0] || 503
-  const message =
-    code === 'gemini_operation_busy' && status === 503
-      ? '当前可用 Gemini 账号并发繁忙，请稍后重试'
-      : known?.[1] || error?.message || 'Gemini request failed.'
-  return {
-    status,
-    details: error?.details,
-    retryAfter: error?.retryAfter,
-    body: {
-      error: {
-        type: status === 429 ? 'rate_limit_error' : status >= 500 ? 'api_error' : 'invalid_request_error',
-        code,
-        message,
+  if (PUBLIC_CLIENT_PASSTHROUGH_CODES.has(code) || code.startsWith('license_')) {
+    const def = PUBLIC_CLIENT_ENGLISH_DEFAULT(code)
+    const status = Number.isInteger(error?.status) ? error.status : def[0]
+    const message = PUBLIC_FIXED_MESSAGE_CODES.has(code)
+      ? def[1]
+      : typeof error?.message === 'string' && error.message.trim()
+        ? error.message.trim()
+        : def[1] || 'Gemini request failed.'
+    const nonRetryable = PUBLIC_CLIENT_NON_RETRYABLE_CODES.has(code) || code.startsWith('license_')
+    const details =
+      error?.details && typeof error.details === 'object'
+        ? { ...error.details, ...(nonRetryable && error.details.retryable === undefined ? { retryable: false } : {}) }
+        : nonRetryable
+          ? { retryable: false }
+          : undefined
+    return {
+      status,
+      details,
+      retryAfter: error?.retryAfter,
+      body: {
+        error: {
+          type:
+            status === 429
+              ? 'rate_limit_error'
+              : status === 403
+                ? 'permission_error'
+                : status === 404
+                  ? 'not_found_error'
+                  : status >= 500
+                    ? 'api_error'
+                    : 'invalid_request_error',
+          code,
+          message,
+          ...(details ? { details } : {}),
+        },
       },
+    }
+  }
+
+  // Inherit Anthropic's `mapUpstreamError` + `rewritePoolErrorForClient` + `extractErrorLogFields`
+  // so public protocol clients receive standard protocol error envelopes without internal Chinese ops guidance.
+  const rawStatus =
+    Number.isInteger(error?.status) && error.status >= 400 && error.status < 600
+      ? error.status
+      : Number.isInteger(error?.upstreamStatus) && error.upstreamStatus >= 400 && error.upstreamStatus < 600
+        ? error.upstreamStatus
+        : 502
+  const mappedInboundCode =
+    code === 'gemini_inference_invalid_output'
+      ? ErrorCode.UPSTREAM_EMPTY_STREAM
+      : code === 'gemini_inference_timeout'
+        ? ErrorCode.UPSTREAM_TIMEOUT
+        : code === 'gemini_proxy_error' || code === 'gemini_proxy_unavailable'
+          ? ErrorCode.UPSTREAM_NETWORK
+          : code === 'gemini_operation_busy'
+            ? 'slot_busy'
+            : code === 'gemini_native_worker_unavailable' ||
+                code === 'gemini_native_bridge_timeout' ||
+                code === 'gemini_inference_start_failed'
+              ? ErrorCode.KERNEL_UNAVAILABLE
+              : code === 'gemini_upstream_unavailable' && rawStatus === 529
+                ? ErrorCode.UPSTREAM_OVERLOADED
+                : code === 'gemini_quota_exhausted'
+                  ? ErrorCode.UPSTREAM_RATE_LIMIT
+                  : code === 'gemini_oauth_required'
+                    ? ErrorCode.UPSTREAM_AUTH
+                    : ErrorCode.UPSTREAM_ERROR
+  const rawMessage =
+    typeof error?.message === 'string' && error.message.trim() && error.message.trim() !== code
+      ? error.message.trim()
+      : null
+  const upstreamType =
+    rawStatus === 529
+      ? 'overloaded_error'
+      : rawStatus === 429
+        ? 'rate_limit_error'
+        : rawStatus === 401
+          ? 'authentication_error'
+          : rawStatus === 403
+            ? 'permission_error'
+            : rawStatus === 504 || rawStatus === 408
+              ? 'timeout_error'
+              : 'upstream_error'
+  const syntheticHeaders = {}
+  if (Number.isFinite(Number(error?.retryAfter)) && Number(error.retryAfter) > 0) {
+    syntheticHeaders['retry-after'] = String(Math.max(1, Math.ceil(Number(error.retryAfter))))
+  }
+  const syntheticBody = {
+    type: 'error',
+    error: {
+      type: upstreamType,
+      code: mappedInboundCode,
+      message: rawMessage || `Upstream HTTP ${rawStatus}`,
+      ...(error?.details && typeof error.details === 'object' ? { details: error.details } : {}),
     },
   }
+  const mapped = rewritePoolErrorForClient(mapUpstreamError(rawStatus, syntheticBody, syntheticHeaders), syntheticBody)
+  const logFields = extractErrorLogFields({ status: rawStatus, body: syntheticBody }, mapped)
+  const loggedCode = resolveLoggedErrorCode({
+    explicitCode: code,
+    mappedCode: mapped.body?.error?.code,
+    upstreamType: logFields.upstream_type,
+    fallbackCode: ErrorCode.UPSTREAM_ERROR,
+  })
+  const mergedDetails =
+    error?.details && typeof error.details === 'object'
+      ? { ...(mapped.body?.error?.details || {}), ...error.details }
+      : mapped.body?.error?.details
+  const retryAfter =
+    Number.isFinite(Number(error?.retryAfter)) && Number(error.retryAfter) > 0
+      ? Math.max(1, Math.ceil(Number(error.retryAfter)))
+      : mapped.retryAfterSec
+  return {
+    status: mapped.status,
+    details: mergedDetails,
+    retryAfter,
+    logFields,
+    loggedCode,
+    body: mapped.body,
+  }
+}
+
+function PUBLIC_CLIENT_ENGLISH_DEFAULT(code) {
+  if (Object.hasOwn(PUBLIC_ENGLISH_DEFAULTS, code)) return PUBLIC_ENGLISH_DEFAULTS[code]
+  if (code.startsWith('license_')) return [403, 'CRAG registration is required.']
+  return [400, 'Request failed.']
 }
 
 function plainParts(parts, { typed = false } = {}) {
@@ -3097,11 +3298,16 @@ export function createGeminiPublicHandler({
         }
         observeGeminiError(error)
         const mapped = publicError(error)
-        logBag.error_code = mapped.body.error.code
+        logBag.error_code = mapped.loggedCode || mapped.body.error.code
         logBag.error_message = mapped.body.error.message
+        if (mapped.logFields?.upstream_type) logBag.upstream_type = mapped.logFields.upstream_type
+        if (mapped.logFields?.error_details) logBag.error_details = mapped.logFields.error_details
         logBag.final_state = 'failed'
         if (Number.isFinite(Number(mapped.retryAfter)) && Number(mapped.retryAfter) > 0) {
           res.setHeader?.('Retry-After', String(Math.max(1, Math.ceil(Number(mapped.retryAfter)))))
+        }
+        if (mapped.details?.retryable === false) {
+          res.setHeader?.('x-should-retry', 'false')
         }
         return respondJson(
           mapped.status,
@@ -3384,14 +3590,22 @@ export function createGeminiPublicHandler({
       }
       observeGeminiError(error)
       const mapped = publicError(error)
-      logBag.error_code = mapped.body.error.code
+      logBag.error_code = mapped.loggedCode || mapped.body.error.code
       logBag.error_message = mapped.body.error.message
+      if (mapped.logFields?.upstream_type) logBag.upstream_type = mapped.logFields.upstream_type
+      if (mapped.logFields?.error_details) logBag.error_details = mapped.logFields.error_details
       logBag.final_state = 'failed'
       if (headersSent) {
         ownLogStatusOverride = 200
         try {
           res.write(
-            formatGeminiProtocolStreamError(protocol, mapped.status, mapped.body.error.code, mapped.body.error.message),
+            formatGeminiProtocolStreamError(
+              protocol,
+              mapped.status,
+              mapped.body.error.code,
+              mapped.body.error.message,
+              mapped.details,
+            ),
           )
           res.end()
         } catch {}
@@ -3400,6 +3614,9 @@ export function createGeminiPublicHandler({
       }
       if (Number.isFinite(Number(mapped.retryAfter)) && Number(mapped.retryAfter) > 0) {
         res.setHeader?.('Retry-After', String(Math.max(1, Math.ceil(Number(mapped.retryAfter)))))
+      }
+      if (mapped.details?.retryable === false) {
+        res.setHeader?.('x-should-retry', 'false')
       }
       return respondJson(
         mapped.status,

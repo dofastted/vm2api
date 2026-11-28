@@ -748,9 +748,53 @@ def test_d_bind_proxy_shard_egress_options_and_domain_proxy_safety():
     assert res.returncode != 0
 
 
+def test_e_default_session_model_prefers_supported_gemini_and_skips_blocked_3p():
+    assert host_mod.NATIVE_DEFAULT_MODEL == "gemini-3.8-flash-medium"
+    pick = host_mod.Host._initial_session_model
+    # Prefers gemini-3.8-flash-medium over alphabetically earlier claude-* / *-disabled / tab_*
+    assert (
+        pick(
+            {
+                "call_models": [
+                    "claude-opus-5-5-high",
+                    "gemini-2.5-flash",
+                    "gemini-3-flash",
+                    "gemini-3.8-flash-high",
+                    "gemini-3.8-flash-medium",
+                    "gemini-4-neon-disabled",
+                    "tab_flash_lite_preview",
+                ]
+            }
+        )
+        == "gemini-3.8-flash-medium"
+    )
+    # Falls back to Gemini 4 when 3.8-flash absent, skipping *-disabled / 3p
+    assert (
+        pick(
+            {
+                "call_models": [
+                    "claude-sonnet-5-5-high",
+                    "gemini-4-argon-disabled",
+                    "gemini-4-hydrogen-medium",
+                    "gemini-3.1-flash-image",
+                ]
+            }
+        )
+        == "gemini-4-hydrogen-medium"
+    )
+    # Never returns blocked requested_model
+    assert (
+        pick({"call_models": ["gemini-3.1-flash-image"]}, requested_model="gemini-4-neon-disabled")
+        == "gemini-3.1-flash-image"
+    )
+    # Empty call_models falls back to NATIVE_DEFAULT_MODEL
+    assert pick({"call_models": []}) == "gemini-3.8-flash-medium"
+
+
 if __name__ == "__main__":
     test_a_umask_0077_dir_creation_onboarding_call_models_and_self_heal()
     test_b_oauth_clients_extraction_multi_fallback_and_read_account_forwarding()
     test_c_direct_oauth_pull_models_and_accurate_error_status_codes()
     test_d_bind_proxy_shard_egress_options_and_domain_proxy_safety()
+    test_e_default_session_model_prefers_supported_gemini_and_skips_blocked_3p()
     print("OK")
