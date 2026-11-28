@@ -31,10 +31,7 @@ import {
 import { HISTORY_WINDOW_MS, rollWindowHistory } from './window-history.mjs'
 import { accountTierKey, isNearLimit, normalizeTiers, resolveTierPolicy } from './quota-tiers.mjs'
 import { resolvePolicyModelId } from '../protocol/model-policy.mjs'
-import {
-  isFableCreditsRequiredMessage,
-  isOrganizationDisabledUsageResult,
-} from './upstream-error-policy.mjs'
+import { isFableCreditsRequiredMessage, isOrganizationDisabledUsageResult } from './upstream-error-policy.mjs'
 import { SessionLimitRegistry } from './session-limit.mjs'
 import { applyVmQuotaConfig, applyVmQuotaPolicy } from './vm-quota-override.mjs'
 import {
@@ -1570,7 +1567,8 @@ export class AccountQuota {
     if (!accountId) return null
     const acc = this.repo.get(accountId)
     if (!acc) return null
-    const revoke = /access token has been revoked|token has been revoked|token_revoked|invalidated oauth token|oauth_revoked/i
+    const revoke =
+      /access token has been revoked|token has been revoked|token_revoked|invalidated oauth token|oauth_revoked/i
     const u = acc.unified || {}
     const lp = u.last_probe || acc.last_probe || null
     const fb = u.fable || null
@@ -1699,7 +1697,7 @@ export class AccountQuota {
     for (const a of this.repo.list()) {
       if (a.vm_id === vmId || a.account_id === vmId) {
         a.max_rpm = v
-        if (override) a.rpm_override = 1
+        a.rpm_override = override ? 1 : 0
         out.push(this.repo.save(a))
       }
     }
