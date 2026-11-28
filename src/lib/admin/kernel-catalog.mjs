@@ -45,6 +45,13 @@ const archFor = (projectRoot, kernel, runtimeOptions) =>
   kernel === 'crag' ? cragTargetArch(projectRoot, runtimeOptions) : 'amd64'
 const CRAG_PINNED_RELEASES = [
   {
+    tag: 'payload-2026.11.28-crag-3.1.30',
+    label: '3.1.30 修复顶层 cache_control、Haiku 5.5、count_tokens 与 fast-mode/compact beta 合成',
+    size: 168939626,
+    manifestSha256: '129dde38496b20ea8d9d8582551a0138ffaa02bba3f751e9c4de360388bbd33c',
+    sha256: '46d3fced7991064275770f9143475e6d5c28d449e7579e5698c463b84a15c1bd',
+  },
+  {
     tag: 'payload-2026.11.28-crag-3.1.29',
     label: '3.1.29 修复 V4 工具续接 409 冲突死锁与 inline-tools-2026-09-15 缺失 400',
     size: 168929186,

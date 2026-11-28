@@ -26,7 +26,7 @@ import { canCountTokens, canOfficialUsage, credentialModeOfVm, isApiKeyMode } fr
 import { attachUsageFetchMeta, getUsageCache, getUsageFetchMeta } from '../oauth/usage-cache.mjs'
 import { probeAccount } from '../oauth/usage-probe.mjs'
 import { isOfficialUsageRateLimited, shouldHopOfficialUsage } from '../oauth/crs-usage-probe.mjs'
-import { countTokensViaKernel, countTokensViaWorker } from '../transport/go-worker-client.mjs'
+import { countTokensViaKernel, countTokensViaWorker, extractCragCallerHeaders } from '../transport/go-worker-client.mjs'
 import { peekRustHealth } from '../transport/kernel-router.mjs'
 import { apiKeyBetaHeader, setupTokenBetaHeader } from './claude-code-betas.mjs'
 import { listQuotaFromHeaders, publicUsageWindow, usageWindowsEmpty } from '../pool/quota-window.mjs'
@@ -487,9 +487,16 @@ export async function handleUserCountTokens(req, res, deps) {
   const outboundBody = officialTraffic ? parsed.body : sanitizeThirdPartyCountTokensBody(parsed.body, { routing })
   const caps = slotCapabilitiesForCountTokens(peeked, deps)
   if (caps.includes('count_tokens_v1')) {
+    const kernelHeaders = {}
+    if (officialTraffic) {
+      const callerHeaders = extractCragCallerHeaders(req?.headers, { includeUserAgent: true })
+      if (callerHeaders) Object.assign(kernelHeaders, callerHeaders)
+      const beta = req?.headers?.['anthropic-beta']
+      if (typeof beta === 'string' && beta.trim()) kernelHeaders['anthropic-beta'] = beta.trim()
+    }
     const hop = await (deps.countTokensViaKernel || countTokensViaKernel)(peeked.exec, {
       body: outboundBody,
-      headers: {},
+      headers: kernelHeaders,
       timeoutMs: 45000,
     })
     return sendCountTokensHopResult(res, json, hop, { preserveOfficialErrors: true })
