@@ -812,4 +812,31 @@ test('V7: claude_code_only on /v1/messages/count_tokens rejects bare UA spoof an
     seenOfficial.body.tools.map((t) => t.name),
     ['Bash'],
   )
+  assert.equal(seenOfficial.headers['anthropic-beta'], 'claude-code-20250219')
+  assert.equal(seenOfficial.headers['x-claude-code-session-id'], sessionId)
+
+  // Third-party count_tokens preserves tool_addition in role:system while folding text prose
+  const inlineSanitized = sanitizeThirdPartyCountTokensBody({
+    model: 'claude-opus-5-5',
+    messages: [
+      {
+        role: 'system',
+        content: [
+          { type: 'text', text: 'Hidden prompt' },
+          {
+            type: 'tool_addition',
+            tool: {
+              type: 'tool_definition',
+              definition: { name: 'inline_fn', input_schema: { type: 'object' } },
+            },
+          },
+        ],
+      },
+      { role: 'user', content: 'hello' },
+    ],
+  })
+  assert.equal(inlineSanitized.messages[0].role, 'system')
+  assert.equal(inlineSanitized.messages[0].content[0].type, 'tool_addition')
+  assert.equal(inlineSanitized.messages[0].content[0].tool.definition.name, 'mcp__inline_fn')
+  assert.ok(JSON.stringify(inlineSanitized.messages[1]).includes('Hidden prompt'))
 })

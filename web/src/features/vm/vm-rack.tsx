@@ -98,7 +98,7 @@ function RackHeader({
       <dl className='m-0 flex gap-5 md:col-span-2 xl:col-span-1'>
         {t.seatsMax > 0 ? (
           <div className='grid min-w-16 gap-0.5'>
-            <dt className='text-[11.5px] text-muted-foreground'>席位</dt>
+            <dt className='text-[11.5px] text-muted-foreground'>执行位</dt>
             <dd className='m-0 text-[15px] font-[620] tracking-[-0.015em] tabular-nums'>
               {t.seatsUsed}/{t.seatsMax}
             </dd>

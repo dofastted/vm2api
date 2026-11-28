@@ -654,6 +654,10 @@ export function sanitizeErrorDetailsForLog(rawDetails, { status = null, upstream
   if (riskBucket) out.risk_bucket = riskBucket
   const punishment = sanitizeErrorToken(src.punishment, 64)
   if (punishment) out.punishment = punishment
+  const u400Category = sanitizeErrorToken(src.upstream_400_category, 48)
+  if (u400Category) out.upstream_400_category = u400Category
+  const u400Action = sanitizeErrorToken(src.upstream_400_action, 32)
+  if (u400Action) out.upstream_400_action = u400Action
   for (const [key, value] of Object.entries(src)) {
     if (!/^jev_score_[a-z][a-z0-9_-]{0,31}$/.test(key)) continue
     const num = Number(value)
@@ -676,6 +680,8 @@ export function sanitizeErrorDetailsForLog(rawDetails, { status = null, upstream
       'gate_miss',
       'risk_bucket',
       'punishment',
+      'upstream_400_category',
+      'upstream_400_action',
     ]) {
       if (Object.hasOwn(out, key)) compact[key] = out[key]
     }
@@ -804,6 +810,7 @@ export function mapUpstreamError(status, body, headers = {}) {
       'invalid_kernel_request',
       'unsupported_capability',
       'thinking_incompatible',
+      'crag_prompt_too_large',
       ErrorCode.IMAGE_TOO_LARGE,
     ].includes(inboundCode)
   ) {
@@ -971,6 +978,16 @@ export function mapUpstreamError(status, body, headers = {}) {
     })
   }
 
+  if (inboundCode === 'pool_forbidden') {
+    return makeError({
+      type: ErrorType.PERMISSION,
+      code: 'pool_forbidden',
+      message: String(msg || '无权访问目标分组池'),
+      status: 403,
+      request_id,
+    })
+  }
+
   if (status === 401 || status === 403 || upType === 'authentication_error') {
     return makeError({
       type: ErrorType.UPSTREAM,
@@ -1003,6 +1020,17 @@ export function mapUpstreamError(status, body, headers = {}) {
       }),
       ...(retryAfterSec ? { retryAfterSec } : {}),
     }
+  }
+
+  if (inboundCode === 'crag_prompt_replace_empty_unsupported') {
+    return makeError({
+      type: ErrorType.OVERLOADED,
+      code: 'crag_prompt_replace_empty_unsupported',
+      message: String(msg),
+      status: 503,
+      details: { retryable: false },
+      request_id,
+    })
   }
 
   if (status === 529 || upType === 'overloaded_error') {
@@ -1137,6 +1165,10 @@ const STRICT_LOCAL_GATEWAY_CODES = new Set([
   'pool_queue_timeout',
   'pool_rate_limited',
   'pool_fable_rate_limited',
+  'crag_prompt_replace_empty_unsupported',
+  'crag_prompt_too_large',
+  'pool_forbidden',
+  'pool_unavailable',
 ])
 
 const SEMANTIC_TYPE_STATUS = Object.freeze({

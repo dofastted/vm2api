@@ -983,6 +983,49 @@ test('third-party tool additions and removals follow the declared tool name', ()
   assert.deepEqual(toStandardAnthropicBody(officialBody, { official: true }).body.messages[1], officialBody.messages[1])
 })
 
+test('inline tool_addition tool_definition renames definition.name, scrubs description, and aligns tool_choice/tool_use', () => {
+  const body = {
+    model: 'claude-opus-5-5',
+    tool_choice: { type: 'tool', name: 'lookup_inline' },
+    messages: [
+      {
+        role: 'system',
+        content: [
+          {
+            type: 'tool_addition',
+            tool: {
+              type: 'tool_definition',
+              definition: {
+                name: 'lookup_inline',
+                description: 'OpenCode inline lookup helper',
+                input_schema: { type: 'object', properties: {} },
+              },
+            },
+          },
+        ],
+      },
+      { role: 'user', content: 'run lookup' },
+      {
+        role: 'assistant',
+        content: [{ type: 'tool_use', id: 't1', name: 'lookup_inline', input: {} }],
+      },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'ok' }] },
+      {
+        role: 'system',
+        content: [{ type: 'tool_removal', tool: { type: 'tool_reference', name: 'lookup_inline' } }],
+      },
+    ],
+  }
+  const { body: out, reverse } = toStandardAnthropicBody(body)
+  assert.equal(out.messages[0].role, 'system')
+  assert.equal(out.messages[0].content[0].tool.definition.name, 'mcp__lookup_inline')
+  assert.doesNotMatch(out.messages[0].content[0].tool.definition.description, /OpenCode/i)
+  assert.equal(out.tool_choice.name, 'mcp__lookup_inline')
+  assert.equal(out.messages[2].content[0].name, 'mcp__lookup_inline')
+  assert.equal(out.messages[4].content[0].tool.name, 'mcp__lookup_inline')
+  assert.equal(reverse.mcp__lookup_inline, 'lookup_inline')
+})
+
 test('#953 client-supplied mcp__ names in tool_reference stay unchanged', () => {
   const result = scrubUpstreamClientBody({
     tools: [

@@ -7,6 +7,11 @@
  *
  * State is process-local and mirrored onto account runtime `model_states.__circuit`
  * when a repo is attached. Operator `schedulable` is never toggled.
+ *
+ * One instance serves Claude VMs and Gemini environments (`gemini:<id>`). A scope
+ * gives units under an id prefix their own threshold and open window, so
+ * `gemini.pool.circuit_*` does not borrow Claude's `pool.circuit_*`. A scope
+ * threshold of 0 turns that scope's circuit off.
  */
 
 const CIRCUIT_KEY = '__circuit'
@@ -18,6 +23,7 @@ export class UnitCircuit {
     this.openMs = Math.max(1, Number(openMs) || 30_000)
     this.now = now
     this.units = new Map()
+    this.scopes = new Map()
   }
 
   bindRepo(repo) {
@@ -27,6 +33,40 @@ export class UnitCircuit {
   configure({ failureThreshold, openMs } = {}) {
     if (failureThreshold != null) this.failureThreshold = Math.max(1, Number(failureThreshold) || 3)
     if (openMs != null) this.openMs = Math.max(1000, Number(openMs) || 30_000)
+  }
+
+  /**
+   * Settings for units whose id starts with `prefix`. Unset fields follow the
+   * global settings; a threshold of 0 disables the circuit for the scope.
+   */
+  configureScope(prefix, { failureThreshold, openMs } = {}) {
+    if (!prefix) return
+    const scope = {}
+    if (failureThreshold != null && Number.isFinite(Number(failureThreshold))) {
+      scope.failureThreshold = Math.max(0, Math.trunc(Number(failureThreshold)))
+    }
+    if (openMs != null) scope.openMs = Math.max(1000, Number(openMs) || 30_000)
+    this.scopes.set(String(prefix), scope)
+  }
+
+  clearScope(prefix) {
+    this.scopes.delete(String(prefix))
+  }
+
+  settingsFor(accountId) {
+    let failureThreshold = this.failureThreshold
+    let openMs = this.openMs
+    if (accountId && this.scopes.size) {
+      const id = String(accountId)
+      let matched = ''
+      for (const [prefix, scope] of this.scopes) {
+        if (prefix.length <= matched.length || !id.startsWith(prefix)) continue
+        matched = prefix
+        failureThreshold = scope.failureThreshold ?? this.failureThreshold
+        openMs = scope.openMs ?? this.openMs
+      }
+    }
+    return { failureThreshold, openMs, enabled: failureThreshold > 0 }
   }
 
   snapshot(accountId) {
@@ -39,13 +79,15 @@ export class UnitCircuit {
    */
   inspect(accountId, now = this.now()) {
     if (!accountId) return { ok: true, state: 'closed' }
+    const { openMs, enabled } = this.settingsFor(accountId)
+    if (!enabled) return { ok: true, state: 'closed' }
     const unit = this._ensure(accountId, now)
     if (unit.state === 'closed') return { ok: true, state: 'closed' }
     if (unit.state === 'open') {
       return { ok: false, reason: 'circuit_open', until: unit.openUntil, state: 'open' }
     }
     if (unit.probeHeld) {
-      return { ok: false, reason: 'circuit_probe', until: now + this.openMs, state: 'half_open' }
+      return { ok: false, reason: 'circuit_probe', until: now + openMs, state: 'half_open' }
     }
     return { ok: true, state: 'half_open', probeAvailable: true }
   }
@@ -55,6 +97,8 @@ export class UnitCircuit {
    */
   admit(accountId, now = this.now()) {
     if (!accountId) return { ok: true, state: 'closed' }
+    const { openMs, enabled } = this.settingsFor(accountId)
+    if (!enabled) return { ok: true, state: 'closed' }
     const unit = this._ensure(accountId, now)
     if (unit.state === 'closed') return { ok: true, state: 'closed' }
     if (unit.state === 'open') {
@@ -66,7 +110,7 @@ export class UnitCircuit {
       this._save(accountId, unit)
     }
     if (unit.probeHeld) {
-      return { ok: false, reason: 'circuit_probe', until: now + this.openMs, state: 'half_open' }
+      return { ok: false, reason: 'circuit_probe', until: now + openMs, state: 'half_open' }
     }
     unit.probeHeld = true
     this._save(accountId, unit)
@@ -75,14 +119,19 @@ export class UnitCircuit {
 
   recordFailure(accountId, now = this.now()) {
     if (!accountId) return null
+    const { failureThreshold, openMs, enabled } = this.settingsFor(accountId)
     const unit = this._ensure(accountId, now)
+    if (!enabled) {
+      unit.probeHeld = false
+      return { ...unit }
+    }
     if (unit.state === 'open' && now < unit.openUntil) return unit
     unit.failures += 1
     unit.probeHeld = false
-    if (unit.state === 'half_open' || unit.failures >= this.failureThreshold) {
+    if (unit.state === 'half_open' || unit.failures >= failureThreshold) {
       unit.state = 'open'
-      unit.openUntil = now + this.openMs
-      unit.failures = this.failureThreshold
+      unit.openUntil = now + openMs
+      unit.failures = failureThreshold
     }
     this._save(accountId, unit)
     return { ...unit }
@@ -115,13 +164,14 @@ export class UnitCircuit {
 
   /** Panel view. Reads without taking the probe; open past its window reads as half_open. */
   view(accountId, now = this.now()) {
-    const unit = accountId ? this._ensure(accountId, now) : { state: 'closed', failures: 0, openUntil: 0 }
+    const { failureThreshold, openMs, enabled } = this.settingsFor(accountId)
+    const unit = accountId && enabled ? this._ensure(accountId, now) : { state: 'closed', failures: 0, openUntil: 0 }
     return {
       state: unit.state,
       failures: unit.failures,
-      threshold: this.failureThreshold,
+      threshold: failureThreshold,
       open_until: unit.state === 'open' ? unit.openUntil : null,
-      open_ms: this.openMs,
+      open_ms: openMs,
     }
   }
 

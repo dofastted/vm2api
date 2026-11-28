@@ -45,15 +45,36 @@ const archFor = (projectRoot, kernel, runtimeOptions) =>
   kernel === 'crag' ? cragTargetArch(projectRoot, runtimeOptions) : 'amd64'
 const CRAG_PINNED_RELEASES = [
   {
+    tag: 'payload-2026.11.28-crag-3.1.31',
+    label: '3.1.31（推荐）收口 wire.rs Beta SSOT、门控 diagnostics 注入并移除重复 runtime beta 推导',
+    size: 168956657,
+    manifestSha256: '270fcd28e6e61e597d5425f861c4c7dcda532b7991c31fabcf35ffb552c81cd0',
+    sha256: '58ef8c34d2a8d13451ad221113b7eb17288dfa3600f6fd740e41601c843c51a9',
+  },
+  {
+    tag: 'payload-2026.11.28-crag-3.1.30',
+    label: '3.1.30（历史·建议改用 3.1.31）缺 diagnostics 门控与模板 scope/extra_betas 防护',
+    size: 168939626,
+    manifestSha256: '129dde38496b20ea8d9d8582551a0138ffaa02bba3f751e9c4de360388bbd33c',
+    sha256: '46d3fced7991064275770f9143475e6d5c28d449e7579e5698c463b84a15c1bd',
+  },
+  {
+    tag: 'payload-2026.11.28-crag-3.1.29',
+    label: '3.1.29（历史·建议改用 3.1.31）缺 3.1.30–3.1.31 顶层缓存/Haiku 5.5/count_tokens 与 beta SSOT 修复',
+    size: 168929186,
+    manifestSha256: 'b035d4e6824c3c15f53be8d58bed3b37192ef1fe44bcd2f5e6f9a9af72fc24a5',
+    sha256: '2c780520df6f3301e267cc1d521167964c0d96371847b738c37f18068e61371e',
+  },
+  {
     tag: 'payload-2026.11.28-crag-3.1.27',
-    label: '3.1.27 统一 PromptSpec v1、拆解 Self-Probe、缓存/Zero 安全与 tool_use handoff_complete 修复',
+    label: '3.1.27（历史·含 409/inline-tools 缺陷，建议改用 3.1.31）统一 PromptSpec v1',
     size: 168930962,
     manifestSha256: '6b8ad1e85df367c37f22cfc7661a67e51d8ccba72a21408d64efef8e02162c2e',
     sha256: '31d94d341061789bdda7f34f115cf35037b913c43b55c8df65ae1f7061388ecb',
   },
   {
     tag: 'payload-2026.11.28-crag-3.1.26',
-    label: '3.1.26 原生 V4 Headless Bridge、自定义系统底座/vsock 与 tool_use handoff_complete 修复',
+    label: '3.1.26（历史·含 409/inline-tools 缺陷，建议改用 3.1.31）原生 V4 Headless Bridge',
     size: 168863735,
     manifestSha256: 'e8a6cd7e0481622c48c03fb50ab039f9d3ccd87a5c5534770570a4f5181959b9',
     sha256: 'cad5fe5ebb7c35d7c8eec54265d346c7faad7a09358c859cd3d4d8fe4bed14e5',
@@ -395,6 +416,8 @@ function publicProduct(id, ready, meta = {}, code) {
       ? { release_options: CRAG_PINNED_RELEASES.filter(({ label }) => label).map(({ tag, label }) => ({ tag, label })) }
       : {}),
     ...(isCragPayloadTag(meta.payload_tag) ? { payload_tag: meta.payload_tag } : {}),
+    ...(Array.isArray(meta.capabilities) && meta.capabilities.length ? { capabilities: [...meta.capabilities] } : {}),
+    ...(Number.isInteger(meta.kernel_generation) ? { kernel_generation: meta.kernel_generation } : {}),
     ...(!ready
       ? {
           code,
@@ -469,7 +492,17 @@ export function describeKernelCatalog(projectRoot, runtimeOptions) {
       'crag',
       verified.ok,
       {
-        ...(verified.ok ? { version: verified.manifest.version } : {}),
+        ...(verified.ok
+          ? {
+              version: verified.manifest.version,
+              ...(Array.isArray(verified.manifest.capabilities) && verified.manifest.capabilities.length
+                ? { capabilities: verified.manifest.capabilities }
+                : {}),
+              ...(Number.isInteger(verified.manifest.kernel_generation)
+                ? { kernel_generation: verified.manifest.kernel_generation }
+                : {}),
+            }
+          : {}),
         ...release,
       },
       verified.code,

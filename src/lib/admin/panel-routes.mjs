@@ -44,6 +44,7 @@ import {
   readJevConfig,
   resumeJevKeys,
 } from '../protocol/jev-intercept.mjs'
+import { invalidateRiskBanCache } from '../protocol/intercept-gate.mjs'
 import { JevUsageRepo } from '../db/repos/jev-usage-repo.mjs'
 import { RefusalGuardsRepo } from '../db/repos/refusal-guards-repo.mjs'
 import { RefusalDeviceBlocksRepo } from '../db/repos/refusal-device-blocks-repo.mjs'
@@ -147,7 +148,13 @@ import { publicUserView } from './panel-users.mjs'
 import { authorizePanelRoute, mePayload, panelIdentity } from './panel-acl.mjs'
 import { INTEGRATION_DELEGATED, handleIntegrationAdminRoute } from './integration-routes.mjs'
 import { IntegrationTokenStore } from './integration-tokens.mjs'
-import { callGeminiHost, createGeminiPanelHandler, geminiProxyFor, isGeminiPanelPath } from '../gemini/routes.mjs'
+import {
+  callGeminiHost,
+  createGeminiPanelHandler,
+  geminiProxyEgressOptionsFor,
+  geminiProxyFor,
+  isGeminiPanelPath,
+} from '../gemini/routes.mjs'
 import {
   denyIfUserCannotDeleteVm,
   denyIfUserMissesKey,
@@ -249,9 +256,11 @@ import { successCountSince } from '../pool/warmup-monitor.mjs'
 import { snapshotDatabaseMetricsAsync } from '../db/database-metrics.mjs'
 import { queryActiveUsage } from '../oauth/active-usage-query.mjs'
 import { getUsageCache } from '../oauth/usage-cache.mjs'
-import { getDb, getDbEngine, getDbPath, getPgPool } from '../db/database.mjs'
+import { DB_INSTANCE_ID, getDb, getDbEngine, getDbPath, getPgPool, isDbOpen } from '../db/database.mjs'
+import { VmPoolsRepo } from '../db/repos/vm-pools-repo.mjs'
 import { usagePoolEnabled, usageRead } from '../db/sqlite-pool.mjs'
-import { getCacheRuntime } from '../cache/index.mjs'
+import { computeEtag, matchesEtag } from '../cache/cache-client.mjs'
+import { getCacheRuntime, notifyDbTablesMutated } from '../cache/index.mjs'
 import {
   readLocalVersion,
   loadChangelog,
@@ -810,9 +819,50 @@ function slotProxyHint(px = {}, label = null) {
   return label ? `${label} · ${endpoint}` : endpoint
 }
 
+const PANEL_STATUS_SYM = Symbol('panelStatus')
+
 export function createPanelHandler(ctx) {
-  const json = (res, ...args) => (res?._integrationJson || ctx.json)(res, ...args)
+  const json = (res, status, ...args) => {
+    if (res && typeof res === 'object') res[PANEL_STATUS_SYM] = status
+    return (res?._integrationJson || ctx.json)(res, status, ...args)
+  }
   const readBody = (req, ...args) => (req?._integrationReadBody || ctx.readBody)(req, ...args)
+  const resolvePanelDb = () => {
+    try {
+      return ctx.apiKeyStore?.db || ctx.getDb?.() || (isDbOpen() ? getDb() : null)
+    } catch {
+      return null
+    }
+  }
+  const cacheScopeOf = (db = resolvePanelDb()) => {
+    if (db && isDbOpen() && db === getDb()) {
+      return db.engine === 'postgres' ? 'pg' : db[DB_INSTANCE_ID] || 'sqlite'
+    }
+    return db?.[DB_INSTANCE_ID] || ctx.cfg?.paths?.project || 'isolated'
+  }
+  const sendCachedJson = (req, res, status, payload, { etag = null, cacheStatus = null } = {}) => {
+    const tag = etag || computeEtag(payload)
+    if (typeof res?.setHeader === 'function') {
+      res.setHeader('ETag', tag)
+      res.setHeader('Cache-Control', 'private, no-cache')
+      if (cacheStatus) res.setHeader('X-Snapshot-Cache', cacheStatus)
+    }
+    const inm = req?.headers?.['if-none-match']
+    if (inm && matchesEtag(inm, tag) && typeof res?.writeHead === 'function' && typeof res?.end === 'function') {
+      if (res && typeof res === 'object') res[PANEL_STATUS_SYM] = 304
+      res.writeHead(
+        304,
+        corsHeadersForRequest(req, {
+          ETag: tag,
+          'Cache-Control': 'private, no-cache',
+          ...(cacheStatus ? { 'X-Snapshot-Cache': cacheStatus } : {}),
+        }),
+      )
+      res.end()
+      return true
+    }
+    return json(res, status, payload)
+  }
   const integrationTokenStore = ctx.integrationTokenStore || new IntegrationTokenStore()
   const geminiPanel = createGeminiPanelHandler({
     json,
@@ -895,6 +945,7 @@ export function createPanelHandler(ctx) {
   }
   const handleSchedulerPools = createSchedulerPoolsHandler({
     getDb: () => apiKeyStore?.db || ctx.getDb?.() || getDb(),
+    getRouting: () => ctx.routingConfig || {},
     cfg,
     apiKeyStore: ctx.apiKeyStore,
     apiEndpointStore: ctx.apiEndpointStore,
@@ -1887,6 +1938,179 @@ export function createPanelHandler(ctx) {
     )
   }
 
+  const isReadOnlyPanelPost = (method, pathname) => {
+    if (method !== 'POST') return false
+    if (
+      pathname === '/api/panel/login' ||
+      pathname === '/api/panel/login/totp' ||
+      pathname === '/api/panel/logout' ||
+      pathname === '/api/panel/scheduler/explain' ||
+      pathname === '/api/panel/api-endpoints/fetch-models' ||
+      pathname === '/api/panel/api/messages' ||
+      pathname === '/api/panel/anthropic/messages' ||
+      pathname === '/api/panel/jev-intercept/models' ||
+      pathname === '/api/panel/jev-intercept/probe' ||
+      pathname === '/api/panel/jev-intercept/quota' ||
+      pathname === '/api/panel/notify/test' ||
+      pathname === '/api/panel/notify/check'
+    ) {
+      return true
+    }
+    return (
+      /^\/api\/panel\/api-keys\/[^/]+\/reveal$/.test(pathname) ||
+      /^\/api\/panel\/proxies\/[^/]+\/reveal$/.test(pathname) ||
+      /^\/api\/panel\/api-endpoints\/[^/]+\/fetch-models$/.test(pathname) ||
+      /^\/api\/panel\/vms\/[^/]+\/(desktop-ticket|shell-ticket|test-chat|count-tokens)$/.test(pathname)
+    )
+  }
+
+  const invalidateCachesForPanelMutation = (method, pathname) => {
+    if (method === 'GET' || method === 'HEAD' || method === 'OPTIONS') return
+    if (isReadOnlyPanelPost(method, pathname)) return
+    // Pool & scheduler routes already invalidate with exact tables inside handleSchedulerPools.
+    if (
+      pathname === '/api/panel/pools' ||
+      pathname.startsWith('/api/panel/pools/') ||
+      pathname.startsWith('/api/panel/scheduler/')
+    ) {
+      return
+    }
+    const cache = getCacheRuntime()
+    let tables = ['settings']
+    let namespaces = ['panel']
+    let clearBilling = false
+    let clearUsers = false
+    let clearGroups = false
+    let clearPoolAccess = false
+    let clearNamesTable = null
+    let vmIdToClear = null
+    let riskBanKindToClear = null
+
+    if (
+      pathname === '/api/panel/vms' ||
+      pathname.startsWith('/api/panel/vms/') ||
+      pathname.startsWith('/admin/vms/') ||
+      pathname.startsWith('/admin/vm/') ||
+      pathname === '/api/panel/dataplane' ||
+      pathname.startsWith('/api/panel/kernels/') ||
+      pathname.startsWith('/api/panel/wrap-cli/') ||
+      pathname === '/api/panel/probe' ||
+      pathname === '/api/panel/health-probe' ||
+      pathname === '/api/panel/usage-probe'
+    ) {
+      tables = ['vms', 'accounts', 'account_runtime']
+      namespaces = ['panel', 'overview', 'filter-options']
+      clearNamesTable = 'vms'
+      const m = pathname.match(/^\/api\/panel\/vms\/([^/]+)/)
+      if (m) vmIdToClear = decodeURIComponent(m[1])
+    } else if (pathname === '/api/panel/proxies' || pathname.startsWith('/api/panel/proxies/')) {
+      tables = ['proxies', 'settings']
+      namespaces = ['panel']
+    } else if (pathname === '/api/panel/api-keys' || pathname.startsWith('/api/panel/api-keys/')) {
+      tables = ['api_keys', 'api_key_pool_bindings']
+      namespaces = ['panel', 'filter-options']
+      clearPoolAccess = true
+      clearNamesTable = 'api_keys'
+    } else if (pathname === '/api/panel/vm-pools' || pathname.startsWith('/api/panel/vm-pools/')) {
+      tables = ['vm_pools', 'scheduler_pools', 'scheduler_pool_members']
+      namespaces = ['panel']
+      clearPoolAccess = true
+    } else if (pathname === '/api/panel/api-endpoints' || pathname.startsWith('/api/panel/api-endpoints/')) {
+      tables = ['api_endpoints', 'api_endpoint_keys']
+      namespaces = ['panel']
+    } else if (
+      pathname === '/api/panel/users' ||
+      pathname.startsWith('/api/panel/users/') ||
+      pathname.startsWith('/api/panel/2fa') ||
+      pathname.startsWith('/api/panel/redeem') ||
+      pathname.startsWith('/api/panel/groups')
+    ) {
+      tables = ['users', 'groups']
+      namespaces = ['panel', 'stats', 'stats-filtered', 'filter-options']
+      clearUsers = true
+      clearGroups = true
+      clearNamesTable = 'users'
+    } else if (pathname === '/api/panel/pricing' || pathname.startsWith('/api/panel/pricing/')) {
+      tables = ['settings', 'usage_logs']
+      namespaces = ['panel', 'stats', 'stats-filtered', 'overview', 'logs-summary']
+      clearBilling = true
+    } else if (
+      pathname === '/api/panel/request-logs' ||
+      pathname.startsWith('/api/panel/request-logs/') ||
+      pathname.startsWith('/api/panel/usage-logs/')
+    ) {
+      tables = ['usage_logs', 'settings']
+      namespaces = ['panel', 'stats', 'stats-filtered', 'overview', 'logs-summary', 'active-sessions', 'filter-options']
+      clearBilling = true
+    } else if (/^\/api\/panel\/backups\/[^/]+\/restore$/.test(pathname)) {
+      tables = ['usage_logs', 'users', 'api_keys', 'settings', 'accounts', 'account_runtime', 'scheduler_pools']
+      namespaces = [
+        'panel',
+        'stats',
+        'stats-filtered',
+        'overview',
+        'logs-summary',
+        'active-sessions',
+        'filter-options',
+        'metrics',
+      ]
+      clearBilling = true
+      clearUsers = true
+      clearGroups = true
+      clearPoolAccess = true
+      clearNamesTable = '*'
+      riskBanKindToClear = 'all'
+    } else if (pathname.startsWith('/api/panel/refusal-session-blocks')) {
+      tables = ['refusal_session_blocks']
+      namespaces = ['panel']
+      riskBanKindToClear = 'session'
+    } else if (pathname.startsWith('/api/panel/refusal-device-blocks')) {
+      tables = ['refusal_device_blocks', 'refusal_session_blocks']
+      namespaces = ['panel']
+      riskBanKindToClear = 'all'
+    } else if (pathname.startsWith('/api/panel/refusal-guards')) {
+      tables = ['refusal_guards', 'settings']
+      namespaces = ['panel']
+      riskBanKindToClear = 'all'
+    } else if (
+      pathname === '/api/panel/routing' ||
+      pathname === '/admin/routing' ||
+      pathname.startsWith('/api/panel/settings') ||
+      pathname.startsWith('/api/panel/model-policy') ||
+      pathname.startsWith('/api/panel/distill') ||
+      pathname.startsWith('/api/panel/refusal-') ||
+      pathname.startsWith('/api/panel/jev-intercept') ||
+      pathname.startsWith('/api/panel/notify') ||
+      pathname === '/api/panel/onboarding'
+    ) {
+      tables = ['settings']
+      namespaces = ['panel']
+    }
+
+    notifyDbTablesMutated(tables)
+    if (clearBilling) requestLog?.repo?.invalidateBillingCache?.()
+    if (namespaces.length) cache.dashboard.invalidateNamespaces(namespaces).catch(() => {})
+    if (tables.includes('settings')) cache.entity.invalidateSettings().catch(() => {})
+    if (clearUsers) cache.entity.invalidateUsers().catch(() => {})
+    if (clearGroups) cache.entity.invalidateGroups().catch(() => {})
+    if (clearPoolAccess) cache.entity.invalidatePoolAccess().catch(() => {})
+    if (riskBanKindToClear === 'session') {
+      invalidateRiskBanCache({ kind: 'session' })
+    } else if (riskBanKindToClear === 'all') {
+      invalidateRiskBanCache()
+    }
+    if (vmIdToClear) {
+      cache.entity.invalidateVmOwner(vmIdToClear).catch(() => {})
+    } else if (tables.includes('vms')) {
+      cache.entity.invalidateVmOwners().catch(() => {})
+    }
+    if (clearNamesTable === '*') {
+      cache.entity.invalidateNames().catch(() => {})
+    } else if (clearNamesTable) {
+      cache.entity.invalidateNames(clearNamesTable).catch(() => {})
+    }
+  }
+
   async function handlePanelInner(req, res, url) {
     const p = url.pathname
     if (!p.startsWith('/admin') && !p.startsWith('/api/panel')) return false
@@ -2448,14 +2672,16 @@ export function createPanelHandler(ctx) {
       }
       if (p.startsWith('/api/panel/cluster/')) return ctx.clusterRoutes.handle(req, res, url)
       if (req.method === 'GET' && p === '/api/panel/database/metrics') {
+        const bypass = url.searchParams.get('refresh') === '1'
         const snapshot = await snapshotDatabaseMetricsAsync({
           db: getDb(),
           dbPath: getDbPath(),
           pgPool: getPgPool(),
           usageCache: getUsageCache(),
           cacheRuntime: getCacheRuntime(),
+          bypass,
         })
-        return json(res, 200, panel.ok(snapshot))
+        return sendCachedJson(req, res, 200, panel.ok(snapshot))
       }
       if (req.method === 'GET' && p === '/api/panel/version') {
         const refresh = ['1', 'true'].includes(String(url.searchParams.get('refresh') || '').toLowerCase())
@@ -2621,20 +2847,63 @@ export function createPanelHandler(ctx) {
         return json(res, 200, { ok: true, deleted: id })
       }
       if (req.method === 'GET' && p === '/api/panel/api-keys') {
-        const snap = apiKeyStore.snapshot()
         const ident = panelIdentity(req)
         const filterOwner = ident.role === 'admin' ? normalizeOwnerId(url.searchParams.get('owner_id')) : null
-        const mine = (snap.keys || []).filter(
-          (key) => panelOwnsKey(req, key) && (!filterOwner || normalizeOwnerId(key.owner_id) === filterOwner),
+        const bypass = url.searchParams.get('refresh') === '1'
+        const payload = await getCacheRuntime().dashboard.getOrSetSWR(
+          'panel',
+          {
+            ep: 'api-keys',
+            scope: cacheScopeOf(apiKeyStore?.db || resolvePanelDb()),
+            delegated: req[INTEGRATION_DELEGATED] === true,
+            apiKeyKind: req.apiKeyKind || null,
+            role: ident.role,
+            panelUserId: normalizeOwnerId(req.panelUserId),
+            filterOwner,
+          },
+          () => {
+            let mine
+            let rawById = null
+            if (typeof apiKeyStore?.repo?.list === 'function') {
+              const rawList = apiKeyStore.repo.list()
+              let vmPoolNames = null
+              const getVmPoolNames = () => {
+                if (vmPoolNames) return vmPoolNames
+                vmPoolNames = new Map()
+                try {
+                  for (const pool of new VmPoolsRepo(apiKeyStore.db).list()) vmPoolNames.set(pool.id, pool.name)
+                } catch {}
+                return vmPoolNames
+              }
+              rawById = new Map()
+              mine = []
+              for (const raw of rawList) {
+                const rec = typeof apiKeyStore._overlayDbRecord === 'function' ? apiKeyStore._overlayDbRecord(raw) : raw
+                if (!panelOwnsKey(req, rec)) continue
+                const view = publicKeyView(rec, { reveal: false })
+                if (filterOwner && normalizeOwnerId(view.owner_id) !== filterOwner) continue
+                view.inflight = apiKeyStore.inflight?.get?.(rec.id) || 0
+                if (view.vm_pool_id) view.vm_pool_name = getVmPoolNames().get(view.vm_pool_id) || null
+                rawById.set(rec.id, rec)
+                mine.push(view)
+              }
+            } else {
+              const snap = apiKeyStore.snapshot()
+              mine = (snap.keys || []).filter(
+                (key) => panelOwnsKey(req, key) && (!filterOwner || normalizeOwnerId(key.owner_id) === filterOwner),
+              )
+            }
+            const enrichedKeys = enrichApiKeyViewsWithPools(apiKeyStore.db, mine, rawById)
+            return {
+              ok: true,
+              total: enrichedKeys.length,
+              active: enrichedKeys.filter((k) => k.status === 'active').length,
+              keys: enrichedKeys,
+            }
+          },
+          { freshTtlMs: 5_000, ttlMs: 15_000, bypass },
         )
-        const rawById = new Map((apiKeyStore.repo?.list?.() || []).map((r) => [r.id, r]))
-        const enrichedKeys = enrichApiKeyViewsWithPools(apiKeyStore.db, mine, rawById)
-        return json(res, 200, {
-          ok: true,
-          total: enrichedKeys.length,
-          active: enrichedKeys.filter((k) => k.status === 'active').length,
-          keys: enrichedKeys,
-        })
+        return sendCachedJson(req, res, 200, payload)
       }
       if (req.method === 'GET' && /^\/api\/panel\/api-keys\/[^/]+\/stats$/.test(p)) {
         const id = p.split('/')[4]
@@ -3355,43 +3624,66 @@ export function createPanelHandler(ctx) {
       if (req.method === 'GET' && p === '/api/panel/request-logs/stats') {
         const u = new URL(req.url, 'http://x')
         const bucket = (u.searchParams.get('bucket') || 'day').toLowerCase() === 'hour' ? 'hour' : 'day'
-        const since = u.searchParams.get('since') || new Date(Date.now() - 7 * 86400_000).toISOString()
+        const rawSince = u.searchParams.get('since')
+        const since = rawSince || new Date(Date.now() - 7 * 86400_000).toISOString()
         const until = u.searchParams.get('until') || null
-        const tenant = panelIdentity(req).role === 'user'
+        const ident = panelIdentity(req)
+        const tenant = ident.role === 'user'
         const owner_user_id = tenant ? req.panelUserId : u.searchParams.get('user_id') || null
-        let totals
-        let buckets
-        let window
-        if (usagePoolEnabled()) {
-          try {
-            const jobs = [
-              usageRead({ kind: 'repo', method: 'aggregate', args: [{ since, until, bucket, owner_user_id }] }),
-              usageRead({ kind: 'repo', method: 'windowStats', args: [{ since, until, owner_user_id }] }),
-            ]
-            if (!tenant) jobs.unshift(usageRead({ kind: 'repo', method: 'totals' }))
-            const out = await Promise.all(jobs)
-            if (tenant) [buckets, window] = out
-            else [totals, buckets, window] = out
-          } catch (err) {
-            console.warn(`[sqlite-pool] repo.stats: ${err?.message || err}`)
-          }
-        }
-        if (buckets === undefined) {
-          totals = tenant ? null : requestLog.totals()
-          buckets = requestLog.aggregate({ since, until, bucket, owner_user_id })
-          window = requestLog.windowStats({ since, until, owner_user_id })
-        }
-        return json(res, 200, {
-          ok: true,
-          bucket,
-          since,
-          until,
-          totals: totals ?? null,
-          buckets,
-          window,
-          muted_error_classes: requestLog.snapshot().muted_error_classes,
-          config: tenant ? null : requestLog.snapshot(),
-        })
+        const bypass = u.searchParams.get('refresh') === '1'
+        const snapCfg = requestLog.snapshot()
+        const payload = await getCacheRuntime().dashboard.getOrSetSWR(
+          'stats',
+          {
+            ep: 'request-logs-stats',
+            scope: cacheScopeOf(requestLog?.repo?.db || resolvePanelDb()),
+            role: ident.role,
+            tenant,
+            owner_user_id: owner_user_id == null ? null : String(owner_user_id),
+            bucket,
+            since: rawSince || 'default_7d',
+            until,
+            muted: snapCfg?.muted_error_classes || [],
+          },
+          async () => {
+            let totals
+            let buckets
+            let window
+            if (usagePoolEnabled()) {
+              try {
+                const jobs = [
+                  usageRead({ kind: 'repo', method: 'aggregate', args: [{ since, until, bucket, owner_user_id }] }),
+                  usageRead({ kind: 'repo', method: 'windowStats', args: [{ since, until, owner_user_id }] }),
+                ]
+                if (!tenant) jobs.unshift(usageRead({ kind: 'repo', method: 'totals' }))
+                const out = await Promise.all(jobs)
+                if (tenant) [buckets, window] = out
+                else [totals, buckets, window] = out
+              } catch (err) {
+                console.warn(`[sqlite-pool] repo.stats: ${err?.message || err}`)
+              }
+            }
+            if (buckets === undefined) {
+              totals = tenant ? null : requestLog.totals()
+              buckets = requestLog.aggregate({ since, until, bucket, owner_user_id })
+              window = requestLog.windowStats({ since, until, owner_user_id })
+            }
+            const curCfg = requestLog.snapshot()
+            return {
+              ok: true,
+              bucket,
+              since,
+              until,
+              totals: totals ?? null,
+              buckets,
+              window,
+              muted_error_classes: curCfg.muted_error_classes,
+              config: tenant ? null : curCfg,
+            }
+          },
+          { freshTtlMs: 15_000, ttlMs: 30_000, bypass },
+        )
+        return sendCachedJson(req, res, 200, payload)
       }
       if (req.method === 'GET' && /^\/api\/panel\/request-logs\/[^/]+\/attempts$/.test(p)) {
         const requestId = p.split('/')[4]
@@ -3428,14 +3720,44 @@ export function createPanelHandler(ctx) {
       const tenantId = () => (panelIdentity(req).role === 'user' ? req.panelUserId : null)
       if (req.method === 'GET' && p === '/api/panel/usage-logs') {
         const u = new URL(req.url, 'http://x')
-        return json(res, 200, panel.ok(await readView('listBatch', usageLogFilters(req, u))))
+        const filters = usageLogFilters(req, u)
+        const view = usageLogsView()
+        const data =
+          typeof view.listBatchAsync === 'function'
+            ? await view.listBatchAsync(filters, { baseLoader: (f) => readView('listBatch', f) })
+            : await readView('listBatch', filters)
+        return json(res, 200, panel.ok(data))
       }
       if (req.method === 'GET' && p === '/api/panel/usage-logs/summary') {
         const u = new URL(req.url, 'http://x')
-        return json(res, 200, panel.ok(await readView('summary', usageLogFilters(req, u))))
+        const filters = usageLogFilters(req, u)
+        const ident = panelIdentity(req)
+        const bypass = u.searchParams.get('refresh') === '1'
+        const snap = await getCacheRuntime().dashboard.getOrLoadSnapshot(
+          'logs-summary',
+          {
+            scope: cacheScopeOf(isDbOpen() ? getDb() : null),
+            role: ident.role,
+            filters,
+            muted: requestLog?.mutedErrorClasses || [],
+          },
+          async () => panel.ok(await readView('summary', filters)),
+          { ttlMs: 15_000, bypass },
+        )
+        return sendCachedJson(req, res, 200, snap.value, { etag: snap.etag, cacheStatus: snap.cacheStatus })
       }
       if (req.method === 'GET' && p === '/api/panel/usage-logs/filter-options') {
-        return json(res, 200, panel.ok(await readView('filterOptions', { owner_user_id: tenantId() })))
+        const u = new URL(req.url, 'http://x')
+        const bypass = u.searchParams.get('refresh') === '1'
+        const view = usageLogsView()
+        const data =
+          typeof view.filterOptionsAsync === 'function'
+            ? await view.filterOptionsAsync(
+                { owner_user_id: tenantId(), bypass },
+                { baseLoader: (o) => readView('filterOptions', o) },
+              )
+            : await readView('filterOptions', { owner_user_id: tenantId() })
+        return json(res, 200, panel.ok(data))
       }
       if (req.method === 'GET' && p === '/api/panel/usage-logs/session-suggestions') {
         const u = new URL(req.url, 'http://x')
@@ -3447,19 +3769,30 @@ export function createPanelHandler(ctx) {
         const u = new URL(req.url, 'http://x')
         const minutes = u.searchParams.get('minutes')
         const limit = u.searchParams.get('limit')
-        return json(res, 200, panel.ok(await readView('activeSessions', { minutes, limit, owner_user_id: tenantId() })))
+        const bypass = u.searchParams.get('refresh') === '1'
+        const view = usageLogsView()
+        const data =
+          typeof view.activeSessionsAsync === 'function'
+            ? await view.activeSessionsAsync(
+                { minutes, limit, owner_user_id: tenantId(), bypass },
+                { baseLoader: (o) => readView('activeSessions', o) },
+              )
+            : await readView('activeSessions', { minutes, limit, owner_user_id: tenantId() })
+        return json(res, 200, panel.ok(data))
       }
       if (req.method === 'GET' && p === '/api/panel/usage-logs/overview') {
         const u = new URL(req.url, 'http://x')
         const tz = u.searchParams.get('tz') || 'UTC'
         const owner = tenantId()
         const bypass = u.searchParams.get('refresh') === '1'
-        const data = await getCacheRuntime().dashboard.getOrLoad(
-          'usage-overview',
-          { tz, owner },
-          () => readView('overview', { tz, owner_user_id: owner }),
-          { bypass },
-        )
+        const view = usageLogsView()
+        const data =
+          typeof view.overviewAsync === 'function'
+            ? await view.overviewAsync(
+                { tz, owner_user_id: owner, bypass },
+                { baseLoader: (o) => readView('overview', o) },
+              )
+            : await readView('overview', { tz, owner_user_id: owner })
         return json(res, 200, panel.ok(data))
       }
 
@@ -3469,16 +3802,35 @@ export function createPanelHandler(ctx) {
         const q = statsParams(req, u, 'dimension')
         if (q.error) return json(res, 400, { ok: false, error: { message: q.error } })
         const { range, dimension, tz, owner_user_id } = q
+        const ident = panelIdentity(req)
         const bypass = u.searchParams.get('refresh') === '1'
-        const data = await getCacheRuntime().dashboard.getOrLoad(
-          'statistics',
-          { range, dimension, tz, owner_user_id },
-          async () =>
+        const cacheKey = {
+          ep: 'statistics',
+          scope: cacheScopeOf(isDbOpen() ? getDb() : null),
+          role: ident.role,
+          range,
+          dimension,
+          tz,
+          owner_user_id: owner_user_id == null ? null : String(owner_user_id),
+        }
+        const load = async () =>
+          panel.ok(
             (await readUsage('stats', 'statistics', [{ range, dimension, tz, owner_user_id }])) ??
-            new StatisticsRepo(getDb()).statistics({ range, dimension, tz, owner_user_id }),
-          { bypass },
-        )
-        return json(res, 200, panel.ok(data))
+              new StatisticsRepo(getDb()).statistics({ range, dimension, tz, owner_user_id }),
+          )
+        if (owner_user_id) {
+          const snap = await getCacheRuntime().dashboard.getOrLoadSnapshot('stats-filtered', cacheKey, load, {
+            ttlMs: 30_000,
+            bypass,
+          })
+          return sendCachedJson(req, res, 200, snap.value, { etag: snap.etag, cacheStatus: snap.cacheStatus })
+        }
+        const payload = await getCacheRuntime().dashboard.getOrSetSWR('stats', cacheKey, load, {
+          freshTtlMs: 15_000,
+          ttlMs: 30_000,
+          bypass,
+        })
+        return sendCachedJson(req, res, 200, payload)
       }
       if (req.method === 'GET' && p === '/api/panel/statistics/leaderboard') {
         const u = new URL(req.url, 'http://x')
@@ -3486,16 +3838,37 @@ export function createPanelHandler(ctx) {
         if (q.error) return json(res, 400, { ok: false, error: { message: q.error } })
         const { range, dimension: scope, tz, owner_user_id } = q
         const limit = u.searchParams.get('limit')
+        const ident = panelIdentity(req)
         const bypass = u.searchParams.get('refresh') === '1'
-        const data = await getCacheRuntime().dashboard.getOrLoad(
-          'statistics-leaderboard',
-          { range, scope, limit, tz, owner_user_id },
-          async () =>
+        const cacheKey = {
+          ep: 'statistics-leaderboard',
+          scope: cacheScopeOf(isDbOpen() ? getDb() : null),
+          role: ident.role,
+          range,
+          lbScope: scope,
+          limit,
+          tz,
+          owner_user_id: owner_user_id == null ? null : String(owner_user_id),
+        }
+        const load = async () =>
+          panel.ok(
             (await readUsage('stats', 'leaderboard', [{ range, scope, limit, tz, owner_user_id }])) ??
-            new StatisticsRepo(getDb()).leaderboard({ range, scope, limit, tz, owner_user_id }),
-          { bypass },
-        )
-        return json(res, 200, panel.ok(data))
+              new StatisticsRepo(getDb()).leaderboard({ range, scope, limit, tz, owner_user_id }),
+          )
+        const customLimit = limit != null && limit !== '' && !['10', '20'].includes(String(limit))
+        if (owner_user_id || customLimit) {
+          const snap = await getCacheRuntime().dashboard.getOrLoadSnapshot('stats-filtered', cacheKey, load, {
+            ttlMs: 30_000,
+            bypass,
+          })
+          return sendCachedJson(req, res, 200, snap.value, { etag: snap.etag, cacheStatus: snap.cacheStatus })
+        }
+        const payload = await getCacheRuntime().dashboard.getOrSetSWR('stats', cacheKey, load, {
+          freshTtlMs: 15_000,
+          ttlMs: 30_000,
+          bypass,
+        })
+        return sendCachedJson(req, res, 200, payload)
       }
 
       if (req.method === 'GET' && p === '/api/panel/billing') {
@@ -3505,7 +3878,29 @@ export function createPanelHandler(ctx) {
         const groupBy = u.searchParams.get('group_by') === 'key' ? 'key' : 'vm'
         const since = u.searchParams.get('from') || u.searchParams.get('since') || null
         const until = u.searchParams.get('until') || null
-        return json(res, 200, panel.ok(requestLog.ownerBilling({ ownerUserId, since, until, groupBy })))
+        const bypass = u.searchParams.get('refresh') === '1'
+        let data
+        if (typeof requestLog?.ownerBillingAsync === 'function') {
+          data = await requestLog.ownerBillingAsync({ ownerUserId, since, until, groupBy, bypass })
+        } else if (typeof requestLog?.repo?.ownerBillingAsync === 'function') {
+          data = await requestLog.repo.ownerBillingAsync({ ownerUserId, since, until, groupBy, bypass })
+        } else {
+          data = await getCacheRuntime().dashboard.getOrSetSWR(
+            'stats',
+            {
+              ep: 'billing',
+              scope: cacheScopeOf(requestLog?.repo?.db || resolvePanelDb()),
+              role: ident.role,
+              ownerUserId: ownerUserId == null ? null : String(ownerUserId),
+              groupBy,
+              since,
+              until,
+            },
+            () => requestLog.ownerBilling({ ownerUserId, since, until, groupBy }),
+            { freshTtlMs: 15_000, ttlMs: 60_000, bypass },
+          )
+        }
+        return sendCachedJson(req, res, 200, panel.ok(data))
       }
 
       // ---- Backups (local auto/manual, download, restore) ----
@@ -3604,45 +3999,80 @@ export function createPanelHandler(ctx) {
 
       // GET /api/panel/dashboard
       if (req.method === 'GET' && p === '/api/panel/dashboard') {
-        return json(
-          res,
-          200,
-          await panel.buildDashboard({
-            cfg,
-            accountQuota,
-            stickyRouter,
-            routingConfig: ctx.routingConfig,
-            stats,
-            requestLog,
-            poolScheduler: ctx.poolScheduler,
-            proxyPool,
-            clusterNodes: clusterNodesOf(ctx),
-          }),
+        const ident = panelIdentity(req)
+        const bypass = url.searchParams.get('refresh') === '1'
+        const payload = await getCacheRuntime().dashboard.getOrSetSWR(
+          'panel',
+          {
+            ep: 'dashboard',
+            scope: cacheScopeOf(requestLog?.repo?.db || resolvePanelDb()),
+            project: cfg?.paths?.project || null,
+            role: ident.role,
+          },
+          () =>
+            panel.buildDashboard({
+              cfg,
+              accountQuota,
+              stickyRouter,
+              routingConfig: ctx.routingConfig,
+              stats,
+              requestLog,
+              poolScheduler: ctx.poolScheduler,
+              proxyPool,
+              clusterNodes: clusterNodesOf(ctx),
+              bypass,
+            }),
+          { freshTtlMs: 5_000, ttlMs: 15_000, bypass },
         )
+        return sendCachedJson(req, res, 200, payload)
       }
       if (req.method === 'GET' && p === '/api/panel/vms') {
         const ident = panelIdentity(req)
+        const ownerUserId = ident.role === 'user' ? req.panelUserId : null
         const filterOwner = ident.role === 'admin' ? normalizeOwnerId(url.searchParams.get('owner_user_id')) : null
-        const built = await panel.buildVmList({
-          cfg,
-          accountQuota,
-          routingConfig: ctx.routingConfig,
-          poolScheduler: ctx.poolScheduler,
-          proxyPool,
-          requestLog,
-          role: ident.role,
-          ownerUserId: ident.role === 'user' ? req.panelUserId : null,
-          clusterNodes: clusterNodesOf(ctx),
-        })
-        if (filterOwner && built?.data) {
-          if (Array.isArray(built.data.items)) {
-            built.data.items = built.data.items.filter((v) => vmOwnerId(v) === filterOwner)
-          }
-          if (Array.isArray(built.data.vms)) {
-            built.data.vms = built.data.vms.filter((v) => vmOwnerId(v) === filterOwner)
-          }
-        }
-        return json(res, 200, built)
+        const bypass = url.searchParams.get('refresh') === '1'
+        const payload = await getCacheRuntime().dashboard.getOrSetSWR(
+          'panel',
+          {
+            ep: 'vms',
+            scope: cacheScopeOf(requestLog?.repo?.db || resolvePanelDb()),
+            project: cfg?.paths?.project || null,
+            role: ident.role,
+            ownerUserId: normalizeOwnerId(ownerUserId),
+            filterOwner,
+          },
+          async () => {
+            const built = await panel.buildVmList({
+              cfg,
+              accountQuota,
+              routingConfig: ctx.routingConfig,
+              poolScheduler: ctx.poolScheduler,
+              proxyPool,
+              requestLog,
+              role: ident.role,
+              ownerUserId,
+              clusterNodes: clusterNodesOf(ctx),
+              bypass,
+            })
+            if (filterOwner && built?.data) {
+              return {
+                ...built,
+                data: {
+                  ...built.data,
+                  ...(Array.isArray(built.data.items)
+                    ? { items: built.data.items.filter((v) => vmOwnerId(v) === filterOwner) }
+                    : {}),
+                  ...(Array.isArray(built.data.vms)
+                    ? { vms: built.data.vms.filter((v) => vmOwnerId(v) === filterOwner) }
+                    : {}),
+                },
+              }
+            }
+            return built
+          },
+          { freshTtlMs: 5_000, ttlMs: 15_000, bypass },
+        )
+        return sendCachedJson(req, res, 200, payload)
       }
       // GET /api/panel/pool/stream — live seat / queue snapshots (SSE over fetch).
       if (req.method === 'GET' && p === '/api/panel/pool/stream') {
@@ -4537,6 +4967,7 @@ export function createPanelHandler(ctx) {
       if (req.method === 'GET' && /^\/api\/panel\/vms\/[^/]+$/.test(p)) {
         const id = p.split('/').pop()
         const ident = panelIdentity(req)
+        const bypass = url.searchParams.get('refresh') === '1'
         const result = await panel.buildVmDetail({
           cfg,
           accountQuota,
@@ -4548,6 +4979,7 @@ export function createPanelHandler(ctx) {
           kernelHealth: panelKernelHealth,
           clusterNodes: clusterNodesOf(ctx),
           role: ident.role,
+          bypass,
         })
         if (result.status) return json(res, result.status, result.body)
         return json(res, 200, result)
@@ -5196,6 +5628,7 @@ export function createPanelHandler(ctx) {
           baseUrl: `http://127.0.0.1:${cfg.port}`,
           apiKey: cfg.api_key,
           accountQuota,
+          nodePenalty: ctx.poolScheduler?.nodePenalties?.()?.get(id) || null,
         })
         return json(res, 200, panel.ok(result))
       }
@@ -7457,7 +7890,20 @@ export function createPanelHandler(ctx) {
       }
       // GET /api/panel/usage
       if (req.method === 'GET' && p === '/api/panel/usage') {
-        return json(res, 200, panel.buildUsage({ accountQuota, cfg, requestLog }))
+        const ident = panelIdentity(req)
+        const bypass = url.searchParams.get('refresh') === '1'
+        const payload = await getCacheRuntime().dashboard.getOrSetSWR(
+          'panel',
+          {
+            ep: 'usage',
+            scope: cacheScopeOf(requestLog?.repo?.db || resolvePanelDb()),
+            project: cfg?.paths?.project || null,
+            role: ident.role,
+          },
+          () => panel.buildUsageAsync({ accountQuota, cfg, requestLog, bypass }),
+          { freshTtlMs: 5_000, ttlMs: 15_000, bypass },
+        )
+        return sendCachedJson(req, res, 200, payload)
       }
       // GET /api/panel/models
       if (req.method === 'GET' && p === '/api/panel/models') {
@@ -7714,6 +8160,10 @@ export function createPanelHandler(ctx) {
           resolveGeminiProxy: (proxyId, envId) => {
             const ownerUserId = ctx.geminiOwnersRepo?.getOwner?.(envId) ?? null
             return geminiProxyFor(ctx.proxyPool, proxyId, { ownerUserId })
+          },
+          resolveGeminiProxyEgressOptions: (proxyId, envId) => {
+            const ownerUserId = ctx.geminiOwnersRepo?.getOwner?.(envId) ?? null
+            return geminiProxyEgressOptionsFor(ctx.proxyPool, proxyId, { ownerUserId })
           },
           apiEndpointStore: ctx.apiEndpointStore,
           cfg,
@@ -8643,8 +9093,12 @@ export function createPanelHandler(ctx) {
 
   return async function handlePanel(req, res, url) {
     const out = await handlePanelInner(req, res, url)
-    if (out !== false && shouldSyncSchedulerOnMutation(req.method, url.pathname) && (res.statusCode || 200) < 400) {
-      notifySchedulerConfigChanged(`${req.method}:${url.pathname}`)
+    const status = res?.[PANEL_STATUS_SYM] ?? res?.statusCode ?? 200
+    if (out !== false && status < 400) {
+      invalidateCachesForPanelMutation(req.method, url.pathname)
+      if (shouldSyncSchedulerOnMutation(req.method, url.pathname)) {
+        notifySchedulerConfigChanged(`${req.method}:${url.pathname}`)
+      }
     }
     return out
   }

@@ -1235,11 +1235,15 @@ export function applyClaudeSSELineToMessage(line, state) {
   if (evt.type === 'content_block_stop') {
     const idx = Number.isInteger(evt.index) ? evt.index : 0
     const block = message.content[idx]
-    if (block && typeof block._inputJson === 'string' && block._inputJson) {
-      try {
-        block.input = JSON.parse(block._inputJson)
-      } catch {
-        block.input = block.input || {}
+    if (block && typeof block._inputJson === 'string') {
+      if (block._inputJson) {
+        try {
+          block.input = JSON.parse(block._inputJson)
+        } catch {
+          block.input = block.input || {}
+        }
+      } else if (!block.input || typeof block.input !== 'object' || Array.isArray(block.input)) {
+        block.input = {}
       }
       delete block._inputJson
     }

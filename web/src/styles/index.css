@@ -249,13 +249,88 @@
   animation: countdown-shrink linear both;
 }
 
+/* ── 系统提示词页动效配置 ──────────────────────────────────────────
+   Operate 面：滑动指示器 + 层叠预览入场 + 按需展开手风琴。
+   所有位移 ≤6px，统一 --ease-out-expo；降噪偏好下仅保留状态切换，不位移。 */
+@keyframes prompt-pane-in {
+  from {
+    opacity: 0;
+    transform: translateY(5px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+.animate-prompt-pane-in {
+  animation: prompt-pane-in 200ms var(--ease-out-expo) both;
+}
+
+@keyframes prompt-layer-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+.animate-prompt-layer-in {
+  animation: prompt-layer-in 190ms var(--ease-out-expo) both;
+}
+
+@keyframes prompt-json-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+.animate-prompt-json-in {
+  animation: prompt-json-in 220ms var(--ease-out-expo) both;
+}
+
+.prompt-sliding-thumb {
+  transition: none;
+}
+.prompt-sliding-thumb[data-animate='true'] {
+  transition:
+    transform 220ms var(--ease-out-expo),
+    opacity 150ms ease-out;
+}
+
+.prompt-accordion {
+  display: grid;
+  grid-template-rows: 0fr;
+  transition: grid-template-rows 220ms var(--ease-out-expo);
+}
+.prompt-accordion[data-open='true'] {
+  grid-template-rows: 1fr;
+}
+.prompt-accordion-inner {
+  overflow: hidden;
+  min-height: 0;
+}
+
 @media (prefers-reduced-motion: reduce) {
   /* 保留「出现」这个状态事实，去掉位移。opacity 直达终值。 */
   .animate-settings-pane-in,
   .animate-save-bar-in,
   .animate-seat-rise,
-  .animate-countdown-shrink {
+  .animate-countdown-shrink,
+  .animate-prompt-pane-in,
+  .animate-prompt-layer-in,
+  .animate-prompt-json-in {
     animation: none;
+  }
+  .prompt-sliding-thumb,
+  .prompt-sliding-thumb[data-animate='true'],
+  .prompt-accordion {
+    transition-duration: 0.01ms !important;
   }
 }
 

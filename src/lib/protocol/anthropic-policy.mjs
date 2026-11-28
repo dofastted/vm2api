@@ -770,6 +770,19 @@ export function scrubUpstreamClientBody(
   const declared = new Set(
     !preserveToolNames && Array.isArray(out.tools) ? out.tools.map((tool) => tool?.name).filter(Boolean) : [],
   )
+  if (Array.isArray(out.messages)) {
+    for (const message of out.messages) {
+      if (!Array.isArray(message?.content)) continue
+      for (const block of message.content) {
+        const def =
+          block?.type === 'tool_addition' && block.tool?.type === 'tool_definition' ? block.tool.definition : null
+        if (def && typeof def === 'object' && !Array.isArray(def) && typeof def.name === 'string' && def.name) {
+          if (!toolByName.has(def.name)) toolByName.set(def.name, def)
+          if (!preserveToolNames) declared.add(def.name)
+        }
+      }
+    }
+  }
   const rename = (name, toolObj = null) => {
     if (preserveToolNames) return name
     if (assigned.has(name)) return assigned.get(name)
@@ -804,14 +817,14 @@ export function scrubUpstreamClientBody(
       return next
     })
   }
-  if (out.tool_choice && typeof out.tool_choice === 'object' && typeof out.tool_choice.name === 'string') {
-    const name = assigned.get(out.tool_choice.name)
-    if (name !== undefined && name !== out.tool_choice.name) out.tool_choice = { ...out.tool_choice, name }
-  }
   if (Array.isArray(out.messages)) {
     out.messages = out.messages.map((message) =>
       preserveToolNames && message?.role !== 'system' ? message : scrubMessage(message, rename),
     )
+  }
+  if (out.tool_choice && typeof out.tool_choice === 'object' && typeof out.tool_choice.name === 'string') {
+    const name = assigned.get(out.tool_choice.name)
+    if (name !== undefined && name !== out.tool_choice.name) out.tool_choice = { ...out.tool_choice, name }
   }
   return { body: out, reverse }
 }
@@ -828,6 +841,36 @@ function scrubTextBlock(block) {
 
 function scrubToolReferenceFields(block, rename) {
   if (!block || typeof block !== 'object') return { block, changed: false }
+  if (
+    block.type === 'tool_addition' &&
+    block.tool?.type === 'tool_definition' &&
+    block.tool.definition &&
+    typeof block.tool.definition === 'object' &&
+    !Array.isArray(block.tool.definition) &&
+    !isAnthropicServerTool(block.tool.definition)
+  ) {
+    const def = block.tool.definition
+    let nextDef = def
+    let defChanged = false
+    if (typeof def.name === 'string') {
+      const name = rename(def.name, def)
+      if (name !== def.name) {
+        nextDef = { ...nextDef, name }
+        defChanged = true
+      }
+    }
+    if (typeof def.description === 'string') {
+      const description = scrubClientProse(def.description, { includeThirdPartyBrands: true })
+      if (description !== def.description) {
+        nextDef = { ...nextDef, description }
+        defChanged = true
+      }
+    }
+    if (defChanged) {
+      return { block: { ...block, tool: { ...block.tool, definition: nextDef } }, changed: true }
+    }
+    return { block, changed: false }
+  }
   if (
     (block.type === 'tool_addition' || block.type === 'tool_removal') &&
     block.tool?.type === 'tool_reference' &&

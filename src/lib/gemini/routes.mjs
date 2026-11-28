@@ -40,6 +40,8 @@ import { createGeminiSlotPrefs, parseGeminiDisplayName, parseGeminiScheduleLevel
 import { resolveCragGeminiPromptPolicy } from './system-prompt.mjs'
 import { configuredDnsUpstream, proxyDnsEmptyTypes } from '../vm/egress.mjs'
 import { compileWithProtoFront, protoFrontMode } from '../transport/proto-front-client.mjs'
+import { resolveAuditSessionIdentity, riskPrincipal } from '../core/refusal-guard.mjs'
+import { observeUpstreamRisk } from '../protocol/intercept-gate.mjs'
 import {
   clientBlockErrorOf,
   isTrustedGateDecision,
@@ -896,7 +898,12 @@ function proxyRecordFor(proxyPool, proxyId, ownerUserId = null) {
 
 function proxyEgressOptionsFor(proxyPool, proxyId, { ownerUserId = null } = {}) {
   if (!proxyPool || !validId(proxyId)) return null
-  const proxy = proxyRecordFor(proxyPool, proxyId, ownerUserId)
+  const targetOwner = normalizeOwnerId(ownerUserId)
+  const proxy = proxyRecordFor(proxyPool, proxyId, targetOwner)
+  if (!proxy) return null
+  const pOwner = normalizeOwnerId(proxy.owner_user_id)
+  const ownerAllowed = targetOwner ? !pOwner || pOwner === targetOwner : !pOwner
+  if (!ownerAllowed) return null
   const withAuth = proxyPool.getProxyByIdWithAuth?.(proxyId) || null
   const opts = {}
   if (proxy?.domain_forward === true || withAuth?.domain_forward === true) {
@@ -1013,7 +1020,12 @@ export const callGeminiHostStream = (operation, payload, options) =>
  * for all authorized, licensed OAuth environments so inference starts hot and recovers
  * automatically after control-plane or gemini-host restarts.
  */
-export async function warmGeminiEnvironments({ callHost = callGeminiHost, proxyPool, environmentIds = null } = {}) {
+export async function warmGeminiEnvironments({
+  callHost = callGeminiHost,
+  proxyPool,
+  geminiOwnersRepo = null,
+  environmentIds = null,
+} = {}) {
   const report = { warmed: 0, warming: 0, skipped: 0 }
   let view
   try {
@@ -1049,15 +1061,16 @@ export async function warmGeminiEnvironments({ callHost = callGeminiHost, proxyP
       report.warmed += 1
       continue
     }
+    const ownerUserId = geminiOwnersRepo?.getOwner ? normalizeOwnerId(geminiOwnersRepo.getOwner(env.id)) : null
     let proxyUrl
     try {
-      proxyUrl = proxyFor(pool, env.proxy_id)
+      proxyUrl = proxyFor(pool, env.proxy_id, { ownerUserId })
     } catch {
       report.skipped += 1
       continue
     }
     const proxySha256 = crypto.createHash('sha256').update(proxyUrl).digest('hex')
-    const egressOptions = proxyEgressOptionsFor(pool, env.proxy_id)
+    const egressOptions = proxyEgressOptionsFor(pool, env.proxy_id, { ownerUserId })
     try {
       const res = await callHost('warm', {
         id: env.id,
@@ -1226,7 +1239,7 @@ export async function checkGeminiAccounts({
   return report
 }
 
-export function createGeminiTerminal({ proxyPool, callHost = callGeminiHost }) {
+export function createGeminiTerminal({ proxyPool, geminiOwnersRepo = null, callHost = callGeminiHost }) {
   return createGeminiTerminalBridge({
     callHost,
     async resolveTarget(id) {
@@ -1244,11 +1257,12 @@ export function createGeminiTerminal({ proxyPool, callHost = callGeminiHost }) {
       if (typeof environment.proxy_id !== 'string' || !ID.test(environment.proxy_id)) {
         throw hostError('gemini_proxy_unavailable', 409)
       }
+      const ownerUserId = geminiOwnersRepo?.getOwner ? normalizeOwnerId(geminiOwnersRepo.getOwner(id)) : null
       const pool = proxyPool()
-      const egressOptions = proxyEgressOptionsFor(pool, environment.proxy_id)
+      const egressOptions = proxyEgressOptionsFor(pool, environment.proxy_id, { ownerUserId })
       return {
         proxy_id: environment.proxy_id,
-        proxy_url: proxyFor(pool, environment.proxy_id),
+        proxy_url: proxyFor(pool, environment.proxy_id, { ownerUserId }),
         ...(egressOptions ? { egress_options: egressOptions } : {}),
       }
     },
@@ -2730,10 +2744,20 @@ export function createGeminiPublicHandler({
 
     // Bypasses #1-#4 closed: every public Gemini inference call must clear the
     // unified pre-dispatch JEV gate BEFORE any Gemini account/slot reservation.
+    const geminiRiskState = resolveRiskRepos({ settings, refusalGuards, refusalDevices, refusalSessions })
+    const baseGeminiIdentity = resolveAuditSessionIdentity({
+      inbound: body,
+      body,
+      headers: req.headers,
+      principal: riskPrincipal(req),
+    })
+    const geminiIdentity =
+      !baseGeminiIdentity.sessionId && stickyHeader
+        ? { ...baseGeminiIdentity, sessionId: stickyHeader }
+        : baseGeminiIdentity
     const existingDecision = preDispatchDecision || req._preDispatchDecision || null
     let gateDecision = isTrustedGateDecision(existingDecision) ? existingDecision : null
     if (!gateDecision) {
-      const riskState = resolveRiskRepos({ settings, refusalGuards, refusalDevices, refusalSessions })
       const preDispatchInput = {
         req,
         inbound: body,
@@ -2742,12 +2766,13 @@ export function createGeminiPublicHandler({
             ? { ...body, model: targetModel }
             : body,
         headers: req.headers,
+        identity: geminiIdentity,
         distillRules: cfg?.distill,
-        policy: riskState.policy,
+        policy: geminiRiskState.policy,
         settings,
-        repo: riskState.repo,
-        devices: riskState.devices,
-        sessions: riskState.sessions,
+        repo: geminiRiskState.repo,
+        devices: geminiRiskState.devices,
+        sessions: geminiRiskState.sessions,
         requestId: activeLogCtx?.request_id || '',
         poolJevProfile:
           poolAccess.effectivePool?.jev_profile || req.poolJevProfile || req.apiKeyRecord?.jev_profile || null,
@@ -2776,6 +2801,7 @@ export function createGeminiPublicHandler({
       const retryAfter = gateDecision.retry_after_sec || gateDecision.error?.retryAfterSec
       if (retryAfter) res.setHeader?.('Retry-After', String(retryAfter))
       const clientErr = clientBlockErrorOf(gateDecision)
+      if (clientErr.details?.retryable === false) res.setHeader?.('x-should-retry', 'false')
       return respondJson(
         clientErr.status,
         protocolErrorBody(protocol, clientErr.status, clientErr.code, clientErr.message, clientErr.details),
@@ -2957,6 +2983,32 @@ export function createGeminiPublicHandler({
       }
     }
 
+    const observeGeminiError = (error) => {
+      if (!error || controller.signal.aborted) return
+      const upstreamStatus = Number(error.upstreamStatus) || 0
+      if (upstreamStatus !== 400) return
+      observeUpstreamRisk({
+        ...geminiRiskState,
+        inbound: body,
+        body,
+        headers: req.headers,
+        identity: geminiIdentity,
+        result: {
+          ok: false,
+          status: upstreamStatus,
+          upstreamStatus,
+          body: {
+            error: {
+              code: typeof error.code === 'string' ? error.code : 'gemini_upstream_error',
+              message: String(error.message || ''),
+            },
+          },
+        },
+        logBag,
+        requestId: activeLogCtx?.request_id || '',
+      })
+    }
+
     const inboundIdentity = resolveSchedulerIdentity({
       inbound: body,
       headers: req.headers,
@@ -3042,6 +3094,7 @@ export function createGeminiPublicHandler({
           finishOwnLog(499)
           return
         }
+        observeGeminiError(error)
         const mapped = publicError(error)
         logBag.error_code = mapped.body.error.code
         logBag.error_message = mapped.body.error.message
@@ -3237,6 +3290,7 @@ export function createGeminiPublicHandler({
         finishOwnLog(499)
         return
       }
+      observeGeminiError(error)
       const mapped = publicError(error)
       logBag.error_code = mapped.body.error.code
       logBag.error_message = mapped.body.error.message

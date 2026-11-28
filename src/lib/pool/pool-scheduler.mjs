@@ -28,7 +28,7 @@ import { isCodexVm } from '../vm/vm-kind.mjs'
 import { setResetPriorityEnabled } from './credential-weight.mjs'
 import { PLATFORM_SCOPE } from '../admin/resource-owner.mjs'
 import { rustKernelBusy } from '../transport/rust-kernel-client.mjs'
-import { resolveSessionSlots } from '../vm/slot-engine.mjs'
+import { activeCragManifestForSlot, resolveKernelDataplane, resolveSessionSlots } from '../vm/slot-engine.mjs'
 import { vmNodeDataPath } from '../cluster/placement.mjs'
 import { GATE_DIAL_TIMEOUT_MS } from '../cluster/direct-link.mjs'
 import { KernelLeaseStats, normalizeKernelLeaseMode } from './kernel-lease.mjs'
@@ -46,8 +46,6 @@ const WAIT_TIMEOUT_MAX_MS = 120000
 
 export const QUEUE_MAX_MIN = 1
 export const QUEUE_MAX_MAX = 999
-export const SEAT_GRACE_MAX_MS = 120000
-export const SEAT_BUDGET_RESERVE_MAX = 0.5
 export const CIRCUIT_THRESHOLD_MAX = 20
 export const CIRCUIT_OPEN_MIN_MS = 1000
 
@@ -57,21 +55,16 @@ export const DEFAULT_POOL_ROUTING = Object.freeze({
   max_primary_sessions: null,
   max_subagents_per_session: null,
   queue_max: 50,
-  seat_grace_ms: 30000,
-  seat_budget_reserve_pct: 0.02,
   fallback_wait_timeout_ms: 30000,
-  sticky_wait_timeout_ms: 45000,
   circuit_failure_threshold: 3,
   circuit_open_ms: 30000,
   session_affinity_first: false,
   fresh_account_isolation_ms: 0,
-  kernel_lease_queue_grace_ms: 5000,
 })
 
 const DEFAULT_CONFIG = {
   ...DEFAULT_POOL_ROUTING,
   worker_health_ttl_ms: 5000,
-  heartbeat_stale_ms: 15000,
   fable_max_per_account: 4,
   default_max_per_account: 2,
 }
@@ -115,25 +108,7 @@ export function normalizePoolRouting(pool = {}) {
   next.keep_pin_on_model_gate = next.keep_pin_on_model_gate === true
   next.reset_priority = next.reset_priority !== false
   next.kernel_lease = normalizeKernelLeaseMode(next.kernel_lease)
-  next.kernel_lease_queue_grace_ms = clampNumber(
-    next.kernel_lease_queue_grace_ms,
-    DEFAULT_POOL_ROUTING.kernel_lease_queue_grace_ms,
-    0,
-    WAIT_TIMEOUT_MAX_MS,
-  )
   next.queue_max = clampNumber(next.queue_max, DEFAULT_POOL_ROUTING.queue_max, QUEUE_MAX_MIN, QUEUE_MAX_MAX)
-  next.seat_grace_ms = clampNumber(next.seat_grace_ms, DEFAULT_POOL_ROUTING.seat_grace_ms, 0, SEAT_GRACE_MAX_MS)
-  next.seat_budget_reserve_pct = clampNumber(
-    next.seat_budget_reserve_pct,
-    DEFAULT_POOL_ROUTING.seat_budget_reserve_pct,
-    0,
-    SEAT_BUDGET_RESERVE_MAX,
-    { round: false },
-  )
-  next.sticky_wait_timeout_ms = clampWaitTimeoutMs(
-    next.sticky_wait_timeout_ms,
-    DEFAULT_POOL_ROUTING.sticky_wait_timeout_ms,
-  )
   next.fallback_wait_timeout_ms = clampWaitTimeoutMs(
     next.fallback_wait_timeout_ms,
     DEFAULT_POOL_ROUTING.fallback_wait_timeout_ms,
@@ -321,8 +296,11 @@ function maxConcurrencyOf(vm, fallback = 2) {
   return parseConcurrency(vm?.policy?.maxConcurrency, fallback)
 }
 
-function seatCapOf(vm, fallback = 20) {
-  return Math.min(resolveSessionSlots(vm, { inference: { session_slots: fallback } }), effectiveSlotCount(vm))
+export function seatCapOf(vm, fallback = 20, options = null, routing = undefined) {
+  return Math.min(
+    resolveSessionSlots(vm, { inference: { session_slots: fallback } }),
+    effectiveSlotCount(vm, routing, options),
+  )
 }
 
 export function familyLimitsOf(vm, pool = {}, physical = seatCapOf(vm, pool.default_session_slots)) {
@@ -381,6 +359,29 @@ function makeAbortError(message = 'Selection cancelled') {
   return Object.assign(new Error(message), { code: 'selection_cancelled' })
 }
 
+const DEFAULT_HEARTBEAT_QUIET_WINDOW_MS = 15_000
+
+function heartbeatFingerprint(update) {
+  const ws = update?.worker_status || {}
+  const cred = ws?.credential || {}
+  return JSON.stringify([
+    update?.vm_id || null,
+    update?.status || null,
+    Number(update?.credential_generation) || 0,
+    update?.refresh_status || null,
+    ws?.ok ?? null,
+    ws?.engine || null,
+    ws?.worker_version || null,
+    ws?.runtime_variant || null,
+    ws?.dataplane || null,
+    ws?.last_error || ws?.error || null,
+    cred?.has_access ?? null,
+    cred?.has_refresh ?? null,
+    cred?.expires_at || null,
+    cred?.credential_state || null,
+  ])
+}
+
 function allowedClaudeNodeKeysFromScope(keyScope) {
   if (!keyScope || typeof keyScope !== 'object') return undefined
   if (Array.isArray(keyScope.allowed_vms) && keyScope.allowed_vms.length > 0) {
@@ -427,8 +428,16 @@ export class PoolScheduler extends EventEmitter {
     this.kernelLeaseStats = new KernelLeaseStats()
     this.changePending = false
     this.healthCache = new Map()
+    // 238 `node_offline`: last probe could not reach the worker. Read by the
+    // scheduler telemetry batch so the 2s push does not undo the exclusion.
+    this.workerUnreachable = new Map()
     this.healthFlights = new Map()
     this.healthWrites = new Map()
+    this._lastWrittenHeartbeats = new Map() // accountId -> { fingerprint, at }
+    this.heartbeatQuietWindowMs =
+      config?.heartbeat_quiet_window_ms !== undefined
+        ? Math.max(0, Number(config.heartbeat_quiet_window_ms) || 0)
+        : DEFAULT_HEARTBEAT_QUIET_WINDOW_MS
     this.maintenanceTimer = null
     this.maintenanceFlight = null
     this.maintenanceStopped = false
@@ -449,6 +458,35 @@ export class PoolScheduler extends EventEmitter {
       })
     }
     return rt
+  }
+
+  capacityOptionsForVm(vm, routing = null) {
+    if (!vm) return null
+    const cached = this.healthCache?.get?.(vm.id)?.value
+    const healthCaps = cached?.capabilities || cached?.worker_status?.capabilities
+    if (Array.isArray(healthCaps) && healthCaps.length) return { capabilities: healthCaps }
+    if (cached?.transport === 'headless_bridge') return { headlessBridge: true }
+    const effectiveRouting =
+      routing && typeof routing === 'object'
+        ? routing
+        : typeof this.getRouting === 'function'
+          ? this.getRouting() || {}
+          : {}
+    if (
+      this.projectRoot &&
+      (resolveKernelDataplane(vm, effectiveRouting) === 'crag' ||
+        vm.kernel_installation?.kernel === 'crag' ||
+        vm.runtime?.runtime_variant === 'crag-v2')
+    ) {
+      const manifest = activeCragManifestForSlot(this.projectRoot, vm, vmCliHomePath(this.projectRoot, vm.id))
+      if (manifest?.capabilities) return { capabilities: manifest.capabilities }
+    }
+    return null
+  }
+
+  seatCapForVm(vm) {
+    const routing = typeof this.getRouting === 'function' ? this.getRouting() || {} : {}
+    return seatCapOf(vm, this.config.default_session_slots, this.capacityOptionsForVm(vm, routing), routing)
   }
 
   executionContext(vm, accountId) {
@@ -741,6 +779,7 @@ export class PoolScheduler extends EventEmitter {
       (dataPath === 'ssh' && value?.status === 0 && value.ok !== true)
     ) {
       if (this.healthCache.get(exec.vmId)?.dataPath === dataPath) this.healthCache.delete(exec.vmId)
+      this.workerUnreachable.set(exec.vmId, { at: Date.now(), dataPath })
       this.schedulerRuntime?.enqueueTelemetry?.([
         {
           node_key: formatNodeKey('claude_vm', exec.vmId),
@@ -791,6 +830,7 @@ export class PoolScheduler extends EventEmitter {
         }
       }
     }
+    this.workerUnreachable.delete(exec.vmId)
     this.healthCache.set(exec.vmId, {
       at: Date.now(),
       value,
@@ -834,8 +874,17 @@ export class PoolScheduler extends EventEmitter {
 
   async flushHealthWrites() {
     if (this.maintenanceStopped || !this.runtimeRepo) return
+    const quietMs = Math.max(0, Number(this.heartbeatQuietWindowMs) || 0)
     for (const [accountId, update] of this.healthWrites) {
+      const fp = heartbeatFingerprint(update)
+      const now = Number(update?.worker_heartbeat_at) || Date.now()
+      const prev = this._lastWrittenHeartbeats.get(accountId)
+      if (quietMs > 0 && prev && prev.fingerprint === fp && now - prev.at < quietMs) {
+        if (this.healthWrites.get(accountId) === update) this.healthWrites.delete(accountId)
+        continue
+      }
       await this.runtimeRepo.writeHeartbeat(update)
+      this._lastWrittenHeartbeats.set(accountId, { fingerprint: fp, at: now })
       if (this.healthWrites.get(accountId) === update) this.healthWrites.delete(accountId)
     }
   }
@@ -870,6 +919,7 @@ export class PoolScheduler extends EventEmitter {
     const ids = [...new Set([accountId, vmId].filter(Boolean))]
     let cleared = false
     for (const id of ids) {
+      this._lastWrittenHeartbeats.delete(id)
       try {
         if (this.runtimeRepo?.clearAuthCooldown?.(id, { vmId })) cleared = true
       } catch {}
@@ -885,6 +935,7 @@ export class PoolScheduler extends EventEmitter {
     const ids = [...new Set([accountId, vmId].filter(Boolean))]
     let cleared = false
     for (const id of ids) {
+      this._lastWrittenHeartbeats.delete(id)
       try {
         if (this.runtimeRepo?.clearGrantRevokeCooldown?.(id, { vmId })) cleared = true
       } catch {}
@@ -901,6 +952,11 @@ export class PoolScheduler extends EventEmitter {
     if (!vmId || !this.schedulerRuntime?.unrestNode) return false
     void this.schedulerRuntime.unrestNode(formatNodeKey('claude_vm', vmId)).catch(() => {})
     return true
+  }
+
+  /** Rust `node_cooldown` of Claude slots by vm id (see SchedulerRuntime#activeNodePenalties). */
+  nodePenalties(nowMs = Date.now()) {
+    return this.schedulerRuntime?.activeNodePenalties?.(nowMs) || new Map()
   }
 
   releaseSticky(bound, stickyKey, stickyKeys) {
@@ -1013,6 +1069,7 @@ export class PoolScheduler extends EventEmitter {
   }
 
   markCooldown(candidate, { until, reason, model = null, status = 'cooldown' } = {}) {
+    if (candidate?.accountId) this._lastWrittenHeartbeats.delete(candidate.accountId)
     this.runtimeRepo?.markCooldown?.(candidate.accountId, {
       vmId: candidate.vmId,
       until,
@@ -1196,7 +1253,7 @@ export class PoolScheduler extends EventEmitter {
       let limits = null
       try {
         const vm = this.projectRoot ? getVm(this.projectRoot, vmId) : null
-        limits = vm ? familyLimitsOf(vm, this.config) : null
+        limits = vm ? familyLimitsOf(vm, this.config, this.seatCapForVm(vm)) : null
       } catch {}
       seats[vmId] = {
         seats_used: count,

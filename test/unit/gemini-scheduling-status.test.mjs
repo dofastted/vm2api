@@ -399,6 +399,57 @@ test('Req 3: All Gemini accounts unschedulable returns HTTP 429 High Load (gemin
   assert.ok(Number(headers['retry-after']) >= 1)
 })
 
+test('Req 3b (#2049): a 502 mark ages out, so the same healthy account serves again instead of gemini_pool_overloaded', async () => {
+  const envs = [makeEnv('env-a')]
+  const clock = { t: Date.parse('2026-11-28T06:24:57.670Z') }
+  const slotPrefs = createGeminiSlotPrefs({ now: () => clock.t })
+  slotPrefs.markUnschedulable('env-a', 'upstream_502', 'LLM response received', { upstream_status: 502 })
+
+  const scheduler = createGeminiScheduler({
+    schedulerRuntime: makeMockGeminiRuntime(),
+    slotPrefs,
+    resolveProxy: () => 'socks5h://u:p@192.0.2.10:1080',
+    callHost: async (op) => {
+      if (op === 'list') return { payload_state: 'installed', environments: envs }
+      return {}
+    },
+    getRoutingConfig: () => ({ gemini: DEFAULT_GEMINI_ROUTING }),
+  })
+  const handle = createGeminiPublicHandler({
+    json: (_res, status, body) => ({ status, body }),
+    readBody: async (req) => req.body,
+    scheduler,
+  })
+  const call = () =>
+    handle(
+      {
+        method: 'POST',
+        url: '/v1/chat/completions',
+        body: { model: 'gemini-3-pro', messages: [{ role: 'user', content: 'hi' }] },
+        apiKeyKind: 'managed',
+        apiKeyRecord: { id: 'k1', group_type: 'gemini' },
+        headers: {},
+        once() {},
+      },
+      { setHeader() {}, once() {} },
+    )
+
+  const parked = await call()
+  assert.equal(parked.status, 429)
+  assert.equal(parked.body.error.code, 'gemini_pool_overloaded')
+
+  clock.t += 10 * 60 * 1000
+  const after = await call()
+  assert.notEqual(
+    after.body?.error?.code,
+    'gemini_pool_overloaded',
+    'expired 502 mark must not keep the pool overloaded',
+  )
+  // The account was attempted again (the mock host then 502s on inference, which is
+  // marked afresh): the mark now carries the new timestamp, not the original one.
+  assert.equal(slotPrefs.resolved('env-a').unschedulable?.at, new Date(clock.t).toISOString())
+})
+
 test('Req 4: Periodic account status checker updates unschedulable errors, replenishes recovered quotas, and projects fields in panel API', async () => {
   const nowMs = Date.parse('2026-11-26T12:00:00Z')
   const envs = [

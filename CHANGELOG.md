@@ -1,5 +1,148 @@
 # Changelog
 
+## 1.4.263 — 2026-11-28 · 修复无参工具调用被误判为 `502 native_handoff_invalid`
+
+- **无参工具调用的空 `input_json_delta` 不再残留 `_inputJson`（#2101）**：Anthropic 在流式返回无参工具（如 `CronList`、`ListAgents`）时，会在 `content_block_start`（`input: {}`）与 `content_block_stop` 之间发一条空的 `input_json_delta`（`partial_json: ""`）。`src/lib/protocol/convert.mjs` 的 `applyClaudeSSELineToMessage` 在收尾时用 `if (block._inputJson)` 判断，空串为假值导致整段被跳过、`_inputJson` 没有删除；下游 `native-handoff.mjs` 看到 `Object.hasOwn(block, '_inputJson')` 就把这个合法的无参调用判成 `502 native_handoff_invalid: Native tool batch has invalid identity or arguments`，并让 `issued-tool-replay` 跳过记录。
+  - 现在 `content_block_stop` 只要 `_inputJson` 是字符串就收尾并删除；非空串仍走 `JSON.parse`，空串保证 `input` 为对象（`{}`）
+  - 安全边界不变：未收到 `content_block_stop` 的截断流仍保留 `_inputJson`，`native-handoff.mjs` 对此的校验没有放宽；非法 JSON 的行为也不变
+- 部署说明：本次改动零数据库迁移、零 Rust 变更、零 `deploy/payload.json` 变更；升级后重启控制面即可生效。
+
+## 1.4.262 — 2026-11-28 · 上游 HTTP 400 按类别清洗，对会话相关的 400 封禁该会话 10 分钟
+
+- **终态上游 400 的分类与 10 分钟会话封禁（#2081）**：请求经过 failover / 修复重试后仍以真实上游 400 结束时，网关统一经 `classifyUpstream400`（`src/lib/core/refusal-guard.mjs`）分类，并只封当前租户下的该会话 10 分钟（不封设备、不降级已有的永久封禁、保留 `hit_count`）。封禁期内同一会话的请求在前置拦截处收到不可重试的 400（`x-should-retry: false`），不再继续冲击上游。
+  - **不封会话（清洗排除）**：`account_disabled`（账号/组织被禁用或受限）、`auth_credential`（凭据/鉴权失效）、`billing_credit`（余额或额度不足）、`model_unavailable`、`gateway_local`（网关/内核本地前置拒绝）、`auto_mode_classifier`
+  - **封 10 分钟**：`policy_refusal`、`third_party_client`、`context_too_long`（`prompt is too long` 等）、`tool_pair_broken`（`tool_use` 与 `tool_result` 配对损坏）、`thinking_history_broken`、`search_or_cache_invalid`、`media_invalid`、`message_structure_invalid`、`tool_schema_invalid`、`state_reference_invalid`、`beta_or_header_invalid`，以及未能归类的 `unknown`
+  - 覆盖 Anthropic 协议、Codex（含 Search / Images / Responses WS）、Gemini 公共路由与 `count_tokens`；Gemini 拦截分支补上 `x-should-retry: false`；中间的 failover / 修复重试跳不会误封，只在终态落盘；`findBan` 修复了会话封禁的过期判断
+  - 运营可见：封禁原因为 `upstream_400:<category>`，日志详情与风控面板显示类别与动作（`upstream_400_action`）
+- **行为取舍，升级前请知悉**：该功能随「封锁拒答会话」开关**默认开启**（设置项 `refusal_session_block_enabled`，在「前置 → 拒答与封禁」可关闭）。Claude Code 遇到 `prompt is too long` 的标准恢复是「压缩上下文后用同一会话 id 重发」，在该设计下这次重发会在 10 分钟内收到不可重试的 400，`tool_pair_broken` 同理；`max_tokens` 超限当前归入 `unknown`（同样封 10 分钟）。如不希望如此，关闭该开关即可。
+- 部署说明：本次改动零数据库迁移（沿用既有会话封禁表，无 DB 迁移）、零 Rust 变更、零 `deploy/payload.json` 变更；升级后重启控制面即可生效。
+
+## 1.4.261 — 2026-11-28 · 文档：vm2api 与 CRAG V4 的协议边界；内核目录标注历史 V4 载荷的升级建议
+
+- **`vm2api` ↔ CRAG 协议与整流边界文档与内核目录 label（#2093）**：
+  - `docs/PROTOCOL.md`：「CRAG native V2 部署边界」更新为「CRAG Native V4 部署与协议边界」；新增「`vm2api` ↔ CRAG 协议与整流边界（Claude Code `2.1.321`）」，写明网关入口的协议转译、第三方 `system` / `role=system|developer` 文本搬迁、CRAG 最终出口 `2.1.321` 结构整流（`src/lib/protocol/crag-321-rectifier.mjs`）与槽内 CRAG 的职责划分；新增「历史 CRAG V4 载荷升级策略（`3.1.26`–`3.1.30` → `3.1.31`）」
+  - `src/lib/admin/kernel-catalog.mjs`：仅更新 `CRAG_PINNED_RELEASES` 中 `3.1.31`（标注「推荐」）与 `3.1.30` / `3.1.29` / `3.1.27` / `3.1.26`（标注「历史·建议改用 3.1.31」）的展示 `label`；所有 `tag` / `size` / `sha256` / `manifestSha256` 保持不变，不覆写历史 Release 的不可变附件
+- 部署说明：本次改动零数据库迁移、零 Rust 变更、零 `deploy/payload.json` 变更、零协议行为变更；仅文档与面板内核列表中的展示文字，升级后重启控制面即可。
+
+## 1.4.260 — 2026-11-28 · CRAG 出口新增 Claude Code 2.1.321 结构整流器
+
+- **CRAG 最终出口统一执行 2.1.321 结构整流（#2089）**：新增 `src/lib/protocol/crag-321-rectifier.mjs` 作为单一真值，在 `prepareCragRequest`（严格官方透传与非严格/第三方两条分支）以及 `count_tokens`（`user-count-tokens.mjs`、`go-worker-client.mjs` 的 `countTokensViaKernel`）出口调用，把不合法或版本漂移的结构改写成 2.1.321 的合法等价形态，而不是放行到上游触发 400。
+  - **合法请求零修改**：已满足结构与 `cache_control` 不变量的请求原引用返回，不破坏官方缓存前缀与续传哈希；仓库内真实官方抓包夹具（2.1.303 骨架）在严格与非严格模式下均零修改且幂等
+  - **`role: "system"` 整流**：非指令的 `role: "system"` 不能位于首位，必须紧跟 `user`（或以服务端 `*_tool_result` 结尾的 `assistant`）之后；首部的 `tool_addition(tool_definition)` 提升到顶层 `tools[]`（按 `name` 去重），首部纯文本提升到顶层 `system[]`，`tool_removal` / `tool_reference` / `clear_at` 延后到首条 `user` 之后；中段与尾部的违规系统回合延后或前置 `user("continue")`；连续的非指令系统回合合并；`role: "developer"` 归一为 `system`；directive-only 的空 `system` 回合保留
+  - **非 `system` 回合中的工具块**：`user` / `assistant` 内的 `tool_addition` / `tool_removal` 抽出为合法的 `role: "system"` 回合
+  - **字段整流**：`thinking.budgetTokens` → 整型 `budget_tokens`；`output_config.effort` 清理并小写；`output_config.format` 的 object schema 补 `additionalProperties: false`；剥离 `annotations`；整流后统一执行 `repairCacheBreakpoints`（修复 `thinking.cache_control`、超 4 个断点与重排引发的 `5m → 1h` 倒挂）；`canonicalRequest` 校验 `tool_choice` 时识别内联 `tool_definition`
+  - **作用范围**：仅 CRAG 原生路径（`cragPrint` 为真）；`cli-node` 路径不经过整流器，输出保持不变
+- **测试修复（#2092）**：`go-worker-client.test.mjs` 的「worker canonicalizes passthrough bodies before either kernel」此前对两条内核路径共用同一期望，#2089 合入后在 dev 上失败 1 例；现按 `cragPrint` 分路径断言。纯测试改动，无用户可见变化
+- 部署说明：本次改动零数据库迁移、零 Rust 变更、零 `deploy/payload.json` 变更；协议层改动随控制面重启生效，CRAG 内核载荷字节未变。
+
+## 1.4.259 — 2026-11-28 · V4 协议纯度收口（内联 `tool_choice`、首部 `role: "system"` 控制回合）与 CRAG `3.1.31` 钉选
+
+- **内联工具与首部系统控制回合的协议不变量收口（#2085）**：
+  - `src/lib/protocol/model-policy.mjs`：`validateToolChoice` 识别 `body.messages` 中内联的 `tool_addition`（`tool.type === 'tool_definition'`）工具，`tool_choice`（`auto` / `any` / `tool`）指向内联定义的工具时不再在入口被误判为 400
+  - `src/lib/protocol/crag-whitelist.mjs`：`tool_choice.type === 'tool'` 只匹配顶层 `tools` 或内联 `tool_addition (tool_definition)`，缺少定义的裸 `tool_reference` 会被拒绝
+  - `src/lib/protocol/sanitize.mjs`：首部 `role: "system" | "developer"` 回合只上提纯文本块，`tool_addition` / `tool_removal` / `tool_reference` 等协议块原位保留；非空的首部 `clear_at` 回合保持原位且多遍处理幂等，空的 `clear_at` 回合不再绕过首部 user 守卫；`mergeConsecutiveAnthropicMessages` 新增 `preserveConsecutiveSystem` 选项
+  - `src/lib/protocol/outbound-attempt.mjs`：第三方 `role: "system"` 折叠时保留相邻系统控制回合各自的消息级 `cache_control`，不再合并成一回合
+  - `src/lib/protocol/anthropic-policy.mjs`：收紧内联 `tool_definition` 守卫（非数组、`name` 非空、未改动时不克隆、`tool_definition` 提前返回）
+- **CRAG `3.1.31` 载荷钉选（#2085，配套 `dofastted/crag#44`）**：`deploy/payload.json` 的 `crag_release` 升级至 `payload-2026.11.28-crag-3.1.31`，并在 `src/lib/admin/kernel-catalog.mjs` 注册 `3.1.31`（收口 `wire.rs` Beta SSOT、门控 diagnostics 注入、移除重复的 runtime beta 推导）；零密钥轮换，沿用现役 `issuer_public_key_id=9dbb4bc2…` / `payload_key_id=835451e2…`，CRAGGemini 载荷不变，`3.1.30` 及更早版本保留可回退
+- 部署说明：本次改动零数据库迁移、零 Rust `kin-scheduler` 变更；`deploy/payload.json` 仅更新 CRAG 载荷（`crag-v2` 三个资产与 `crag-v2-licensed-amd64.tar.gz`），`kin-kernel` / `cli-node` / `wrap-cli` 与 CRAGGemini 字节未变，既有 `wrap` / Codex / 老 `kincli` 槽位预期 **`SLOT_SYNC=skip`**；需要在 CRAG 槽位使用 `3.1.31` 时，按内核目录单独安装或切换。协议层改动随控制面重启生效。
+
+## 1.4.258 — 2026-11-28 · 控制面 Gemini 熔断改按 `gemini.pool.circuit_*` 生效
+
+- **控制面 `gemini:<环境 id>` 单元熔断跟随 `gemini.pool.circuit_*`（#2084，外部贡献）**：此前 `gemini.pool.circuit_failure_threshold` / `circuit_open_ms` 只通过 `apply-policy` 下发给 CRAGGemini 内核，控制面这一层的 Gemini 环境熔断实际借用的是 Claude 的 `pool.circuit_*`——在面板里改 Gemini 的熔断阈值（包括设为 `0` 关闭）对控制面不生效，环境详情里显示的 threshold / open_ms 也是 Claude 的值。
+  - `src/lib/pool/unit-circuit.mjs`：新增按 id 前缀的作用域 `configureScope` / `clearScope` / `settingsFor`，`inspect` / `admit` / `recordFailure` / `view` 按单元所在作用域取阈值与冷却时长，取最长匹配前缀，无匹配时用全局值；作用域阈值为 `0` 时该作用域不熔断（不计失败、始终放行、面板显示 closed）
+  - `src/lib/admin/routing-runtime.mjs`：`configureUnitCircuit` 在配置全局值后，用 `normalizeGeminiRouting(routing.gemini).pool` 配置 `gemini:` 作用域；保存路由时 `body.pool` 或 `body.gemini` 任一存在即重新配置（此前只看 `body.pool`）
+  - Claude 单元仍按 `pool.circuit_*`，不受影响；两边保持默认 `3 / 30000` 时行为不变
+- 部署说明：本次改动零数据库迁移、零 Rust 变更、零前端改动；升级后重启控制面即可生效，若运营曾在面板把 Gemini 熔断阈值设为 `0`，升级后控制面这一层才会真正关闭 Gemini 熔断。
+
+## 1.4.257 — 2026-11-28 · Gemini 多租户代理出口隔离、上游错误语义保留与 V4 headless 容量对齐
+
+- **Gemini 多租户代理出口隔离与目录过滤（#2079）**：
+  - `src/lib/gemini/routes.mjs`：`proxyEgressOptionsFor` 在取认证信息前先做租户归属校验——租户环境只能用平台共享代理或自己的代理，平台环境只能用无归属代理，别的租户的代理一律返回 `null`；`warmGeminiEnvironments` 与 `createGeminiTerminal` 按环境归属解析代理与 `egress_options`，租户环境的预热与终端不再丢失出口选项
+  - `src/lib/admin/catalog-monitor.mjs`、`src/lib/admin/panel-routes.mjs`、`src/server.mjs`：`syncGeminiCatalog` / `createCatalogMonitor` 经 `resolveGeminiProxyEgressOptions` 把 `egress_options` 带到模型目录拉取
+  - `src/lib/gemini/scheduler.mjs`：对外部传入的 `catalogSnapshot` 增加 `ownerScope` 与 `allowedEnvIds` 过滤，托管号池路径行为不变
+- **上游错误语义保留（#2079）**：`mapUpstreamError` 新增 `crag_prompt_too_large`（400）、`pool_forbidden`（403 `permission_error`）、`crag_prompt_replace_empty_unsupported`（503 `overloaded_error`，不可重试）并补入 `STRICT_LOCAL_GATEWAY_CODES`；旧槽位抛出 `crag_prompt_replace_empty_unsupported` 时保留 503 语义，混合池内直接切换到支持的节点，耗尽时向客户端保留 503（`src/lib/core/errors.mjs`、`src/lib/pool/{upstream-error-policy,failover-runner}.mjs`）
+- **V4 headless bridge 容量对齐（#2079）**：槽位持久化并透出 `capabilities` / `kernel_generation` / `transport`（`kernel-install.mjs`、`vm-registry.mjs`、`kernel-catalog.mjs`），`isHeadlessBridgeSlot` 识别 `kernel_installation.transport === 'headless_bridge'` 与 `kernel_generation >= 4`；容量对账器、看门狗、`seatCapOf` / `seatCapForVm` 与 `/api/panel/pools` 统一按同一份能力计算有效槽位数，避免面板座位数与内核实际容量不一致
+- 部署说明：本次改动零数据库迁移、零 Rust 变更；升级后重启控制面即可生效，V4 内核槽位的座位上限会按其声明的能力重新计算。
+
+## 1.4.256 — 2026-11-28 · Gemini 单次上游 502 不再把健康账号永久摘出调度
+
+- **瞬时 `upstream_502` / `proxy_502` 的 unschedulable 标记 10 分钟后自动过期（#2077，Fixes #2049）**：此前一次上游 502 会把 `settings.gemini_slot_prefs[envId].unschedulable` 持久化，而全仓没有任何自动清除路径（周期检查的自动恢复只覆盖 `reauth_required` / `verification_required` / `location_unsupported` / `ineligible`），健康账号因此被永久摘出调度，所有 Gemini 请求返回 `429 gemini_pool_overloaded`，只能手动 `recover`。
+  - `src/lib/gemini/slot-prefs.mjs`：`get()` / `resolved()` / `all()` 读取时判定，瞬时原因的标记距其 `at` 满 10 分钟即过期，并从存储中删除；新的 502 会重新计时；升级前已落盘的旧 502 标记按其既有 `at` 过期，无需迁移
+  - 确定性状态（`reauth_required`、`verification_required`、`location_unsupported`、`ineligible`）与运营手动 `schedulable:false` 不受影响；`gemini.failover.unschedulable_on_502=false` 仍可整体关闭该标记行为
+  - 10 分钟为固定默认值，未做成配置项；issue 中「面板取消进行中的授权」一项未处理（独立接口，另行跟进）
+- 部署说明：本次改动零数据库迁移、零 Rust 变更、零前端改动；升级后重启控制面即可生效，已被 502 标记的账号会在各自 `at` 满 10 分钟后自动恢复。
+
+## 1.4.255 — 2026-11-28 · 虚拟机面板透出 Rust 调度器 `node_cooldown`，测试链接给出准确原因
+
+- **面板显示与调度器一致：`node_cooldown` 不再被当成「可用」（#2069，Fixes #2057）**：Rust `kin-scheduler` 在连续上游拒答（如 `content_filter_refusal`）等情形下会让槽位进入节点级冷却并将其排除出派发，状态落在 `scheduler_node_penalties`，但面板此前只读 JS 侧的运行时冷却，于是该槽仍显示「可用 / 正在接单」、`diagnose` 全绿。
+  - `src/lib/scheduler/scheduler-runtime.mjs` 新增只读的 `activeNodePenalties()`，`src/lib/pool/pool-scheduler.mjs` 暴露为 `nodePenalties()`：仅取 `claude_vm`、节点级（`model_scope='*'`）、有时限的惩罚，模型级与永久惩罚不计入冷却
+  - `src/lib/admin/panel-api.mjs` 的 `enrichVm` 将其并入 `cooldown_until` / `cooldown_reason`（`node_cooldown:<原因>`），槽位在 `/#/vms` 归入受限区并显示「冷却中」，「清冷却」入口随之可用（既有的 `cooldown/clear` 会同步解除 Rust 节点冷却）；列表与详情新增 `node_cooldown: { until, reason, left_ms }`；Codex 槽不受影响
+  - `src/lib/admin/vm-test-chat.mjs`：测试链接的 pin 请求被调度器拒绝且该槽确在冷却时，返回 `code: node_cooldown` 与剩余分秒，调度器原文保留在 `upstream_message`，不再显示笼统的 `pinned node ... is busy · upstream_overloaded`
+- 部署说明：本次改动零数据库迁移、零 Rust 变更、零前端改动（前端已按 `availability` / `cooldown_until` 分区）；升级后重启控制面即可生效。
+
+## 1.4.254 — 2026-11-28 · 热修：`role: "system"` `tool_addition`/`tool_removal` 400、内联工具改写与 CRAG `3.1.30` beta 兼容性修复
+
+- **修复中转/第三方流量触发 `400 messages.*.content: 'tool_addition'/'tool_removal' blocks are only permitted within role: "system" messages` 及重构兼容性回归**：
+  - **收口第三方 `role: "system"|"developer"` 折叠路径（`src/lib/protocol/{third-party-system,outbound-attempt}.mjs`）**：`foldThirdPartyRoleSystemMessages` 统一复用 `extractThirdPartySystemMessages`（SSOT），仅搬迁纯文本块到 `messages[firstUser]`，完整保留 `tool_addition` / `tool_removal` / `tool_reference` 非文本块与 `output_config` / `clear_at` / `cache_control` 回合控制原位留在 `role: "system"`。
+  - **首条 `role: "system"` 工具控制回合保留（`src/lib/protocol/sanitize.mjs`）**：`normalizeAnthropicMessages` 对首条 `user` 之前的 `role: "system"` 消息保留 `tool_addition` / `tool_removal` 块在 `role: "system"`（混合文本仍上提至顶层 `system`），且不再误插 `{ role: 'user', content: '.' }`。
+  - **内联工具名与描述统一改写与白名单放行（`src/lib/protocol/{anthropic-policy,crag-whitelist}.mjs`）**：`scrubToolReferenceFields` 同步改写 `tool_addition.tool.definition.{name,description}` 并将内联声明纳入 `toolByName`/`declared` 索引后再对齐 `tool_choice.name`；`sanitizeCragBodyWhitelist` 在校验 `tool_choice: { type: 'tool', name }` 时识别消息中 `tool_addition` 声明的内联工具。
+  - **官方 `count_tokens_v1` 请求头透传（`src/lib/protocol/user-count-tokens.mjs`）**：经严格校验的官方 Claude Code 流量调用 `count_tokens_v1` 时透传 `extractCragCallerHeaders` 与 `anthropic-beta`，第三方流量仍保持 `{}`。
+- **钉选 CRAG V4 `3.1.30` 延续载荷（`dofastted/crag#43`、`payload-2026.11.28-crag-3.1.30`，零密钥轮换）**：
+  - 修复 `wire.rs::scan_body_features` 遗漏顶层 `body.cache_control`（`1h` / `evict_on_complete` / `scope`）、`synthesize_betas` 误将 `claude-haiku-5-5` 判为旧 Haiku 及 `/v1/messages/count_tokens` 缺少按需 beta，并修复 `runtime.rs::collect_body_feature_betas` 对 `fast-mode-2026-02-01` 与 `compact_20260904` 的门控。
+  - `deploy/payload.json` 与 `src/lib/admin/kernel-catalog.mjs` 升级至 `payload-2026.11.28-crag-3.1.30`（沿用生产公钥 `9dbb4bc2…` / 载荷密钥 `835451e2…`，保留 `3.1.29` 可一键回退）。
+- 部署说明：本次热修零数据库迁移、零前端与 `bin/` 变更；更新控制面至 `v1.4.254` 并刷新宿主 `share/crag/kernels/v2/amd64/` 与共享仓 `store/crag/current -> versions/3.1.30` 后滚动重载 CRAG 槽即可生效。
+
+## 1.4.253 — 2026-11-28 · 清理 M3 切换后无人读取的号池/故障转移配置键与面板滑块
+
+- **删除 M3 切换（v1.4.243）后没有任何读取方的 routing 键（#2063）**：
+  - 移除 `pool.sticky_wait_timeout_ms`、`pool.seat_grace_ms`、`pool.seat_budget_reserve_pct`、`pool.kernel_lease_queue_grace_ms`、`pool.heartbeat_stale_ms` 与 `failover.session_queue_timeout_ms` 的默认值、归一化与 `src/config/routing.json` 条目（`src/lib/pool/{pool-scheduler,failover-runner}.mjs`）；已存有这些键的 `routing.json` 照常加载，未知键原样透传、不读也不报错，生产配置无需修改
+  - 设置页「号池」移除不再生效的「每席位预算预留」滑块与余量阶梯图、「粘性等待」滑块，排队时间线只画全局排队一条线，与 Rust 调度器立即溢出一致（`web/src/features/settings/{pool-pane.tsx,routing-draft.ts}`）；`docs/INFERENCE.md`、`docs/API.md` 同步改写，`session_queue_timeout_ms` 改指向号池级配置（`scheduler_pools.session_queue_timeout_ms`，该列未改动）
+  - 保留仍在生效的 `pool.circuit_failure_threshold` / `pool.circuit_open_ms`（`unitCircuit` 全局单例仍由 Claude 与 Gemini 调度共用）
+- 测试修复（#2066）：`test/unit/failover-runner.test.mjs` 的 mock 调度器现在与生产契约一致，识别 `skipSessionGate`；此前 #2056 合入后「batch 成员并发不串行」用例会永远等待 mock 会话锁，整文件撞到 300s 上限（dev 的推送 CI 只跑被改动的测试文件，因此未被发现）。纯测试改动，无用户可见变化
+- 部署说明：本次改动零数据库迁移、零 Rust 变更；仅删除无读取方的配置与面板控件，升级无需额外操作。
+
+## 1.4.252 — 2026-11-28 · 补回 M3 切换丢失的 238 调度规则（Fable 闸、节点闸、借号不搬 pin、续聊不跨号等）
+
+- **恢复 Rust `kin-scheduler` 切换（v1.4.243，#1994）时丢失的 v1.4.238 JS 调度规则（#2056）**：规则加在 Rust 调度器或调用它的 JS 边界上，未回退到 JS 调度；逐条对照表见 `docs/scheduler-m3-parity.md`。
+  - **Fable 闸**：`pool.fable_requires_max` 与 `model_denied_until` 恢复生效，Fable 只派到 Max 槽位，池内无 Max 时立即返回 `429 fable_requires_max`，不再把请求派到 Pro 槽后挂满 600s 才 `504`；面板角标与派发共用同一判断（`src/lib/pool/slot-model-gate.mjs`、`src/lib/admin/panel-api.mjs`）
+  - **按模型等待闸与节点闸**：冷却中的模型、Fable 族冷却、`7d_oi`、周额度拆分会跳过对应账号；代理未绑定或失配、账号停用、凭据异常、并发为 0、内核故障、离线、worker 不可达的槽位带原因排除，不再接流量（`src/lib/scheduler/{node-gates,scheduler-runtime}.mjs`，遥测新增 `schedulable` / `unschedulable_reason` / `new_sessions_blocked`）
+  - **会话与 pin 语义**：`keep_pin_on_model_gate` 借号不搬 pin 与 machine；ephemeral 请求（摘要分叉、短探针）只读地跟随本会话或父会话的 pin；`keep_session_home` 续聊出错不再跨号重放，home 槽 `slot_busy` 时等待，超时返回 `529 session_home_slot_busy`（`src/lib/pool/failover-runner.mjs`）；batch 成员按成员键粘号且不被 SessionGate 串行
+  - **耗尽保护分档**：`exhaustion_guard` 的 continuing 档只接已 pin 的续聊、stop 档整槽排除；宿主内存告急时续聊豁免新会话带
+  - **Rust 协议**：`AcquireRequest` 新增 `keep_pin_on_model_gate`、`model_gated_node_keys`、`skip_session_gate`，`NodeTelemetryUpdate` 新增 `new_sessions_blocked`，均带 `serde(default)`，旧调用方不受影响
+- 部署说明：本次改动零数据库迁移、`deploy/payload.json` 未变；包含 Rust `kin-scheduler` 变更，`v1.4.252` 的控制面镜像会随发布重新构建调度器二进制，升级后重启控制面即可生效。
+
+## 1.4.251 — 2026-11-28 · Codex 控制面对齐 `kin-codex-kernel v0.4.9`：UDS packed 增量、WS `ws_replay` 续接与实时中断
+
+- **Codex 传输与 Responses WebSocket 对齐 `kin-codex-kernel v0.4.9`（#2058）**：
+  - **UDS `/packed` 压缩与滚动增量（`src/lib/transport/{codex-kernel-client,go-worker-client}.mjs`）**：仅当 worker 状态声明 `uds_packed_v1` 能力时启用（旧内核走原路径）；发送 1 级 `gzip` 与 64B 滚动 Rabin-Karp copy-span 增量，基底缓存上限 32 MiB / 64 条 / 280s；遇到 UDS miss（`409` + `x-kin-uds-miss: 1` + `x-kin-upstream-sent: 0`）时自动以完整正文重试一次
+  - **WebSocket `ws_replay` 增量续接（`src/lib/protocol/{responses-ws,handle-codex}.mjs`）**：向内核传递 `options.ws_replay`（`{}` / `{ previous_response_id }`），请求侧保留完整展开的 `body.input`；`incomplete_details.reason === "interrupted"` 且有最终输出的回合与已完成回合一样进入连接重放缓存
+  - **实时 `response.interrupt` 转发**：`x-tap-interrupt === "websocket"` 时转发到 `POST /internal/v1/interrupt`，`204` 保持上游生成不中断，`409` 返回 `response.interrupt.failed` 且不中止连接
+  - **遥测与重试安全（`src/lib/pool/codex-slot-pool.mjs` 等）**：从客户端响应中剔除内部 `x-tap-*` / `x-kin-*` 头；`x-tap-turn-timing`（头与 trailer）记入 `logBag.hop_meta.codex_vm_timing.attempts[]`；`x-kin-upstream-sent: unknown` 时停止同账号、传输层与故障转移重试，避免重复提交
+- 部署说明：本次改动零数据库迁移；`deploy/payload.json` 未变，`kin-codex-kernel` 仍为既有钉选版本；UDS packed 仅在 worker 声明 `uds_packed_v1` 时启用，实时中断仅在内核返回 `x-tap-interrupt: websocket` 时转发，升级后无需额外操作。
+
+## 1.4.250 — 2026-11-28 · 热修：钉选 CRAG `3.1.29` 修复 V4 工具续接 `409` 死锁与 `inline-tools-2026-09-15` 缺失 `400`
+
+- **CRAG V4 内核双项热修并钉选 `3.1.29` 延续载荷（`dofastted/crag#41`、`payload-2026.11.28-crag-3.1.29`）**：
+  - **修复 `409 tool_result submission conflicts with accepted results` 死锁**：修复自 `v1.4.240`（CRAG V4 `69b9cd0`）引入的 `prepare_claim_validated` 回归——原 V3 `claim_batch_with_digest` 的 `ToolTombstone::Replay => 409` 被误并入全历史快照续接路径，导致已认领的 `tool_use_id` 在首次提交因 `499`/断流/升级失败后，只要后续重试触发 `submitted_digest` 变化（如官方 Claude Code 降级非流式并下调 `max_tokens` `128000 → 64000`、CRAG 滚动升级切换 `crag_prompt` / `crag_prompt_spec`、网关重写消息或独立分支续接）即永久死锁在 `409`。现恢复 `3.1.25` 既有全历史快照续接语义：精确摘要重放仍走 `joined_replay` 幂等复用，非精确提交创建独立快照交付，完整保留跨租户隔离（400）、`NotResumable`（400）、`Cancelled`（410）、`account_changed`（409）与 `partial_provider_output_nonretryable` 冷却（409）。
+  - **修复 `400 messages.0.content.0.tool_addition.tool: a tool_definition requires anthropic-beta: inline-tools-2026-09-15`**：CRAG V4 `bridge/wire.rs`（`scan_content_block` / `synthesize_betas`，覆盖 `/v1/messages` 与 `/v1/messages/count_tokens`）与 `runtime.rs`（`collect_body_feature_betas`）复用 `prompt::is_inline_tool_addition` 按需追加 `inline-tools-2026-09-15`（仅在消息携带 `tool_addition` 且 `tool.type == "tool_definition"` 时注入，且永不进入 `sticky_rejected_betas`），对齐 `v1.4.239` 及之前行为。
+  - **零生产密钥轮换**：沿用生产公钥 `9dbb4bc2…` / 载荷密钥 `835451e2…`；`deploy/payload.json` 的 `crag_release` 升级至 `payload-2026.11.28-crag-3.1.29`，并在 `src/lib/admin/kernel-catalog.mjs` 注册 `3.1.29`（保留 `3.1.27` / `3.1.26` / `3.1.25` 可回退）。
+- 部署说明：本次热修仅更新 CRAG V4 签名载荷清单与内核目录，零数据库迁移、零前端或 `bin/` 变更；升级后在宿主刷新 `share/crag/kernels/v2/amd64/` 与共享仓 `store/crag/current -> versions/3.1.29` 并滚动重拉 CRAG 槽即可生效。
+
+## 1.4.249 — 2026-11-28 · `/system` 系统提示词页面重构为 Anthropic / Google 品牌口径
+
+- **`/system` 页面简化重构与按需 JSON 预览（#2051）**：
+  - `web/src/features/system/**` 与 `web/src/styles/index.css`：顶部品牌切换仅区分 **Anthropic** 与 **Google**，面板可见文案中不再出现内部内核代号；保存提示改为「已保存 · Anthropic/Google · …」，Google 零注入模式文案由「0提示词」改为「0注入」
+  - 新增 `sliding-tabs.tsx`、`raw-json-panel.tsx`、`raw-json.ts`、`google-prompt.ts`：出站 JSON 仅在用户点击「加载 JSON 原始内容」时惰性构造，0注入模式下禁用；`cragGeminiPersonaFromCompat` 等 Google 提示词辅助函数迁入 `google-prompt.ts`
+  - 仅前端改动：后端接口与 `craggemini_persona_preset` / `craggemini_system_prompt` 等字段名保持不变
+- 部署说明：本次改动零数据库迁移、零后端运行时变更，仅前端静态资源；升级无需额外操作。
+
+## 1.4.248 — 2026-11-28 · 面板「席位」统一更名为「执行位」
+
+- **面板文案：`session_slots`「席位」统一更名为「执行位」（#2043，拆自 #1970）**：
+  - `web/src/features/vm/{list-page,vm-detail-card,vm-list-table,vm-rack,vm-rack-blade,vm-scheduling}.tsx` 与 `web/src/features/settings/pool-pane.tsx` 中面板可见的「席位 / 席位上限 / 席位占用 / 席位与流量」改为「执行位」口径，并澄清「物理执行位」与「根会话（主会话）数」的说明；仅文案变更，不改任何接口字段与调度行为
+- 测试对齐（#2050）：`web/src/features/vm/vm-list-table.test.tsx` 的 403 文案断言对齐 `gemini-account-status` 现行「Google 403：地区或账号受限」，修复任何改动 `web/` 的 PR 在 `ci / web tests and build` 被基线断言卡住的问题；纯测试改动，无用户可见变化
+- 部署说明：本次改动零数据库迁移、零后端运行时变更，仅前端静态资源与文案；升级无需额外操作。
+
 ## 1.4.247 — 2026-11-28 · API 端点默认 `body_policy` 切为 `caller` 并修复 `/#/api` 开关即时持久化
 
 - **API 端点 `body_policy` 默认透传调用方原始正文并修复 `/#/api` 开关持久化（#2045）**：

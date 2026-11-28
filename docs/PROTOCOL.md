@@ -6,17 +6,40 @@
 
 上游 hop 始终 `stream:true`。客户端 SSE 透传；非流或 `x-kin-delivery: verified` 则缓冲到 `message_stop` 再聚合。
 
-## CRAG native V2 部署边界
+## CRAG Native V4 部署与协议边界
 
-`dataplane: "crag"` 一律采用 native V2 与官方 Claude；省略版本和已存的 `legacy` 也走 v2，不再安装 `cc-node` 或 `share/crag/kin-kernel`。`KIN_CRAG_V2_ROOT` 指向解压后的签名加密发布目录，必须包含 `encrypted: true` native manifest、完整 SHA-256 成员、架构匹配的 `crag-v2` 启动器、签名 `crag-v2.payload.enc`、发布公钥与官方 Claude；不接受旧 Node、明文 native V2 或未 bundled 的独立部署变体。
+`dataplane: "crag"` 一律采用 native CRAG（当前标准为 **Native V4 Headless Bridge**，`transport: "headless_bridge"`，兼容接收 `"tui"` 别名）与官方 Claude；省略版本和已存的 `legacy` 也走 `crag-v2` 通道，不再安装 `cc-node` 或 `share/crag/kin-kernel`。`KIN_CRAG_V2_ROOT` 指向解压后的签名加密发布目录，必须包含 `encrypted: true` native manifest、完整 SHA-256 成员、架构匹配的 `crag-v2` 启动器、签名 `crag-v2.payload.enc`、发布公钥与官方 Claude（或 Custom OS 只读共享仓中经 `CRAG-OFFICIAL-CLAUDE-V1` 验签的 `claude`）；不接受旧 Node、明文 native 核心或未验签的独立部署变体。
 
-物化后的 `.kin/kin-kernel` 直接 exec `.kin/crag-v2/crag-v2`，Claude 位于 `.kin/crag-v2/claude-code-2.1.321/claude`；不复制 Node 或注入旧 CLI 版本。替换产物后沿用现有显式 idle-restart 流程；写 `kernel.json` 本身不新增自动重启。判断 idle 必须计入 active、waiting-tool、queued 和实际 PID，不能把 runnable ceiling 与物理容量之差当作运行任务数。
+物化后的 `.kin/kin-kernel` 直接 exec `.kin/crag-v2/crag-v2`，内嵌 Claude 位于 `.kin/crag-v2/claude-code-2.1.321/claude`（Custom OS KVM/Docker 槽复用只读共享仓 `/opt/kin/store/claude/current -> versions/2.1.321/claude`）；不复制 Node 或注入旧 CLI 版本。替换产物后沿用现有显式 idle-restart / `restart_crag` 热重载流程；写 `kernel.json` 本身不新增自动重启。判断 idle 必须计入 active、waiting-tool、queued 和实际 PID，不能把 runnable ceiling 与物理容量之差当作运行任务数。
 
-所有 CRAG 选择与正常 hop 都要求该 VM 的离线注册码；V2 原生网关再次校验签名、设备绑定和当前 UTC 到期时间。缺失/无效/错误 VM/未生效/已到期均为终态 403，不当作 OAuth 刷新、模型策略、账号冷却或 Go 回退。cli-node/wrap 不要求 CRAG 注册码。
+所有 CRAG 选择与正常 hop 都要求该 VM 的有效授权（离线 `CRAGL1` / 宿主 `CRAGH2` / 槽位 `CRAGS1` / 包绑定 `CRAGK1`）；原生网关再次校验签名、设备绑定、包密钥 ID 与当前 UTC 到期时间。缺失/无效/错误 VM/未生效/已到期均为终态 403，不当作 OAuth 刷新、模型策略、账号冷却或 Go 回退。cli-node/wrap 不要求 CRAG 授权。
 
 槽详情「推理内核」提供机器码复制、注册码激活/替换，以及签名内的期限、生效时间和到期时间；无授权点击 CRAG 会进入激活，不提前改 VM 配置或停内核。期限只能由供应方签发为 1个月/半年/1年（UTC 自然月 1/6/12，月底收敛），客户不能直接改过期时间。错误替换码不破坏现有有效授权，续期只换授权，不隐式切换内核。
 
 设备私钥/注册码保存在与现有 worker run 映射一致的 Linux 私有目录；保留运行数据与 machine-id 的普通容器重建保留授权，复制到不同 VM/设备无效。不要把 `license_dir` 放在 WSL DrvFS。启动器只在 sealed memfd 解密业务程序，不写明文；客户包不含供应方私钥/产品 AES key。离线授权不支持远程吊销，不能可靠阻止 root 回拨时间或复制全部设备材料。
+
+### `vm2api` ↔ CRAG 协议与整流边界（Claude Code `2.1.321`）
+
+两仓严格分工，避免同一职责双边重复实现或非法载荷穿透到上游：
+
+- **`vm2api` 负责（网关控制面与 CRAG 入口整流）**：
+  - 负责协议转译（OpenAI/Gemini → Anthropic）、第三方 `system` / `messages[].role=system|developer` 纯文本搬迁、工具名重写与响应/SSE 反向还原、模型策略、封控、限流、多租户计费、账号池调度与故障转移。
+  - **CRAG 最终出口 `2.1.321` 结构整流（SSOT：`src/lib/protocol/crag-321-rectifier.mjs`）**：在 `kernel-request.mjs::prepareCragRequest`（`/v1/messages`，覆盖 `strictPassthrough: true` 与非严格双分支）以及 `user-count-tokens.mjs` / `go-worker-client.mjs::countTokensViaKernel`（`/v1/messages/count_tokens`，覆盖官方与第三方）统一执行：
+    - **合法零修改快路径**：已满足 Claude Code `2.1.321` 结构与 `cache_control` 不变量的请求原引用返回（0 分配、0 改动，保留官方缓存前缀、续传哈希、未来官方扩展字段与 `scope`/`evict_on_complete`）。
+    - **非法/版本漂移载荷就地修复为合法 `2.1.321` 结构**（即使开启 `crag_strict_passthrough: true` 也强制检查，应对入站官方客户端版本与槽内 `2.1.321` 不一致的场景）：
+      1. `messages[0]` 携带非指令 `role: "system"`：`tool_addition(tool_definition)` 提升至顶层 `tools[]`（按 `name` 去重，重名覆盖项延后至首条 `user` 后）；无 `clear_at` 前导文本提升至顶层 `system[]`；`tool_removal` / `tool_reference` / `clear_at` 延后至首条 `user` 后。
+      2. 普通 `assistant`（未以 `*_tool_result` 服务端工具结果结尾）后的非指令 `role: "system"`：若后续存在 `user` 则延后至该 `user` 后（`assistant → user → system`）；若位于尾部或紧接另一条 `assistant` 则前置 `user("continue")` 锚点；连续非指令 `role: "system"` 合并为单条合法 `role: "system"`；保留任意位置的 directive-only `{ role: "system", content: [], output_config }`（旧模型自动降级提升尾部 `effort`）。
+      3. 非 `system`（`user`/`assistant`）中非法内嵌的 `tool_addition`/`tool_removal` 抽离到合法 `role: "system"` 轮次；`role: "developer"` 归一为 `system`；空 `system` 壳（含空 `clear_at`）丢弃（全空消息集仍 fail-closed 400）。
+      4. `thinking.budgetTokens` → 整型 `budget_tokens`、清理/小写化 `output_config.effort`、补齐 `output_config.format` `additionalProperties: false`、剥离 `annotations`，并在消息重排后执行 `repairCacheBreakpoints` 消除 `thinking` 断点、超 4 断点与 `5m → 1h` 倒挂。
+- **`CRAG`（`crag-v2`）负责（槽内原生执行与线协议合成）**：
+  - 负责槽内许可验签、官方 `claude-code-2.1.321` Headless Bridge 桥接、`PromptSpec v1` 渲染与 Self-Probe、**唯一 `anthropic-beta` 合成真值源（`wire.rs`）**（覆盖 `/v1/messages` 与 `/v1/messages/count_tokens`，含 `inline-tools-2026-09-15`、顶层 `cache_control`、Haiku 5.5、`diagnostics`/`fast-mode`/`compact`/`prompt-caching-scope` 门控与防 `extra_betas` 污染）、工具续接已校验快照恢复与 `native_handoff_v1` / `provider_result_v2`。
+  - CRAG **不做**跨轮次消息角色重排、不做第三方提示词搬迁或工具改名、不做账号池故障转移；对未通过 `protocol.rs` 硬约束的字段保持 fail-closed 400。
+
+### 历史 CRAG V4 载荷升级策略（`3.1.26`–`3.1.30` → `3.1.31`）
+
+- V3 历史基线（`<= 3.1.25`，对应 `vm2api <= v1.4.239`）运行官方 CLI 子进程，不受 V4 `409` 工具续接死锁与 `wire.rs` beta 缺陷影响。
+- V4 历史载荷 `payload-2026.11.28-crag-3.1.26`（`v1.4.240`–`v1.4.244`）、`3.1.27`（`v1.4.245`–`v1.4.249`）、`3.1.29`（`v1.4.250`–`v1.4.253`）与 `3.1.30`（`v1.4.254`–`v1.4.258`）在对应历史镜像的 `deploy/payload.json` 与 `CRAG_PINNED_RELEASES` 中均硬编码校验 `size + sha256 + manifestSha256`，因此**禁止覆写旧 tag 附件**。
+- 新版 [`payload-2026.11.28-crag-3.1.31`](https://github.com/dofastted/vm2api/releases/tag/payload-2026.11.28-crag-3.1.31) 采用**零密钥轮换**签名并向后兼容 `v1.4.240`–`v1.4.258`（缺省 `crag_prompt_spec` 时自动兼容旧 `crag_persona_preset`/`crag_prompt`）；任意 `v1.4.240+` 控制面可直接拉取 `payload-2026.11.28-crag-3.1.31` 替换槽位内核（或升级至 `v1.4.259+`）。
 
 
 ## 官方 Claude Code 判定

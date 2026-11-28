@@ -18,6 +18,7 @@ import {
 import {
   ensureRustKernel,
   dataplaneUsesCcNode,
+  kernelCapacityOptions,
   kernelSlotsConverge,
   requestedCragSessionSlots,
   wrapSlotCount,
@@ -149,11 +150,12 @@ export function watchdogProbeVm(vm, { relayPaths = clusterRelayPaths, exists = f
   }
 }
 
-function kernelSlotMismatch(exec, health, routing) {
+export function kernelSlotMismatch(exec, health, routing) {
   const configPath = rustKernelPaths(exec).configPath
   if (!configPath) return false
   const requested = routing?.inference ? requestedCragSessionSlots(exec.vm, routing) : undefined
-  return kernelSlotsConverge(configPath, health, wrapSlotCount(exec.vm), requested)
+  const capacityOptions = kernelCapacityOptions(exec, exec.vm, health)
+  return kernelSlotsConverge(configPath, health, wrapSlotCount(exec.vm, routing, capacityOptions), requested)
 }
 
 export function createKernelWatchdog({

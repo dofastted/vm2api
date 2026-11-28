@@ -151,6 +151,74 @@ export class AccountRuntimeRepo {
     return this.schedulingSnapshot([accountId]).get(accountId)?.state || null
   }
 
+  /**
+   * Batch-read merged runtime state for many account IDs using index-friendly
+   * PK `IN (...)` subqueries on both `accounts` and `account_runtime` (1 RPC per chunk).
+   * @param {Iterable<string>} accountIds
+   * @returns {Map<string, object>}
+   */
+  getMany(accountIds) {
+    const unique = []
+    const seen = new Set()
+    for (const raw of accountIds || []) {
+      if (raw == null || raw === '') continue
+      const id = String(raw)
+      if (!seen.has(id)) {
+        seen.add(id)
+        unique.push(id)
+      }
+    }
+    const result = new Map()
+    if (!unique.length) return result
+    const CHUNK = 500
+    for (let i = 0; i < unique.length; i += CHUNK) {
+      const chunk = unique.slice(i, i + CHUNK)
+      const placeholders = chunk.map(() => '?').join(', ')
+      const rows = this.db
+        .prepare(`
+          SELECT a.id, a.vm_id, a.priority, a.load_factor, a.last_used_at,
+                 a.temp_unschedulable_until, a.temp_unschedulable_reason,
+                 a.rate_limited_at, a.rate_limit_reset_at, a.overload_until,
+                 a.session_window_start, a.session_window_end, a.session_window_status,
+                 a.updated_at,
+                 r.account_id AS rt_account_id, r.vm_id AS rt_vm_id, r.status AS rt_status,
+                 r.updated_at AS rt_updated_at, r.model_states_json, r.credential_generation,
+                 r.refresh_status, r.worker_heartbeat_at, r.worker_status_json
+          FROM (
+            SELECT id, vm_id, priority, load_factor, last_used_at,
+                   temp_unschedulable_until, temp_unschedulable_reason,
+                   rate_limited_at, rate_limit_reset_at, overload_until,
+                   session_window_start, session_window_end, session_window_status,
+                   updated_at
+            FROM accounts WHERE id IN (${placeholders})
+          ) a
+          FULL JOIN (
+            SELECT account_id, vm_id, status, updated_at, model_states_json,
+                   credential_generation, refresh_status, worker_heartbeat_at,
+                   worker_status_json
+            FROM account_runtime WHERE account_id IN (${placeholders})
+          ) r ON r.account_id = a.id
+        `)
+        .all(...chunk, ...chunk)
+      for (const row of rows) {
+        const account = row.id == null ? null : row
+        const runtime =
+          row.rt_account_id == null
+            ? null
+            : {
+                ...row,
+                account_id: row.rt_account_id,
+                vm_id: row.rt_vm_id,
+                status: row.rt_status,
+                updated_at: row.rt_updated_at,
+              }
+        const state = mergeState(runtime, account)
+        if (state?.account_id) result.set(state.account_id, state)
+      }
+    }
+    return result
+  }
+
   list() {
     return this._allSnapshots.all().map((row) => this.snapshotRow(row).state)
   }

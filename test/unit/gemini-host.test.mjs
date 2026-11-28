@@ -2001,3 +2001,233 @@ test('geminiProxyFor accepts HTTP and domain proxies, forwards egress_options wh
   assert.equal(missingOAuth.body.error.code, 'gemini_oauth_client_not_configured')
   assert.equal('egress_options' in calls[1][1], false)
 })
+
+test('Gemini multi-tenant proxy egress isolation, owner-aware warm/terminal, catalogSnapshot pool scope, and catalog-monitor egress forwarding', async () => {
+  const { createGeminiTerminal, geminiProxyEgressOptionsFor, geminiProxyFor, warmGeminiEnvironments } = await import(
+    '../../src/lib/gemini/routes.mjs'
+  )
+  const { syncGeminiCatalog } = await import('../../src/lib/admin/catalog-monitor.mjs')
+
+  const rows = [
+    {
+      id: 'px-platform',
+      enabled: true,
+      status: 'ok',
+      kind: 'http',
+      domain_forward: true,
+      dns_disable_svcb_https: true,
+      owner_user_id: null,
+    },
+    {
+      id: 'px-tenant-a',
+      enabled: true,
+      status: 'ok',
+      kind: 'socks5',
+      domain_forward: true,
+      dns_disable_svcb_https: true,
+      owner_user_id: 'user-a',
+    },
+    {
+      id: 'px-tenant-b',
+      enabled: true,
+      status: 'ok',
+      kind: 'http',
+      domain_forward: true,
+      dns_disable_svcb_https: true,
+      owner_user_id: 'user-b',
+    },
+  ]
+  const authById = {
+    'px-platform': { url: 'http://192.0.2.10:8080', domain_forward: true, dns_disable_svcb_https: true },
+    'px-tenant-a': { url: 'socks5://u:p@192.0.2.11:1080', domain_forward: true, dns_disable_svcb_https: true },
+    'px-tenant-b': { url: 'http://u:p@192.0.2.12:8080', domain_forward: true, dns_disable_svcb_https: true },
+  }
+  const pool = {
+    snapshot: ({ ownerUserId = null } = {}) => ({
+      proxies: rows.filter((row) => (ownerUserId ? row.owner_user_id === ownerUserId : row.owner_user_id == null)),
+    }),
+    getProxyByIdWithAuth: (id) => authById[id] || null,
+  }
+
+  // Must #1: cross-tenant proxyId must NOT leak egress options via getProxyByIdWithAuth.
+  assert.deepEqual(geminiProxyEgressOptionsFor(pool, 'px-tenant-a', { ownerUserId: 'user-a' }), {
+    domain_forward: true,
+    dns_empty_types: [64, 65],
+  })
+  assert.equal(geminiProxyEgressOptionsFor(pool, 'px-tenant-b', { ownerUserId: 'user-a' }), null)
+  assert.equal(geminiProxyEgressOptionsFor(pool, 'px-tenant-b', { ownerUserId: null }), null)
+  // Tenant may still read platform proxy egress options.
+  assert.deepEqual(geminiProxyEgressOptionsFor(pool, 'px-platform', { ownerUserId: 'user-a' }), {
+    domain_forward: true,
+    dns_empty_types: [64, 65],
+  })
+
+  // Must #2a: warmGeminiEnvironments resolves tenant private proxy + egress_options via geminiOwnersRepo.
+  const owners = new Map([['env-tenant-a', 'user-a']])
+  const geminiOwnersRepo = { getOwner: (envId) => owners.get(envId) ?? null }
+  const warmCalls = []
+  const warmReport = await warmGeminiEnvironments({
+    proxyPool: () => pool,
+    geminiOwnersRepo,
+    callHost: async (op, payload) => {
+      warmCalls.push([op, payload])
+      if (op === 'list') {
+        return {
+          payload_state: 'installed',
+          payload_mode: 'crag_subscription',
+          environments: [
+            {
+              id: 'env-tenant-a',
+              auth_method: 'oauth',
+              auth_state: 'authorized',
+              proxy_id: 'px-tenant-a',
+              runtime_ready: false,
+              models_discovered: false,
+              crag_license: { valid: true },
+            },
+          ],
+        }
+      }
+      if (op === 'warm') return { warmed: true, runtime_ready: true }
+      throw new Error(`unexpected ${op}`)
+    },
+  })
+  assert.equal(warmReport.warmed, 1)
+  assert.equal(warmReport.skipped, 0)
+  const warmPayload = warmCalls.find(([op]) => op === 'warm')?.[1]
+  assert.equal(warmPayload.proxy_url, 'socks5h://u:p@192.0.2.11:1080')
+  assert.deepEqual(warmPayload.egress_options, { domain_forward: true, dns_empty_types: [64, 65] })
+
+  // Must #2b: createGeminiTerminal resolves tenant private proxy via geminiOwnersRepo (and denies without it).
+  const termCalls = []
+  const term = createGeminiTerminal({
+    proxyPool: () => pool,
+    geminiOwnersRepo,
+    callHost: async (op, payload) => {
+      termCalls.push([op, payload])
+      if (op === 'get') {
+        return {
+          id: 'env-tenant-a',
+          payload_state: 'installed',
+          auth_method: 'oauth',
+          auth_state: 'authorized',
+          proxy_id: 'px-tenant-a',
+        }
+      }
+      return { ok: true }
+    },
+  })
+  const issued = await term.issueTicket('env-tenant-a')
+  assert.ok(issued.ticket)
+  await term.close()
+  const termWithoutOwners = createGeminiTerminal({
+    proxyPool: () => pool,
+    callHost: async (op) => {
+      if (op === 'get') {
+        return {
+          id: 'env-tenant-a',
+          payload_state: 'installed',
+          auth_method: 'oauth',
+          auth_state: 'authorized',
+          proxy_id: 'px-tenant-a',
+        }
+      }
+      return { ok: true }
+    },
+  })
+  await assert.rejects(() => termWithoutOwners.issueTicket('env-tenant-a'), { code: 'gemini_proxy_unavailable' })
+  await termWithoutOwners.close()
+
+  // Must #3: scheduler filters externally supplied catalogSnapshot by allowedEnvIds & ownerScope before picking.
+  const schedCalls = []
+  const sched = createGeminiScheduler({
+    callHost: async (op, payload) => {
+      schedCalls.push([op, payload])
+      if (op === 'test-chat') return { run_id: 'a'.repeat(32) }
+      if (op === 'test-chat-status') {
+        return {
+          state: 'completed',
+          text: 'from-env-2',
+          usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+        }
+      }
+      return { ok: true }
+    },
+    resolveProxy: (proxyId, envOwner) => geminiProxyFor(pool, proxyId, { ownerUserId: envOwner }),
+    resolveProxyEgressOptions: (proxyId, envOwner) =>
+      geminiProxyEgressOptionsFor(pool, proxyId, { ownerUserId: envOwner }),
+    geminiOwnersRepo: { getOwner: (envId) => (envId === 'env-1' ? 'user-b' : 'user-a') },
+    schedulerRuntime: createMockSchedulerRuntime(),
+  })
+  const externalCatalog = {
+    models: [{ id: 'gemini-2.5-flash', object: 'model', owned_by: 'google' }],
+    accounts: [
+      {
+        id: 'env-1',
+        proxy_id: 'px-tenant-b',
+        auth_method: 'oauth',
+        schedule_level: 1,
+        max_concurrency: 4,
+        capabilities: new Set(['full_gemini_api', 'multi_turn']),
+        models: ['gemini-2.5-flash'],
+        catalogIndex: new Map(),
+      },
+      {
+        id: 'env-2',
+        proxy_id: 'px-tenant-a',
+        auth_method: 'oauth',
+        schedule_level: 5,
+        max_concurrency: 4,
+        capabilities: new Set(['full_gemini_api', 'multi_turn']),
+        models: ['gemini-2.5-flash'],
+        catalogIndex: new Map(),
+      },
+    ],
+    unlicensedAccounts: [],
+  }
+  const done = await sched.complete({
+    model: 'gemini-2.5-flash',
+    text: 'hi',
+    ownerScope: { type: 'user', userId: 'user-a' },
+    allowedEnvIds: ['env-2'],
+    catalogSnapshot: externalCatalog,
+  })
+  assert.equal(done.text, 'from-env-2')
+  const inferPayload = schedCalls.find(([op]) => op === 'test-chat')?.[1]
+  assert.equal(inferPayload?.id, 'env-2')
+  assert.deepEqual(inferPayload?.egress_options, { domain_forward: true, dns_empty_types: [64, 65] })
+
+  // Should #4: syncGeminiCatalog forwards egress_options on callGeminiHost('models', ...).
+  const syncCalls = []
+  await syncGeminiCatalog({
+    callGeminiHost: async (op, payload) => {
+      syncCalls.push([op, payload])
+      if (op === 'list') {
+        return {
+          environments: [
+            {
+              id: 'env-tenant-a',
+              auth_state: 'authorized',
+              oauth_imported: false,
+              proxy_id: 'px-tenant-a',
+              models_discovered: false,
+              models: [],
+            },
+          ],
+        }
+      }
+      if (op === 'models') {
+        return { id: 'env-tenant-a', models: ['gemini-2.5-flash'], account: null }
+      }
+      return {}
+    },
+    resolveGeminiProxy: (proxyId, envId) =>
+      geminiProxyFor(pool, proxyId, { ownerUserId: geminiOwnersRepo.getOwner(envId) }),
+    resolveGeminiProxyEgressOptions: (proxyId, envId) =>
+      geminiProxyEgressOptionsFor(pool, proxyId, { ownerUserId: geminiOwnersRepo.getOwner(envId) }),
+    fetchModelsDev: async () => [],
+  })
+  const modelsPayload = syncCalls.find(([op]) => op === 'models')?.[1]
+  assert.equal(modelsPayload?.id, 'env-tenant-a')
+  assert.deepEqual(modelsPayload?.egress_options, { domain_forward: true, dns_empty_types: [64, 65] })
+})

@@ -84,6 +84,9 @@ fn base_req(
         is_admin_diagnostic: false,
         pin_node_key: None,
         exclude_nodes: vec![],
+        keep_pin_on_model_gate: false,
+        model_gated_node_keys: vec![],
+        skip_session_gate: false,
     }
 }
 
@@ -2488,4 +2491,348 @@ async fn required_runtime_capabilities_filters_and_recovers_via_telemetry() {
         .unwrap();
     assert_eq!(recovered.selected_node.node_key, "claude_vm:missing");
     release_ok(&eng, &recovered.lease_id);
+}
+
+fn two_node_engine() -> SchedulerEngine {
+    let eng = SchedulerEngine::new(EngineOptions::default());
+    eng.bootstrap(BootstrapRequest {
+        controller_epoch: CompactString::const_new("ep1"),
+        role: Role::Leader,
+        config_version: Some(1),
+        config_snapshot: ConfigSnapshot {
+            config_version: 1,
+            pools: vec![PoolConfig {
+                id: CompactString::const_new("pool_1"),
+                members: vec![
+                    member_cfg("claude_vm:vm1", NodeType::ClaudeVm, "vm1", 1),
+                    member_cfg("claude_vm:vm2", NodeType::ClaudeVm, "vm2", 2),
+                ],
+                ..Default::default()
+            }],
+            nodes: vec![
+                node_cfg(
+                    "claude_vm:vm1",
+                    NodeType::ClaudeVm,
+                    "vm1",
+                    Provider::Anthropic,
+                    9,
+                    4,
+                    4,
+                ),
+                node_cfg(
+                    "claude_vm:vm2",
+                    NodeType::ClaudeVm,
+                    "vm2",
+                    Provider::Anthropic,
+                    7,
+                    4,
+                    4,
+                ),
+            ],
+            ..Default::default()
+        },
+        active_sticky_bindings: vec![],
+        active_penalties: vec![],
+        initial_telemetry: vec![],
+    });
+    eng
+}
+
+/// 238 keep_pin_on_model_gate: home vm1 cannot serve this model (JS gate), so
+/// the turn borrows vm2 and the next turn goes home. Off: the pin follows.
+async fn model_gate_borrow_then_next_turn(keep_pin: bool) -> String {
+    let eng = two_node_engine();
+    let r1 = eng
+        .acquire(base_req(
+            "r1",
+            "pool_1",
+            "claude-opus-4-6",
+            ModelFamily::Claude,
+            "s1",
+            Some("m1"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r1.selected_node.node_key, "claude_vm:vm1");
+    eng.commit(CommitRequest {
+        lease_id: r1.lease_id.clone(),
+    });
+    release_ok(&eng, &r1.lease_id);
+
+    let mut gated = base_req(
+        "r2",
+        "pool_1",
+        "claude-fable-5",
+        ModelFamily::Claude,
+        "s1",
+        Some("m1"),
+    );
+    gated.api_key_scope.allowed_node_keys = vec![CompactString::const_new("claude_vm:vm2")];
+    gated.model_gated_node_keys = vec![CompactString::const_new("claude_vm:vm1")];
+    gated.keep_pin_on_model_gate = keep_pin;
+    let r2 = eng.acquire(gated).await.unwrap();
+    assert_eq!(r2.selected_node.node_key, "claude_vm:vm2");
+    eng.commit(CommitRequest {
+        lease_id: r2.lease_id.clone(),
+    });
+    release_ok(&eng, &r2.lease_id);
+
+    let r3 = eng
+        .acquire(base_req(
+            "r3",
+            "pool_1",
+            "claude-opus-4-6",
+            ModelFamily::Claude,
+            "s1",
+            Some("m1"),
+        ))
+        .await
+        .unwrap();
+    release_ok(&eng, &r3.lease_id);
+    r3.selected_node.node_key.to_string()
+}
+
+#[tokio::test]
+async fn keep_pin_on_model_gate_borrows_without_moving_session_pin() {
+    assert_eq!(
+        model_gate_borrow_then_next_turn(true).await,
+        "claude_vm:vm1"
+    );
+}
+
+#[tokio::test]
+async fn keep_pin_on_model_gate_off_lets_pin_follow_the_spill() {
+    assert_eq!(
+        model_gate_borrow_then_next_turn(false).await,
+        "claude_vm:vm2"
+    );
+}
+
+#[tokio::test]
+async fn keep_pin_on_model_gate_does_not_cover_scope_filtering() {
+    // Home dropped for a non-model reason (key scope only): pin follows, as 238
+    // did for any non-model-gate exclusion.
+    let eng = two_node_engine();
+    let r1 = eng
+        .acquire(base_req(
+            "r1",
+            "pool_1",
+            "claude-opus-4-6",
+            ModelFamily::Claude,
+            "s1",
+            None,
+        ))
+        .await
+        .unwrap();
+    eng.commit(CommitRequest {
+        lease_id: r1.lease_id.clone(),
+    });
+    release_ok(&eng, &r1.lease_id);
+    let mut scoped = base_req(
+        "r2",
+        "pool_1",
+        "claude-opus-4-6",
+        ModelFamily::Claude,
+        "s1",
+        None,
+    );
+    scoped.api_key_scope.allowed_node_keys = vec![CompactString::const_new("claude_vm:vm2")];
+    scoped.keep_pin_on_model_gate = true;
+    let r2 = eng.acquire(scoped).await.unwrap();
+    eng.commit(CommitRequest {
+        lease_id: r2.lease_id.clone(),
+    });
+    release_ok(&eng, &r2.lease_id);
+    let r3 = eng
+        .acquire(base_req(
+            "r3",
+            "pool_1",
+            "claude-opus-4-6",
+            ModelFamily::Claude,
+            "s1",
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r3.selected_node.node_key, "claude_vm:vm2");
+}
+
+/// 238: a summary fork (own session id, parent = conversation) and a seatless
+/// probe (conversation's own session id) land on the conversation's pinned
+/// node, and leave no stick of their own.
+#[tokio::test]
+async fn ephemeral_summary_and_probe_follow_session_pin_without_sticking() {
+    let eng = two_node_engine();
+    // Pin s1 to vm2 by letting vm1 be unavailable for one committed turn.
+    let mut first = base_req(
+        "r1",
+        "pool_1",
+        "claude-opus-4-6",
+        ModelFamily::Claude,
+        "s1",
+        None,
+    );
+    first.api_key_scope.allowed_node_keys = vec![CompactString::const_new("claude_vm:vm2")];
+    let r1 = eng.acquire(first).await.unwrap();
+    assert_eq!(r1.selected_node.node_key, "claude_vm:vm2");
+    eng.commit(CommitRequest {
+        lease_id: r1.lease_id.clone(),
+    });
+    release_ok(&eng, &r1.lease_id);
+
+    let mut summary = base_req(
+        "r2",
+        "pool_1",
+        "claude-opus-4-6",
+        ModelFamily::Claude,
+        "sum-1",
+        None,
+    );
+    summary.is_ephemeral_probe = true;
+    summary.parent_session_id = Some(CompactString::const_new("s1"));
+    let r2 = eng.acquire(summary).await.unwrap();
+    assert_eq!(r2.selected_node.node_key, "claude_vm:vm2");
+    assert_eq!(
+        r2.explain.affinity.why,
+        Some(AffinityWhy::EphemeralFollowSession)
+    );
+    eng.commit(CommitRequest {
+        lease_id: r2.lease_id.clone(),
+    });
+    release_ok(&eng, &r2.lease_id);
+
+    let mut probe = base_req(
+        "r3",
+        "pool_1",
+        "claude-opus-4-6",
+        ModelFamily::Claude,
+        "s1",
+        None,
+    );
+    probe.is_ephemeral_probe = true;
+    let r3 = eng.acquire(probe).await.unwrap();
+    assert_eq!(r3.selected_node.node_key, "claude_vm:vm2");
+    release_ok(&eng, &r3.lease_id);
+
+    // The summary session left no stick: a non-ephemeral request on it ranks fresh.
+    let r4 = eng
+        .acquire(base_req(
+            "r4",
+            "pool_1",
+            "claude-opus-4-6",
+            ModelFamily::Claude,
+            "sum-1",
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r4.selected_node.node_key, "claude_vm:vm1");
+}
+
+/// 238 quotaGuardLevel `continuing` / filterByHostMemory: a node in the guard
+/// band or on a memory-critical host keeps the conversations pinned to it and
+/// refuses new ones.
+async fn continuing_only_case(update: NodeTelemetryUpdate, reason: ExcludeReason) {
+    let eng = two_node_engine();
+    let r1 = eng
+        .acquire(base_req(
+            "r1",
+            "pool_1",
+            "claude-opus-4-6",
+            ModelFamily::Claude,
+            "s1",
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r1.selected_node.node_key, "claude_vm:vm1");
+    eng.commit(CommitRequest {
+        lease_id: r1.lease_id.clone(),
+    });
+    release_ok(&eng, &r1.lease_id);
+
+    eng.update_telemetry(TelemetryBatchRequest {
+        nodes: vec![update],
+    });
+
+    let r2 = eng
+        .acquire(base_req(
+            "r2",
+            "pool_1",
+            "claude-opus-4-6",
+            ModelFamily::Claude,
+            "s1",
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        r2.selected_node.node_key, "claude_vm:vm1",
+        "pinned conversation stays"
+    );
+    release_ok(&eng, &r2.lease_id);
+
+    let mut sub = base_req(
+        "r3",
+        "pool_1",
+        "claude-opus-4-6",
+        ModelFamily::Claude,
+        "s1-sub",
+        None,
+    );
+    sub.parent_session_id = Some(CompactString::const_new("s1"));
+    let r3 = eng.acquire(sub).await.unwrap();
+    assert_eq!(
+        r3.selected_node.node_key, "claude_vm:vm1",
+        "subagent follows parent"
+    );
+    release_ok(&eng, &r3.lease_id);
+
+    let r4 = eng
+        .acquire(base_req(
+            "r4",
+            "pool_1",
+            "claude-opus-4-6",
+            ModelFamily::Claude,
+            "s2",
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        r4.selected_node.node_key, "claude_vm:vm2",
+        "new conversation goes elsewhere"
+    );
+    assert!(
+        r4.explain
+            .excluded
+            .iter()
+            .any(|e| e.reason == reason && e.node == "claude_vm:vm1")
+    );
+}
+
+#[tokio::test]
+async fn quota_guard_band_keeps_pinned_conversations_and_refuses_new_ones() {
+    continuing_only_case(
+        NodeTelemetryUpdate {
+            node_key: CompactString::const_new("claude_vm:vm1"),
+            new_sessions_blocked: Some(true),
+            ..Default::default()
+        },
+        ExcludeReason::NewSessionBlocked,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn host_memory_pressure_keeps_pinned_conversations_and_refuses_new_ones() {
+    continuing_only_case(
+        NodeTelemetryUpdate {
+            node_key: CompactString::const_new("claude_vm:vm1"),
+            host_memory_pressure: Some(true),
+            ..Default::default()
+        },
+        ExcludeReason::MemoryPressure,
+    )
+    .await;
 }

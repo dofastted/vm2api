@@ -183,12 +183,18 @@ export function codexFailoverBudget(routing = {}) {
   }
 }
 
+function upstreamSentOf(result) {
+  const raw = result?.upstreamSent ?? result?.headers?.['x-kin-upstream-sent']
+  return raw == null ? '' : String(raw).trim().toLowerCase()
+}
+
 /** Same-account retries are only useful for transient failures; auth and quota errors switch seats. */
 export function isRetryableSameCodexAccount(
   result,
   { headersSent = false, conversionError = null, signal = null } = {},
 ) {
   if (!result || result.ok === true || result.committed === true || headersSent || conversionError) return false
+  if (upstreamSentOf(result) === 'unknown') return false
   if (signal?.aborted) return false
   const status = Number(result.status) || 0
   const code = String(result.body?.error?.code || result.error_code || '')
@@ -249,6 +255,8 @@ function execFor(projectRoot, vm) {
 export function isRetryableCodexTransport(result) {
   if (!result || result.ok === true) return false
   if (result.committed === true) return false
+  const sent = upstreamSentOf(result)
+  if (sent === 'unknown' || sent === '1') return false
   const code = String(result.body?.error?.code || result.error_code || '')
   const msg = String(result.body?.error?.message || result.error || '')
   const status = Number(result.status) || 0
@@ -530,15 +538,20 @@ export function reasoningHistoryFallback(args, result) {
   }
 }
 
-export async function runCodexKernelHop({ hop, args = {}, onEvent, onReasoningFallback } = {}) {
+export async function runCodexKernelHop({ hop, args = {}, onEvent, onReasoningFallback, onAttempt } = {}) {
   let emitted = false
   const wrapped = async (line) => {
     emitted = true
     if (onEvent) await onEvent(line)
   }
-  let result = await hop({ ...args, onEvent: wrapped })
+  const invoke = async (hopArgs) => {
+    const res = await hop({ ...hopArgs, onEvent: wrapped })
+    if (onAttempt) onAttempt(res)
+    return res
+  }
+  let result = await invoke(args)
   if (!result?.ok && !emitted && isRetryableCodexTransport(result)) {
-    result = { ...(await hop({ ...args, onEvent: wrapped })), transport_retried: true }
+    result = { ...(await invoke(args)), transport_retried: true }
   }
   const fallback = !emitted && !result?.transport_retried ? reasoningHistoryFallback(args, result) : null
   if (fallback) {
@@ -546,7 +559,7 @@ export async function runCodexKernelHop({ hop, args = {}, onEvent, onReasoningFa
       await onReasoningFallback({ originalResult: result, body: fallback.args.body, ...fallback.info })
     if (args.signal?.aborted) return result
     result = {
-      ...(await hop({ ...fallback.args, onEvent: wrapped })),
+      ...(await invoke(fallback.args)),
       reasoning_history_retried: true,
       reasoning_history_fallback: fallback.info,
     }
@@ -577,6 +590,7 @@ export async function handleCodexProtocol({
   refusalSessions = null,
   keyScope = null,
   afterHop = null,
+  recordFinal400 = null,
   ownerScope = null,
   pinVmId = undefined,
   poolAccess = null,
@@ -876,6 +890,7 @@ export async function handleCodexProtocol({
 
   const excludedNodeKeys = new Set()
   const gone = clientGoneSignal(req, res)
+  const codexTimingAttempts = []
   const failoverBudget = codexFailoverBudget(routing)
   const sameRetryDelay = Number(routing?.failover?.same_account_retry_delay_ms)
   const sameRetryDelayMs =
@@ -1087,11 +1102,47 @@ export async function handleCodexProtocol({
       if (captureOutbound) logBag.outbound_body = outboundBody
       logBag.outbound_headers = redactHeaders(outboundHeaders)
       let hopEmitted = false
+      let clientFirstWriteMs = null
+      const hopExec = ready?.health
+        ? { ...execFor(projectRoot, vm), workerStatus: ready.health }
+        : execFor(projectRoot, vm)
+      const wsReplay =
+        req?._responsesWsReplay && typeof req._responsesWsReplay === 'object' ? req._responsesWsReplay : undefined
+      const recordTimingAttempt = (attemptResult) => {
+        const firstTextMs = Number.isFinite(attemptResult?.firstTokenAt)
+          ? Math.max(0, attemptResult.firstTokenAt - requestStartedAt)
+          : (attemptResult?.ttftMs ?? null)
+        const firstByteMs = Number.isFinite(attemptResult?.firstByteAt)
+          ? Math.max(0, attemptResult.firstByteAt - requestStartedAt)
+          : (attemptResult?.firstByteMs ?? null)
+        codexTimingAttempts.push({
+          kernel_request_id: attemptResult?.hopRequestId || null,
+          vm_id: vm.id,
+          status: attemptResult?.status ?? null,
+          upstream_sent: upstreamSentOf(attemptResult) || null,
+          upstream: attemptResult?.turnTiming || null,
+          ...(attemptResult?.udsPacked ? { uds_packed: attemptResult.udsPacked } : {}),
+          ...(attemptResult?.upstreamError ? { upstream_error: attemptResult.upstreamError } : {}),
+          node: {
+            first_byte_ms: firstByteMs,
+            first_text_ms: firstTextMs,
+            first_generated_event_type: attemptResult?.nodeTiming?.firstGeneratedEventType || null,
+            first_release_type: attemptResult?.nodeTiming?.firstReleaseType || null,
+            client_first_write_ms: clientFirstWriteMs,
+            client_first_write_source_type: attemptResult?.nodeTiming?.clientFirstWriteSourceType || null,
+          },
+        })
+        logBag.hop_meta = {
+          ...logBag.hop_meta,
+          codex_vm_timing: { attempts: codexTimingAttempts },
+        }
+      }
       const runHop = () =>
         runCodexKernelHop({
           hop,
+          onAttempt: recordTimingAttempt,
           args: {
-            exec: execFor(projectRoot, vm),
+            exec: hopExec,
             signal: gone.signal,
             timeoutMs: cfg?.limits?.upstream_timeout_ms ?? 600_000,
             idleTimeoutMs: resolveStreamIdleTimeoutMs(routing, cfg),
@@ -1099,13 +1150,18 @@ export async function handleCodexProtocol({
             redactionPrincipal: req.apiKeyRecord?.id || (req.apiKeyKind === 'master' ? 'master' : ''),
             redactionSession: String(req.headers?.['x-session-id'] || inboundSession.session_id || ''),
             gatewayRequestId: res?._kinRequestId || null,
+            onInterruptReady: req?._onCodexInterruptReady,
             body: outboundBody,
             envelope: {
               body: outboundBody,
               headers: outboundHeaders,
               stream: true,
               session,
-              options: { ...codexKernelRequestOptions(routing, vm), installation_id: written?.installationId },
+              options: {
+                ...codexKernelRequestOptions(routing, vm),
+                installation_id: written?.installationId,
+                ...(wsReplay ? { ws_replay: wsReplay } : {}),
+              },
             },
           },
           onReasoningFallback: ({ body: retryBody }) => {
@@ -1132,10 +1188,14 @@ export async function handleCodexProtocol({
                   protocol === 'anthropic.messages'
                     ? responsesSseToAnthropicEvents(line, anthropicSse)
                     : responsesSseToChatChunk(line, 'codex', chatSse)
-                if (mapped) res.write(mapped)
+                if (mapped) {
+                  if (clientFirstWriteMs == null) clientFirstWriteMs = Math.max(0, Date.now() - requestStartedAt)
+                  res.write(mapped)
+                }
               } catch (error) {
                 if (error.code !== 'tool_arguments_mismatch') throw error
                 conversionError = { type: 'upstream_protocol_error', code: error.code, message: error.message }
+                if (clientFirstWriteMs == null) clientFirstWriteMs = Math.max(0, Date.now() - requestStartedAt)
                 res.write(
                   protocol === 'anthropic.messages'
                     ? `event: error\ndata: ${JSON.stringify({ type: 'error', error: conversionError })}\n\n`
@@ -1145,13 +1205,16 @@ export async function handleCodexProtocol({
               return
             }
             const named = nameSseEvent(line)
-            if (named) res.write(named)
+            if (named) {
+              if (clientFirstWriteMs == null) clientFirstWriteMs = Math.max(0, Date.now() - requestStartedAt)
+              res.write(named)
+            }
           },
         })
 
       const runAttempt = async () => {
         let result = await runHop()
-        let policyRefusal = afterHop?.(result)
+        let policyRefusal = afterHop?.(result, { blockSessionOn400: false })
         const error = result?.body?.error
         if (
           !compatibleTools &&
@@ -1174,7 +1237,7 @@ export async function handleCodexProtocol({
             outboundBody = { ...outboundBody, tools: compatibleTools }
             if (captureOutbound) logBag.outbound_body = outboundBody
             result = await runHop()
-            policyRefusal = afterHop?.(result)
+            policyRefusal = afterHop?.(result, { blockSessionOn400: false })
           }
         }
         return { result, policyRefusal }
@@ -1333,6 +1396,7 @@ export async function handleCodexProtocol({
       }
 
       if (policyRefusal && policyRefusal !== 'upstream:billing_refusal') {
+        if (!gone.signal.aborted) recordFinal400?.(result)
         await releaseActiveLeaseNow({ outcome: 'ok', http_status: Number(result?.status) || 400 })
         stats.errors++
         const error = upstreamRiskClientError(policyRefusal, res._kinRequestId)
@@ -1346,6 +1410,7 @@ export async function handleCodexProtocol({
 
       const failureReport = buildCodexFailureReport(result)
       if (res.headersSent || hopEmitted) {
+        if (!gone.signal.aborted) recordFinal400?.(result)
         await releaseActiveLeaseNow({
           outcome: failureReport.error_class === 'timeout' ? 'timeout' : 'error',
           http_status: failureReport.http_status || undefined,
@@ -1392,6 +1457,7 @@ export async function handleCodexProtocol({
     gone.settle()
   }
 
+  if (last && !last.ok && !gone.signal.aborted) recordFinal400?.(last)
   stats.errors++
   logBag.error_code = last?.body?.error?.code || 'codex_upstream'
   logBag.error_message ||= last?.body?.error?.message || null
@@ -1547,6 +1613,7 @@ export async function handleCodexSearch({
   poolAccess = null,
   originPoolId = null,
   schedulerRuntime = null,
+  recordFinal400 = null,
 }) {
   logBag.via = 'codex-search'
   const reject = (status, type, code, message) => {
@@ -1790,6 +1857,14 @@ export async function handleCodexSearch({
     return reject(502, 'api_error', last?.error || 'upstream_transport', 'Codex search upstream request failed')
   }
   const payload = parseJson(last.text)
+  if (last.status === 400 && !gone.signal.aborted) {
+    recordFinal400?.({
+      ok: false,
+      status: 400,
+      upstreamStatus: 400,
+      body: payload ?? last.text,
+    })
+  }
   if (payload === undefined) {
     logBag.final_state = 'upstream_error'
     return reject(
@@ -1835,6 +1910,7 @@ export async function handleCodexImages({
   poolAccess = null,
   originPoolId = null,
   schedulerRuntime = null,
+  recordFinal400 = null,
 }) {
   logBag.via = 'codex-images'
   const reject = (status, type, code, message) => {
@@ -2117,6 +2193,14 @@ export async function handleCodexImages({
     return reject(502, 'api_error', last?.error || 'upstream_transport', 'Codex images upstream request failed')
   }
   const payload = parseJson(last.text)
+  if (last.status === 400 && !gone.signal.aborted) {
+    recordFinal400?.({
+      ok: false,
+      status: 400,
+      upstreamStatus: 400,
+      body: payload ?? last.text,
+    })
+  }
   if (payload === undefined) {
     logBag.final_state = 'upstream_error'
     return reject(

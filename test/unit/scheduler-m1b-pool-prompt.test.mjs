@@ -204,7 +204,11 @@ async function startMockCragHealthSocket(t, root, health = {}) {
 function writeVmFile(root, vm) {
   const dir = path.join(root, 'vms')
   fs.mkdirSync(dir, { recursive: true })
-  fs.writeFileSync(path.join(dir, `${vm.id}.json`), JSON.stringify(vm))
+  // 238 never scheduled a Claude slot without a bound SOCKS proxy.
+  const record = vm.proxy
+    ? vm
+    : { proxy_cli_enabled: true, proxy: { id: `proxy-${vm.id}`, url: 'socks5h://127.0.0.1:10001' }, ...vm }
+  fs.writeFileSync(path.join(dir, `${vm.id}.json`), JSON.stringify(record))
 }
 
 async function startJevServer(t, handler) {

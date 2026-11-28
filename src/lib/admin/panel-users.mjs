@@ -8,6 +8,7 @@
 import crypto from 'node:crypto'
 import { resolveStoreDb } from '../db/database.mjs'
 import { UsersRepo } from '../db/repos/users-repo.mjs'
+import { getCacheRuntime, notifyDbTablesMutated } from '../cache/index.mjs'
 import { clampVmCreateQuota } from './resource-owner.mjs'
 import { reclaimAssignedVms } from '../vm/vm-registry.mjs'
 
@@ -140,6 +141,10 @@ export class PanelUserStore {
   rebind(db) {
     this.db = db
     this.repo = new UsersRepo(db)
+    getCacheRuntime()
+      .entity.invalidateUsers()
+      .catch(() => {})
+    notifyDbTablesMutated(['users'])
   }
 
   list() {
@@ -150,8 +155,16 @@ export class PanelUserStore {
     return this.repo.getById(id)
   }
 
+  getByIdAsync(id) {
+    return this.repo.getByIdAsync(id)
+  }
+
   getByUsername(username) {
     return this.repo.getByUsername(username)
+  }
+
+  getByUsernameAsync(username) {
+    return this.repo.getByUsernameAsync(username)
   }
 
   countEnabledAdmins() {

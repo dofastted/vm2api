@@ -173,13 +173,15 @@ test('normalizePoolRouting and PoolScheduler.reloadConfig clamp timeouts and rep
   const pool = new PoolScheduler({
     config: { sticky_wait_timeout_ms: 500, fallback_wait_timeout_ms: 999999, queue_max: 2000 },
   })
-  assert.equal(pool.config.sticky_wait_timeout_ms, 1000)
+  // sticky_wait_timeout_ms is dead since M3 (Rust spills immediately): stored values pass through unclamped.
+  assert.equal(pool.config.sticky_wait_timeout_ms, 500)
+  assert.equal(Object.hasOwn(pool.config, 'heartbeat_stale_ms'), false)
   assert.equal(pool.config.fallback_wait_timeout_ms, 120000)
   assert.equal(pool.config.queue_max, 999)
   assert.equal(pool.snapshot().engine, 'rust')
 
-  pool.reloadConfig({ sticky_wait_timeout_ms: 'nope', fallback_wait_timeout_ms: null, strategy: 'fill' })
-  assert.equal(pool.config.sticky_wait_timeout_ms, 45000)
+  pool.reloadConfig({ fallback_wait_timeout_ms: null, strategy: 'fill' })
+  assert.equal(Object.hasOwn(pool.config, 'sticky_wait_timeout_ms'), false)
   assert.equal(pool.config.fallback_wait_timeout_ms, 30000)
   assert.equal(pool.config.strategy, 'fill')
 

@@ -98,6 +98,10 @@ pub struct NodeTelemetryUpdate {
     pub quota_util_7d_pct: Option<f32>,
     #[serde(default)]
     pub host_memory_pressure: Option<bool>,
+    /// 238 exhaustion_guard `continuing` band: only sessions already pinned to
+    /// this node may use it; new conversations go elsewhere.
+    #[serde(default)]
+    pub new_sessions_blocked: Option<bool>,
     #[serde(default)]
     pub proxy_ready: Option<bool>,
     #[serde(default)]
@@ -211,6 +215,19 @@ pub struct AcquireRequest {
     pub pin_node_key: Option<NodeKey>,
     #[serde(default)]
     pub exclude_nodes: Vec<NodeKey>,
+    /// 238 `pool.keep_pin_on_model_gate`: when the session's pinned node is out
+    /// only because it cannot serve this model, the request borrows another node
+    /// and the session / machine pins stay home.
+    #[serde(default)]
+    pub keep_pin_on_model_gate: bool,
+    /// Nodes the caller dropped from `allowed_node_keys` for a model reason
+    /// (plan gate, per-model wait). Rust cannot tell these from scope filtering.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_gated_node_keys: Vec<NodeKey>,
+    /// Batch-group member (238 batchMember): sticky and counted like a session,
+    /// but concurrent requests of one member are not serialized by SessionGate.
+    #[serde(default)]
+    pub skip_session_gate: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -476,6 +476,41 @@ test('SSE assembler rebuilds tool_use input from json deltas', () => {
   assert.equal(state.message.content[0]._inputJson, undefined)
 })
 
+test('SSE assembler clears _inputJson on empty input_json_delta for zero-argument tool_use', () => {
+  const state = createClaudeMessageAssembler()
+  const lines = [
+    'data: {"type":"message_start","message":{"id":"msg_zero","type":"message","role":"assistant","content":[]}}',
+    '',
+    'data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_cronlist","name":"CronList","input":{}}}',
+    '',
+    'data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":""}}',
+    '',
+    'data: {"type":"content_block_stop","index":0}',
+    '',
+    'data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":16}}',
+    '',
+  ]
+  for (const line of lines) applyClaudeSSELineToMessage(line, state)
+  assert.equal(state.message.stop_reason, 'tool_use')
+  assert.equal(state.message.content[0].name, 'CronList')
+  assert.deepEqual(state.message.content[0].input, {})
+  assert.equal(Object.hasOwn(state.message.content[0], '_inputJson'), false)
+})
+
+test('SSE assembler retains _inputJson when tool_use stream truncates before content_block_stop', () => {
+  const state = createClaudeMessageAssembler()
+  const lines = [
+    'data: {"type":"message_start","message":{"id":"msg_trunc","type":"message","role":"assistant","content":[]}}',
+    '',
+    'data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_trunc","name":"CronList","input":{}}}',
+    '',
+    'data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":""}}',
+    '',
+  ]
+  for (const line of lines) applyClaudeSSELineToMessage(line, state)
+  assert.equal(Object.hasOwn(state.message.content[0], '_inputJson'), true)
+})
+
 test('pretty-printed SSE converts to completion chunks', () => {
   const state = createOpenAICompletionStreamState(MODEL, 'vm-1')
   const chunks = collect(claudeSSELineToOpenAICompletionChunks, state, PRETTY_SSE)

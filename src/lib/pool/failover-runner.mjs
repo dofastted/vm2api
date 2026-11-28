@@ -186,7 +186,6 @@ const DEFAULTS = {
   max_total_attempts: 12,
   max_accounts_per_request: 0,
   total_retry_deadline_ms: 120000,
-  session_queue_timeout_ms: 900_000,
   poison_request_threshold: 2,
   poison_request_window_ms: 30 * 60_000,
   poison_request_quarantine_ms: 10 * 60_000,
@@ -196,6 +195,25 @@ const DEFAULTS = {
   same_account_retry_delay_ms: 500,
   same_account_retry_max_hop_ms: 10_000,
   signature_repair: false,
+  // A conversation that already had a session pin when the request arrived
+  // stays on the node its first attempt ran on: a failed attempt retries that
+  // node or returns its error, it never replays the transcript elsewhere.
+  keep_session_home: false,
+  // keep_session_home: pause between retries of a home kernel that had no free slot.
+  home_slot_busy_retry_ms: 2000,
+  // keep_session_home: once the request has run this long, a busy home kernel
+  // answers 529 session_home_slot_busy. 0 keeps waiting until the deadline.
+  home_slot_busy_max_wait_ms: 0,
+}
+
+const SESSION_PIN_WHY = new Set(['session_hit', 'session_hit_after_wait'])
+const SESSION_PIN_NOTES = new Set(['session_spill_busy', 'session_node_unavailable'])
+
+/** The Rust decision found a live session pin for this request (hit or spill). */
+function acquiredWithSessionPin(acquired) {
+  const affinity = acquired?.explain?.affinity
+  if (SESSION_PIN_WHY.has(affinity?.why)) return true
+  return Array.isArray(affinity?.notes) && affinity.notes.some((n) => SESSION_PIN_NOTES.has(n?.why))
 }
 
 function clone(value) {
@@ -730,6 +748,7 @@ export class FailoverRunner {
     stickyRouter = null,
     attemptsRepo = null,
     rateLimitService = null,
+    requestLog = null,
     config = {},
     onProxyFailure = null,
     onCredentialFailure = null,
@@ -743,6 +762,7 @@ export class FailoverRunner {
     this.stickyRouter = stickyRouter
     this.attemptsRepo = attemptsRepo
     this.rateLimitService = rateLimitService
+    this.requestLog = requestLog || null
     this.config = { ...DEFAULTS, ...(config || {}) }
     this.onProxyFailure = onProxyFailure
     this.onCredentialFailure = onCredentialFailure
@@ -979,6 +999,8 @@ export class FailoverRunner {
     quotaRequest = null,
     allowQueue = true,
     schedulerRuntime = null,
+    requestLog = null,
+    onPhase = null,
   } = {}) {
     if (typeof callAttempt !== 'function') throw new Error('FailoverRunner requires callAttempt')
 
@@ -1020,7 +1042,12 @@ export class FailoverRunner {
       poolAccess?.effectivePool?.id ||
       keyScope?.vm_pool_id ||
       VIRTUAL_POOL_IDS.claude
-    const resolvedSessionId = inboundIdentity?.sessionId || (stickyKey ? String(stickyKey) : '') || crypto.randomUUID()
+    // A batch member's identity is its member key (238 scopeStickyKey(memberKey)).
+    const resolvedSessionId =
+      (batchMember === true && stickyKey ? String(stickyKey) : '') ||
+      inboundIdentity?.sessionId ||
+      (stickyKey ? String(stickyKey) : '') ||
+      crypto.randomUUID()
     const resolvedMachineId = inboundIdentity?.machineId || stickyDeviceId || deviceKey || null
     const isManagedPool = Boolean(poolAccess && poolAccess.legacy === false)
     const resolvedAllowedKeys = Array.isArray(allowedNodeKeys)
@@ -1048,9 +1075,10 @@ export class FailoverRunner {
       sessionId: resolvedSessionId,
       sessionIdSource: inboundIdentity?.sessionSource || null,
       parentSessionId: inboundIdentity?.parentSessionId || rootSessionId || null,
-      isEphemeralProbe: Boolean(
-        isEphemeralProbe || skipSessionSeat || batchMember === true || inboundIdentity?.isEphemeralProbe,
-      ),
+      // 238 batchMember: sticky to its member key and counted as a session,
+      // but members are not serialized (skipSessionGate), not ephemeral.
+      isEphemeralProbe: Boolean(isEphemeralProbe || skipSessionSeat || inboundIdentity?.isEphemeralProbe),
+      skipSessionGate: batchMember === true,
       noQueue: allowQueue === false,
       isAdminDiagnostic: resolvedAdminDiagnostic,
       pinNodeKey: pinVmId ? formatNodeKey('claude_vm', pinVmId) : null,
@@ -1110,6 +1138,33 @@ export class FailoverRunner {
 
     let activeLeaseId = acquired.lease_id
     let activeSelected = this.#resolveSelected(acquired, { model, quotaRequest })
+    const liveLog = requestLog || this.requestLog || null
+    const emitPhase = (patch) => {
+      try {
+        liveLog?.updatePhase?.(reqId, patch)
+      } catch {}
+      if (typeof onPhase === 'function') {
+        try {
+          onPhase({ requestId: reqId, ...patch })
+        } catch {}
+      }
+    }
+    emitPhase({
+      phase: 'routing',
+      attempt_count: 1,
+      vm_id: activeSelected?.vmId || null,
+      account_id: activeSelected?.accountId || null,
+    })
+
+    // 238 keep_session_home: a continuing conversation's home for this request
+    // is the node its first attempt ran on. Subagents and batch members excluded.
+    const keepHome = this.config.keep_session_home === true && !pinVmId && !!stickyKey && batchMember !== true
+    const subagentRequest = !!(inboundIdentity?.parentSessionId || rootSessionId)
+    const homeNodeKey =
+      keepHome && !subagentRequest && acquiredWithSessionPin(acquired)
+        ? acquired?.selected_node?.node_key || null
+        : null
+    const isHome = (sel) => !!homeNodeKey && (sel?.nodeKey || formatNodeKey('claude_vm', sel?.vmId)) === homeNodeKey
     let activeCommitted = false
     let commitPromise = null
     let activeInflightCounted = false
@@ -1145,6 +1200,57 @@ export class FailoverRunner {
         budget.allowSameUnit(selected.accountId, policy, hopMs, this.config.same_account_retry_max_hop_ms) &&
         budget.hops < maxTotalAttempts &&
         Date.now() < deadline
+
+      const failedRelease = () => ({
+        outcome: failureReport.error_class === 'timeout' ? 'timeout' : 'error',
+        http_status: failureReport.http_status || undefined,
+        error_class: failureReport.error_class,
+        error_signature: failureReport.error_signature,
+        error_message: failureReport.error_message,
+        retry_after_sec: failureReport.retry_after_sec,
+      })
+
+      // keep_session_home: the home never hands the transcript to another node.
+      if (!committedNow && isHome(selected)) {
+        if (policy?.reason === 'slot_busy') {
+          // Nothing ran: wait for the home kernel instead of spilling.
+          const maxWait = Number(this.config.home_slot_busy_max_wait_ms) || 0
+          const waitedOut = maxWait > 0 && Date.now() - startedAt >= maxWait
+          if (allowQueue === false || waitedOut || Date.now() >= deadline) {
+            await releaseActiveLeaseNow(failedRelease())
+            return {
+              done: true,
+              result: {
+                ...poolOverloadedError({ reason: 'session_home_slot_busy', attempt_count: budget.hops }),
+                ...attribution(),
+              },
+            }
+          }
+          try {
+            const waitMs = Number(this.config.home_slot_busy_retry_ms ?? 2000)
+            await sleepWithSignal(Math.max(0, Math.min(waitMs, deadline - Date.now())), signal)
+          } catch {
+            await releaseActiveLeaseNow({ outcome: 'aborted' })
+            return { done: true, result: { ...clientCancelledResult(), via: 'rust-scheduler', ...attribution() } }
+          }
+          return { done: false }
+        }
+        if (canSameUnit) {
+          budget.noteSameUnit(selected.accountId)
+          try {
+            await sleepWithSignal(this.config.same_account_retry_delay_ms, signal)
+          } catch {
+            await releaseActiveLeaseNow({ outcome: 'aborted' })
+            return { done: true, result: { ...clientCancelledResult(), via: 'rust-scheduler', ...attribution() } }
+          }
+          return { done: false }
+        }
+        await releaseActiveLeaseNow(failedRelease())
+        return {
+          done: true,
+          result: preferLastResult(lastResult, lastPolicy, null, { ...attribution(), session_home_kept: true }),
+        }
+      }
 
       // Pinned VM or freshly refreshed OAuth credential stays on the current lease directly.
       if (canSameUnit && (pinVmId || policy?.reason === 'oauth_refresh_required')) {
@@ -1272,6 +1378,14 @@ export class FailoverRunner {
         const attemptNo = budget.hops + 1
         const selected = activeSelected
         lastSelected = selected
+        if (attemptNo > 1) {
+          emitPhase({
+            phase: 'retrying',
+            attempt_count: attemptNo,
+            vm_id: selected?.vmId || null,
+            account_id: selected?.accountId || null,
+          })
+        }
 
         if (signal?.aborted || isClientCancelledResult(lastResult)) {
           finalReleasePayload = { outcome: 'aborted' }
@@ -1419,6 +1533,13 @@ export class FailoverRunner {
             onCommit: () => {
               committed = true
               activeCommitted = true
+              emitPhase({
+                phase: 'streaming',
+                attempt_count: attemptNo,
+                vm_id: selected?.vmId || null,
+                account_id: selected?.accountId || null,
+                ttft_ms: Math.max(0, Date.now() - startedAt),
+              })
               if (activeLeaseId && !commitPromise) {
                 const lid = activeLeaseId
                 commitPromise = rt.commitLease(lid).catch(() => {})
@@ -1829,20 +1950,24 @@ export class FailoverRunner {
             return { ...clientCancelledResult({ committed }), via: 'rust-scheduler', ...attribution() }
           }
 
+          const isCragEmptyReplaceUnsupported = error?.code === 'crag_prompt_replace_empty_unsupported'
           result = {
             ok: false,
-            status: 0,
+            status: isCragEmptyReplaceUnsupported ? error.status || 503 : 0,
             transportError: true,
             committed,
-            terminalState: committed ? 'incomplete' : 'transport_error',
-            body: {
-              type: 'error',
-              error: {
-                type: 'worker_error',
-                code: error.code || 'attempt_failed',
-                message: String(error.message || error).slice(0, 300),
-              },
-            },
+            terminalState: committed ? 'incomplete' : isCragEmptyReplaceUnsupported ? 'rejected' : 'transport_error',
+            body:
+              isCragEmptyReplaceUnsupported && error.body
+                ? error.body
+                : {
+                    type: 'error',
+                    error: {
+                      type: 'worker_error',
+                      code: error.code || 'attempt_failed',
+                      message: String(error.message || error).slice(0, 300),
+                    },
+                  },
           }
           policy = classifyAttempt(
             result,

@@ -28,6 +28,89 @@ export const REFUSAL_SESSION_BLOCK_SETTING = 'refusal_session_block_enabled'
 export const REFUSAL_SIMILARITY_CHOICES = Object.freeze([80, 85, 90, 95])
 export const RISK_AUDIT_SETTING = 'risk_audit_policy'
 export const DEFAULT_BAN_STEPS = Object.freeze([10, 10, 0])
+export const UPSTREAM_400_SESSION_BLOCK_MS = 10 * 60_000
+export const UPSTREAM_400_SESSION_REASON = 'upstream_400'
+
+/**
+ * Single source of truth for upstream HTTP 400 classification & session-block sanitization.
+ *
+ * - `blockSession: false` (cleaned/excluded): account, billing, credential, gateway-local,
+ *   or model-availability errors that are NOT caused by a poisoned caller session.
+ * - `blockSession: true` (10m session cooldown): session-history corruption, deterministic
+ *   client schema/structure errors, third-party rejections, policy refusals, or unclassified
+ *   real upstream 400s that would otherwise loop and keep hammering upstream.
+ */
+export const UPSTREAM_400_CATEGORIES = Object.freeze({
+  // --- Cleaned / Excluded (do NOT block caller session) ---
+  auto_mode_classifier: Object.freeze({ label: '自动模式分类器侧请求', blockSession: false, group: 'skip' }),
+  gateway_local: Object.freeze({ label: '网关/内核本地前置拒绝', blockSession: false, group: 'skip' }),
+  account_disabled: Object.freeze({ label: '上游账号/组织被禁用或受限', blockSession: false, group: 'skip' }),
+  auth_credential: Object.freeze({ label: '上游凭据或鉴权失效', blockSession: false, group: 'skip' }),
+  billing_credit: Object.freeze({ label: '上游账号余额或额度不足', blockSession: false, group: 'skip' }),
+  model_unavailable: Object.freeze({ label: '上游模型不可用或无权限', blockSession: false, group: 'skip' }),
+
+  // --- Blocked for 10m (prevent repeat upstream 400 loops) ---
+  policy_refusal: Object.freeze({ label: '上游内容/使用政策拒答', blockSession: true, group: 'session_block' }),
+  third_party_client: Object.freeze({ label: '第三方客户端计费拒绝', blockSession: true, group: 'session_block' }),
+  context_too_long: Object.freeze({ label: '上下文或 Token 超限', blockSession: true, group: 'session_block' }),
+  tool_pair_broken: Object.freeze({ label: '工具调用历史配对损坏', blockSession: true, group: 'session_block' }),
+  thinking_history_broken: Object.freeze({
+    label: 'Thinking/推理签名或配置损坏',
+    blockSession: true,
+    group: 'session_block',
+  }),
+  search_or_cache_invalid: Object.freeze({
+    label: '搜索加密块或缓存标记非法',
+    blockSession: true,
+    group: 'session_block',
+  }),
+  media_invalid: Object.freeze({ label: '图片/文档附件超限或损坏', blockSession: true, group: 'session_block' }),
+  message_structure_invalid: Object.freeze({
+    label: '消息角色或空内容结构损坏',
+    blockSession: true,
+    group: 'session_block',
+  }),
+  tool_schema_invalid: Object.freeze({
+    label: '工具 Schema 或参数校验失败',
+    blockSession: true,
+    group: 'session_block',
+  }),
+  state_reference_invalid: Object.freeze({
+    label: '会话/响应引用 ID 已失效',
+    blockSession: true,
+    group: 'session_block',
+  }),
+  beta_or_header_invalid: Object.freeze({
+    label: 'Beta 请求头或采样参数非法',
+    blockSession: true,
+    group: 'session_block',
+  }),
+  unknown: Object.freeze({ label: '其他上游 400 请求错误', blockSession: true, group: 'session_block' }),
+})
+
+export function isUpstream400Reason(reason) {
+  return (
+    typeof reason === 'string' &&
+    (reason === UPSTREAM_400_SESSION_REASON || reason.startsWith(`${UPSTREAM_400_SESSION_REASON}:`))
+  )
+}
+
+export function upstream400ReasonFor(category) {
+  const key = Object.hasOwn(UPSTREAM_400_CATEGORIES, category) ? category : 'unknown'
+  return `${UPSTREAM_400_SESSION_REASON}:${key}`
+}
+
+export function upstream400CategoryFromReason(reason) {
+  if (!isUpstream400Reason(reason)) return ''
+  if (reason === UPSTREAM_400_SESSION_REASON) return 'unknown'
+  const suffix = reason.slice(UPSTREAM_400_SESSION_REASON.length + 1).trim()
+  return Object.hasOwn(UPSTREAM_400_CATEGORIES, suffix) ? suffix : 'unknown'
+}
+
+export function upstream400CategoryLabel(category) {
+  const meta = Object.hasOwn(UPSTREAM_400_CATEGORIES, category) ? UPSTREAM_400_CATEGORIES[category] : null
+  return meta ? meta.label : ''
+}
 const DEFAULT_RISK_POLICY = Object.freeze({
   ban_steps: DEFAULT_BAN_STEPS,
   blocked_tools: [],
@@ -237,6 +320,220 @@ export function upstreamRiskReason(result, phrases = []) {
 const AUTH_ACCOUNT_BAN_RE =
   /\b(?:organization_disabled|account_disabled|account_suspended|account\s+has\s+been\s+(?:disabled|suspended|banned|terminated)|this\s+organization\s+has\s+been\s+disabled)\b/i
 
+const UPSTREAM_400_GATEWAY_LOCAL_CODES = new Set([
+  'invalid_kernel_request',
+  'invalid_envelope',
+  'classifier_model_incompatible',
+  'classifier_runtime_unsupported',
+  'classifier_invalid_cache',
+  'invalid_request_context',
+  'slot_oauth_unavailable',
+])
+const UPSTREAM_400_LICENSE_CODE_RE =
+  /^license_(?:required|expired|not_yet_valid|invalid|binding_mismatch|unconfigured|crag_host_over_quota|crag_host_usage_unverified)$/i
+const UPSTREAM_400_ACCOUNT_DISABLED_RE =
+  /organization has been disabled|oauth authentication is currently not allowed|organization[^.\n]{0,60}(?:blocked|banned|disabled)|account[_\s-]?(?:disabled|suspended|banned|ineligible)|account has been (?:disabled|suspended|banned|terminated)|tos_violation|verification_required|location_unsupported|unsupported_region|country,\s*region,\s*or\s*territory\s*not\s*supported/i
+const UPSTREAM_400_AUTH_CREDENTIAL_CODES = new Set([
+  'authentication_error',
+  'oauth_revoked',
+  'token_revoked',
+  'invalid_grant',
+  'invalid_api_key',
+  'gemini_oauth_required',
+])
+const UPSTREAM_400_AUTH_CREDENTIAL_RE =
+  /\b(?:token has been revoked|token_revoked|invalidated oauth token|oauth_revoked|invalid_grant|api[_\s-]?key[_\s-]+(?:not[_\s-]+valid|invalid|expired)|invalid[_\s-]+x-api-key|credential[_\s-]+(?:needs refresh|refresh failed|required)|slot has no credential)\b/i
+const UPSTREAM_400_BILLING_CREDIT_CODES = new Set([
+  'billing_error',
+  'insufficient_quota',
+  'usage_limit_reached',
+  'billing_hard_limit_reached',
+  'upstream:billing_refusal',
+])
+const UPSTREAM_400_BILLING_CREDIT_RE =
+  /credit balance is too low|extra usage required|usage credits? (?:are )?required|out of extra usage|you['’]?ve hit your limit|insufficient[_\s-]?(?:quota|credits?|balance|funds)|billing[_\s-]?(?:hard[_\s-]?limit|not[_\s-]?active|error)|exceeded your current quota|plan does not include/i
+const UPSTREAM_400_MODEL_UNAVAILABLE_CODES = new Set([
+  'model_not_found',
+  'model_not_supported',
+  'model_not_allowed',
+  'unsupported_model',
+  'gemini_model_unavailable',
+])
+const UPSTREAM_400_MODEL_UNAVAILABLE_RE =
+  /\bthe model\b[^.\n]{0,80}\b(?:does not exist|not found|is not supported|not supported|not available|has been (?:deprecated|decommissioned|retired)|access)\b|\b(?:unknown|invalid|unsupported)\s+model(?:\s+(?:id|name))?\b|\bmodel\b[^.\n]{0,60}\b(?:not found|does not exist|is not supported|has been deprecated|has been retired|decommissioned)\b/i
+const UPSTREAM_400_CONTEXT_TOO_LONG_CODES = new Set([
+  'context_length_exceeded',
+  'prompt_too_long',
+  'request_too_large',
+  'max_tokens_exceeded',
+])
+const UPSTREAM_400_CONTEXT_TOO_LONG_RE =
+  /prompt is too long|input is too long|context[_\s-]?length[_\s-]?exceeded|maximum context length|exceeds? (?:the )?(?:maximum|max) (?:number of )?(?:tokens|context|input|length)|too many (?:input )?tokens|token count exceeds|request (?:payload )?size exceeds|input exceeds the context window/i
+const UPSTREAM_400_TOOL_PAIR_RE =
+  /tool_use_id|tool_use[^.\n]{0,120}tool_result|tool_result[^.\n]{0,120}(?:required|missing|expected|without)|no tool (?:output|call) found for function call|function[_\s-]?(?:call|response) turn (?:must come|comes) immediately|number of function response parts|tool_call_id/i
+const UPSTREAM_400_THINKING_CODES = new Set(['thinking_incompatible'])
+const UPSTREAM_400_THINKING_RE =
+  /invalid signature in thinking|thinking(?: or redacted_thinking)? blocks?[^.\n]{0,120}cannot be modified|expected [`'"]?thinking|must contain thinking|each thinking block|thinking\.budget_tokens|adaptive thinking|does not support adaptive|thought[_\s-]?signature|between_tools|reasoning[^.\n]{0,80}encrypted_content|encrypted_content[^.\n]{0,80}reasoning/i
+const UPSTREAM_400_SEARCH_OR_CACHE_RE =
+  /cache_control|maximum of \d+ blocks with [`'"]?cache_control|`?search_result`?\s+block|web_search_result|encrypted_content/i
+const UPSTREAM_400_MEDIA_CODES = new Set([
+  'image_too_large',
+  'invalid_image',
+  'invalid_image_format',
+  'invalid_image_url',
+])
+const UPSTREAM_400_MEDIA_RE =
+  /image dimensions? exceed max allowed size|could not process (?:image|pdf|document|audio|video)|image exceeds \d+\s*mb|invalid (?:image|media_type|mime_type|base64)|unsupported (?:image|media|mime|file) (?:type|format)|unable to (?:download|decode|parse) (?:image|media|document)|base64[^.\n]{0,60}(?:invalid|decode|corrupt)|inline_data[^.\n]{0,60}(?:invalid|mime)/i
+const UPSTREAM_400_MESSAGE_STRUCTURE_CODES = new Set(['invalid_messages', 'invalid_content'])
+const UPSTREAM_400_MESSAGE_STRUCTURE_RE =
+  /roles must alternate|conversation must (?:end|start)|final (?:assistant )?message|messages?:[^.\n]{0,80}(?:end|start)[^.\n]{0,80}(?:user|assistant)|must (?:end|start) with a user|must have non-empty content|content blocks? must be non-empty|empty (?:text|content|message|messages)|alternate between user and model|contents[^.\n]{0,60}must not be empty|at least one message|messages[^.\n]{0,40}cannot be empty/i
+const UPSTREAM_400_TOOL_SCHEMA_CODES = new Set([
+  'invalid_json_schema',
+  'invalid_request_schema',
+  'invalid_function_parameters',
+  'unknown_parameter',
+  'missing_required_parameter',
+])
+const UPSTREAM_400_TOOL_SCHEMA_RE =
+  /invalid_json_schema|invalid schema for [`'"]?tools|unsatisfiable schema|additionalProperties|output_config|tool_choice|input_schema|extra inputs are not permitted|input tag\b.+\bdoes not match|field required|input should be|invalid json payload received|unknown name [`'"]|invalid_type|missing required parameter|unknown parameter|\btools\.\d+/i
+const UPSTREAM_400_STATE_REF_CODES = new Set([
+  'previous_response_not_found',
+  'item_not_found',
+  'conversation_not_found',
+  'thread_not_found',
+])
+const UPSTREAM_400_STATE_REF_RE =
+  /previous_response_id[^.\n]{0,60}(?:not found|invalid|expired)|item with id [^\s]+ not found|response [`'"]?resp_[^`'"]+['"`]? not found|conversation (?:id )?[^.\n]{0,60}not found|thread (?:id )?[^.\n]{0,60}not found/i
+const UPSTREAM_400_BETA_OR_HEADER_RE =
+  /anthropic-beta|unexpected value\(s\)[^.\n]{0,80}beta|invalid beta|beta header|(?:does not support|unsupported)[^.\n]{0,60}\b(?:temperature|top_p|top_k)\b|`?(?:temperature|top_p|top_k)`?\s+(?:is|are|may only be)\s+(?:deprecated|not supported|set to)/i
+
+function makeUpstream400Verdict(category, status = 400) {
+  const key = Object.hasOwn(UPSTREAM_400_CATEGORIES, category) ? category : 'unknown'
+  const meta = UPSTREAM_400_CATEGORIES[key]
+  return {
+    status,
+    category: key,
+    group: meta.group,
+    blockSession: meta.blockSession,
+    skipReason: meta.blockSession ? '' : key,
+    reason: meta.blockSession ? upstream400ReasonFor(key) : '',
+    label: meta.label,
+  }
+}
+
+/**
+ * Classify a real upstream HTTP 400 response and decide whether the caller session
+ * must be blocked for 10 minutes (`blockSession: true`) or cleaned/skipped (`false`).
+ * Returns `null` when `result` is not a real upstream HTTP 400.
+ */
+export function classifyUpstream400(result, { phrases = [], classifier = null } = {}) {
+  if (
+    !result ||
+    result.ok === true ||
+    result.upstreamExecutions === 0 ||
+    result.transportError === true ||
+    result.via === 'kernel-preflight'
+  ) {
+    return null
+  }
+  const status = Number(result?.providerResult?.http_status ?? result?.upstreamStatus ?? result?.status) || 0
+  if (status !== 400) return null
+  if (classifier?.purpose === 'auto_mode_classifier') return makeUpstream400Verdict('auto_mode_classifier', status)
+  if (result.credential_ensure_failed === true) return makeUpstream400Verdict('auth_credential', status)
+
+  const error = result?.body?.error
+  const codes = [
+    error?.code,
+    error?.upstream_code,
+    error?.type,
+    result?.upstreamError?.code,
+    result?.upstreamError?.type,
+    result?.code,
+    result?.error_code,
+  ]
+    .filter((v) => typeof v === 'string' && v.trim())
+    .map((v) => v.trim().toLowerCase())
+  const text = [
+    error?.type,
+    error?.code,
+    error?.upstream_code,
+    result?.upstreamError?.type,
+    result?.upstreamError?.code,
+    result?.upstreamError?.message,
+    error?.message,
+    result?.body?.message,
+    typeof result?.body === 'string' ? result.body : '',
+  ]
+    .filter(Boolean)
+    .join('\n')
+
+  // 1. Non-session exclusions (cleaned out so account/billing/credential/gateway issues never lock user sessions).
+  if (codes.some((code) => UPSTREAM_400_GATEWAY_LOCAL_CODES.has(code) || UPSTREAM_400_LICENSE_CODE_RE.test(code))) {
+    return makeUpstream400Verdict('gateway_local', status)
+  }
+  if (AUTH_ACCOUNT_BAN_RE.test(text) || UPSTREAM_400_ACCOUNT_DISABLED_RE.test(text)) {
+    return makeUpstream400Verdict('account_disabled', status)
+  }
+  if (
+    codes.some((code) => UPSTREAM_400_AUTH_CREDENTIAL_CODES.has(code)) ||
+    UPSTREAM_400_AUTH_CREDENTIAL_RE.test(text)
+  ) {
+    return makeUpstream400Verdict('auth_credential', status)
+  }
+  // Check third-party extra-usage rejection BEFORE account billing_credit because its wording mentions "extra usage".
+  if (isThirdPartyClientMessage(text)) {
+    return makeUpstream400Verdict('third_party_client', status)
+  }
+  if (codes.some((code) => UPSTREAM_400_BILLING_CREDIT_CODES.has(code)) || UPSTREAM_400_BILLING_CREDIT_RE.test(text)) {
+    return makeUpstream400Verdict('billing_credit', status)
+  }
+  if (
+    codes.some((code) => UPSTREAM_400_MODEL_UNAVAILABLE_CODES.has(code)) ||
+    UPSTREAM_400_MODEL_UNAVAILABLE_RE.test(text)
+  ) {
+    return makeUpstream400Verdict('model_unavailable', status)
+  }
+
+  // 2. Session-poisoned / deterministic loop 400 categories (block session for 10m).
+  if (upstreamRiskReason(result, phrases)) {
+    return makeUpstream400Verdict('policy_refusal', status)
+  }
+  if (
+    codes.some((code) => UPSTREAM_400_CONTEXT_TOO_LONG_CODES.has(code)) ||
+    UPSTREAM_400_CONTEXT_TOO_LONG_RE.test(text)
+  ) {
+    return makeUpstream400Verdict('context_too_long', status)
+  }
+  if (UPSTREAM_400_TOOL_PAIR_RE.test(text)) {
+    return makeUpstream400Verdict('tool_pair_broken', status)
+  }
+  if (codes.some((code) => UPSTREAM_400_THINKING_CODES.has(code)) || UPSTREAM_400_THINKING_RE.test(text)) {
+    return makeUpstream400Verdict('thinking_history_broken', status)
+  }
+  if (UPSTREAM_400_SEARCH_OR_CACHE_RE.test(text)) {
+    return makeUpstream400Verdict('search_or_cache_invalid', status)
+  }
+  if (codes.some((code) => UPSTREAM_400_MEDIA_CODES.has(code)) || UPSTREAM_400_MEDIA_RE.test(text)) {
+    return makeUpstream400Verdict('media_invalid', status)
+  }
+  if (
+    codes.some((code) => UPSTREAM_400_MESSAGE_STRUCTURE_CODES.has(code)) ||
+    UPSTREAM_400_MESSAGE_STRUCTURE_RE.test(text)
+  ) {
+    return makeUpstream400Verdict('message_structure_invalid', status)
+  }
+  if (codes.some((code) => UPSTREAM_400_TOOL_SCHEMA_CODES.has(code)) || UPSTREAM_400_TOOL_SCHEMA_RE.test(text)) {
+    return makeUpstream400Verdict('tool_schema_invalid', status)
+  }
+  if (codes.some((code) => UPSTREAM_400_STATE_REF_CODES.has(code)) || UPSTREAM_400_STATE_REF_RE.test(text)) {
+    return makeUpstream400Verdict('state_reference_invalid', status)
+  }
+  if (UPSTREAM_400_BETA_OR_HEADER_RE.test(text)) {
+    return makeUpstream400Verdict('beta_or_header_invalid', status)
+  }
+  return makeUpstream400Verdict('unknown', status)
+}
+
 /**
  * Orthogonal post-hop error classifier so risk feedback never confuses protocol
  * 400s, third-party billing rejections, or auth bans with content refusals.
@@ -279,16 +576,22 @@ function refusalBlockSuffix(match) {
     const expiresAt = match.row?.expires_at
     const session = match.row?.subject_kind === 'session'
     if (session || expiresAt || (match.row?.identity_value && match.row.identity_value !== match.row.device_id)) {
+      const u400Category = isUpstream400Reason(ban) ? upstream400CategoryFromReason(ban) : ''
+      const u400Label = u400Category && u400Category !== 'unknown' ? upstream400CategoryLabel(u400Category) : ''
+      const sessionMessage = expiresAt
+        ? isUpstream400Reason(ban)
+          ? u400Label
+            ? `此会话因上游 400 错误（${u400Label}）已临时封禁至 ${expiresAt}，请开启新会话或稍后再试。`
+            : `此会话因上游 400 错误已临时封禁至 ${expiresAt}，请开启新会话或稍后再试。`
+          : `此会话已临时封禁至 ${expiresAt}，请开启新会话或稍后再试。`
+        : '此会话已封禁，请勿继续使用此会话。'
       return {
-        message: session
-          ? '此会话已封禁，请勿继续使用此会话。'
-          : expiresAt
-            ? `此设备已封禁至 ${expiresAt}。`
-            : '此设备已永久封禁。',
+        message: session ? sessionMessage : expiresAt ? `此设备已封禁至 ${expiresAt}。` : '此设备已永久封禁。',
         standalone: true,
         details: {
           reason: session ? 'session' : 'device',
           ban_reason: ban,
+          ...(u400Category ? { upstream_400_category: u400Category } : {}),
           ...(expiresAt ? { expires_at: expiresAt } : {}),
         },
       }
@@ -334,9 +637,11 @@ function refusalBlockSuffix(match) {
 /** Original sentence stays; a match only appends why this call was blocked. */
 export function refusalGuardError(requestId, match) {
   const extra = refusalBlockSuffix(match)
+  const blockedBy =
+    match?.kind === 'device' && match?.row?.subject_kind === 'session' ? 'session' : match?.kind || 'exact'
   return makeRefusalGuardError({
     requestId,
-    blockedBy: match?.kind || 'exact',
+    blockedBy,
     sourceRequestId: match?.row?.source_request_id,
     message: extra?.standalone ? extra.message : REFUSAL_GUARD_MESSAGE + (extra?.message || ''),
     details: extra?.details,
@@ -345,6 +650,20 @@ export function refusalGuardError(requestId, match) {
 
 const DEVICE_ID_MIN = 8
 const DEVICE_ID_MAX = 200
+
+function headerValueOf(headers, name) {
+  if (!headers || typeof headers !== 'object') return ''
+  if (Object.hasOwn(headers, name) && headers[name] != null) {
+    const raw = headers[name]
+    return Array.isArray(raw) ? String(raw[0] ?? '') : String(raw)
+  }
+  const want = String(name).toLowerCase()
+  for (const [k, v] of Object.entries(headers)) {
+    if (String(k).toLowerCase() !== want || v == null) continue
+    return Array.isArray(v) ? String(v[0] ?? '') : String(v)
+  }
+  return ''
+}
 
 /** Inbound client device. Never the slot's rewritten outbound id, and never IP/UA/API key. */
 export function inboundRefusalDeviceId({ inbound, body, headers } = {}) {
@@ -364,27 +683,63 @@ export function refusalAuditIdentity({ inbound, body = inbound, headers = {}, pr
     [
       ...decoded.map((value) => value?.device_id),
       ...sources.flatMap((source) => [source?.device_id, source?.deviceId]),
-      headers['x-kin-device-id'],
+      headerValueOf(headers, 'x-kin-device-id'),
     ],
     DEVICE_ID_MIN,
   )
   const machine = first(
     [
       ...sources.flatMap((source) => [source?.machine_id, source?.machineId, source?.meachine_id]),
-      headers['x-kin-machine-id'],
-      headers['x-machine-id'],
+      headerValueOf(headers, 'x-kin-machine-id'),
+      headerValueOf(headers, 'x-machine-id'),
     ],
     DEVICE_ID_MIN,
   )
+  const agentRoot = claudeCodeAgentRootSession({ inbound: inbound || {}, body: body || {}, headers: headers || {} })
   const sessionId = first([
+    agentRoot,
     ...decoded.map((value) => value?.session_id),
-    ...sources.flatMap((source) => [source?.session_id, source?.sessionId, source?.session]),
-    headers['x-claude-code-session-id'],
-    headers['x-session-id'],
-    headers['session-id'],
-    headers.session_id,
+    ...sources.flatMap((source) => [
+      source?.session_id,
+      source?.sessionId,
+      source?.session,
+      source?.conversation_id,
+      source?.conversationId,
+      source?.thread_id,
+      source?.prompt_cache_key,
+    ]),
+    headerValueOf(headers, 'x-claude-code-session-id'),
+    headerValueOf(headers, 'x-session-id'),
+    headerValueOf(headers, 'x-conversation-id'),
+    headerValueOf(headers, 'x-opencode-session'),
+    headerValueOf(headers, 'x-opencode-session-id'),
+    headerValueOf(headers, 'session-id'),
+    headerValueOf(headers, 'session_id'),
+    headerValueOf(headers, 'thread-id'),
   ])
   return { deviceId: device || machine, machineId: machine, sessionId, principal }
+}
+
+/**
+ * SSOT audit identity shared by pre-dispatch enforcement and post-hop recording.
+ * Preserves an explicit caller-supplied identity while normalizing any root
+ * session from inbound/body/headers (including Claude Code sub-agents and Codex
+ * conversation/cache keys).
+ */
+export function resolveAuditSessionIdentity({
+  inbound,
+  body = inbound,
+  headers = {},
+  identity = null,
+  principal = '',
+} = {}) {
+  const base = identity || refusalAuditIdentity({ inbound, body, headers, principal })
+  const extracted =
+    refusalSessionId({ inbound, body, headers }) ||
+    refusalAuditIdentity({ inbound, body, headers, principal: base?.principal || principal }).sessionId
+  const rootSessionId = extracted || base?.sessionId || ''
+  if (!base) return { deviceId: '', machineId: '', sessionId: rootSessionId, principal }
+  return rootSessionId && rootSessionId !== base.sessionId ? { ...base, sessionId: rootSessionId } : base
 }
 
 export function riskPrincipal(req) {

@@ -624,6 +624,31 @@ test('#2 CRAG whitelist lets tool_addition / tool_removal through and still rebu
     tool: { type: 'tool_reference', name: 'lookup' },
     cache_control: { type: 'ephemeral', ttl: '1h' },
   })
+
+  // tool_choice targeting an inline tool_definition declared in messages[] is accepted.
+  const inlineChoice = prepareCragRequest(
+    {
+      model: 'claude-opus-5-5',
+      tool_choice: { type: 'tool', name: 'inline_lookup' },
+      messages: [
+        {
+          role: 'system',
+          content: [
+            {
+              type: 'tool_addition',
+              tool: {
+                type: 'tool_definition',
+                definition: { name: 'inline_lookup', input_schema: { type: 'object' } },
+              },
+            },
+          ],
+        },
+        { role: 'user', content: 'hi' },
+      ],
+    },
+    { capabilities: V3_CAPS },
+  )
+  assert.deepEqual(inlineChoice.tool_choice, { type: 'tool', name: 'inline_lookup' })
 })
 
 test('third-party system relocation + prepareCragPrintBody omits redundant CLI identity placeholder (prevents Extra Usage)', () => {

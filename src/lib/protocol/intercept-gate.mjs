@@ -1,4 +1,6 @@
 import { detectDistill, distillBlockError, isOpenaiPlatformModel } from '../core/distill-detect.mjs'
+import { DB_INSTANCE_ID, getDb, isDbOpen } from '../db/database.mjs'
+import { getCacheRuntime } from '../cache/index.mjs'
 import { redactSecrets } from '../core/security.mjs'
 import {
   ErrorType,
@@ -9,8 +11,10 @@ import {
 } from '../core/errors.mjs'
 import {
   blockedRiskTool,
+  classifyUpstream400,
   classifyUpstreamError,
   DEFAULT_BAN_STEPS,
+  isUpstream400Reason,
   matchRefusalSession,
   matchStoredRefusal,
   refusalFingerprint,
@@ -19,7 +23,9 @@ import {
   refusalPromptSignature,
   refusalAuditIdentity,
   refusalSessionId,
-  upstreamRiskReason,
+  resolveAuditSessionIdentity,
+  UPSTREAM_400_SESSION_BLOCK_MS,
+  UPSTREAM_400_SESSION_REASON,
 } from '../core/refusal-guard.mjs'
 import {
   HARD_POLICY_RULES,
@@ -92,11 +98,181 @@ function retryAfterFromExpiry(expiresAt, now, fallbackSec = 600) {
 }
 
 function enforcesBan(policy, row) {
-  if (isJevReason(row?.reason)) {
+  if (isJevReason(row?.reason) || isUpstream400Reason(row?.reason)) {
     if (row?.subject_kind === 'session' && policy?.session_block_enabled === false) return false
     return true
   }
   return !!(policy?.enabled && (policy.device_block_enabled || row?.reason?.endsWith(':nsfw')))
+}
+
+const RISK_BAN_PREFIX = 'risk:bans:'
+const RISK_SESSION_PREFIX = 'risk:bans:session:'
+const RISK_DEVICE_PREFIX = 'risk:bans:device:'
+const RISK_BAN_L1_TTL_MS = 10_000
+const RISK_BAN_L2_TTL_MS = 15_000
+
+const wrappedBanRepos = new WeakSet()
+const wrappedBanProtos = new WeakSet()
+
+function riskScopePrefix(db) {
+  if (!db) return 'mock:'
+  if (isDbOpen() && db === getDb()) return ''
+  return `${db?.[DB_INSTANCE_ID] || 'isolated'}:`
+}
+
+/**
+ * Invalidate cached refusal session/device ban verdicts across L1 + Redis L2.
+ * Accepts `{ kind?: 'session'|'device'|'all'|null, db?: Database|null }` or a
+ * shorthand kind string (`'session'|'device'|'all'`). Safe to call fire-and-forget.
+ */
+export function invalidateRiskBanCache(opts = {}) {
+  const client = getCacheRuntime()?.client
+  if (!client) return Promise.resolve()
+  const kind = typeof opts === 'string' ? opts : (opts?.kind ?? null)
+  const db = typeof opts === 'object' && opts !== null ? (opts.db ?? null) : null
+  const prefix =
+    kind === 'session'
+      ? `${RISK_SESSION_PREFIX}${db ? riskScopePrefix(db) : ''}`
+      : kind === 'device'
+        ? `${RISK_DEVICE_PREFIX}${db ? riskScopePrefix(db) : ''}`
+        : `${RISK_BAN_PREFIX}`
+  return client.invalidate({ prefixes: [prefix] }).catch(() => {})
+}
+
+function attachBanRepoInvalidationHooks(repo, kind) {
+  if (!repo || !repo.db) return
+  const methods =
+    kind === 'session'
+      ? ['block', 'remove', 'clear']
+      : ['block', 'blockSession', 'recordViolation', 'remove', 'clear', 'linkAlias']
+  const proto = Object.getPrototypeOf(repo)
+  if (proto && proto !== Object.prototype) {
+    if (wrappedBanProtos.has(proto)) return
+    wrappedBanProtos.add(proto)
+    for (const name of methods) {
+      const orig = proto[name]
+      if (typeof orig !== 'function') continue
+      proto[name] = function wrappedRiskBanWrite(...args) {
+        const out = orig.apply(this, args)
+        if (this?.db) invalidateRiskBanCache({ kind, db: this.db })
+        return out
+      }
+    }
+    return
+  }
+  if (wrappedBanRepos.has(repo)) return
+  wrappedBanRepos.add(repo)
+  for (const name of methods) {
+    if (typeof repo[name] !== 'function') continue
+    const orig = repo[name].bind(repo)
+    repo[name] = (...args) => {
+      const out = orig(...args)
+      invalidateRiskBanCache({ kind, db: repo.db })
+      return out
+    }
+  }
+}
+
+function deviceBanCacheKey(db, identity, policy) {
+  const scope = riskScopePrefix(db)
+  const policyKey = `${policy?.enabled ? 1 : 0}:${policy?.device_block_enabled ? 1 : 0}:${policy?.session_block_enabled === false ? 0 : 1}`
+  const parts = [
+    identity?.principal || '',
+    identity?.deviceId || '',
+    identity?.sessionId || '',
+    identity?.ip || '',
+    identity?.keyId || '',
+    identity?.userId || '',
+    ...(Array.isArray(identity?.aliases) ? identity.aliases : []),
+  ]
+  return `${RISK_DEVICE_PREFIX}${scope}${policyKey}:${parts.join('|')}`
+}
+
+async function cachedMatchRefusalSession({ inbound, body, headers, sessions, now }) {
+  if (!sessions) return null
+  const useCache = Boolean(sessions.db && getCacheRuntime()?.client?.enabled && Math.abs(now - Date.now()) <= 60_000)
+  if (!useCache) {
+    return matchRefusalSession({ inbound, body, headers, sessions })
+  }
+  attachBanRepoInvalidationHooks(sessions, 'session')
+  const sessionId = refusalSessionId({ inbound, body, headers })
+  if (!sessionId) return null
+  const scope = riskScopePrefix(sessions.db)
+  const key = `${RISK_SESSION_PREFIX}${scope}${sessionId}`
+  const client = getCacheRuntime().client
+  const isPrimary = scope === ''
+  const hit = await client.get(key, {
+    useL2: isPrimary,
+    prefixes: [RISK_BAN_PREFIX, RISK_SESSION_PREFIX],
+    maxL1TtlMs: RISK_BAN_L1_TTL_MS,
+  })
+  if (hit.hit) {
+    const cached = hit.value?.v ?? null
+    if (!cached) return null
+    if (cached.row?.expires_at && Date.parse(cached.row.expires_at) <= now) {
+      invalidateRiskBanCache({ kind: 'session', db: sessions.db })
+      return null
+    }
+    return cached
+  }
+  const matched = matchRefusalSession({ inbound, body, headers, sessions })
+  if (isPrimary) {
+    await client.set(
+      key,
+      { v: matched || null },
+      {
+        ttlMs: RISK_BAN_L2_TTL_MS,
+        l1TtlMs: RISK_BAN_L1_TTL_MS,
+        prefixes: [RISK_BAN_PREFIX, RISK_SESSION_PREFIX],
+      },
+    )
+  } else {
+    client.setL1(key, { v: matched || null }, RISK_BAN_L1_TTL_MS)
+  }
+  return matched
+}
+
+async function cachedFindDeviceBan({ devices, identity, policy, now }) {
+  if (!devices?.findBan) return null
+  const useCache = Boolean(devices.db && getCacheRuntime()?.client?.enabled && Math.abs(now - Date.now()) <= 60_000)
+  const accepts = (row) => enforcesBan(policy, row)
+  if (!useCache) {
+    return devices.findBan(identity, now, accepts)
+  }
+  attachBanRepoInvalidationHooks(devices, 'device')
+  const scope = riskScopePrefix(devices.db)
+  const key = deviceBanCacheKey(devices.db, identity, policy)
+  const client = getCacheRuntime().client
+  const isPrimary = scope === ''
+  const hit = await client.get(key, {
+    useL2: isPrimary,
+    prefixes: [RISK_BAN_PREFIX, RISK_DEVICE_PREFIX],
+    maxL1TtlMs: RISK_BAN_L1_TTL_MS,
+  })
+  if (hit.hit) {
+    const cached = hit.value?.v ?? null
+    if (!cached) return null
+    if (cached.expires_at && Date.parse(cached.expires_at) <= now) {
+      invalidateRiskBanCache({ kind: 'device', db: devices.db })
+    } else {
+      return cached
+    }
+  }
+  const found = devices.findBan(identity, now, accepts) || null
+  if (isPrimary) {
+    await client.set(
+      key,
+      { v: found },
+      {
+        ttlMs: RISK_BAN_L2_TTL_MS,
+        l1TtlMs: RISK_BAN_L1_TTL_MS,
+        prefixes: [RISK_BAN_PREFIX, RISK_DEVICE_PREFIX],
+      },
+    )
+  } else {
+    client.setL1(key, { v: found }, RISK_BAN_L1_TTL_MS)
+  }
+  return found
 }
 
 function recordBan(decision, { devices, policy, requestId, now = Date.now() }) {
@@ -111,17 +287,20 @@ function recordBan(decision, { devices, policy, requestId, now = Date.now() }) {
   const evidence = { requestId, fingerprint: decision.fingerprint || null, reason: decision.reason || decision.kind }
   try {
     if (store?.recordViolation) {
-      return (
+      const ban =
         store.recordViolation(identity, {
           ...evidence,
           steps: policy?.risk_audit?.ban_steps || DEFAULT_BAN_STEPS,
           now,
           accepts: (row) => enforcesBan(policy, row),
         }) || null
-      )
+      if (ban) invalidateRiskBanCache({ kind: 'device', db: store.db || null })
+      return ban
     }
     if (identity.deviceId) {
-      return store?.block?.({ ...evidence, deviceId: identity.deviceId }) || null
+      const ban = store?.block?.({ ...evidence, deviceId: identity.deviceId }) || null
+      if (ban) invalidateRiskBanCache({ kind: 'device', db: store.db || null })
+      return ban
     }
   } catch {
     console.warn('[risk-audit] failed to persist ban')
@@ -191,7 +370,94 @@ function mergeLogErrorDetails(logBag, patch) {
   logBag.error_details = { ...(logBag.error_details || {}), ...patch }
 }
 
-export function observeUpstreamRisk({ inbound, body, identity, result, logBag, requestId, policy, repo, devices }) {
+export function recordUpstream400SessionBlock({
+  inbound,
+  body = inbound,
+  headers,
+  identity,
+  result,
+  logBag = null,
+  requestId = null,
+  policy = null,
+  devices = null,
+  classifier = null,
+  now = Date.now(),
+} = {}) {
+  const verdict = classifyUpstream400(result, {
+    phrases: policy?.risk_audit?.upstream_policy_phrases,
+    classifier,
+  })
+  if (!verdict) return null
+  if (!verdict.blockSession) {
+    if (logBag) logBag.risk_session_block_skipped = verdict.skipReason || verdict.category
+    mergeLogErrorDetails(logBag, {
+      upstream_400_category: verdict.category,
+      upstream_400_action: 'skipped',
+    })
+    return null
+  }
+  if (policy?.session_block_enabled === false) {
+    mergeLogErrorDetails(logBag, {
+      upstream_400_category: verdict.category,
+      upstream_400_action: 'skipped',
+    })
+    return null
+  }
+  const effectiveIdentity = resolveAuditSessionIdentity({ inbound, body, headers, identity })
+  if (!effectiveIdentity.sessionId) {
+    mergeLogErrorDetails(logBag, {
+      upstream_400_category: verdict.category,
+      upstream_400_action: 'no_session',
+    })
+    return null
+  }
+  try {
+    const ban =
+      devices?.blockSession?.(effectiveIdentity, {
+        requestId,
+        reason: verdict.reason || UPSTREAM_400_SESSION_REASON,
+        ttlMs: UPSTREAM_400_SESSION_BLOCK_MS,
+        now,
+      }) || null
+    if (ban) invalidateRiskBanCache({ kind: 'device', db: devices?.db || null })
+    if (ban && ban.expires_at) {
+      mergeLogErrorDetails(logBag, {
+        upstream_400_category: verdict.category,
+        upstream_400_action: 'session_10m',
+        punishment: 'session_10m_400',
+      })
+    } else if (ban && !ban.expires_at) {
+      mergeLogErrorDetails(logBag, {
+        upstream_400_category: verdict.category,
+        upstream_400_action: 'permanent_kept',
+      })
+    } else {
+      mergeLogErrorDetails(logBag, {
+        upstream_400_category: verdict.category,
+      })
+    }
+    return ban
+  } catch {
+    console.warn('[risk-audit] failed to persist upstream 400 session block')
+    return null
+  }
+}
+
+export function observeUpstreamRisk({
+  inbound,
+  body = inbound,
+  headers,
+  identity,
+  result,
+  logBag,
+  requestId,
+  policy,
+  repo,
+  devices,
+  classifier = null,
+  blockSessionOn400 = true,
+  now = Date.now(),
+}) {
   if (!result || result.upstreamExecutions === 0 || result.transportError === true) return ''
   const rawMessage =
     result.upstreamError?.message ||
@@ -199,7 +465,7 @@ export function observeUpstreamRisk({ inbound, body, identity, result, logBag, r
     result.body?.message ||
     (typeof result.body === 'string' ? result.body : '')
   const classified = classifyUpstreamError(result, policy?.risk_audit?.upstream_policy_phrases)
-  const isBadRequest = classified.status === 400
+  const isBadRequest = classified.status === 400 && result.ok !== true
   const reason = classified.bucket === 'policy' ? classified.reason : ''
   if (
     !isBadRequest &&
@@ -209,10 +475,26 @@ export function observeUpstreamRisk({ inbound, body, identity, result, logBag, r
   ) {
     return ''
   }
+  const effectiveIdentity = resolveAuditSessionIdentity({ inbound, body, headers, identity })
   const message = JSON.parse(redactSecrets(String(rawMessage))).slice(0, 500)
   if (isBadRequest) {
     logBag.audit_upstream_400 = true
     logBag.audit_upstream_400_message ||= message
+    if (blockSessionOn400) {
+      recordUpstream400SessionBlock({
+        inbound,
+        body,
+        headers,
+        identity: effectiveIdentity,
+        result,
+        logBag,
+        requestId,
+        policy,
+        devices,
+        classifier,
+        now,
+      })
+    }
   }
   if (classified.bucket === 'protocol') {
     mergeLogErrorDetails(logBag, { risk_bucket: 'protocol' })
@@ -272,7 +554,15 @@ export function observeUpstreamRisk({ inbound, body, identity, result, logBag, r
     console.warn('[risk-audit] failed to persist upstream refusal')
   }
   if (reason !== 'upstream:billing_refusal' && !suspectOverRefusal) {
-    recordBan({ identity, fingerprint, reason, banDevice: true }, { devices, policy, requestId })
+    const escalated = recordBan(
+      { identity: effectiveIdentity, fingerprint, reason, banDevice: true },
+      { devices, policy, requestId, now },
+    )
+    if (isBadRequest && blockSessionOn400 && escalated && logBag?.error_details) {
+      const nextDetails = { ...logBag.error_details, upstream_400_action: 'permanent_kept' }
+      delete nextDetails.punishment
+      logBag.error_details = nextDetails
+    }
   }
   return reason
 }
@@ -464,9 +754,8 @@ export async function evaluateProtocolIntercept({
   const profile = normalizeJevProfile(jevProfile)
   const audit = policy?.risk_audit
   const isAutoModeClassifier = classifier?.purpose === 'auto_mode_classifier'
-  const rootSessionId = refusalSessionId({ inbound, body, headers }) || identity.sessionId || ''
-  const effectiveIdentity =
-    rootSessionId && rootSessionId !== identity.sessionId ? { ...identity, sessionId: rootSessionId } : identity
+  const effectiveIdentity = resolveAuditSessionIdentity({ inbound, body, headers, identity })
+  const rootSessionId = effectiveIdentity.sessionId || ''
   const reject = (fields) => block({ deviceId: effectiveIdentity.deviceId, identity: effectiveIdentity, ...fields })
   const interceptOpts = { interceptSession, ctx: bodyCtx }
   let rawDocument
@@ -474,7 +763,7 @@ export async function evaluateProtocolIntercept({
     // A session the provider already refused never hops again: before every
     // other layer, whatever the prompt now says.
     if (policy?.session_block_enabled !== false && sessions) {
-      const refused = matchRefusalSession({ inbound, body, headers, sessions })
+      const refused = await cachedMatchRefusalSession({ inbound, body, headers, sessions, now })
       if (refused) {
         const error = refusalGuardError(requestId, refused)
         return block({
@@ -492,7 +781,7 @@ export async function evaluateProtocolIntercept({
         })
       }
     }
-    const banned = devices?.findBan?.(effectiveIdentity, now, (row) => enforcesBan(policy, row))
+    const banned = await cachedFindDeviceBan({ devices, identity: effectiveIdentity, policy, now })
     if (banned) {
       const tempJevBan = banned.subject_kind === 'device' && isJevReason(banned.reason) && !!banned.expires_at
       const error = tempJevBan
@@ -510,6 +799,7 @@ export async function evaluateProtocolIntercept({
         error,
         logErrorCode: 'refusal_guard',
         errorMessage,
+        errorDetails: error.body?.error?.details || null,
         intercept: gateVerdict({ kind: 'block', by: 'refusal', keyword: banned.subject_kind }),
       })
     }

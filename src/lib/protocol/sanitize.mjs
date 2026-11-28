@@ -414,6 +414,28 @@ export function normalizeAnthropicMessages(
         if (effort) trailingEmptyEffort = effort
         continue
       }
+      if (!seenUser && keepMidConversationSystem) {
+        const split = splitLeadingSystemProtocolMessage(message)
+        if (split.hasProtocolBlocks) {
+          if (split.textBlocks.length) {
+            appendLiftedSystemMessage(systemParts, mapped, { ...message, content: split.textBlocks })
+          }
+          if (effort) {
+            liftedContentEffort = null
+            trailingEmptyEffort = null
+          }
+          mapped.push(keptAnthropicMessage({ ...message, content: split.remainingBlocks }, 'system'))
+          continue
+        }
+        if (message.clear_at != null) {
+          if (effort) {
+            liftedContentEffort = null
+            trailingEmptyEffort = null
+          }
+          mapped.push(keptAnthropicMessage(message, 'system'))
+          continue
+        }
+      }
       if (!seenUser || !keepMidConversationSystem) {
         appendLiftedSystemMessage(systemParts, mapped, message)
         if (effort) liftedContentEffort = effort
@@ -434,7 +456,7 @@ export function normalizeAnthropicMessages(
   }
 
   const merged = mergeConsecutiveAnthropicMessages(mapped, { preserveConsecutiveUser })
-  if (merged.length && merged[0].role !== 'user' && !isEmptyEffortControl(merged[0])) {
+  if (merged.length && merged[0].role !== 'user' && !isLeadingSystemControl(merged[0])) {
     merged.unshift({ role: 'user', content: '.' })
   }
 
@@ -505,6 +527,40 @@ function messageOutputConfigEffort(message) {
   return typeof effort === 'string' && effort.trim() ? effort : null
 }
 
+const SYSTEM_PROTOCOL_CONTROL_BLOCK_TYPES = new Set(['tool_addition', 'tool_removal', 'tool_reference'])
+
+function isSystemProtocolControlBlock(block) {
+  return Boolean(block && typeof block === 'object' && SYSTEM_PROTOCOL_CONTROL_BLOCK_TYPES.has(block.type))
+}
+
+function isLiftableSystemTextBlock(part) {
+  if (typeof part === 'string') return true
+  if (!part || typeof part !== 'object') return false
+  return (
+    typeof part.text === 'string' && (part.type == null || ['text', 'input_text', 'output_text'].includes(part.type))
+  )
+}
+
+function splitLeadingSystemProtocolMessage(message) {
+  const content = message?.content
+  if (!Array.isArray(content)) {
+    return { hasProtocolBlocks: false, textBlocks: [], remainingBlocks: [] }
+  }
+  const textBlocks = []
+  const remainingBlocks = []
+  let hasProtocolBlocks = false
+  for (const part of content) {
+    if (part == null) continue
+    if (isLiftableSystemTextBlock(part)) {
+      textBlocks.push(part)
+    } else {
+      if (isSystemProtocolControlBlock(part)) hasProtocolBlocks = true
+      remainingBlocks.push(part)
+    }
+  }
+  return { hasProtocolBlocks, textBlocks, remainingBlocks }
+}
+
 function isEmptyEffortControl(message) {
   const role = String(message?.role || '')
     .trim()
@@ -514,6 +570,16 @@ function isEmptyEffortControl(message) {
     anthropicContentIsEmpty(message?.content) &&
     !!messageOutputConfigEffort(message)
   )
+}
+
+function isLeadingSystemControl(message) {
+  if (isEmptyEffortControl(message)) return true
+  const role = String(message?.role || '')
+    .trim()
+    .toLowerCase()
+  if (role !== 'system' && role !== 'developer') return false
+  if (message?.clear_at != null && !anthropicContentIsEmpty(message?.content)) return true
+  return Array.isArray(message?.content) && message.content.some(isSystemProtocolControlBlock)
 }
 
 /**
@@ -598,7 +664,10 @@ export function anthropicContentIsEmpty(content) {
   })
 }
 
-export function mergeConsecutiveAnthropicMessages(messages, { preserveConsecutiveUser = false } = {}) {
+export function mergeConsecutiveAnthropicMessages(
+  messages,
+  { preserveConsecutiveUser = false, preserveConsecutiveSystem = false } = {},
+) {
   const out = []
   for (const message of messages) {
     const last = out[out.length - 1]
@@ -606,6 +675,7 @@ export function mergeConsecutiveAnthropicMessages(messages, { preserveConsecutiv
       !last ||
       last.role !== message.role ||
       (preserveConsecutiveUser && message.role === 'user') ||
+      (preserveConsecutiveSystem && (message.role === 'system' || message.role === 'developer')) ||
       messageHasTurnControls(last) ||
       messageHasTurnControls(message)
     ) {
