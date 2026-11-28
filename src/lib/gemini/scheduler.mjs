@@ -338,6 +338,7 @@ function known(error) {
     if (Number.isFinite(error.retryAfterMs) && error.retryAfterMs > 0) out.retryAfterMs = error.retryAfterMs
     if (error.retryAfter != null) out.retryAfter = error.retryAfter
     if (typeof error.upstreamReason === 'string' && error.upstreamReason) out.upstreamReason = error.upstreamReason
+    if (error.localError === true) out.localError = true
     if (error.contentRejected === true) out.contentRejected = true
     if (typeof error.workerCode === 'string' && error.workerCode) out.workerCode = error.workerCode
     if (error.bridgeDisconnected === true) out.bridgeDisconnected = true
@@ -356,11 +357,22 @@ function accountCapabilities(environment) {
   return new Set(environment.auth_method === 'api_key' ? FULL_GEMINI_CAPABILITIES : NATIVE_TUI_CAPABILITIES)
 }
 
+// Only trusted local tool validators can exempt a failure from node health penalties.
+function isLocalToolContractFailure(failure) {
+  return (
+    failure?.localError === true &&
+    (failure.code === 'gemini_tool_call_required' ||
+      (failure.code === 'gemini_inference_invalid_output' && failure.upstreamReason === 'undeclared_tool_call'))
+  )
+}
+
 function buildGeminiFailureReport(failure, attemptUpstreamStatus) {
   const code = String(failure?.code || 'gemini_inference_failed')
   const httpStatus = Number(attemptUpstreamStatus ?? failure?.status ?? 0) || 0
   let errorClass
-  if (code === 'gemini_content_rejected' || failure?.contentRejected === true) {
+  if (isLocalToolContractFailure(failure)) {
+    errorClass = 'request_protocol'
+  } else if (code === 'gemini_content_rejected' || failure?.contentRejected === true) {
     errorClass = 'refusal'
   } else if (code === 'gemini_quota_exhausted') {
     errorClass = 'quota_exhausted'
@@ -505,7 +517,10 @@ async function consumeStreamResponse(
                 ? 'gemini_invalid_request'
                 : 'gemini_inference_failed'
     const err = fail(streamError.status || FAILURES[code][0], code, streamError.message)
-    if (Number.isInteger(streamError.status)) err.upstreamStatus = streamError.status
+    const upstreamStatus = streamError.localError === true ? response.statusCode : streamError.status
+    if (Number.isInteger(upstreamStatus)) err.upstreamStatus = upstreamStatus
+    if (streamError.localError === true) err.localError = true
+    if (streamError.reason) err.upstreamReason = streamError.reason
     err.timing = timing.snapshot()
     err.usage = result.usage
     throw err
@@ -1873,6 +1888,7 @@ export function createGeminiScheduler({
               throw attachAttemptMeta(failure)
             }
 
+            const isLocalToolFailure = isLocalToolContractFailure(failure)
             const isUpstream503 =
               failureCode === 'gemini_upstream_unavailable' ||
               (attemptUpstreamStatus === 503 &&
@@ -1881,6 +1897,7 @@ export function createGeminiScheduler({
             const isLocalBridgeDisconnect = isLocalBridgeDisconnectFailure(failure, failureCode, attemptUpstreamStatus)
             if (isLocalBridgeDisconnect) localBridgeDisconnects += 1
             const isUpstream502 =
+              !isLocalToolFailure &&
               !isUpstream503 &&
               !isLocalBridgeDisconnect &&
               (attemptUpstreamStatus === 502 ||
@@ -1909,7 +1926,12 @@ export function createGeminiScheduler({
                 },
               ])
               invalidateCatalogCache()
-            } else if (NON_CIRCUIT_FAILURES.has(failureCode) || isUpstream503 || isLocalBridgeDisconnect) {
+            } else if (
+              isLocalToolFailure ||
+              NON_CIRCUIT_FAILURES.has(failureCode) ||
+              isUpstream503 ||
+              isLocalBridgeDisconnect
+            ) {
               poolScheduler?.unitCircuit?.releaseProbe?.(accountKey)
             } else {
               poolScheduler?.unitCircuit?.recordFailure?.(accountKey)
@@ -2042,7 +2064,7 @@ export function createGeminiScheduler({
 
             const errorScope = ACCOUNT_WIDE_COOLDOWN_ERRORS.has(failureCode)
               ? 'account'
-              : failureCode === 'gemini_content_rejected'
+              : isLocalToolFailure || failureCode === 'gemini_content_rejected'
                 ? 'request'
                 : failureCode === 'gemini_quota_exhausted'
                   ? 'quota'

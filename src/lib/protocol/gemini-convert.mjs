@@ -3128,8 +3128,15 @@ function finalizeToolsAndRestoreContext(protocol, ir) {
   }
 
   let allowedWireNames = null
-  if (Array.isArray(ir.allowedToolNames) && ir.allowedToolNames.length) {
-    allowedWireNames = new Set(ir.allowedToolNames.map((n) => nameToWire.get(n) || geminiFuncName(n)))
+  if (Array.isArray(ir.allowedToolNames)) {
+    if (!ir.allowedToolNames.length || ir.allowedToolNames.some((name) => !nameToWire.has(name))) {
+      throw makeProtocolError(
+        400,
+        'gemini_invalid_request',
+        'Allowed tools must be a non-empty subset of declared tools.',
+      )
+    }
+    allowedWireNames = new Set(ir.allowedToolNames.map((name) => nameToWire.get(name)))
   }
 
   let effectiveTools = normalizedTools
@@ -3138,13 +3145,19 @@ function finalizeToolsAndRestoreContext(protocol, ir) {
   }
   if (typeof ir.toolChoice === 'string' && ir.toolChoice.startsWith('name:')) {
     const wantedRaw = ir.toolChoice.slice(5)
-    const wantedWire = nameToWire.get(wantedRaw) || geminiFuncName(wantedRaw)
-    if (!allowedWireNames) allowedWireNames = new Set([wantedWire])
+    const wantedWire = nameToWire.get(wantedRaw)
+    if (!wantedWire || (allowedWireNames && !allowedWireNames.has(wantedWire))) {
+      throw makeProtocolError(400, 'gemini_invalid_request', 'The required function must be a declared, allowed tool.')
+    }
+    allowedWireNames = new Set([wantedWire])
   }
 
   const restoreContext = {
     protocol,
     toolMap,
+    // History-only names may be added to toolMap while building the request.
+    // They must not authorize new calls in the model's response.
+    declaredToolNames: new Set(normalizedTools.map((tool) => tool.wireName)),
     wireNameFor,
     toolChoice: ir.toolChoice || '',
     allowedToolNames: allowedWireNames,
@@ -4122,6 +4135,7 @@ export function createGeminiRestoreTransform(
   const enforceMaxTokens = ag && Number.isInteger(ctx.maxOutputTokens) && ctx.maxOutputTokens > 0
 
   let terminated = false
+  let toolValidationFailed = false
   let stopBuf = ''
   let formatBuf = ''
   let emittedToolCalls = 0
@@ -4209,7 +4223,7 @@ export function createGeminiRestoreTransform(
         emit(event)
         return
       }
-      if (terminated) return
+      if (terminated || toolValidationFailed) return
 
       if (event.kind === 'thinking') {
         if (ctx.hideThinking) return
@@ -4255,6 +4269,18 @@ export function createGeminiRestoreTransform(
           ) {
             return
           }
+        }
+        if (!entry || !ctx.declaredToolNames?.has(entry.wireName)) {
+          toolValidationFailed = true
+          emit({
+            kind: 'error',
+            status: 502,
+            code: 'gemini_inference_invalid_output',
+            reason: 'undeclared_tool_call',
+            localError: true,
+            message: 'Upstream returned an undeclared function call.',
+          })
+          return
         }
         if (ctx.disableParallelTools && emittedToolCalls >= 1) return
         emittedToolCalls += 1
@@ -4333,7 +4359,7 @@ export function createGeminiRestoreTransform(
       emit(event)
     },
     flush(emit) {
-      if (terminated) return
+      if (terminated || toolValidationFailed) return
       if (bufferForResponseFormat && formatBuf) {
         const clean = unwrapStructuredText(formatBuf, ctx.responseFormat)
         formatBuf = ''
