@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.4.262 — 2026-11-28 · 上游 HTTP 400 按类别清洗，对会话相关的 400 封禁该会话 10 分钟
+
+- **终态上游 400 的分类与 10 分钟会话封禁（#2081）**：请求经过 failover / 修复重试后仍以真实上游 400 结束时，网关统一经 `classifyUpstream400`（`src/lib/core/refusal-guard.mjs`）分类，并只封当前租户下的该会话 10 分钟（不封设备、不降级已有的永久封禁、保留 `hit_count`）。封禁期内同一会话的请求在前置拦截处收到不可重试的 400（`x-should-retry: false`），不再继续冲击上游。
+  - **不封会话（清洗排除）**：`account_disabled`（账号/组织被禁用或受限）、`auth_credential`（凭据/鉴权失效）、`billing_credit`（余额或额度不足）、`model_unavailable`、`gateway_local`（网关/内核本地前置拒绝）、`auto_mode_classifier`
+  - **封 10 分钟**：`policy_refusal`、`third_party_client`、`context_too_long`（`prompt is too long` 等）、`tool_pair_broken`（`tool_use` 与 `tool_result` 配对损坏）、`thinking_history_broken`、`search_or_cache_invalid`、`media_invalid`、`message_structure_invalid`、`tool_schema_invalid`、`state_reference_invalid`、`beta_or_header_invalid`，以及未能归类的 `unknown`
+  - 覆盖 Anthropic 协议、Codex（含 Search / Images / Responses WS）、Gemini 公共路由与 `count_tokens`；Gemini 拦截分支补上 `x-should-retry: false`；中间的 failover / 修复重试跳不会误封，只在终态落盘；`findBan` 修复了会话封禁的过期判断
+  - 运营可见：封禁原因为 `upstream_400:<category>`，日志详情与风控面板显示类别与动作（`upstream_400_action`）
+- **行为取舍，升级前请知悉**：该功能随「封锁拒答会话」开关**默认开启**（设置项 `refusal_session_block_enabled`，在「前置 → 拒答与封禁」可关闭）。Claude Code 遇到 `prompt is too long` 的标准恢复是「压缩上下文后用同一会话 id 重发」，在该设计下这次重发会在 10 分钟内收到不可重试的 400，`tool_pair_broken` 同理；`max_tokens` 超限当前归入 `unknown`（同样封 10 分钟）。如不希望如此，关闭该开关即可。
+- 部署说明：本次改动零数据库迁移（沿用既有会话封禁表，无 DB 迁移）、零 Rust 变更、零 `deploy/payload.json` 变更；升级后重启控制面即可生效。
+
 ## 1.4.261 — 2026-11-28 · 文档：vm2api 与 CRAG V4 的协议边界；内核目录标注历史 V4 载荷的升级建议
 
 - **`vm2api` ↔ CRAG 协议与整流边界文档与内核目录 label（#2093）**：
