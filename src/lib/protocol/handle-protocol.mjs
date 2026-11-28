@@ -134,12 +134,17 @@ import {
   ErrorType,
   ErrorCode,
 } from '../core/errors.mjs'
-import { resolveWorkspaceMode, isOfficialClaudeClient } from './workspace-mode.mjs'
+import { resolveWorkspaceMode } from './workspace-mode.mjs'
 import { officialMessagesBody } from './anthropic-messages.mjs'
 import { canReuseCanonicalHistory } from './sanitize.mjs'
 import { hasForeignSystemBlock, relocateThirdPartySystem, thirdPartyRelocateEnabled } from './third-party-system.mjs'
 import { blockedClientError, blockedClientFor } from '../identity/blocked-clients.mjs'
-import { prepareOutboundEnvelope, prepareCliHopBody, prepareCliPersonaInput } from './outbound-attempt.mjs'
+import {
+  foldThirdPartyRoleSystemMessages,
+  prepareOutboundEnvelope,
+  prepareCliHopBody,
+  prepareCliPersonaInput,
+} from './outbound-attempt.mjs'
 import {
   callerCwdDeclaration,
   cragV2KernelActive,
@@ -185,19 +190,17 @@ import {
   applyCrsUnofficialPersona,
   configuredTimezone,
   cragStrictPassthroughEnabled,
-  detectProxiedOfficialCcFromRoutingFile,
   billingIndexesFromMessages,
   ccEntrypointFromRouting,
   ensureBillingAttribution,
   extractFirstUserText,
-  isOfficialClaudeCodeTraffic,
-  isProxiedOfficialClaudeCode,
   officialFamilyBodyPassthrough,
   personaHidesUsageFromRoutingFile,
   personaUsagePassthroughFromRoutingFile,
   standingUsageFromRoutingFile,
   personaModeFromRoutingFile,
 } from '../identity/crs-persona.mjs'
+import { verifyOfficialClaudeCode } from '../identity/official-cc-verifier.mjs'
 import { isPresetEnvEnabled } from '../identity/persona-template.mjs'
 import {
   compileSpecForCliNode,
@@ -401,6 +404,16 @@ export function createHandleProtocol(deps) {
   const toolPruneCache = new ToolResultPruneCache()
   const routingConfigPath = deps.routingConfigPath
   const getRouting = () => (typeof deps.getRoutingConfig === 'function' ? deps.getRoutingConfig() : deps.routingConfig)
+  function effectiveRoutingForVerify() {
+    let snap = getRouting() || {}
+    if (routingConfigPath) {
+      try {
+        const disk = readJsonParsedCached(routingConfigPath)
+        if (disk && typeof disk === 'object') snap = disk
+      } catch {}
+    }
+    return snap
+  }
   const getHealthMonitor = () =>
     typeof deps.getHealthMonitor === 'function' ? deps.getHealthMonitor() : deps.healthMonitor
   const getFailoverRunner = () =>
@@ -777,6 +790,7 @@ export function createHandleProtocol(deps) {
     backend,
     apiPlatform,
     riskState,
+    officialTraffic = null,
   }) {
     // Reuse a trusted frame-level pre-dispatch verdict (e.g. Responses WebSocket)
     // only when its evaluated backend matches the resolved inference backend and
@@ -800,9 +814,9 @@ export function createHandleProtocol(deps) {
       return false
     }
     const official =
-      isOfficialClaudeCodeTraffic(req.headers, inbound) ||
-      isOfficialClaudeClient(fp.client_class) ||
-      (detectProxiedOfficialCcFromRoutingFile(routingConfigPath) && isProxiedOfficialClaudeCode(inbound, req.headers))
+      typeof officialTraffic === 'boolean'
+        ? officialTraffic
+        : verifyOfficialClaudeCode(req.headers, inbound, { routing: effectiveRoutingForVerify() }).official === true
     const classifier = classifyClaudeRequestPurpose(inbound, { officialTraffic: official })
     const interceptSession = interceptSessionKey ? peekInterceptSession(interceptSessionKey) : null
     const decision = await runUnifiedPreDispatch({
@@ -1074,6 +1088,8 @@ export function createHandleProtocol(deps) {
     repaired = false,
     dropSampling = false,
     strictPassthrough = false,
+    officialPassthrough = false,
+    officialTraffic = false,
     safeguardsSanitized = false,
     requestContext = null,
     routing = {},
@@ -1109,6 +1125,8 @@ export function createHandleProtocol(deps) {
       repaired,
       dropSampling,
       strictPassthrough,
+      officialPassthrough,
+      officialTraffic,
       safeguardsSanitized,
       requestContext,
       slotWaitMs: candidate.slotWaitMs,
@@ -1259,8 +1277,61 @@ export function createHandleProtocol(deps) {
     logBag.inbound_device_id = sessionIdForLog(auditIdentity.deviceId)
     logBag.reasoning_effort = reasoningEffortOf(inbound)
     const fp = fingerprintRequest(req, inbound)
+    const rawBodyBytes = Buffer.isBuffer(req?.rawBodyBytes)
+      ? req.rawBodyBytes
+      : Buffer.isBuffer(req?.rawBody)
+        ? req.rawBody
+        : typeof req?.rawBody === 'string'
+          ? Buffer.from(req.rawBody, 'utf8')
+          : undefined
+    const officialCcVerdict =
+      protocol === 'anthropic.messages'
+        ? verifyOfficialClaudeCode(req.headers, inbound, {
+            routing: effectiveRoutingForVerify(),
+            rawBodyBytes,
+          })
+        : {
+            tier: 'third_party',
+            official: false,
+            direct: false,
+            proxied: false,
+            auxiliary: false,
+            allowPassthrough: false,
+            hasForeignSystem: false,
+            hasNonOfficialTools: false,
+            cloneId: null,
+            failReasons: ['non_anthropic_protocol'],
+            userId: null,
+            billing: null,
+          }
+    const officialTraffic = officialCcVerdict.official === true
+    if (
+      !officialTraffic &&
+      (officialCcVerdict.tier === 'spoofed_cc' ||
+        officialCcVerdict.cloneId ||
+        /^claude-cli\//i.test(String(req.headers?.['user-agent'] || '')))
+    ) {
+      logBag.hop_meta = {
+        ...logBag.hop_meta,
+        spoofed_claude_code: {
+          tier: officialCcVerdict.tier || 'spoofed_cc',
+          ...(officialCcVerdict.cloneId ? { clone_id: officialCcVerdict.cloneId } : {}),
+          fail_reasons: Array.isArray(officialCcVerdict.failReasons) ? officialCcVerdict.failReasons : [],
+        },
+      }
+    }
     const riskState = { policy: refusalPolicy(), repo: refusalRepo(), devices: deviceRepo(), sessions: sessionRepo() }
-    const gateArgs = { req, inbound, fp, logBag, requestId: logCtx.request_id, res, identity: auditIdentity, riskState }
+    const gateArgs = {
+      req,
+      inbound,
+      fp,
+      logBag,
+      requestId: logCtx.request_id,
+      res,
+      identity: auditIdentity,
+      riskState,
+      officialTraffic,
+    }
 
     // Bypass #3 closed: `/v1/messages` with a Gemini-scoped key must pass pool
     // Fail-Closed authorization AND unified pre-dispatch JEV BEFORE delegating.
@@ -1466,8 +1537,10 @@ export function createHandleProtocol(deps) {
       !panelDiagnostics &&
       detectInboundPlatform(inbound?.model).platform === 'anthropic' &&
       (protocol !== 'anthropic.messages' ||
-        isHealthShape(req.headers, inbound, getHealthMonitor()?.getConfig?.() || DEFAULT_HEALTH_PROBE, protocol) ||
-        !isClaudeCodeFamilyRequest(req.headers, inbound, { routing: routingNow }))
+        isHealthShape(req.headers, inbound, getHealthMonitor()?.getConfig?.() || DEFAULT_HEALTH_PROBE, protocol, {
+          officialTraffic,
+        }) ||
+        !isClaudeCodeFamilyRequest(req.headers, inbound, { routing: routingNow, rawBodyBytes }))
     ) {
       stats.errors++
       const errorResult = claudeCodeOnlyError()
@@ -1492,7 +1565,7 @@ export function createHandleProtocol(deps) {
       res.statusCode = errorResult.status
       return json(res, errorResult.status, errorResult.body)
     }
-    const healthDecision = getHealthMonitor()?.decide?.(req.headers, inbound, protocol)
+    const healthDecision = getHealthMonitor()?.decide?.(req.headers, inbound, protocol, { officialTraffic })
     if (healthDecision?.action === 'fail') {
       stats.requests++
       stats.by_route[protocol] = (stats.by_route[protocol] || 0) + 1
@@ -1852,7 +1925,11 @@ export function createHandleProtocol(deps) {
       protocol === 'anthropic.messages' &&
       getHealthMonitor()?.getConfig?.()?.intercept_warmup === true
     ) {
-      const warmupKind = detectWarmupIntercept(inbound, { userAgent: req.headers['user-agent'] || '' })
+      const warmupKind = detectWarmupIntercept(inbound, {
+        userAgent: req.headers['user-agent'] || '',
+        headers: req.headers,
+        officialTraffic,
+      })
       if (warmupKind) {
         stats.requests++
         stats.by_route[protocol] = (stats.by_route[protocol] || 0) + 1
@@ -2146,10 +2223,7 @@ export function createHandleProtocol(deps) {
 
     const hdrRewrite = String(req.headers['x-kin-rewrite'] || '') === '1'
     const rewriteEnabled = cfg.rewrite.enabled || hdrRewrite
-    const officialInbound =
-      isOfficialClaudeCodeTraffic(req.headers, inbound) ||
-      (detectProxiedOfficialCcFromRoutingFile(routingConfigPath) && isProxiedOfficialClaudeCode(inbound, req.headers))
-    const officialTraffic = officialInbound
+    const officialInbound = officialTraffic
     const requestContext = classifyClaudeRequestPurpose(inbound, { officialTraffic })
     const summarySession = agentSummarySession(inbound, { officialTraffic })
     const tenantPrincipal = authenticatedTenant(req)
@@ -2170,7 +2244,8 @@ export function createHandleProtocol(deps) {
     if (replayScope) ctx.body = issuedTools.restore(replayScope, ctx.body)
     // Recognition alone is not passthrough. Only the protocol-tab switch keeps
     // the Claude Code family body; every other inbound is rewritten below.
-    let officialPassthrough = officialFamilyBodyPassthrough(officialInbound, getRouting())
+    let officialPassthrough =
+      officialCcVerdict.allowPassthrough === true && officialFamilyBodyPassthrough(officialInbound, getRouting())
     // Operator opt-in, per API endpoint: forward the caller's own identity and
     // billing blocks instead of preparing them for the configured persona (#1321).
     // Evaluated here on purpose -- after the risk/route pass may have re-picked
@@ -2215,7 +2290,8 @@ export function createHandleProtocol(deps) {
         })
         if (pfCompile) {
           if (inferenceBackend !== 'api' && pfCompile.decision) {
-            officialPassthrough = pfCompile.decision.allow_passthrough === true
+            officialPassthrough =
+              officialCcVerdict.allowPassthrough === true && pfCompile.decision.allow_passthrough === true
           }
           logBag.hop_meta = {
             ...logBag.hop_meta,
@@ -2354,11 +2430,16 @@ export function createHandleProtocol(deps) {
     }
     let inboundToolReverse = {}
     const deferToolNameRewrite =
-      (protocol === 'anthropic.messages' && inferenceBackend !== 'api') || protocol === 'openai.responses'
+      inferenceBackend !== 'api' && (protocol === 'anthropic.messages' || protocol === 'openai.responses')
     let cragSystem = projectCallerSystem(ctx.body.system, callerEnvironment)
     const hasCragSystem = cragSystem !== ctx.body.system
     try {
-      if (!preserveApiCallerBody && !apiNonAnthropic && !requestContext && !officialPassthrough) {
+      if (
+        (!preserveApiCallerBody || protocol !== 'anthropic.messages') &&
+        !apiNonAnthropic &&
+        !requestContext &&
+        !officialPassthrough
+      ) {
         const standard = toStandardAnthropicBody(ctx.body, {
           official: officialTraffic === true,
           rewriteTools: getRouting()?.compatibility?.tool_name_rewrite !== false,
@@ -2411,7 +2492,7 @@ export function createHandleProtocol(deps) {
       }
     }
     const bodyCtx = createRequestBodyContext(ctx.body)
-    const officialClient = isOfficialClaudeClient(fp.client_class)
+    const officialClient = officialTraffic
     const callerSession = extractCallerSession({ inbound, body: ctx.body, headers: req.headers })
     const executionSession = summarySession || callerSession
     const firstUserText = extractFirstUserText(ctx.body?.messages) || extractFirstUserText(inbound?.messages)
@@ -2602,24 +2683,38 @@ export function createHandleProtocol(deps) {
       const resolvedPreset = effectivePreset || (!policy?.applies ? resolveGlobalUnifiedPreset(routingSnap) : null)
       if (resolvedPreset === 'zero') return false
       return (
-        (!officialTraffic || hasForeignSystemBlock(preRelocateBody.system)) && thirdPartyRelocateEnabled(routingSnap)
+        (!officialTraffic || hasForeignSystemBlock(preRelocateBody.system)) &&
+        thirdPartyRelocateEnabled(routingSnap, { onlyForeign: officialTraffic === true })
       )
     }
     let relocatedCache = null
     const getRelocatedForAttempt = () => {
       if (!relocatedCache) {
         const relocated = relocateThirdPartySystem(preRelocateBody, { onlyForeign: officialTraffic === true })
+        let nextBody = relocated.moved ? relocated.body : preRelocateBody
+        let moved = relocated.moved
+        if (!officialTraffic) {
+          const folded = foldThirdPartyRoleSystemMessages(nextBody)
+          if (folded !== nextBody) {
+            nextBody = folded
+            moved = true
+          }
+        }
         let cragBody = null
-        if (relocated.moved && hasCragSystem) {
-          cragBody = relocateThirdPartySystem(
+        if (moved && hasCragSystem) {
+          const cragRelocated = relocateThirdPartySystem(
             { ...preRelocateBody, system: preRelocateCragSystem },
             { onlyForeign: officialTraffic === true },
-          ).body
+          )
+          const cragBase = cragRelocated.moved
+            ? cragRelocated.body
+            : { ...preRelocateBody, system: preRelocateCragSystem }
+          cragBody = !officialTraffic ? foldThirdPartyRoleSystemMessages(cragBase) : cragBase
         }
         relocatedCache = {
-          body: relocated.moved ? relocated.body : preRelocateBody,
+          body: nextBody,
           cragBody,
-          moved: relocated.moved,
+          moved,
         }
       }
       return relocatedCache
@@ -2854,6 +2949,8 @@ export function createHandleProtocol(deps) {
             onPublicLine: publicStream ? (line) => publicStream.observe(line) : null,
             requestContext,
             passthrough: officialPassthrough,
+            officialTraffic,
+            toolNames: inboundToolReverse,
             routing: getRouting(),
             redactionPrincipal: req.apiKeyRecord?.id || (req.apiKeyKind === 'master' ? 'master' : ''),
             redactionSession: String(req.headers?.['x-claude-code-session-id'] || ''),
@@ -3484,6 +3581,9 @@ export function createHandleProtocol(deps) {
               }
               if (!strictPassthrough) {
                 for (const policy of extra.repairs || []) source = repairAnthropicRequest(source, policy)
+                if (!officialTraffic && !officialPassthrough && !attemptPoolOwnsSystemDirectly) {
+                  source = foldThirdPartyRoleSystemMessages(source)
+                }
               }
               hopBody = prepareCragPrintBody(source, {
                 preset: cragPromptSpec.mode,
@@ -3579,6 +3679,8 @@ export function createHandleProtocol(deps) {
                   cliHop: true,
                   cragPrint: true,
                   strictPassthrough,
+                  officialPassthrough: officialPassthrough === true,
+                  officialTraffic,
                   stripClientBeta:
                     headlessBridge &&
                     !strictPassthrough &&
@@ -3610,7 +3712,10 @@ export function createHandleProtocol(deps) {
               if (cliPoolPassthrough) {
                 hopBody = shallowCopyBody(attemptPersonaIn)
               } else if (attemptPoolPrompt.applies && attemptPoolPrompt.mode === 'override') {
-                const overridden = applyPoolPromptToAnthropicBody(shallowCopyBody(attemptPersonaIn), attemptPoolPrompt)
+                const callerInput = !officialTraffic
+                  ? foldThirdPartyRoleSystemMessages(shallowCopyBody(attemptPersonaIn))
+                  : shallowCopyBody(attemptPersonaIn)
+                const overridden = applyPoolPromptToAnthropicBody(callerInput, attemptPoolPrompt)
                 hopBody = applyCrsUnofficialPersona(prepareCliPersonaInput(overridden, 'zero'), {
                   forceConfigured: true,
                   routingFile: routingConfigPath,
@@ -3623,20 +3728,20 @@ export function createHandleProtocol(deps) {
                   entrypoint: entrypointNow,
                 })
               } else {
-                hopBody = applyCrsUnofficialPersona(
-                  prepareCliPersonaInput(shallowCopyBody(attemptPersonaIn), effectiveCliPersona),
-                  {
-                    forceConfigured: true,
-                    routingFile: routingConfigPath,
-                    cacheTtl: requestedCacheTtl,
-                    mode: effectiveCliPersona,
-                    sessionId: attemptSessionId,
-                    model: hopBody?.model,
-                    cliVersion: outboundProfile.cliVersion,
-                    identity,
-                    entrypoint: entrypointNow,
-                  },
-                )
+                const callerInput = !officialTraffic
+                  ? foldThirdPartyRoleSystemMessages(shallowCopyBody(attemptPersonaIn))
+                  : shallowCopyBody(attemptPersonaIn)
+                hopBody = applyCrsUnofficialPersona(prepareCliPersonaInput(callerInput, effectiveCliPersona), {
+                  forceConfigured: true,
+                  routingFile: routingConfigPath,
+                  cacheTtl: requestedCacheTtl,
+                  mode: effectiveCliPersona,
+                  sessionId: attemptSessionId,
+                  model: hopBody?.model,
+                  cliVersion: outboundProfile.cliVersion,
+                  identity,
+                  entrypoint: entrypointNow,
+                })
                 if (attemptPoolPrompt.applies && attemptPoolPrompt.mode === 'append') {
                   hopBody = applyPoolPromptToAnthropicBody(hopBody, attemptPoolPrompt)
                 }
@@ -3658,6 +3763,7 @@ export function createHandleProtocol(deps) {
               routing: routingNow,
               personaPreset:
                 !requestContext && !effectiveOfficialPassthrough && !cliPoolPassthrough ? effectiveCliPersona : null,
+              officialTraffic,
             })
             if (!requestContext) {
               hopBody = ensureBillingAttribution(hopBody, {
@@ -3747,6 +3853,8 @@ export function createHandleProtocol(deps) {
                 cliHop: true,
                 cragPrint: false,
                 promptSpec: cliPromptSpec,
+                officialPassthrough: effectiveOfficialPassthrough === true,
+                officialTraffic,
                 preparedHop,
                 transportRouting,
                 requestContext,
@@ -3838,6 +3946,7 @@ export function createHandleProtocol(deps) {
             identity,
             unofficial: !officialTraffic,
             officialClient: officialTraffic,
+            officialTraffic,
             sessionId: attemptSessionId,
             accountId: selected.accountId,
             boundSessionId: keptSession,
@@ -3853,7 +3962,8 @@ export function createHandleProtocol(deps) {
             apiKeyId: req.apiKeyRecord?.id ?? '',
             stream: upstreamStream,
             cacheControlLimit: Number(getRouting()?.compatibility?.cache_control_limit) || 4,
-            toolNameRewrite: openaiCompat ? false : getRouting()?.compatibility?.tool_name_rewrite !== false,
+            toolNameRewrite:
+              openaiCompat && !deferToolNameRewrite ? false : getRouting()?.compatibility?.tool_name_rewrite !== false,
             cacheTtl,
             cacheBreakpoints,
             preserveThinkingBlocks,
@@ -3884,6 +3994,8 @@ export function createHandleProtocol(deps) {
             meta: {
               toolNames: composeToolNames(inboundToolReverse, prepared.toolNames),
               sessionId: attemptSessionId,
+              officialPassthrough: effectiveHttpOfficialPassthrough === true,
+              officialTraffic,
               repaired,
               dropSampling,
             },
@@ -3919,6 +4031,8 @@ export function createHandleProtocol(deps) {
               repaired: attemptMeta?.repaired === true,
               dropSampling: attemptMeta?.dropSampling === true,
               strictPassthrough: attemptMeta?.strictPassthrough === true,
+              officialPassthrough: attemptMeta?.officialPassthrough ?? officialPassthrough === true,
+              officialTraffic: attemptMeta?.officialTraffic ?? officialTraffic === true,
               safeguardsSanitized: attemptMeta?.safeguardsSanitized === true,
               requestContext: attemptMeta?.requestContext || requestContext,
               want1m,
@@ -3972,6 +4086,8 @@ export function createHandleProtocol(deps) {
               repaired: attemptMeta?.repaired === true,
               dropSampling: attemptMeta?.dropSampling === true,
               strictPassthrough: attemptMeta?.strictPassthrough === true,
+              officialPassthrough: attemptMeta?.officialPassthrough ?? officialPassthrough === true,
+              officialTraffic: attemptMeta?.officialTraffic ?? officialTraffic === true,
               safeguardsSanitized: attemptMeta?.safeguardsSanitized === true,
               requestContext: attemptMeta?.requestContext || requestContext,
               body,

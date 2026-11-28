@@ -208,7 +208,31 @@ test('health probe mode uses the full official Claude Code prompt', () => {
   assert.deepEqual(inbound.system[1].cache_control, { type: 'ephemeral', ttl: '1h' })
   assert.match(inbound.system[2].text, /# Environment/)
   assert.deepEqual(inbound.system[2].cache_control, { type: 'ephemeral', ttl: '1h' })
-  assert.equal(isOfficialClaudeCodeTraffic(headers, inbound), true)
+  // Incomplete synthetic probe stub (non-UUIDv4 sessionId, no anthropic-beta / Stainless retry+timeout)
+  // must fail closed under strict official Claude Code verification.
+  assert.equal(isOfficialClaudeCodeTraffic(headers, inbound), false)
+
+  // A full realistic official Claude Code header bundle + UUIDv4 session passes strict verification.
+  const fullSessionId = '11111111-2222-4333-8444-555555555555'
+  const fullHeaders = {
+    ...headers,
+    'anthropic-beta': 'claude-code-20250219,oauth-2025-04-20',
+    'anthropic-dangerous-direct-browser-access': 'true',
+    'x-stainless-retry-count': '0',
+    'x-stainless-timeout': '600',
+    'x-claude-code-session-id': fullSessionId,
+  }
+  const fullInbound = {
+    ...inbound,
+    metadata: {
+      user_id: JSON.stringify({
+        device_id: 'a'.repeat(64),
+        account_uuid: '',
+        session_id: fullSessionId,
+      }),
+    },
+  }
+  assert.equal(isOfficialClaudeCodeTraffic(fullHeaders, fullInbound), true)
 })
 
 test('runVmTestChat reports cli-hop when slot engine is rust', async (t) => {

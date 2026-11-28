@@ -3,13 +3,32 @@ import assert from 'node:assert/strict'
 import { detectWarmupIntercept, formatWarmupSse, warmupMockMessage } from '../../src/lib/protocol/warmup-intercept.mjs'
 import { normalizeHealthProbeConfig } from '../../src/lib/admin/health-probe.mjs'
 
-const CC = { userAgent: 'claude-cli/2.1.281 (external, cli)' }
+const CC_FULL_HEADERS = {
+  'user-agent': 'claude-cli/2.1.321 (external, cli)',
+  'x-app': 'cli',
+  'anthropic-version': '2023-06-01',
+  'anthropic-dangerous-direct-browser-access': 'true',
+  'anthropic-beta': 'claude-code-20250219,interleaved-thinking-2025-05-14',
+  'x-stainless-lang': 'js',
+  'x-stainless-os': 'Linux',
+  'x-stainless-arch': 'x64',
+  'x-stainless-runtime': 'node',
+  'x-stainless-runtime-version': 'v26.12.1',
+  'x-stainless-package-version': '0.128.0',
+  'x-stainless-retry-count': '0',
+  'x-stainless-timeout': '600',
+  'x-claude-code-session-id': '11111111-2222-4333-8444-555555555555',
+}
+const CC = { officialTraffic: true, headers: CC_FULL_HEADERS }
 const text = (t) => [{ type: 'text', text: t }]
 const user = (content) => ({ role: 'user', content })
 
-test('Haiku ping with max_tokens=1 requires a claude-cli UA', () => {
+test('V13: Haiku ping with max_tokens=1 requires verified official CC, never bare claude-cli UA', () => {
   const body = { model: 'claude-haiku-4-5', max_tokens: 1, messages: [user(text('quota'))] }
   assert.equal(detectWarmupIntercept(body, CC), 'haiku_ping')
+  assert.equal(detectWarmupIntercept(body, { headers: CC_FULL_HEADERS }), 'haiku_ping')
+  assert.equal(detectWarmupIntercept(body, { userAgent: 'claude-cli/2.1.281 (external, cli)' }), null)
+  assert.equal(detectWarmupIntercept(body, { officialTraffic: false, headers: CC_FULL_HEADERS }), null)
   assert.equal(detectWarmupIntercept(body, { userAgent: 'Go-http-client/1.1' }), null)
   assert.equal(detectWarmupIntercept({ ...body, model: 'claude-sonnet-5' }, CC), null)
 })

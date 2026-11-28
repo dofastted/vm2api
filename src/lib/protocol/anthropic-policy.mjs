@@ -34,6 +34,7 @@ import {
 } from './cache-ttl.mjs'
 import { normalizeImageContentBlocks } from './images.mjs'
 import { normalizeToolInputSchemas } from './tool-input-schema.mjs'
+import { isOfficialClaudeToolName } from '../identity/official-cc-verifier.mjs'
 
 const TOOL_NAME = /^[A-Za-z0-9_-]{1,64}$/
 
@@ -699,20 +700,40 @@ const CLIENT_PROSE = [
 ]
 const CLIENT_SLUG = /(?<![\w./:@'"`-])hermes-agent(?![\w/@-]|\.\w)/g
 
-function scrubClientProse(text) {
+const TOOL_CLIENT_PROSE = [
+  ...CLIENT_PROSE,
+  ['Oh My Pi', 'Claude Code'],
+  ['OpenCode', 'Claude Code'],
+  ['Cherry Studio', 'Claude Code'],
+  ['Roo Code', 'Claude Code'],
+  ['Kilo Code', 'Claude Code'],
+  ['DeepSeek Harness', 'Claude Code'],
+]
+const TOOL_CLIENT_SLUG = /(?<![\w./:@'"`-])(?:hermes-agent|oh-my-pi)(?![\w/@-]|\.\w)/g
+
+function scrubClientProse(text, { includeThirdPartyBrands = false } = {}) {
   let out = String(text ?? '')
-  for (const [from, to] of CLIENT_PROSE) {
+  const pairs = includeThirdPartyBrands ? TOOL_CLIENT_PROSE : CLIENT_PROSE
+  for (const [from, to] of pairs) {
     if (out.includes(from)) out = out.split(from).join(to)
   }
-  return out.replace(CLIENT_SLUG, 'claude-code')
+  return out.replace(includeThirdPartyBrands ? TOOL_CLIENT_SLUG : CLIENT_SLUG, 'claude-code')
 }
 
-/** Third-party tool names Anthropic bills as extra usage. Official CC names stay. */
-export function wireToolName(name, { official = false, rewriteTools = true } = {}) {
+/**
+ * Third-party tool names Anthropic bills as extra usage.
+ * V5: even when `official === true`, ALWAYS verify `isOfficialClaudeToolName(raw, tool)`
+ * so non-CC tools (`_bash`, `fs_read`, `automation_repl`, `bash`, `read`) get `mcp__` prefixed.
+ */
+export function wireToolName(
+  name,
+  { official = false, rewriteTools = true, tool = null, allowClassifierTool = false } = {},
+) {
   const raw = String(name || '')
   if (!raw || raw.startsWith('mcp__')) return raw
   if (raw.startsWith('mcp_')) return `mcp__${raw.slice(4)}`
-  if (official || rewriteTools === false) return raw
+  if (rewriteTools === false) return raw
+  if (official && isOfficialClaudeToolName(raw, tool, { allowClassifierTool })) return raw
   return `mcp__${raw}`
 }
 
@@ -720,27 +741,43 @@ export function wireToolName(name, { official = false, rewriteTools = true } = {
  * Hermes calls this gateway as a third-party Messages client and does not apply
  * its own OAuth identity transform. Rewrite the outbound body before either hop:
  * product strings leave system and tool text, and tool names land on mcp__.
- * Official Claude Code keeps its own tool names; a stray mcp_ name is still fixed.
+ * Official Claude Code keeps its own verified built-in/MCP tool names; non-CC
+ * tools and stray `mcp_` names are always prefixed to `mcp__`.
  */
 export function scrubUpstreamClientBody(
   body,
-  { official = false, rewriteTools = true, preserveToolNames = false, shareUnchanged = false } = {},
+  {
+    official = false,
+    rewriteTools = true,
+    preserveToolNames = false,
+    preserveSystem = false,
+    shareUnchanged = false,
+  } = {},
 ) {
   if (!body || typeof body !== 'object') return { body, reverse: {} }
   const out = shareUnchanged && !isSmallTextTurn(body) ? { ...body } : clone(body)
   const reverse = {}
   const used = new Set()
   const assigned = new Map()
+  const toolByName = new Map()
+  if (Array.isArray(out.tools)) {
+    for (const tool of out.tools) {
+      if (tool && typeof tool === 'object' && typeof tool.name === 'string') {
+        toolByName.set(tool.name, tool)
+      }
+    }
+  }
   const declared = new Set(
     !preserveToolNames && Array.isArray(out.tools) ? out.tools.map((tool) => tool?.name).filter(Boolean) : [],
   )
-  const rename = (name) => {
+  const rename = (name, toolObj = null) => {
     if (preserveToolNames) return name
     if (assigned.has(name)) return assigned.get(name)
-    let wire = wireToolName(name, { official, rewriteTools })
+    const resolvedTool = toolObj || toolByName.get(name) || null
+    let wire = wireToolName(name, { official, rewriteTools, tool: resolvedTool })
     if (!wire) return name
     if (wire !== name) {
-      const base = wireToolName(name, { official, rewriteTools })
+      const base = wireToolName(name, { official, rewriteTools, tool: resolvedTool })
       let suffix = 2
       while (used.has(wire) || declared.has(wire)) {
         const tail = `_${suffix++}`
@@ -752,14 +789,18 @@ export function scrubUpstreamClientBody(
     assigned.set(name, wire)
     return wire
   }
-  if (typeof out.system === 'string') out.system = scrubClientProse(out.system)
-  else if (Array.isArray(out.system)) out.system = out.system.map((block) => scrubTextBlock(block))
+  if (!preserveSystem) {
+    if (typeof out.system === 'string') out.system = scrubClientProse(out.system)
+    else if (Array.isArray(out.system)) out.system = out.system.map((block) => scrubTextBlock(block))
+  }
   if (Array.isArray(out.tools)) {
     out.tools = out.tools.map((tool) => {
       if (!tool || typeof tool !== 'object' || isAnthropicServerTool(tool)) return tool
       const next = { ...tool }
-      if (typeof next.name === 'string') next.name = rename(next.name)
-      if (typeof next.description === 'string') next.description = scrubClientProse(next.description)
+      if (typeof next.name === 'string') next.name = rename(next.name, tool)
+      if (typeof next.description === 'string') {
+        next.description = scrubClientProse(next.description, { includeThirdPartyBrands: true })
+      }
       return next
     })
   }

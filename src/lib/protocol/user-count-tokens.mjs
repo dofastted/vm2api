@@ -13,16 +13,15 @@ import { findAccount } from '../admin/panel-api.mjs'
 import { readJevConfig, scopeAccountFromVm } from './jev-intercept.mjs'
 import { runProtocolIntercept } from './intercept-gate.mjs'
 import { inboundBodyLimit, readRoutingConfigFile } from '../core/config.mjs'
-import {
-  detectProxiedOfficialCcFromRouting,
-  isOfficialClaudeCodeTraffic,
-  isProxiedOfficialClaudeCode,
-} from '../identity/crs-persona.mjs'
+import { verifyOfficialClaudeCode } from '../identity/official-cc-verifier.mjs'
 import {
   claudeCodeOnlyError,
   claudeCodeOnlyFromRouting,
   isClaudeCodeFamilyRequest,
 } from '../identity/claude-code-only.mjs'
+import { toStandardAnthropicBody } from './anthropic-policy.mjs'
+import { relocateThirdPartySystem } from './third-party-system.mjs'
+import { foldThirdPartyRoleSystemMessages } from './outbound-attempt.mjs'
 import { canCountTokens, canOfficialUsage, credentialModeOfVm, isApiKeyMode } from '../oauth/credential-mode.mjs'
 import { attachUsageFetchMeta, getUsageCache, getUsageFetchMeta } from '../oauth/usage-cache.mjs'
 import { probeAccount } from '../oauth/usage-probe.mjs'
@@ -180,7 +179,26 @@ function sendPoolFail(res, json, peeked) {
   return json(res, mapped.status, mapped.body)
 }
 
-function distillContext(req, inbound, { effectivePool = null, routing: routingArg = null, nodeProvider = null } = {}) {
+export function sanitizeThirdPartyCountTokensBody(body, { routing = null } = {}) {
+  if (!body || typeof body !== 'object') return body
+  const relocated = relocateThirdPartySystem(body, { onlyForeign: false })
+  const folded = foldThirdPartyRoleSystemMessages(relocated.moved ? relocated.body : body)
+  const standard = toStandardAnthropicBody(folded, {
+    official: false,
+    rewriteTools: routing?.compatibility?.tool_name_rewrite !== false,
+    preserveToolNames: false,
+  })
+  const out = { ...standard.body }
+  // /v1/messages/count_tokens rejects max_tokens (added by sanitizeAnthropicBody default).
+  delete out.max_tokens
+  return out
+}
+
+function distillContext(
+  req,
+  inbound,
+  { effectivePool = null, routing: routingArg = null, nodeProvider = null, official: officialOverride = null } = {},
+) {
   let routing = routingArg
   if (!routing) {
     try {
@@ -190,8 +208,10 @@ function distillContext(req, inbound, { effectivePool = null, routing: routingAr
     }
   }
   const official =
-    isOfficialClaudeCodeTraffic(req?.headers || {}, inbound) ||
-    (detectProxiedOfficialCcFromRouting(routing || {}) && isProxiedOfficialClaudeCode(inbound, req?.headers || {}))
+    typeof officialOverride === 'boolean'
+      ? officialOverride
+      : verifyOfficialClaudeCode(req?.headers || {}, inbound, { routing: routing || {}, countTokens: true })
+          .official === true
   const zeroInject = isPoolZeroInjectMode(effectivePool, routing || {}, { nodeProvider })
   return { official, zeroInject }
 }
@@ -254,6 +274,7 @@ export async function blockCountTokensBeforeHop(req, inbound, deps = {}) {
       effectivePool: deps.effectivePool || null,
       routing: deps.routing || null,
       nodeProvider: deps.nodeProvider || null,
+      official: deps.official,
     }),
     distillRules: deps.cfg?.distill,
     policy: refusalPolicy(deps),
@@ -352,21 +373,25 @@ export async function handleUserCountTokens(req, res, deps) {
   if (!parsed.ok) return json(res, parsed.error.status, parsed.error.body)
   const modelDenied = keyModelError(req, parsed.body.model, { anthropic: true })
   if (modelDenied) return json(res, modelDenied.status, modelDenied.body)
+  const targetPlatform = detectInboundPlatform(parsed.body.model).platform || 'anthropic'
+  const ccVerdict =
+    targetPlatform === 'anthropic'
+      ? verifyOfficialClaudeCode(req?.headers || {}, inbound, { routing: routing || {}, countTokens: true })
+      : { official: false }
+  const officialTraffic = ccVerdict.official === true
   if (
     claudeCodeOnlyFromRouting(routing) &&
-    detectInboundPlatform(parsed.body.model).platform === 'anthropic' &&
-    !isClaudeCodeFamilyRequest(req?.headers || {}, inbound, { countTokens: true })
+    targetPlatform === 'anthropic' &&
+    !isClaudeCodeFamilyRequest(req?.headers || {}, inbound, { routing, countTokens: true })
   ) {
     const err = claudeCodeOnlyError()
     return json(res, err.status, err.body)
   }
-  const blockedClient =
-    detectInboundPlatform(parsed.body.model).platform === 'anthropic' ? blockedClientFor(inbound, routing) : null
+  const blockedClient = targetPlatform === 'anthropic' ? blockedClientFor(inbound, routing) : null
   if (blockedClient) {
     const err = blockedClientError(blockedClient)
     return json(res, err.status, err.body)
   }
-  const targetPlatform = detectInboundPlatform(parsed.body.model).platform || 'anthropic'
   if (targetPlatform === 'anthropic') {
     try {
       validateImageDimensions(parsed.body)
@@ -428,6 +453,7 @@ export async function handleUserCountTokens(req, res, deps) {
     effectivePool,
     routing,
     nodeProvider: targetPlatform,
+    official: officialTraffic,
   })
   if (gate?.error) {
     if (gate.error.retryAfterSec) res.setHeader?.('retry-after', String(gate.error.retryAfterSec))
@@ -450,6 +476,7 @@ export async function handleUserCountTokens(req, res, deps) {
       effectivePool,
       routing,
       nodeProvider: targetPlatform,
+      official: officialTraffic,
       account: scopeAccountFromVm(peeked.vm, findAccount(deps.accountQuota, peeked.vm)?.unified),
     })
     if (again?.error) {
@@ -457,10 +484,12 @@ export async function handleUserCountTokens(req, res, deps) {
       return json(res, again.error.status, again.error.body)
     }
   }
+  const outboundBody = officialTraffic ? parsed.body : sanitizeThirdPartyCountTokensBody(parsed.body, { routing })
   const caps = slotCapabilitiesForCountTokens(peeked, deps)
   if (caps.includes('count_tokens_v1')) {
     const hop = await (deps.countTokensViaKernel || countTokensViaKernel)(peeked.exec, {
-      body: parsed.body,
+      body: outboundBody,
+      headers: {},
       timeoutMs: 45000,
     })
     return sendCountTokensHopResult(res, json, hop, { preserveOfficialErrors: true })
@@ -479,11 +508,11 @@ export async function handleUserCountTokens(req, res, deps) {
     return json(res, 200, buildUsageView(listed, source))
   }
   const hop = await (deps.countTokensViaWorker || countTokensViaWorker)(peeked.exec, {
-    body: parsed.body,
+    body: outboundBody,
     headers: {
       'user-agent': 'kin-inference/1.0',
       'anthropic-version': '2023-06-01',
-      'anthropic-beta': isApiKeyMode(mode) ? apiKeyBetaHeader('') : setupTokenBetaHeader(parsed.body.model),
+      'anthropic-beta': isApiKeyMode(mode) ? apiKeyBetaHeader('') : setupTokenBetaHeader(outboundBody.model),
     },
     timeoutMs: 45000,
   })

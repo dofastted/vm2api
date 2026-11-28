@@ -37,6 +37,15 @@ import { uuidFromSeed } from './identity-rewrite.mjs'
 import { OFFICIAL_CLI_VERSION } from './vm-identity.mjs'
 import { CCH_PLACEHOLDER } from './cch.mjs'
 import { CLAUDE_CLI_UA_RE, isOfficialClaudeUa } from './official-claude-ua.mjs'
+import {
+  OFFICIAL_CLAUDE_CODE_TOOL_NAMES,
+  computeFingerprintFromTextUtf16,
+  hasVerifiedDesktopHeaders,
+  isOfficialClaudeToolName,
+  isValidStrictOfficialUserId,
+  stripInvisibleUnicode,
+  verifyOfficialClaudeCode,
+} from './official-cc-verifier.mjs'
 import { modelSupportsMidConversationSystem } from '../protocol/anthropic-policy.mjs'
 import { validTimezone } from '../core/timezone.mjs'
 import { normalizeCacheTtl, validateCacheBreakpoints } from '../protocol/cache-ttl.mjs'
@@ -308,15 +317,7 @@ export function extractFirstUserText(messages) {
 }
 
 export function computeClaudeCodeFingerprint(firstUserText = '', cliVersion = DEFAULT_CLI_VERSION) {
-  const buf = Buffer.from(String(firstUserText), 'utf8')
-  let chars = ''
-  for (const i of [4, 7, 20]) {
-    chars += i < buf.length ? String.fromCharCode(buf[i]) : '0'
-  }
-  return createHash('sha256')
-    .update(FINGERPRINT_SALT + chars + cliVersion, 'utf8')
-    .digest('hex')
-    .slice(0, 3)
+  return computeFingerprintFromTextUtf16(firstUserText, cliVersion)
 }
 
 export { CCH_PLACEHOLDER, computeClaudeCodeCch, sealClaudeCodeCch } from './cch.mjs'
@@ -1123,36 +1124,8 @@ export function inboundHasTools(body) {
 export const PERSONA_EXPANSION_MODES = Object.freeze(['official_tools', 'any_tools', 'never'])
 export const DEFAULT_PERSONA_EXPANSION = 'official_tools'
 
-/** Anthropic first-party tool types/names. */
-const OFFICIAL_TOOL_PREFIX_RE =
-  /^(web_search|web_fetch|code_execution|text_editor|str_replace_based_edit_tool|str_replace|computer|bash|memory)(_|$)/i
-
-/** Claude Code built-in tool names (case-insensitive). */
-export const CLAUDE_CODE_TOOL_NAMES = Object.freeze(
-  new Set([
-    'bash',
-    'read',
-    'write',
-    'edit',
-    'multiedit',
-    'glob',
-    'grep',
-    'ls',
-    'task',
-    'agent',
-    'webfetch',
-    'notebookedit',
-    'todowrite',
-    'skill',
-    'askuserquestion',
-    'enterplanmode',
-    'exitplanmode',
-    'bashoutput',
-    'killshell',
-    'listmcpresources',
-    'readmcpresource',
-  ]),
-)
+/** Claude Code built-in tool names (strict case-sensitive PascalCase SSOT). */
+export const CLAUDE_CODE_TOOL_NAMES = OFFICIAL_CLAUDE_CODE_TOOL_NAMES
 
 function toolLabel(tool) {
   if (!tool || typeof tool !== 'object') return ''
@@ -1172,22 +1145,9 @@ export function normalizePersonaExpansion(value) {
 export function isOfficialLookingTool(tool, extraNames = []) {
   const name = toolLabel(tool)
   if (!name) return false
-  const lower = name.toLowerCase()
-  if (OFFICIAL_TOOL_PREFIX_RE.test(lower)) return true
-  if (CLAUDE_CODE_TOOL_NAMES.has(lower)) return true
-  if (lower.startsWith('mcp__')) return true
-  const type = String(tool.type || '')
-    .trim()
-    .toLowerCase()
-  if (type && type !== lower && OFFICIAL_TOOL_PREFIX_RE.test(type)) return true
-  const extras = extraNames
-    .map((n) =>
-      String(n || '')
-        .trim()
-        .toLowerCase(),
-    )
-    .filter(Boolean)
-  return extras.includes(lower)
+  if (isOfficialClaudeToolName(tool?.name, tool)) return true
+  const extras = extraNames.map((n) => String(n || '').trim()).filter(Boolean)
+  return extras.includes(name)
 }
 
 export function inboundHasOfficialLookingTools(body, extraNames = []) {
@@ -1613,47 +1573,27 @@ export function standingUsageFromRoutingFile(filePath, mode) {
   }
 }
 
-const LEGACY_OFFICIAL_USER_ID_RE = /^user_([a-fA-F0-9]{64})_account_([a-fA-F0-9-]*)_session_([a-fA-F0-9-]{36})$/
-
 export function isValidOfficialUserId(raw) {
-  if (raw == null) return false
-  if (typeof raw === 'object') {
-    return !!(raw.device_id && raw.session_id)
-  }
-  const s = String(raw).trim()
-  if (!s) return false
-  if (s.startsWith('{')) {
-    try {
-      const p = JSON.parse(s)
-      return !!(p && p.device_id && p.session_id)
-    } catch {
-      return false
-    }
-  }
-  return LEGACY_OFFICIAL_USER_ID_RE.test(s)
+  return isValidStrictOfficialUserId(raw)
 }
 
 /**
- * oh-my-pi / omp inbound: their own ROLE + PROJECT blocks, or the OAuth
- * stealth prefix (`cc_entrypoint=local-agent` + Agent SDK one-liner).
- * Claude Desktop shares that entrypoint, so its desktop headers let it continue
- * through the existing official checks; OMP-specific system markers still reject it.
+ * oh-my-pi / omp inbound: their own ROLE + PROJECT blocks, RFC 2119 /
+ * <project-context><workstation>, or the OAuth stealth prefix
+ * (`cc_entrypoint=local-agent` without verified Desktop headers).
  */
 export function looksLikeOhMyPiSystem(system, headers = {}) {
-  const text = systemToText(system)
+  const text = stripInvisibleUnicode(systemToText(system))
   if (!text) return false
-  const ua = String(headers['user-agent'] || headers['User-Agent'] || '').trim()
-  const desktop =
-    isOfficialClaudeUa(ua) &&
-    /[ (,]local-agent(?=[,)])/.test(ua) &&
-    /[ (,]agent-sdk\/\d+\.\d+\.\d+(?=[,)])/.test(ua) &&
-    headers['anthropic-client-platform'] === 'desktop_app' &&
-    /^\d+\.\d+\.\d+$/.test(String(headers['anthropic-client-version'] || '').trim())
-  if (/cc_entrypoint\s*=\s*local-agent/i.test(text) && !desktop) return true
+  const desktop = hasVerifiedDesktopHeaders(headers)
+  if (/\bcc_entrypoint\s*=\s*local-agent\b/i.test(text) && !desktop) return true
   if (/<system-conventions>/i.test(text) && /Oh My Pi/i.test(text)) return true
   if (/<system-conventions>/i.test(text) && /<workstation>/i.test(text)) return true
+  if (/<project-context>[\s\S]*?<workstation>/i.test(text)) return true
+  if (/RFC 2119 keywords:\s*MUST,\s*REQUIRED,\s*SHOULD/i.test(text)) return true
   if (/^ROLE\s*\n\s*=+/m.test(text) && /^PROJECT\s*\n\s*=+/m.test(text)) return true
   if (/\b(?:oh my pi|pi coding harness|omp coding harness)\b/i.test(text)) return true
+  if (/\ba coding assistant running inside pi\b/i.test(text)) return true
   // OMP 18.12–18.16 send the Claude Code envelope plus their own role line (captured).
   if (/^You are omp['’]s trusted coding assistant\.?\s*$/im.test(text)) return true
   return false
@@ -1673,7 +1613,7 @@ export function looksLikeOfficialClaudeSystem(system, headers = {}) {
   if (looksLikeOhMyPiSystem(system, headers)) return false
   const text = systemToText(system)
   if (!text) return false
-  if (/x-anthropic-billing-header:/i.test(text)) return true
+  if (/^\s*x-anthropic-billing-header:/i.test(text)) return true
   if (hasOfficialClaudeEntrypoint(text)) return true
   if (hasOfficialClaudeLine(system)) return true
   if (hasOfficialClaudeChildPrompt(system)) return true
@@ -1689,63 +1629,28 @@ export function inboundHasOpenAIToolShape(body = {}) {
 }
 
 /**
- * Official Claude Code family detection uses the CLI User-Agent prefix and body checks.
- * UA + user_id is not enough: third-party Messages clients spoof both.
- * Body must also look like official CC system, and must not be OpenAI tools.
- * oh-my-pi / local-agent stealth is unofficial even with a matching UA.
+ * Official Claude Code direct traffic check — delegates to SSOT strict verifier.
  */
-export function isOfficialClaudeCodeTraffic(headers = {}, body = {}) {
-  const ua = String(headers['user-agent'] || headers['User-Agent'] || '').trim()
-  if (!isOfficialClaudeUa(ua) || !CLAUDE_CLI_UA_RE.test(ua)) return false
-  if (looksLikeOhMyPiSystem(body?.system, headers)) return false
-  if (!isValidOfficialUserId(body?.metadata?.user_id)) return false
-  if (inboundHasOpenAIToolShape(body)) return false
-  return looksLikeOfficialClaudeSystem(body?.system, headers)
-}
-
-/**
- * Billing block plus an entrypoint field. Third-party tools do send the
- * "You are Claude Code" line, but never this block, which is what makes it a
- * usable signal. The entrypoint value itself is not checked: real values drift
- * across IDEs and a forger could fill any of them anyway.
- */
-function systemHasOfficialBillingBlock(system) {
-  return extractSystemTexts(system).some(
-    (text) => /x-anthropic-billing-header/i.test(text) && /cc_entrypoint=/i.test(text),
-  )
-}
-
-/**
- * An upstream API gateway forwarding real Claude Code rewrites the UA to
- * Go-http-client. The billing block is the signal third-party clients do not
- * send, and some relays keep that block while dropping metadata.user_id.
- * A relay that also drops the block still counts when the client beta
- * (`claude-code-20250219`), the official system text, and a valid user_id
- * all survive. The identity line alone is not enough: third-party tools copy it.
- */
-function headerBetaTokens(headers = {}) {
-  const raw = headers?.['anthropic-beta'] || headers?.['Anthropic-Beta'] || ''
-  return String(raw)
-    .split(',')
-    .map((part) => part.trim())
-    .filter(Boolean)
+export function isOfficialClaudeCodeTraffic(headers = {}, body = {}, opts = {}) {
+  return verifyOfficialClaudeCode(headers, body, { ...opts, detectProxiedOfficialCc: false }).direct
 }
 
 export function systemLooksLikeRelayedClaudeCode(system) {
-  if (hasOfficialClaudeLine(system)) return true
   if (isOfficialClaudeSecurityMonitorPrompt(system)) return true
-  return eachSystemText(system).some((text) => looksLikeAgentPrompt(text))
+  const texts = eachSystemText(system)
+  if (!texts.length) return false
+  const first = texts[0].trimStart()
+  const anchoredIdx = /^x-anthropic-billing-header:/i.test(first) ? 1 : 0
+  const anchor = String(texts[anchoredIdx] || '').trimStart()
+  if (OFFICIAL_CC_CHILD_PROMPT_PREFIXES.some((prefix) => anchor.startsWith(prefix))) return true
+  return texts.length >= 2 && texts.some((text) => looksLikeAgentPrompt(text))
 }
 
-export function isProxiedOfficialClaudeCode(body = {}, headers = {}) {
-  if (!body || typeof body !== 'object') return false
-  if (looksLikeOhMyPiSystem(body?.system)) return false
-  if (inboundHasOpenAIToolShape(body)) return false
-  // Billing block first: some relays keep it and may drop user_id. local-agent
-  // already returned above.
-  if (systemHasOfficialBillingBlock(body?.system)) return true
-  if (!isValidOfficialUserId(body?.metadata?.user_id)) return false
-  return headerBetaTokens(headers).includes('claude-code-20250219') && systemLooksLikeRelayedClaudeCode(body?.system)
+/**
+ * Proxied / relayed official Claude Code check — delegates to SSOT strict verifier.
+ */
+export function isProxiedOfficialClaudeCode(body = {}, headers = {}, opts = {}) {
+  return verifyOfficialClaudeCode(headers, body, { ...opts, detectProxiedOfficialCc: true }).proxied
 }
 
 /**

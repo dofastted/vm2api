@@ -14,7 +14,8 @@ import {
 } from '../../src/lib/protocol/cache-ttl.mjs'
 import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs'
 import { createFailoverMockSchedulerRuntime, createMockSchedulerRuntime } from '../helpers/mock-scheduler-runtime.mjs'
-import { OFFICIAL_CLAUDE_CLI_UA } from '../../src/lib/identity/vm-identity.mjs'
+import { OFFICIAL_CLAUDE_CLI_UA, OFFICIAL_CLI_VERSION } from '../../src/lib/identity/vm-identity.mjs'
+import { computeClaudeCodeFingerprintUtf16 } from '../../src/lib/identity/official-cc-verifier.mjs'
 import { clearCachePrefixSessions } from '../../src/lib/protocol/cache-prefix.mjs'
 
 const unixTest = process.platform === 'win32' ? test.skip : test
@@ -425,16 +426,21 @@ for (const backend of ['cli', 'api']) {
 
 for (const preset of ['zero', 'official', 'official_full', 'custom']) {
   test(`CLI ${preset} lifts unsupported mid-system text while retaining its cache boundary`, async (t) => {
+    const messages = [
+      { role: 'user', content: [text('Hello', '1h')] },
+      { role: 'system', content: [text('MID_SYSTEM_CACHE_RULE', '5m')] },
+      { role: 'user', content: 'Continue' },
+    ]
     const out = await outbound(t, {
       preset,
-      headers: { 'x-kin-cache-ttl': '1h' },
+      headers: { ...officialHeaders, 'x-kin-cache-ttl': '1h' },
       input: {
-        model: 'claude-sonnet-5',
-        messages: [
-          { role: 'user', content: [text('Hello', '1h')] },
-          { role: 'system', content: [text('MID_SYSTEM_CACHE_RULE', '5m')] },
-          { role: 'user', content: 'Continue' },
+        ...officialInput(messages),
+        system: [
+          text(officialBilling(messages), null),
+          text("You are Claude Code, Anthropic's official CLI for Claude.", null),
         ],
+        model: 'claude-sonnet-5',
       },
     })
     assert.ok(out.system.some((block) => block.text === 'MID_SYSTEM_CACHE_RULE' && !block.cache_control))
@@ -960,14 +966,32 @@ for (const backend of ['cli', 'api']) {
 
 // Recognized Claude Code with official_cc_passthrough off is rewritten. Its
 // ttl-less markers mean "not chosen" and must not reach the wire as implicit 5m.
-const officialHeaders = { 'user-agent': OFFICIAL_CLAUDE_CLI_UA, 'anthropic-beta': 'claude-code-20250219' }
+const OFFICIAL_SESSION_ID = '11111111-2222-4333-8444-555555555555'
+const officialHeaders = {
+  'user-agent': OFFICIAL_CLAUDE_CLI_UA,
+  'x-app': 'cli',
+  'anthropic-version': '2023-06-01',
+  'anthropic-beta': 'claude-code-20250219',
+  'anthropic-dangerous-direct-browser-access': 'true',
+  'x-claude-code-session-id': OFFICIAL_SESSION_ID,
+  'x-stainless-lang': 'js',
+  'x-stainless-package-version': '0.128.0',
+  'x-stainless-os': 'Linux',
+  'x-stainless-arch': 'x64',
+  'x-stainless-runtime': 'node',
+  'x-stainless-runtime-version': 'v26.12.1',
+  'x-stainless-retry-count': '0',
+  'x-stainless-timeout': '600',
+}
+const officialBilling = (messages) =>
+  `x-anthropic-billing-header: cc_version=${OFFICIAL_CLI_VERSION}.${computeClaudeCodeFingerprintUtf16(messages, OFFICIAL_CLI_VERSION)}; cc_entrypoint=sdk-cli; cch=0f0f0;`
 const officialInput = (messages, tools) => ({
   system: [
-    text('x-anthropic-billing-header: cc_version=2.1.303.abc; cc_entrypoint=cli; cch=0f0f0;', null),
+    text(officialBilling(messages), null),
     text("You are Claude Code, Anthropic's official CLI for Claude.", undefined),
   ],
   metadata: {
-    user_id: JSON.stringify({ device_id: 'd'.repeat(64), session_id: '11111111-2222-4333-8444-555555555555' }),
+    user_id: JSON.stringify({ device_id: 'd'.repeat(64), session_id: OFFICIAL_SESSION_ID }),
   },
   messages,
   ...(tools ? { tools } : {}),
@@ -1031,10 +1055,11 @@ unixTest('API official passthrough keeps the caller marker without a TTL', async
 })
 
 test('CLI official passthrough with dynamic boundary keeps omitted caller TTLs intact', async (t) => {
+  const boundaryMessages = officialHistory(undefined)
   const input = {
-    ...officialInput(officialHistory(undefined)),
+    ...officialInput(boundaryMessages),
     system: [
-      text('x-anthropic-billing-header: cc_version=2.1.303.abc; cc_entrypoint=cli; cch=0f0f0;', null),
+      text(officialBilling(boundaryMessages), null),
       text("You are Claude Code, Anthropic's official CLI for Claude.", undefined),
       text('__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__', null),
     ],

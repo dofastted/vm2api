@@ -203,8 +203,8 @@ function headersEqual(a = {}, b = {}) {
   return JSON.stringify(a) === JSON.stringify(b)
 }
 
-export function storeAccountHeaders(homeDir, reqHeaders = {}) {
-  if (!homeDir) return { stored: false }
+export function storeAccountHeaders(homeDir, reqHeaders = {}, opts = {}) {
+  if (!homeDir || opts?.officialTraffic !== true) return { stored: false }
   const extracted = extractClaudeCodeHeaders(reqHeaders)
   if (!isOfficialClaudeUa(extracted['user-agent'] || '')) return { stored: false }
   // Real Claude Code always sends anthropic-beta. Probe/mimic official UA
@@ -285,11 +285,13 @@ function slotDeviceHeaders(identity = {}) {
   }
 }
 
-/** VM characteristics are the only fingerprint. Official inbound may pass protocol betas. */
+/** VM characteristics are the only fingerprint. Only strictly verified officialTraffic may pass protocol betas. */
 export function resolveVmCharacteristicHeaders(identity = {}, reqHeaders = {}, homeDir = '', model = '', opts = {}) {
   const incoming = extractClaudeCodeHeaders(reqHeaders)
-  const official = isOfficialClaudeUa(incoming['user-agent'] || '')
-  if (official) storeAccountHeaders(homeDir, reqHeaders)
+  const official = opts?.officialTraffic === true
+  if (official && isOfficialClaudeUa(incoming['user-agent'] || '')) {
+    storeAccountHeaders(homeDir, reqHeaders, { officialTraffic: true })
+  }
   const stored = loadStoredHeaders(homeDir) || {}
   const device = slotDeviceHeaders(identity)
   const want1m = opts.want1m === true || hasClaudeCode1mSuffix(model)
@@ -304,7 +306,7 @@ export function resolveVmCharacteristicHeaders(identity = {}, reqHeaders = {}, h
     }
     return applyReplayBetaPolicy(base, model, true, want1m)
   }
-  // Unofficial: ignore inbound protocol / UA. Stored CLI betas fill gaps; VM fingerprint wins.
+  // Unofficial (including bare spoofed claude-cli UA): ignore inbound protocol / UA / conditional headers.
   const base = {
     ...DEFAULTS,
     ...stored,
@@ -317,14 +319,23 @@ export function resolveVmCharacteristicHeaders(identity = {}, reqHeaders = {}, h
 /**
  * Protocol betas: official empty → DefaultBetaHeader; unofficial → FullClaudeCodeMimicryBetas.
  * VM identity overwrites UA / stainless / session. Stored file keeps protocol only.
- * Official inbound omitted anthropic-beta so probes do not wipe stored CLI betas.
+ * Never trusts bare User-Agent; requires explicit verified `opts.officialTraffic === true`.
  */
 export function resolveCrsHeaders(reqHeaders = {}, homeDir = '', identity = null, model = '', opts = {}) {
   const want1m = opts.want1m === true || hasClaudeCode1mSuffix(model)
-  if (identity) return resolveVmCharacteristicHeaders(identity, reqHeaders, homeDir, model, { want1m })
+  const official = opts?.officialTraffic === true
+  if (identity) {
+    return resolveVmCharacteristicHeaders(identity, reqHeaders, homeDir, model, {
+      ...opts,
+      want1m,
+      officialTraffic: official,
+    })
+  }
   const incoming = extractClaudeCodeHeaders(reqHeaders)
-  if (isOfficialClaudeUa(incoming['user-agent'] || '')) {
-    storeAccountHeaders(homeDir, reqHeaders)
+  if (official) {
+    if (isOfficialClaudeUa(incoming['user-agent'] || '')) {
+      storeAccountHeaders(homeDir, reqHeaders, { officialTraffic: true })
+    }
     return applyReplayBetaPolicy({ ...DEFAULTS, ...protocolHeadersOnly(incoming) }, model, true, want1m)
   }
   const stored = loadStoredHeaders(homeDir) || {}

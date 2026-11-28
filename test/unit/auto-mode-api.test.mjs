@@ -208,6 +208,7 @@ test('native Anthropic API backend forwards safeguards and caller protocol heade
     protocol: 'anthropic.messages',
     inbound: body,
     convertedBody: converted,
+    officialTraffic: true,
     converters: { createClaudeMessageAssembler, applyClaudeSSELineToMessage },
     timeoutMs: 3000,
   }
@@ -292,6 +293,7 @@ test('native Anthropic API backend keeps endpoint headers and applies the 1M pol
       protocol: 'anthropic.messages',
       inbound: body,
       convertedBody: toClaudeMessages('anthropic.messages', body, { rewrite: false }).claude,
+      officialTraffic: true,
       converters: { createClaudeMessageAssembler, applyClaudeSSELineToMessage },
       clientStream: false,
       timeoutMs: 3000,

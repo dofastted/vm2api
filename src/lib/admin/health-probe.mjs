@@ -9,8 +9,7 @@
  * alias resolution) and never replay a different model's snapshot.
  */
 import crypto from 'node:crypto'
-import { isOfficialClaudeUa } from '../identity/crs-headers.mjs'
-import { isOfficialClaudeCodeTraffic } from '../identity/crs-persona.mjs'
+import { verifyDirectClaudeCodeHeaders, verifyOfficialClaudeCode } from '../identity/official-cc-verifier.mjs'
 import { vmHasClaudeCredential } from '../vm/vm-registry.mjs'
 import { isValidVmId } from '../vm/vm-file.mjs'
 import { activeHoursOf, evaluateActiveHours } from '../pool/active-hours.mjs'
@@ -652,14 +651,24 @@ export function isSub2apiAccountTest(body = {}) {
  * @param {string} [protocol] inbound protocol; a missing max_tokens only counts
  *   for OpenAI Chat, Responses, and Gemini probes with no token limit field.
  */
-export function isHealthShape(headers = {}, body = {}, cfg = DEFAULT_HEALTH_PROBE, protocol = '') {
+export function isHealthShape(headers = {}, body = {}, cfg = DEFAULT_HEALTH_PROBE, protocol = '', opts = {}) {
   const match = cfg?.match || DEFAULT_HEALTH_PROBE.match
   if (isHealthRealBypass(headers)) return false
   if (match.sub2api_account_test !== false && protocol !== 'openai.responses' && isSub2apiAccountTest(body)) {
     return true
   }
-  if (isOfficialClaudeCodeTraffic(headers, body)) return false
-  if (match.skip_official !== false && isOfficialClaudeUa(headerUa(headers))) return false
+  const verifiedOfficial =
+    typeof opts?.officialTraffic === 'boolean'
+      ? opts.officialTraffic
+      : verifyOfficialClaudeCode(headers, body, { detectProxiedOfficialCc: false }).official
+  if (verifiedOfficial) return false
+  if (
+    match.skip_official !== false &&
+    opts?.officialTraffic !== false &&
+    verifyDirectClaudeCodeHeaders(headers, { requireCodeBeta: true }).ok
+  ) {
+    return false
+  }
   if (match.ua_regex) {
     try {
       if (!new RegExp(match.ua_regex, 'i').test(headerUa(headers))) return false
@@ -840,12 +849,13 @@ export function decideHealthIntercept({
   now = Date.now(),
   protocol = '',
   platform = '',
+  officialTraffic = undefined,
 } = {}) {
   const resolvedPlatform = normalizeHealthPlatform(platform || healthPlatformOf(body))
   const pCfg = platformConfigOf(cfg, resolvedPlatform)
   const platformEnabled = pCfg?.enabled === true
   if (!platformEnabled || !cfg?.intercept_unofficial) return { action: 'pass' }
-  if (!isHealthShape(headers, body, cfg, protocol)) return { action: 'pass' }
+  if (!isHealthShape(headers, body, cfg, protocol, { officialTraffic })) return { action: 'pass' }
   if (!inboundMatchesCacheModels(body, cfg)) return { action: 'pass' }
 
   const requestedModel = String(body?.model || '').trim()
@@ -1448,6 +1458,7 @@ export function createHealthProbeMonitor(opts = {}) {
       snapshotsByModel: states[platform].byModel,
       now,
       platform,
+      officialTraffic: decideOpts?.officialTraffic,
     })
     if (decision.action === 'fail') {
       if (platform === 'google') return { action: 'pass' }

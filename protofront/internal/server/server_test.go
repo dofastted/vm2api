@@ -17,8 +17,19 @@ func boolPtr(b bool) *bool { return &b }
 func officialCCHeaders() map[string]string {
 	return map[string]string{
 		"user-agent":        "claude-cli/2.1.321 (external, sdk-cli)",
+		"x-app":             "cli",
 		"anthropic-version": "2023-06-01",
-		"anthropic-beta":    "claude-code-20250219,interleaved-thinking-2025-05-14",
+		"anthropic-dangerous-direct-browser-access": "true",
+		"anthropic-beta":              "claude-code-20250219,interleaved-thinking-2025-05-14",
+		"x-stainless-lang":            "js",
+		"x-stainless-os":              "Linux",
+		"x-stainless-arch":            "x64",
+		"x-stainless-runtime":         "node",
+		"x-stainless-runtime-version": "v26.12.1",
+		"x-stainless-package-version": "0.128.0",
+		"x-stainless-retry-count":     "0",
+		"x-stainless-timeout":         "600",
+		"x-claude-code-session-id":    "20000000-0000-4000-a000-000000000002",
 	}
 }
 
@@ -31,12 +42,17 @@ func officialCCUserID() string {
 	return string(b)
 }
 
+func officialCCBillingLine(firstUserText string) string {
+	fp3 := detect.ComputeClaudeCodeFingerprintUTF16(firstUserText, "2.1.321")
+	return "x-anthropic-billing-header: cc_version=2.1.321." + fp3 + "; cc_entrypoint=sdk-cli;"
+}
+
 func officialCCBody() map[string]any {
 	return map[string]any{
 		"model":      "claude-sonnet-5-5",
 		"max_tokens": 1024,
 		"system": []any{
-			map[string]any{"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.321; cc_entrypoint=sdk-cli; cch=00000;"},
+			map[string]any{"type": "text", "text": officialCCBillingLine("check status")},
 			map[string]any{"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude.", "cache_control": map[string]any{"type": "ephemeral"}},
 		},
 		"metadata": map[string]any{"user_id": officialCCUserID()},
@@ -140,7 +156,7 @@ func TestClaudeCRAGAntiCollisionAndValidation(t *testing.T) {
 	settingsOn.Compatibility.OfficialCCPassthrough = true
 	badTTL := officialCCBody()
 	badTTL["system"] = []any{
-		map[string]any{"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.321; cc_entrypoint=sdk-cli; cch=00000;"},
+		map[string]any{"type": "text", "text": officialCCBillingLine("tail")},
 		map[string]any{"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude.", "cache_control": map[string]any{"type": "ephemeral", "ttl": "5m"}},
 	}
 	badTTL["messages"] = []any{
@@ -192,7 +208,7 @@ func TestClaudeCRAGAntiCollisionAndValidation(t *testing.T) {
 	// TargetAPIAnthropic passthrough and non-passthrough also auto-repair >4 breakpoints and 5m->1h
 	apiBad := officialCCBody()
 	apiBad["system"] = []any{
-		map[string]any{"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.321; cc_entrypoint=sdk-cli; cch=00000;"},
+		map[string]any{"type": "text", "text": officialCCBillingLine("a1")},
 		map[string]any{"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude.", "cache_control": map[string]any{"type": "ephemeral", "ttl": "5m"}},
 	}
 	apiBad["messages"] = []any{

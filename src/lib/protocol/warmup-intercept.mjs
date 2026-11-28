@@ -3,7 +3,7 @@
  * session seat, a sticky pin, quota, or an upstream call.
  */
 import crypto from 'node:crypto'
-import { isOfficialClaudeUa } from '../identity/official-claude-ua.mjs'
+import { verifyDirectClaudeCodeHeaders, verifyOfficialClaudeCode } from '../identity/official-cc-verifier.mjs'
 
 const TITLE_PROMPT = 'Please write a 5-10 word title for the following conversation:'
 // The CLI text starts with "Analyze"; the matcher omits the first letter.
@@ -51,14 +51,22 @@ function typedParse(body) {
 
 /**
  * @param {object} body inbound Messages body
- * @param {{ userAgent?: string }} [opts] A Haiku request with `max_tokens=1`
- *   needs only the official CLI User-Agent to match the ping probe.
+ * @param {{ officialTraffic?: boolean|null, headers?: object|null, userAgent?: string }} [opts]
+ *   A Haiku request with `max_tokens=1` requires strictly verified official Claude Code
+ *   (`officialTraffic: true` or complete verified CC headers), never a bare UA string.
  * @returns {null | 'haiku_ping' | 'suggestion' | 'warmup'}
  */
-export function detectWarmupIntercept(body = {}, { userAgent = '' } = {}) {
+export function detectWarmupIntercept(body = {}, { officialTraffic = null, headers = null } = {}) {
   if (!body || typeof body !== 'object') return null
   const model = String(body.model || '')
-  if (isOfficialClaudeUa(userAgent) && Number(body.max_tokens) === 1 && model.toLowerCase().includes('haiku')) {
+  const verifiedOfficial =
+    typeof officialTraffic === 'boolean'
+      ? officialTraffic
+      : headers && typeof headers === 'object'
+        ? verifyOfficialClaudeCode(headers, body, { detectProxiedOfficialCc: false }).official ||
+          verifyDirectClaudeCodeHeaders(headers, { requireCodeBeta: true }).ok
+        : false
+  if (verifiedOfficial && Number(body.max_tokens) === 1 && model.toLowerCase().includes('haiku')) {
     return 'haiku_ping'
   }
   // Do not treat turns carrying tools as warmup, title, or suggestion probes.
