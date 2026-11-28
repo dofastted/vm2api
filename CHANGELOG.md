@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.4.269 — 2026-11-28 · Stage 1 10K RPM 热路径与 PG/Redis I/O 优化（含 PG 迁移 `012`）
+
+- **Stage 1 高并发热路径与 PG/Redis I/O 深度优化（#2129）**：针对 Phase 0 真 PostgreSQL 18.6 + Redis 8 20K 回放基准归因的 Top 5 主线程 `Atomics.wait` 阻塞与日志写放大瓶颈，完成三路并行重构（100% 兼容 SQLite 与无 Redis 降级）：
+  - **调度器 L1/L2 精简快照与双 PK 索引查询**：`AccountRuntimeRepo.schedulingSnapshot()` 移除 `COALESCE(a.id, r.account_id) IN (json_each(?))`，改写为双 PK 索引子查询 `FULL JOIN` 并新增异步 `pgPool` 批量加载器；`SchedulerCache` / `SchedulerSnapshotCache` 实现 2s 新鲜 / 10s SWR 宽限 + Redis L2（`sched:snapshot:v1` + `sched:rev`）+ 单飞后台刷新与跨实例 Pub/Sub 失效；`SchedulerRuntime` 移除 200-VM 同步循环，稳态 O(1) 读取共享快照并在 PG 模式走异步 `pgPool` `UNNEST` 批量排干。
+  - **热路径 `Atomics.wait` 清零（配额 / 调度 / Sticky / 并发批量读）**：`ConcurrencyCache.getBatchConcurrency()` 叠加 200ms 进程内短 TTL 缓存 + Promise coalescing (`singleflight`) + `{ fresh: true }` 绕过；`AccountQuota` 移除 `_batchAllocsStmt` `ROW_NUMBER()` 全表扫 `account_allocations`，改为进程内每账号 5 条近期分配环 + PG 异步 `CROSS JOIN LATERAL` 索引查询，`ingestHeaders()` 改为 L1 + Redis Hash 原地更新 + Dirty-Set `1000ms` 异步 `pgPool` `UNNEST` 合批刷盘（仅 429 / 耗尽 / 超安全线等高危态触发跨实例 `bumpRevision()` 失效，常规刷盘不触发调度与面板缓存雪崩），并接线 `src/server.mjs` 启停与优雅关停排干；`PoolScheduler` 与 `StickyRouter` 在 PG 模式全面走 Redis 优先 + 异步 `pgPool` 与共享调度快照。
+  - **`PgLogWriter` `UNNEST` 通道池、安全索引瘦身（PG 迁移 `012`）与实时态 50ms 微批**：`PgLogWriter` 升级固定参数 `UNNEST` 批写（`usage_logs` 76 列 / `request_attempts` 28 列 / `request_log_debug` 3 列，严格对齐 PG 18 类型）+ 多并发 writer 通道池 + 事务级 `SET LOCAL synchronous_commit = off`（`VM2API_LOG_SYNC_COMMIT` 可配）；新增线上安全幂等迁移 `012_optimize_usage_logs_and_attempts_indexes.sql`，删除 `request_attempts` 重复索引 `idx_request_attempt_request`、将 `usage_logs` 二级索引由 18 压降至 9（7 全量 + 2 部分索引）、补齐 `account_allocations` 复合索引 `idx_alloc_account_id_desc (account_id, id DESC)`；`LiveLogCache` 升级 50ms/64 条微批 Pipeline 并在 `closeCacheRuntime()` 停机前排干；`/api/panel/request-logs/stats` 在 15s SWR 缓存外实时叠加 `pg_log_writer` / `inflight_count`。
+  - **真 PG 18.6 + Redis 8 基准复测**：4 实例 1200 RPM（100K 上下文 ~403KB/req，200 VM）下 0% 代理错误吞吐由基线 ~240–300 RPM 提升至 **1,134.2 RPM**（~4.7–5×），主线程 `Atomics.wait` 由 636–963 次/req 降至 **26.77 次/req**（↓24–36×），面板 `dashboard` p95 由 15.8s 降至 **4.89s**，闭环校验 4/4 全绿（`usage_logs` 0% 丢失、`api_keys` 账单 0 误差、`PgLogWriter` 0 丢 0 错、Redis `live:inflight` 0 孤儿）。
+- 部署说明：包含 **PostgreSQL 迁移 `012_optimize_usage_logs_and_attempts_indexes.sql`**（控制面启动时自动幂等应用，仅清理重复/低效索引并新增 `idx_alloc_account_id_desc`，SQLite 不受影响）；零 Rust 变更、零 `deploy/payload.json` 变更；升级后重启控制面即可生效。
+
 ## 1.4.268 — 2026-11-28 · fork 会话与父会话转发相同的 Bash 历史命令，恢复 fork 首轮的提示缓存复用（外部贡献）
 
 - **保留客户端回传的 Bash 命令，使父会话与 fork 的历史前缀一致（#2124，外部贡献 `Gitforxuyang`）**：同一段 Bash 历史在父会话与新 fork 中此前可能被转发成两种文本，导致 fork 首轮无法复用父会话的提示缓存。例如模型返回 `cd /example && pwd`，客户端随后在工具调用历史里回传 `pwd`：父会话命中工具调用回放记录，会补回目录前缀、转发 `cd /example && pwd`；新 fork 没有这条记录，转发 `pwd`。命令位于历史前部时，缓存前缀就此分叉，后面再多相同消息也无法命中。
