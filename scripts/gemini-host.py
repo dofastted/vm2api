@@ -181,7 +181,22 @@ _NATIVE_SUBSTANTIVE_PART_KEYS = frozenset(
     }
 )
 _NATIVE_VALID_ASPECT_RATIOS = frozenset(
-    {"1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"}
+    {
+        "1:1",
+        "1:4",
+        "4:1",
+        "1:8",
+        "8:1",
+        "2:3",
+        "3:2",
+        "3:4",
+        "4:3",
+        "4:5",
+        "5:4",
+        "9:16",
+        "16:9",
+        "21:9",
+    }
 )
 _NATIVE_VALID_IMAGE_SIZES = frozenset({"1K", "2K", "4K"})
 _NATIVE_ALLOWED_TOOL_KEYS = frozenset(
@@ -190,12 +205,15 @@ _NATIVE_ALLOWED_TOOL_KEYS = frozenset(
         "function_declarations",
         "googleSearch",
         "google_search",
+        "googleSearchRetrieval",
+        "google_search_retrieval",
         "urlContext",
         "url_context",
     }
 )
-_NATIVE_ILLEGAL_CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
-_NATIVE_CONV_ID_RE = re.compile(r"[A-Za-z0-9._-]{1,128}\Z")
+_NATIVE_ILLEGAL_CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_NATIVE_CONV_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
+_NATIVE_VALID_WIRE_PROTOCOLS = frozenset({"raw", "gemini", "anthropic"})
 _SSE_STREAM_READ_BYTES = 65536
 AUTH_LINK = re.compile(
     rb"\x1b\]8;[^;\x1b]*;(https://accounts\.google\.com/o/oauth2/auth\?[^\x07\x1b]{1,4096})(?:\x07|\x1b\\)"
@@ -403,16 +421,16 @@ DEFAULT_RUNTIME_POLICY = {
     "session_idle_ttl_secs": NATIVE_SESSION_TTL,
     "max_queue": 32,
     "queue_timeout_ms": 10000,
-    "timeout_ms": 120000,
+    "timeout_ms": 300000,
     "first_byte_timeout_ms": 90000,
-    "idle_timeout_ms": 15000,
+    "idle_timeout_ms": 180000,
     "circuit_failure_threshold": 3,
     "circuit_open_ms": 30000,
     "eligibility_probe_interval_secs": int(ELIGIBILITY_PROBE_INTERVAL),
     "sticky_enabled": True,
     "sticky_ttl_secs": 3600,
     "require_shm": True,
-    "shm_request_mb": 4,
+    "shm_request_mb": 16,
     "shm_response_mb": 16,
 }
 
@@ -650,7 +668,7 @@ def session_diagnostic(session, *, final=False, include_advisory=False):
             code = diag.poll(final=final)
         return None if code in ADVISORY_SESSION_DIAGNOSTICS else code
     return diag.poll(final=final)
-MAX_INFER_BODY = 12 * 1024 * 1024
+MAX_INFER_BODY = 64 * 1024 * 1024
 NATIVE_RUNTIME_ROOT = Path("/run/vm2api-gemini-native")
 FULL_CAPABILITIES = (
     "streaming",
@@ -2900,6 +2918,10 @@ class NativeSession(NativeAgy):
         model=None,
         gateway_policy=None,
         restart_resume=False,
+        wire_protocol=None,
+        provider_result=False,
+        session_reset=False,
+        conversation_id=None,
     ):
         native_mod = native_module()
         if not self.is_alive():
@@ -2919,6 +2941,10 @@ class NativeSession(NativeAgy):
             startup_timeout=45,
             gateway_policy=gateway_policy,
             restart_resume=restart_resume,
+            wire_protocol=wire_protocol,
+            provider_result=provider_result,
+            session_reset=session_reset,
+            conversation_id=conversation_id,
             diagnostic=self.native_diagnostic,
             is_alive=self.is_alive,
             exit_reader=self.read_exit_detail,
@@ -3609,6 +3635,10 @@ class CragDaemonShard:
         model=None,
         gateway_policy=None,
         restart_resume=False,
+        wire_protocol=None,
+        provider_result=False,
+        session_reset=False,
+        conversation_id=None,
     ):
         native_mod = native_module()
         if not self.is_alive():
@@ -3629,6 +3659,10 @@ class CragDaemonShard:
             startup_timeout=45,
             gateway_policy=gateway_policy,
             restart_resume=restart_resume,
+            wire_protocol=wire_protocol,
+            provider_result=provider_result,
+            session_reset=session_reset,
+            conversation_id=conversation_id,
             account_id=env_id,
             is_alive=self.is_alive,
             exit_reader=self.read_exit_detail,
@@ -7854,21 +7888,38 @@ class Host:
 
         if not worker.is_alive() or worker.is_severely_unhealthy():
             return {"direct": False, "reason": "warming"}
-        if not getattr(worker, "_ever_ready", False):
-            health = worker.health(timeout=0.35)
-            if not (
-                isinstance(health, dict)
-                and health.get("ready") is True
-                and health.get("needs_recovery") is not True
-            ):
-                return {"direct": False, "reason": "warming"}
-            worker._ever_ready = True
-            if is_shard and shard_id:
-                with self.lock:
-                    self._clear_shard_fault(shard_id)
+        health = getattr(worker, "_last_health", None)
+        has_health_fn = callable(getattr(worker, "health", None))
+        if not getattr(worker, "_ever_ready", False) or (
+            not isinstance(health, dict) and has_health_fn
+        ):
+            health = worker.health(timeout=0.35) if has_health_fn else {}
+            if not getattr(worker, "_ever_ready", False):
+                if not (
+                    isinstance(health, dict)
+                    and health.get("ready") is True
+                    and health.get("needs_recovery") is not True
+                ):
+                    return {"direct": False, "reason": "warming"}
+                worker._ever_ready = True
+                if is_shard and shard_id:
+                    with self.lock:
+                        self._clear_shard_fault(shard_id)
         if not self._expose_direct_socket(worker):
             return {"direct": False, "reason": "socket_unavailable"}
         use_account_route = is_shard or getattr(worker, "pool_mode", False)
+        raw_caps = health.get("capabilities") if isinstance(health, dict) else None
+        capabilities = (
+            [c for c in raw_caps if isinstance(c, str) and c]
+            if isinstance(raw_caps, list)
+            else []
+        )
+        raw_proto_caps = (
+            health.get("protocol_capabilities") if isinstance(health, dict) else None
+        )
+        protocol_capabilities = (
+            dict(raw_proto_caps) if isinstance(raw_proto_caps, dict) else {}
+        )
         return {
             "direct": True,
             "kind": "shard" if is_shard else "session",
@@ -7886,6 +7937,8 @@ class Host:
             ),
             "account_id": identifier if use_account_route else None,
             "epoch": getattr(worker, "attempt", ""),
+            "capabilities": capabilities,
+            "protocol_capabilities": protocol_capabilities,
             "ttl_ms": 30000,
         }
 
@@ -8529,7 +8582,7 @@ class Host:
         raise Failure(404)
 
     @staticmethod
-    def _extract_native_turn_body(model, body_obj):
+    def _extract_native_turn_body(model, body_obj, *, preserve_thought=False):
         if not isinstance(body_obj, dict):
             return None
         if not _NATIVE_ALLOWED_TOP.issuperset(body_obj):
@@ -8564,8 +8617,8 @@ class Host:
                         has_substantive_part = True
                 if not has_substantive_part and not _NATIVE_SUBSTANTIVE_PART_KEYS.isdisjoint(part):
                     has_substantive_part = True
-                # CRAGGemini SHM does not consume historical thought blocks.
-                if part.get("thought") is True:
+                # Legacy SHM raw mode drops historical thought blocks; lossless gemini wire preserves them.
+                if part.get("thought") is True and not preserve_thought:
                     continue
                 fd = part.get("fileData") if isinstance(part.get("fileData"), dict) else part.get("file_data")
                 if isinstance(fd, dict):
@@ -8764,11 +8817,27 @@ class Host:
             raise Failure(409, "gemini_operation_busy")
         if model not in env.get("call_models", []):
             raise Failure(409, "gemini_model_unavailable")
+        wire_protocol = body.get("wire_protocol")
+        if wire_protocol is not None and wire_protocol not in _NATIVE_VALID_WIRE_PROTOCOLS:
+            raise Failure(400, "gemini_invalid_request")
+        provider_result = body.get("provider_result") is True
+        session_reset = body.get("session_reset") is True
+        conversation_id = body.get("conversation_id")
+        if not isinstance(conversation_id, str) or not _NATIVE_CONV_ID_RE.fullmatch(conversation_id):
+            conversation_id = None
         native_body = None
         if not key:
-            native_body = self._extract_native_turn_body(model, infer_body)
-            if native_body is None:
-                raise Failure(400, "gemini_unsupported_turn")
+            if wire_protocol == "anthropic":
+                if not isinstance(infer_body.get("messages"), list) or not infer_body["messages"]:
+                    raise Failure(400, "gemini_unsupported_turn")
+                native_body = dict(infer_body)
+                native_body["model"] = model
+            else:
+                native_body = self._extract_native_turn_body(
+                    model, infer_body, preserve_thought=(wire_protocol == "gemini")
+                )
+                if native_body is None:
+                    raise Failure(400, "gemini_unsupported_turn")
         evidence = {
             "state": "running",
             "model": model,
@@ -8806,6 +8875,10 @@ class Host:
             "native_body": native_body,
             "gateway_policy": gateway_policy,
             "restart_resume": restart_resume,
+            "wire_protocol": wire_protocol,
+            "provider_result": provider_result,
+            "session_reset": session_reset,
+            "conversation_id": conversation_id,
             "evidence": evidence,
             "entry": infer_entry,
         }
@@ -9100,6 +9173,14 @@ class Host:
                 }
                 if ctx.get("restart_resume") is True:
                     shard_kwargs["restart_resume"] = True
+                if ctx.get("wire_protocol") is not None:
+                    shard_kwargs["wire_protocol"] = ctx["wire_protocol"]
+                if ctx.get("provider_result") is True:
+                    shard_kwargs["provider_result"] = True
+                if ctx.get("session_reset") is True:
+                    shard_kwargs["session_reset"] = True
+                if ctx.get("conversation_id") is not None:
+                    shard_kwargs["conversation_id"] = ctx["conversation_id"]
                 conn, response = shard.open_stream(
                     identifier,
                     ctx["request_id"],
@@ -9194,6 +9275,14 @@ class Host:
             }
             if ctx.get("restart_resume") is True:
                 session_kwargs["restart_resume"] = True
+            if ctx.get("wire_protocol") is not None:
+                session_kwargs["wire_protocol"] = ctx["wire_protocol"]
+            if ctx.get("provider_result") is True:
+                session_kwargs["provider_result"] = True
+            if ctx.get("session_reset") is True:
+                session_kwargs["session_reset"] = True
+            if ctx.get("conversation_id") is not None:
+                session_kwargs["conversation_id"] = ctx["conversation_id"]
             conn, response = session.open_stream(
                 ctx["request_id"],
                 ctx["native_body"],

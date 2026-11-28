@@ -875,7 +875,9 @@ test('Gemini public routes schedule one plain-text turn and reject other keys', 
     assert.equal(denied.status, 403)
     assert.equal(denied.body.error.code, 'gemini_key_required')
   }
-  assert.equal((await handle({ apiKeyKind: 'master', once() {} }, res)).status, 403)
+  assert.equal((await handle({ apiKeyKind: 'other', once() {} }, res)).status, 403)
+  const masterListed = await handle({ method: 'GET', url: '/v1/gemini/sessions', apiKeyKind: 'master', once() {} }, res)
+  assert.equal(masterListed.status, 200)
   const allBareClaude = await handle(
     {
       method: 'POST',

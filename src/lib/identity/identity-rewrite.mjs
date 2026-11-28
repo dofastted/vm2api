@@ -486,19 +486,19 @@ function extractFirstUserIdentityFromGemini(contents) {
   return ''
 }
 
-function extractMultiTurnFirstUserAnchor(src) {
+function extractFirstUserAnchor(src) {
   if (!src || typeof src !== 'object') return { isMultiTurn: false, anchor: '' }
   let isMultiTurn = false
   let raw = ''
   if (Array.isArray(src.messages) && src.messages.length > 0) {
     isMultiTurn = src.messages.length >= 2
-    if (isMultiTurn) raw = extractFirstUserIdentity(src.messages)
+    raw = extractFirstUserIdentity(src.messages)
   } else if (Array.isArray(src.input) && src.input.length > 0) {
     isMultiTurn = src.input.length >= 2
-    if (isMultiTurn) raw = extractFirstUserIdentityFromInput(src.input)
+    raw = extractFirstUserIdentityFromInput(src.input)
   } else if (Array.isArray(src.contents) && src.contents.length > 0) {
     isMultiTurn = src.contents.length >= 2
-    if (isMultiTurn) raw = extractFirstUserIdentityFromGemini(src.contents)
+    raw = extractFirstUserIdentityFromGemini(src.contents)
   }
   const anchor = cleanIdentityValue(raw)
   if (!anchor || isSystemReminderOnly(anchor)) return { isMultiTurn, anchor: '' }
@@ -545,6 +545,8 @@ export function resolveSchedulerIdentity({ inbound = {}, body = {}, headers = {}
     cleanIdentityValue(primaryBody?.previous_response_id) ||
     cleanIdentityValue(body?.previous_response_id)
 
+  const isEphemeralProbe = isShortProbeRequest(primaryBody)
+
   let sessionId = ''
   let parentSessionId = null
   let sessionSource = 'generated_random'
@@ -563,9 +565,9 @@ export function resolveSchedulerIdentity({ inbound = {}, body = {}, headers = {}
     }
   } else {
     generated = true
-    const { isMultiTurn, anchor } = extractMultiTurnFirstUserAnchor(primaryBody)
+    const { isMultiTurn, anchor } = extractFirstUserAnchor(primaryBody)
     let baseSession = ''
-    if (isMultiTurn && anchor) {
+    if (!isEphemeralProbe && anchor) {
       const seed = [
         SCHEDULER_SESSION_SEED,
         cleanIdentityValue(poolId),
@@ -574,21 +576,19 @@ export function resolveSchedulerIdentity({ inbound = {}, body = {}, headers = {}
         anchor,
       ].join('\u0000')
       baseSession = uuidFromSeed(seed)
-      sessionSource = 'derived_multi_turn'
+      sessionSource = isMultiTurn ? 'derived_multi_turn' : 'derived_first_turn'
     } else {
       baseSession = crypto.randomUUID()
       sessionSource = 'generated_random'
     }
     if (agentId) {
       sessionId = agentSessionId(baseSession, agentId)
-      parentSessionId = isMultiTurn && anchor ? baseSession : null
+      parentSessionId = !isEphemeralProbe && anchor ? baseSession : null
       sessionSource = 'subagent'
     } else {
       sessionId = baseSession
     }
   }
-
-  const isEphemeralProbe = isShortProbeRequest(primaryBody)
 
   return Object.freeze({
     sessionId,

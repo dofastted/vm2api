@@ -16,16 +16,18 @@ import time
 from http.client import HTTPException, HTTPResponse
 from pathlib import Path
 
-MAX_BODY = 12 * 1024 * 1024
+MAX_BODY = 64 * 1024 * 1024
 MAX_FRAME = 2 * 1024 * 1024
 MAX_SSE = 16 * 1024 * 1024
 MAX_TEXT = 16 * 1024
 MAX_RESULT = 64 * 1024
-TURN_TIMEOUT = 125
+TURN_TIMEOUT = 305
 TOKEN = re.compile(r"[!-~]{24,4096}\Z")
 MODEL = re.compile(r"[a-z0-9][a-z0-9._-]{0,99}\Z")
 REQUEST_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+CONV_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 ACCOUNT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+VALID_WIRE_PROTOCOLS = frozenset({"raw", "gemini", "anthropic"})
 MAX_WORKER_STDERR = 4096
 LAUNCHER_EXIT_FILE = "launcher-exit"
 LAUNCHER_EXIT_REASONS = frozenset(
@@ -574,8 +576,10 @@ def _map_worker_error(http_status, payload):
     effective_status = upstream if isinstance(upstream, int) and 400 <= upstream <= 599 else http_status
     if code == "unsupported_turn":
         return NativeFailure("gemini_unsupported_turn", 400, message)
-    if code in ("invalid_envelope", "invalid_json"):
+    if code in ("invalid_envelope", "invalid_json", "invalid_wire_protocol"):
         return NativeFailure("gemini_invalid_request", 400, message)
+    if code in ("empty_upstream_stream", "acp_executor_error", "acp_model_unspecified"):
+        return NativeFailure("gemini_inference_invalid_output", 502, message)
     if code in ("queue_full", "native_unavailable", "kernel_stopping", "slot_shm_required", "account_circuit_open"):
         return NativeFailure(
             "gemini_operation_busy"
@@ -588,7 +592,14 @@ def _map_worker_error(http_status, payload):
         return NativeFailure("gemini_inference_timeout", 504, message)
     if code == "cancelled":
         return NativeFailure("gemini_inference_cancelled", 499, message)
-    if code in ("tool_continuation_aborted", "gemini_session_conflict"):
+    if code in (
+        "tool_continuation_aborted",
+        "gemini_session_conflict",
+        "session_conflict",
+        "tool_continuation_already_settled",
+        "duplicate_request",
+        "session_busy",
+    ) or effective_status == 409:
         return NativeFailure("gemini_session_conflict", 409, message)
     if effective_status == 429:
         raw_retry = payload.get("retry_after_ms") if isinstance(payload, dict) else None
@@ -654,6 +665,10 @@ def open_worker_stream(
     turn_timeout=TURN_TIMEOUT,
     gateway_policy=None,
     restart_resume=False,
+    wire_protocol=None,
+    provider_result=False,
+    session_reset=False,
+    conversation_id=None,
     diagnostic=None,
     account_id=None,
     is_alive=None,
@@ -728,8 +743,10 @@ def open_worker_stream(
         envelope["restart_resume"] = True
     if system_prompt_mode == "zero":
         envelope["system_prompt_mode"] = "zero"
-    conv_id = wire_body.get("conversation_id") or wire_body.get("conversationId")
-    if isinstance(conv_id, str) and REQUEST_ID.fullmatch(conv_id):
+    if wire_protocol is not None and wire_protocol not in VALID_WIRE_PROTOCOLS:
+        raise NativeFailure("gemini_inference_bad_input", 400)
+    conv_id = conversation_id or wire_body.get("conversation_id") or wire_body.get("conversationId")
+    if isinstance(conv_id, str) and CONV_ID.fullmatch(conv_id):
         envelope["conversation_id"] = conv_id
     if isinstance(gateway_policy, dict) and gateway_policy:
         envelope["gateway_policy"] = gateway_policy
@@ -741,6 +758,17 @@ def open_worker_stream(
         if account_id is not None
         else "/internal/v1/messages"
     )
+    req_headers = {
+        "Content-Type": "application/json",
+        "Content-Length": str(len(payload)),
+        "X-Kin-Internal-Token": token,
+    }
+    if wire_protocol is not None:
+        req_headers["X-Craggemini-Wire-Protocol"] = wire_protocol
+    if provider_result is True:
+        req_headers["X-Craggemini-Provider-Result"] = "1"
+    if session_reset is True:
+        req_headers["X-Craggemini-Session-Reset"] = "1"
 
     if not skip_ready_probe:
         _wait_worker_ready()
@@ -774,11 +802,7 @@ def open_worker_stream(
             response = connection.request(
                 "POST",
                 message_path,
-                {
-                    "Content-Type": "application/json",
-                    "Content-Length": str(len(payload)),
-                    "X-Kin-Internal-Token": token,
-                },
+                req_headers,
                 payload,
             )
             if diagnostic is not None and connection.sock is not None:

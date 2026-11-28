@@ -25,9 +25,9 @@ export const DEFAULT_GEMINI_ROUTING = Object.freeze({
     session_idle_ttl_secs: 600,
     max_queue: 32,
     queue_timeout_ms: 10_000,
-    timeout_ms: 120_000,
+    timeout_ms: 300_000,
     first_byte_timeout_ms: 90_000,
-    idle_timeout_ms: 15_000,
+    idle_timeout_ms: 180_000,
     circuit_failure_threshold: 3,
     circuit_open_ms: 30_000,
     eligibility_probe_interval_secs: 180,
@@ -45,7 +45,7 @@ export const DEFAULT_GEMINI_ROUTING = Object.freeze({
   }),
   shm: Object.freeze({
     require_shm: true,
-    request_mb: 4,
+    request_mb: 16,
     response_mb: 16,
   }),
 })

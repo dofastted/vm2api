@@ -380,9 +380,16 @@ test('missing session_id: OpenAI Responses input[] and Gemini contents[] multi-t
   assert.notEqual(g2.sessionId, gOtherMac.sessionId)
 })
 
-test('missing session_id: single-turn or reminder-only uses crypto.randomUUID() pure UUIDv4', () => {
+test('missing session_id: non-probe single-turn matches T2 derivation while short probe and reminder-only use random UUIDv4', () => {
   const singleTurn = {
     messages: [{ role: 'user', content: 'Please write a thorough analysis of B-tree vs LSM-tree storage engines.' }],
+  }
+  const multiTurn = {
+    messages: [
+      { role: 'user', content: 'Please write a thorough analysis of B-tree vs LSM-tree storage engines.' },
+      { role: 'assistant', content: 'Sure, let us compare them.' },
+      { role: 'user', content: 'Focus on write amplification.' },
+    ],
   }
   const a = resolveSchedulerIdentity({
     inbound: singleTurn,
@@ -391,18 +398,39 @@ test('missing session_id: single-turn or reminder-only uses crypto.randomUUID() 
     apiKeyId: 'key_1',
   })
   const b = resolveSchedulerIdentity({
-    inbound: singleTurn,
+    inbound: multiTurn,
     headers: { 'x-machine-id': 'mac-1' },
     poolId: 'pool_1',
     apiKeyId: 'key_1',
   })
   assert.match(a.sessionId, UUID_V4_RE)
   assert.match(b.sessionId, UUID_V4_RE)
-  assert.notEqual(a.sessionId, b.sessionId)
-  assert.equal(a.sessionSource, 'generated_random')
+  assert.equal(a.sessionId, b.sessionId, 'T1 non-probe must derive identical sessionId to T2')
+  assert.equal(a.sessionSource, 'derived_first_turn')
+  assert.equal(b.sessionSource, 'derived_multi_turn')
   assert.equal(a.generated, true)
   assert.equal(a.isEphemeralProbe, false)
   assert.equal(FORBIDDEN_SESSION_PREFIX_RE.test(a.sessionId), false)
+
+  // Short single-turn probes remain random UUIDv4 so healthchecks never collide or pin sticky sessions.
+  const shortProbe = { messages: [{ role: 'user', content: 'hi' }] }
+  const p1 = resolveSchedulerIdentity({
+    inbound: shortProbe,
+    headers: { 'x-machine-id': 'mac-1' },
+    poolId: 'pool_1',
+    apiKeyId: 'key_1',
+  })
+  const p2 = resolveSchedulerIdentity({
+    inbound: shortProbe,
+    headers: { 'x-machine-id': 'mac-1' },
+    poolId: 'pool_1',
+    apiKeyId: 'key_1',
+  })
+  assert.match(p1.sessionId, UUID_V4_RE)
+  assert.match(p2.sessionId, UUID_V4_RE)
+  assert.notEqual(p1.sessionId, p2.sessionId)
+  assert.equal(p1.sessionSource, 'generated_random')
+  assert.equal(p1.isEphemeralProbe, true)
 
   // Multi-turn whose first user turn has only <system-reminder> (no real user anchor) falls back to randomUUID().
   const reminderOnlyMultiTurn = {
