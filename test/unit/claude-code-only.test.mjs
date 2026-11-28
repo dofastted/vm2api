@@ -11,6 +11,7 @@ import {
   CRS_OFFICIAL_AGENT_PROMPT,
   CRS_OFFICIAL_CLI_SYSTEM,
   applyCrsUnofficialPersona,
+  computeClaudeCodeFingerprint,
   isOfficialClaudeCodeTraffic,
   isProxiedOfficialClaudeCode,
 } from '../../src/lib/identity/crs-persona.mjs'
@@ -18,16 +19,24 @@ import {
 const CLI_UA = 'claude-cli/2.1.293 (external, cli)'
 const SESSION = '11111111-2222-4333-8444-555555555555'
 const USER_ID = JSON.stringify({ device_id: 'd'.repeat(64), session_id: SESSION })
-const BILLING = 'x-anthropic-billing-header: cc_version=2.1.293.9; cc_entrypoint=cli; cch=ab;'
-// Header set a real 2.1.280 CLI sent on both /v1/messages and count_tokens.
+const billingFor = (ver, text, ep = 'cli') =>
+  `x-anthropic-billing-header: cc_version=${ver}.${computeClaudeCodeFingerprint(text, ver)}; cc_entrypoint=${ep};`
+const BILLING = billingFor('2.1.293', 'hi', 'cli')
+// Complete header set a real CLI sends on both /v1/messages and count_tokens.
 const CLI_HEADERS = {
   'user-agent': CLI_UA,
   'x-app': 'cli',
   'anthropic-version': '2023-06-01',
+  'anthropic-dangerous-direct-browser-access': 'true',
   'anthropic-beta': 'claude-code-20250219,interleaved-thinking-2025-05-14',
   'x-stainless-lang': 'js',
+  'x-stainless-os': 'Linux',
+  'x-stainless-arch': 'x64',
   'x-stainless-runtime': 'node',
-  'x-stainless-package-version': '0.112.1',
+  'x-stainless-runtime-version': 'v26.12.1',
+  'x-stainless-package-version': '0.128.0',
+  'x-stainless-retry-count': '0',
+  'x-stainless-timeout': '600',
   'x-claude-code-session-id': SESSION,
 }
 const OFFICIAL_BODY = {
@@ -60,7 +69,7 @@ const DESKTOP_HEADERS = {
 const DESKTOP_BODY = {
   ...OFFICIAL_BODY,
   system: [
-    { type: 'text', text: 'x-anthropic-billing-header: cc_version=2.1.299.fa6; cc_entrypoint=local-agent;' },
+    { type: 'text', text: billingFor('2.1.299', 'hi', 'local-agent') },
     { type: 'text', text: "You are Claude Code, built on Anthropic's Claude Agent SDK." },
   ],
 }
@@ -349,17 +358,22 @@ test('switch on: local-agent desktop reaches the scheduler without relay detecti
 const OPENCLAW_SYSTEM =
   'You are a personal assistant running inside OpenClaw.\n\n## OpenClaw Control\nUse the configured workspace.'
 const DRIFTED_AGENT = `${CRS_OFFICIAL_AGENT_PROMPT}\n\n# New Section\nVerify the result before replying.`
-const sdkBilling = { type: 'text', text: BILLING.replace('cc_entrypoint=cli', 'cc_entrypoint=sdk-cli') }
+const cliBilling = { type: 'text', text: BILLING }
 const identity = { type: 'text', text: CRS_OFFICIAL_CLI_SYSTEM }
 
-for (const [name, texts, relocated] of [
-  ['a separate OpenClaw block', [DRIFTED_AGENT, OPENCLAW_SYSTEM], true],
-  ['an official prompt with a new section', [DRIFTED_AGENT], false],
-  ['a suffix combined with the official prompt', [`${CRS_OFFICIAL_AGENT_PROMPT}\n\n${OPENCLAW_SYSTEM}`], false],
+for (const [name, texts, expectOfficial, relocated] of [
+  ['a separate OpenClaw block', [DRIFTED_AGENT, OPENCLAW_SYSTEM], false, true],
+  ['an official prompt with a new section', [DRIFTED_AGENT], true, false],
+  [
+    'a suffix combined with the official prompt (V5)',
+    [`${CRS_OFFICIAL_AGENT_PROMPT}\n\n${OPENCLAW_SYSTEM}`],
+    false,
+    true,
+  ],
 ]) {
   test(`handleProtocol with official CLI headers: ${name}`, async (t) => {
-    // Zero preserves non-billing system blocks without bypassing the relocation gate.
-    const routing = { compatibility: { persona_preset: 'zero', detect_proxied_official_cc: false } }
+    // Default official preset runs the ingress relocation gate (Mode 3 zero preserves caller system[]).
+    const routing = { compatibility: { persona_preset: 'official', detect_proxied_official_cc: false } }
     const dir = mkdtempSync(join(tmpdir(), 'cc-system-relocation-'))
     t.after(() => rmSync(dir, { recursive: true, force: true }))
     const routingConfigPath = join(dir, 'routing.json')
@@ -368,10 +382,10 @@ for (const [name, texts, relocated] of [
     const contentBlocks = texts.map((text) => ({ type: 'text', text }))
     const body = {
       ...OFFICIAL_BODY,
-      system: [sdkBilling, identity, ...contentBlocks],
+      system: [cliBilling, identity, ...contentBlocks],
       messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
     }
-    assert.equal(isOfficialClaudeCodeTraffic(CLI_HEADERS, body), true)
+    assert.equal(isOfficialClaudeCodeTraffic(CLI_HEADERS, body), expectOfficial)
     let outbound
     const result = await runProtocol({
       routing,
@@ -384,12 +398,9 @@ for (const [name, texts, relocated] of [
       },
     })
     assert.equal(result.reached, true)
-    // Persona rendering still replaces the billing block.
-    assert.match(outbound.system[0].text, /^x-anthropic-billing-header:/)
-    assert.deepEqual(outbound.system.slice(1), relocated ? [identity] : body.system.slice(1))
-    const expectedContent = relocated
-      ? [{ type: 'text', text: OPENCLAW_SYSTEM }, ...body.messages[0].content]
-      : body.messages[0].content
+    // Ingress strips caller billing before failoverRunner; persona renders billing per attempt.
+    assert.deepEqual(outbound.system, relocated ? [identity] : body.system.slice(1))
+    const expectedContent = relocated ? [...contentBlocks, ...body.messages[0].content] : body.messages[0].content
     assert.deepEqual(outbound.messages, [{ role: 'user', content: expectedContent }])
   })
 }
@@ -505,20 +516,26 @@ const SIDE_HEADERS = {
   ...CLI_HEADERS,
   'anthropic-beta': 'interleaved-thinking-2025-05-14,context-management-2025-06-27,effort-2025-11-24',
 }
+const WEB_SEARCH_TEXT = 'Perform a web search for the query: vm2api'
+const WEB_FETCH_TEXT = '\nWeb page content:\n---\nExample Domain\n---\n\nWhat is this page about?'
+const SIDE_SYSTEM_SEARCH = [
+  { type: 'text', text: billingFor('2.1.293', WEB_SEARCH_TEXT, 'cli') },
+  { type: 'text', text: "You are a Claude agent, built on Anthropic's Claude Agent SDK." },
+]
 const SIDE_SYSTEM = [
-  { type: 'text', text: BILLING },
+  { type: 'text', text: billingFor('2.1.293', WEB_FETCH_TEXT, 'cli') },
   { type: 'text', text: "You are a Claude agent, built on Anthropic's Claude Agent SDK." },
 ]
 const WEB_SEARCH_TURN = {
   model: 'claude-haiku-5',
   max_tokens: 32000,
   system: [
-    ...SIDE_SYSTEM,
+    ...SIDE_SYSTEM_SEARCH,
     { type: 'text', text: 'You run a web search for another Claude model, which is waiting on the result.' },
   ],
   tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 8 }],
   metadata: { user_id: USER_ID },
-  messages: [{ role: 'user', content: [{ type: 'text', text: 'Perform a web search for the query: vm2api' }] }],
+  messages: [{ role: 'user', content: [{ type: 'text', text: WEB_SEARCH_TEXT }] }],
 }
 const WEB_FETCH_SUMMARY = {
   model: 'claude-haiku-5',
@@ -528,7 +545,7 @@ const WEB_FETCH_SUMMARY = {
   messages: [
     {
       role: 'user',
-      content: [{ type: 'text', text: '\nWeb page content:\n---\nExample Domain\n---\n\nWhat is this page about?' }],
+      content: [{ type: 'text', text: WEB_FETCH_TEXT }],
     },
   ],
 }

@@ -118,14 +118,35 @@ test('D: only the independent OpenClaw block is relocated beside an official age
   ])
 })
 
-test('a suffix inside an official agent block does not open the gate', () => {
-  // Concatenation into one official-looking block is the known limitation: the
-  // gate stays shut, so official traffic carrying an appended prompt inside the
-  // same block falls through to the upstream 400 rather than being split on an
-  // unreliable boundary. Splitting mid-block would risk cutting a genuine new
-  // official section out of `system`.
+test('V5: embedded third-party clone inside an official agent block opens the gate and relocates', () => {
   const system = `${CRS_OFFICIAL_AGENT_PROMPT}\n\n${OPENCLAW}`
-  assert.equal(hasForeignSystemBlock(system), false)
+  assert.equal(hasForeignSystemBlock(system), true)
+  const embeddedOpenCode = `${CRS_OFFICIAL_CLI_SYSTEM}\n\n${AGENT}`
+  assert.equal(hasForeignSystemBlock(embeddedOpenCode), true)
+  const r = relocateThirdPartySystem(
+    { system: [{ type: 'text', text: system }], messages: [{ role: 'user', content: 'hi' }] },
+    { onlyForeign: true },
+  )
+  assert.equal(r.moved, true)
+  assert.deepEqual(r.body.system, [{ type: 'text', text: CRS_OFFICIAL_CLI_SYSTEM }])
+})
+
+test('V9: third-party messages[].role=system turns relocate into the first user message', () => {
+  const r = relocateThirdPartySystem({
+    model: 'claude-sonnet-5',
+    messages: [
+      { role: 'system', content: AGENT },
+      { role: 'user', content: 'hi' },
+    ],
+  })
+  assert.equal(r.moved, true)
+  assert.equal(r.blocks, 1)
+  assert.equal(r.body.messages.length, 1)
+  assert.equal(r.body.messages[0].role, 'user')
+  assert.deepEqual(r.body.messages[0].content, [
+    { type: 'text', text: AGENT },
+    { type: 'text', text: 'hi' },
+  ])
 })
 
 test('no system or no messages is a no-op', () => {
@@ -134,11 +155,12 @@ test('no system or no messages is a no-op', () => {
   assert.equal(relocateThirdPartySystem(null).moved, false)
 })
 
-test('switch: follows claude_code_only (off admits and relocates, on rejects upstream of this)', () => {
+test('switch: follows claude_code_only, but V10 keeps onlyForeign relocation enabled when on', () => {
   assert.equal(thirdPartyRelocateEnabled(null), true)
   assert.equal(thirdPartyRelocateEnabled({ compatibility: {} }), true)
   assert.equal(thirdPartyRelocateEnabled({ compatibility: { claude_code_only: false } }), true)
   assert.equal(thirdPartyRelocateEnabled({ compatibility: { claude_code_only: true } }), false)
+  assert.equal(thirdPartyRelocateEnabled({ compatibility: { claude_code_only: true } }, { onlyForeign: true }), true)
 })
 
 // The gate and the mover answer different questions and must not share a

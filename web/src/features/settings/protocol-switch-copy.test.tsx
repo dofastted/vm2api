@@ -38,3 +38,20 @@ describe('blocked client wording', () => {
     )
   })
 })
+
+describe('strict official CC verification scope wording', () => {
+  it('explains that multi-signal verification applies to official traffic/passthrough as well as claude_code_only', () => {
+    const off = render({ claude_code_only: false })
+    expect(off).toContain('官方流量判定与官方透传始终执行严格校验')
+    expect(off).toContain('非零 64-hex device_id + UUIDv4 session_id')
+    expect(off).toContain('拒绝 cch=00000')
+    expect(off).toContain('区分大小写官方 PascalCase / mcp__')
+    expect(off).toContain('排除第三方仿冒/克隆')
+    expect(off).not.toContain('opacity-55')
+
+    const on = render({ claude_code_only: true })
+    expect(on).toContain(
+      '官方流量判定、官方透传与「仅允许 Claude Code」共用同一套严格校验'
+    )
+  })
+})

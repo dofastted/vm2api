@@ -4,7 +4,8 @@ import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
-import { OFFICIAL_CLAUDE_CLI_UA } from '../../src/lib/identity/vm-identity.mjs'
+import { OFFICIAL_CLAUDE_CLI_UA, OFFICIAL_CLI_VERSION } from '../../src/lib/identity/vm-identity.mjs'
+import { computeClaudeCodeFingerprintUtf16 } from '../../src/lib/identity/official-cc-verifier.mjs'
 import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
 import { createFailoverMockSchedulerRuntime } from '../helpers/mock-scheduler-runtime.mjs'
 import { clearCachePrefixSessions } from '../../src/lib/protocol/cache-prefix.mjs'
@@ -207,7 +208,19 @@ async function runCragHop(t, { compatibility = {}, diskCompatibility = null, inp
       headers: {
         authorization: 'Bearer fixture',
         'user-agent': OFFICIAL_CLAUDE_CLI_UA,
+        'x-app': 'cli',
+        'anthropic-version': '2023-06-01',
         'anthropic-beta': 'claude-code-20250219',
+        'anthropic-dangerous-direct-browser-access': 'true',
+        'x-claude-code-session-id': '11111111-2222-4333-8444-555555555555',
+        'x-stainless-lang': 'js',
+        'x-stainless-package-version': '0.128.0',
+        'x-stainless-os': 'Linux',
+        'x-stainless-arch': 'x64',
+        'x-stainless-runtime': 'node',
+        'x-stainless-runtime-version': 'v26.12.1',
+        'x-stainless-retry-count': '0',
+        'x-stainless-timeout': '600',
         ...headers,
       },
       apiKeyKind: 'managed',
@@ -225,19 +238,25 @@ async function runCragHop(t, { compatibility = {}, diskCompatibility = null, inp
   return received[0]
 }
 
-const officialBody = (extra = {}) => ({
-  system: [
-    text('x-anthropic-billing-header: cc_version=2.1.330.abc; cc_entrypoint=cli; cch=0f0f0;', null),
-    text("You are Claude Code, Anthropic's official CLI for Claude.", undefined),
-    text('Caller project instructions', undefined),
-  ],
-  metadata: {
-    user_id: JSON.stringify({ device_id: 'd'.repeat(64), session_id: '11111111-2222-4333-8444-555555555555' }),
-  },
-  tools: [{ name: 'Read', input_schema: { type: 'object' }, cache_control: control() }],
-  messages: [{ role: 'user', content: [text('Inspect cache ttl', undefined)] }],
-  ...extra,
-})
+const officialBilling = (messages) =>
+  `x-anthropic-billing-header: cc_version=${OFFICIAL_CLI_VERSION}.${computeClaudeCodeFingerprintUtf16(messages, OFFICIAL_CLI_VERSION)}; cc_entrypoint=sdk-cli; cch=0f0f0;`
+
+const officialBody = (extra = {}) => {
+  const messages = extra.messages ?? [{ role: 'user', content: [text('Inspect cache ttl', undefined)] }]
+  return {
+    system: [
+      text(officialBilling(messages), null),
+      text("You are Claude Code, Anthropic's official CLI for Claude.", undefined),
+      text('Caller project instructions', undefined),
+    ],
+    metadata: {
+      user_id: JSON.stringify({ device_id: 'd'.repeat(64), session_id: '11111111-2222-4333-8444-555555555555' }),
+    },
+    tools: [{ name: 'Read', input_schema: { type: 'object' }, cache_control: control() }],
+    messages,
+    ...extra,
+  }
+}
 
 for (const webTtl of ['1h', '5m']) {
   unixTest(`CRAG V3 fills omitted TTLs from Web compatibility.cache_ttl=${webTtl}`, async (t) => {
@@ -255,15 +274,16 @@ for (const webTtl of ['1h', '5m']) {
 }
 
 unixTest('CRAG V3 fills omitted TTLs on <cwd>-projected cragSystem and automatic root cache_control', async (t) => {
+  const autoMessages = [{ role: 'user', content: [{ type: 'text', text: 'Auto cached turn' }] }]
   const envelope = await runCragHop(t, {
     compatibility: { cache_ttl: '1h', official_cc_passthrough: false },
     input: officialBody({
       system: [
-        text('x-anthropic-billing-header: cc_version=2.1.330.abc; cc_entrypoint=cli; cch=0f0f0;', null),
+        text(officialBilling(autoMessages), null),
         text("You are Claude Code, Anthropic's official CLI for Claude.", null),
         text('Caller rules\n<cwd>\n/workspace/app\n</cwd>', undefined),
       ],
-      messages: [{ role: 'user', content: [{ type: 'text', text: 'Auto cached turn' }] }],
+      messages: autoMessages,
       cache_control: control(),
     }),
   })
@@ -312,9 +332,16 @@ unixTest('CRAG V3 preserves explicit caller 5m and legal 1h -> 5m under Web 1h c
 })
 
 unixTest('CRAG V3 keeps omitted caller TTLs untouched when official_cc_passthrough is enabled', async (t) => {
+  const passthroughMessages = [{ role: 'user', content: [text('Inspect cache ttl', undefined)] }]
   const envelope = await runCragHop(t, {
     compatibility: { cache_ttl: '1h', official_cc_passthrough: true },
-    input: officialBody(),
+    input: officialBody({
+      system: [
+        text(officialBilling(passthroughMessages), null),
+        text("You are Claude Code, Anthropic's official CLI for Claude.", undefined),
+      ],
+      messages: passthroughMessages,
+    }),
   })
   assert.equal(envelope.preserve_cache_breakpoints, true)
   assert.equal(envelope.body.messages[0].content[0].cache_control.ttl, undefined)

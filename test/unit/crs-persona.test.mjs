@@ -101,10 +101,41 @@ function withRoutingCompat(compat, fn) {
   }
 }
 
+const TEST_DEVICE_ID = 'a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90'
+const TEST_SESSION_ID = '11111111-2222-4333-8444-555555555555'
+const TEST_ACCOUNT_UUID = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
+
+function officialCcHeaders(ua = 'claude-cli/2.1.293 (external, cli)', extra = {}) {
+  const isDesktop = /local-agent/.test(ua)
+  return {
+    'user-agent': ua,
+    'x-app': 'cli',
+    'anthropic-version': '2023-06-01',
+    'anthropic-dangerous-direct-browser-access': 'true',
+    'anthropic-beta': 'claude-code-20250219,interleaved-thinking-2025-05-14',
+    'x-stainless-lang': 'js',
+    'x-stainless-os': 'Linux',
+    'x-stainless-arch': 'x64',
+    'x-stainless-runtime': 'node',
+    'x-stainless-runtime-version': 'v26.12.1',
+    'x-stainless-package-version': '0.128.0',
+    'x-stainless-retry-count': '0',
+    'x-stainless-timeout': '600',
+    'x-claude-code-session-id': TEST_SESSION_ID,
+    ...(isDesktop ? { 'anthropic-client-platform': 'desktop_app', 'anthropic-client-version': '2.42304.0' } : {}),
+    ...extra,
+  }
+}
+
+function officialCcUserId(asObject = false) {
+  const obj = { device_id: TEST_DEVICE_ID, account_uuid: TEST_ACCOUNT_UUID, session_id: TEST_SESSION_ID }
+  return asObject ? obj : JSON.stringify(obj)
+}
+
 function expectedFp(firstUserText, cliVersion = DEFAULT_CLI_VERSION) {
-  const buf = Buffer.from(String(firstUserText), 'utf8')
+  const s = String(firstUserText)
   let chars = ''
-  for (const i of [4, 7, 20]) chars += i < buf.length ? String.fromCharCode(buf[i]) : '0'
+  for (const i of [4, 7, 20]) chars += i < s.length ? s[i] : '0'
   return createHash('sha256')
     .update(FINGERPRINT_SALT + chars + cliVersion, 'utf8')
     .digest('hex')
@@ -123,30 +154,26 @@ test('official Claude Code client leaves system untouched', () => {
 })
 
 test('forceConfigured rewrites official and proxied-official system onto the preset', () => {
-  const omp = 'RFC 2119 keywords: MUST. <workstation> linux'
+  const appended = 'Custom workspace notes: prefer concise diffs.'
   const body = {
     model: 'claude-opus-5-5',
     system: [
       {
         type: 'text',
-        text: 'x-anthropic-billing-header: cc_version=2.1.280.096; cc_entrypoint=cli; cch=bdff0;',
+        text: `x-anthropic-billing-header: cc_version=2.1.293.${expectedFp('ping', '2.1.293')}; cc_entrypoint=cli; cch=bdff0;`,
       },
       {
         type: 'text',
         text: "You are Claude Code, Anthropic's official CLI for Claude.",
       },
-      { type: 'text', text: omp, cache_control: { type: 'ephemeral' } },
+      { type: 'text', text: appended, cache_control: { type: 'ephemeral' } },
     ],
     messages: [{ role: 'user', content: 'ping' }],
     metadata: {
-      user_id: JSON.stringify({
-        device_id: 'dev-1',
-        account_uuid: 'acc-1',
-        session_id: 'sess-1',
-      }),
+      user_id: officialCcUserId(),
     },
   }
-  const headers = { 'user-agent': 'claude-cli/2.1.293 (external, cli)' }
+  const headers = officialCcHeaders('claude-cli/2.1.293 (external, cli)')
   assert.equal(isOfficialClaudeCodeTraffic(headers, body), true)
   const kept = applyCrsUnofficialPersona(body, {
     headers,
@@ -169,10 +196,10 @@ test('forceConfigured rewrites official and proxied-official system onto the pre
     false,
   )
   assert.equal(
-    out.system.some((block) => String(block.text).includes(omp)),
+    out.system.some((block) => String(block.text).includes(appended)),
     false,
   )
-  assert.ok(firstUserContent(out).endsWith(`${callerReminder(omp)}ping`))
+  assert.ok(firstUserContent(out).endsWith(`${callerReminder(appended)}ping`))
   assert.ok(!JSON.stringify(out).includes('cch=bdff0'))
 })
 
@@ -624,14 +651,10 @@ test('official claude-cli UA plus valid user_id is cleaned unless passthrough is
     system: CRS_OFFICIAL_SYSTEM,
     messages: [{ role: 'user', content: 'hi' }],
     metadata: {
-      user_id: JSON.stringify({
-        device_id: 'dev-1',
-        account_uuid: 'acc-1',
-        session_id: 'sess-1',
-      }),
+      user_id: officialCcUserId(),
     },
   }
-  const headers = { 'user-agent': 'claude-cli/2.1.234 (external, cli)' }
+  const headers = officialCcHeaders('claude-cli/2.1.234 (external, cli)')
   assert.equal(isOfficialClaudeCodeTraffic(headers, body), true)
   const kept = applyCrsUnofficialPersona(body, { headers, mode: 'rewrite', officialClient: true })
   assert.equal(kept.system, CRS_OFFICIAL_SYSTEM)
@@ -1157,11 +1180,7 @@ test('vscode / cowork / desktop official family is cleaned unless passthrough is
     system: CRS_OFFICIAL_SYSTEM,
     messages: [{ role: 'user', content: 'hi' }],
     metadata: {
-      user_id: JSON.stringify({
-        device_id: 'dev-1',
-        account_uuid: 'acc-1',
-        session_id: 'sess-1',
-      }),
+      user_id: officialCcUserId(),
     },
   }
   const uas = [
@@ -1170,7 +1189,7 @@ test('vscode / cowork / desktop official family is cleaned unless passthrough is
     'claude-cli/2.1.215 (external, claude-desktop-3p, agent-sdk/0.3.215)',
   ]
   for (const ua of uas) {
-    const headers = { 'user-agent': ua }
+    const headers = officialCcHeaders(ua)
     assert.equal(isOfficialClaudeCodeTraffic(headers, body), true, ua)
     const kept = applyCrsUnofficialPersona(body, {
       headers,
@@ -1614,17 +1633,13 @@ test('zero env off keeps caller system without generating Environment', () => {
 
 test('new official identity variant is cleaned unless passthrough is on', () => {
   const body = {
-    system: "You are Claude Code, Anthropic's newest coding agent.",
+    system: "You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK.",
     messages: [{ role: 'user', content: 'hi' }],
     metadata: {
-      user_id: JSON.stringify({
-        device_id: 'dev-1',
-        account_uuid: 'acc-1',
-        session_id: 'sess-1',
-      }),
+      user_id: officialCcUserId(),
     },
   }
-  const headers = { 'user-agent': 'claude-cli/2.1.300 (external, cli)' }
+  const headers = officialCcHeaders('claude-cli/2.1.300 (external, cli)')
   assert.equal(isOfficialClaudeCodeTraffic(headers, body), true)
   const kept = applyCrsUnofficialPersona(body, {
     headers,
@@ -1642,15 +1657,19 @@ test('new official identity variant is cleaned unless passthrough is on', () => 
   assert.notEqual(out.system, body.system)
 })
 
-test('official entrypoint without exact identity line is cleaned unless passthrough is on', () => {
+test('official anchored vscode billing + identity is cleaned unless passthrough is on', () => {
   const body = {
-    system: 'cc_entrypoint=vscode\nFollow the workspace instructions.',
+    system: [
+      {
+        type: 'text',
+        text: `x-anthropic-billing-header: cc_version=2.1.241.${expectedFp('hi', '2.1.241')}; cc_entrypoint=claude-vscode;`,
+      },
+      { type: 'text', text: CRS_OFFICIAL_CLI_SYSTEM },
+    ],
     messages: [{ role: 'user', content: 'hi' }],
-    metadata: { user_id: { device_id: 'dev-1', session_id: 'sess-1' } },
+    metadata: { user_id: officialCcUserId(true) },
   }
-  const headers = {
-    'user-agent': 'claude-cli/2.1.241 (external, claude-vscode, agent-sdk/0.3.241)',
-  }
+  const headers = officialCcHeaders('claude-cli/2.1.241 (external, claude-vscode, agent-sdk/0.3.241)')
   assert.equal(looksLikeOfficialClaudeSystem(body.system), true)
   assert.equal(isOfficialClaudeCodeTraffic(headers, body), true)
   const kept = applyCrsUnofficialPersona(body, { headers, mode: 'rewrite', officialClient: true })
@@ -1750,16 +1769,12 @@ test('mergeIdentityIntoBilling keeps one billing line and drops standalone ident
 })
 
 function officialChildHeaders() {
-  return { 'user-agent': 'claude-cli/2.1.241 (external, sdk-cli)' }
+  return officialCcHeaders('claude-cli/2.1.241 (external, sdk-cli)')
 }
 
 function officialChildMeta() {
   return {
-    user_id: {
-      device_id: 'dev-child',
-      account_uuid: 'acc-child',
-      session_id: 'sess-child',
-    },
+    user_id: officialCcUserId(true),
   }
 }
 
@@ -1774,7 +1789,7 @@ test('Explore / Compact / web-search child hops are cleaned unless passthrough i
       system: [
         {
           type: 'text',
-          text: 'x-anthropic-billing-header: cc_version=2.1.241.abc; cc_entrypoint=sdk-cli;',
+          text: `x-anthropic-billing-header: cc_version=2.1.241.${expectedFp('hi', '2.1.241')}; cc_entrypoint=sdk-cli;`,
         },
         { type: 'text', text },
       ],

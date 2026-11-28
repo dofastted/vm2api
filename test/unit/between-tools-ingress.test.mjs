@@ -28,7 +28,10 @@ for (const classifier of [false, true]) {
         thinking: { type: 'between_tools' },
         ...invalid,
       }
-      if (classifier) input.metadata = { user_id: { device_id: 'fixture-device', session_id: 'fixture-session' } }
+      const sessionId = '11111111-2222-4333-8444-555555555555'
+      if (classifier) {
+        input.metadata = { user_id: JSON.stringify({ device_id: 'a'.repeat(64), session_id: sessionId }) }
+      }
       let admissions = 0
       let selections = 0
       const response = { headersSent: false, on() {}, once() {}, off() {}, write() {}, end() {} }
@@ -73,7 +76,22 @@ for (const classifier of [false, true]) {
         method: 'POST',
         url: '/v1/messages',
         headers: classifier
-          ? { 'user-agent': 'claude-cli/2.1.293 (external, cli)', 'anthropic-beta': 'claude-code-20250219' }
+          ? {
+              'user-agent': 'claude-cli/2.1.293 (external, cli)',
+              'x-app': 'cli',
+              'anthropic-version': '2023-06-01',
+              'anthropic-beta': 'claude-code-20250219',
+              'anthropic-dangerous-direct-browser-access': 'true',
+              'x-claude-code-session-id': sessionId,
+              'x-stainless-lang': 'js',
+              'x-stainless-package-version': '0.128.0',
+              'x-stainless-os': 'Linux',
+              'x-stainless-arch': 'x64',
+              'x-stainless-runtime': 'node',
+              'x-stainless-runtime-version': 'v26.12.1',
+              'x-stainless-retry-count': '0',
+              'x-stainless-timeout': '600',
+            }
           : { 'user-agent': 'test-client' },
         apiKeyKind: 'managed',
         apiKeyRecord: { category: 'oauth', user_id: 'admin' },

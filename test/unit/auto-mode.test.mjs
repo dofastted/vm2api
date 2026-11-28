@@ -88,11 +88,29 @@ for (const verdict of ['block', 'severity'])
       }
     })
 
+const STRICT_DEVICE_ID = 'a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90'
+const STRICT_SESSION_ID = '11111111-2222-4333-8444-555555555555'
+
 test('#220 severity classifier without billing is official CLI traffic', () => {
   const input = classifierFixture({ verdict: 'severity' })
-  input.metadata = { user_id: { device_id: 'fixture-device', session_id: 'fixture-session' } }
+  input.metadata = { user_id: { device_id: STRICT_DEVICE_ID, session_id: STRICT_SESSION_ID } }
   input.system.push({ type: 'text', text: '## Session Context\nCWD: /work' })
-  const headers = { 'user-agent': 'claude-cli/2.1.283 (external, cli)' }
+  const headers = {
+    'user-agent': 'claude-cli/2.1.283 (external, cli)',
+    'x-app': 'cli',
+    'anthropic-version': '2023-06-01',
+    'anthropic-dangerous-direct-browser-access': 'true',
+    'anthropic-beta': 'claude-code-20250219,interleaved-thinking-2025-05-14',
+    'x-stainless-lang': 'js',
+    'x-stainless-os': 'Linux',
+    'x-stainless-arch': 'x64',
+    'x-stainless-runtime': 'node',
+    'x-stainless-runtime-version': 'v26.12.1',
+    'x-stainless-package-version': '0.128.0',
+    'x-stainless-retry-count': '0',
+    'x-stainless-timeout': '600',
+    'x-claude-code-session-id': STRICT_SESSION_ID,
+  }
   assert.equal(isOfficialClaudeCodeTraffic(headers, input), true)
   assert.deepEqual(classifyClaudeRequestPurpose(input, { officialTraffic: true }), context)
   const body = prepareClassifierBody(input)
@@ -146,7 +164,7 @@ test('strong classifier rules identify relayed official traffic without billing'
     ['tool', 'block'],
   ]) {
     const input = classifierFixture({ format, verdict })
-    input.metadata = { user_id: { device_id: 'fixture-device', session_id: 'fixture-session' } }
+    input.metadata = { user_id: { device_id: STRICT_DEVICE_ID, session_id: STRICT_SESSION_ID } }
     const headers = { 'user-agent': 'Go-http-client/1.1', 'anthropic-beta': 'claude-code-20250219' }
     assert.equal(isProxiedOfficialClaudeCode(input, headers), true)
     assert.equal(

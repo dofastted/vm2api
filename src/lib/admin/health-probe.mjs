@@ -5,8 +5,7 @@
  * shape, real upstream id) and never acquire concurrency.
  */
 import crypto from 'node:crypto'
-import { isOfficialClaudeUa } from '../identity/crs-headers.mjs'
-import { isOfficialClaudeCodeTraffic } from '../identity/crs-persona.mjs'
+import { verifyDirectClaudeCodeHeaders, verifyOfficialClaudeCode } from '../identity/official-cc-verifier.mjs'
 import { vmHasClaudeCredential } from '../vm/vm-registry.mjs'
 import { isValidVmId } from '../vm/vm-file.mjs'
 import { activeHoursOf, evaluateActiveHours } from '../pool/active-hours.mjs'
@@ -369,14 +368,24 @@ export function isSub2apiAccountTest(body = {}) {
  * @param {string} [protocol] inbound protocol; a missing max_tokens only counts
  *   for OpenAI Chat and Responses probes with no token limit field.
  */
-export function isHealthShape(headers = {}, body = {}, cfg = DEFAULT_HEALTH_PROBE, protocol = '') {
+export function isHealthShape(headers = {}, body = {}, cfg = DEFAULT_HEALTH_PROBE, protocol = '', opts = {}) {
   const match = cfg?.match || DEFAULT_HEALTH_PROBE.match
   if (isHealthRealBypass(headers)) return false
   if (match.sub2api_account_test !== false && protocol !== 'openai.responses' && isSub2apiAccountTest(body)) {
     return true
   }
-  if (isOfficialClaudeCodeTraffic(headers, body)) return false
-  if (match.skip_official !== false && isOfficialClaudeUa(headerUa(headers))) return false
+  const verifiedOfficial =
+    typeof opts?.officialTraffic === 'boolean'
+      ? opts.officialTraffic
+      : verifyOfficialClaudeCode(headers, body, { detectProxiedOfficialCc: false }).official
+  if (verifiedOfficial) return false
+  if (
+    match.skip_official !== false &&
+    opts?.officialTraffic !== false &&
+    verifyDirectClaudeCodeHeaders(headers, { requireCodeBeta: true }).ok
+  ) {
+    return false
+  }
   if (match.ua_regex) {
     try {
       if (!new RegExp(match.ua_regex, 'i').test(headerUa(headers))) return false
@@ -505,11 +514,12 @@ export function decideHealthIntercept({
   now = Date.now(),
   protocol = '',
   platform = '',
+  officialTraffic = undefined,
 } = {}) {
   if (!cfg?.enabled || !cfg.intercept_unofficial) return { action: 'pass' }
   const resolvedPlatform = platform || healthPlatformOf(body)
   if (resolvedPlatform === 'gemini' && cfg?.gemini?.enabled === false) return { action: 'pass' }
-  if (!isHealthShape(headers, body, cfg, protocol)) return { action: 'pass' }
+  if (!isHealthShape(headers, body, cfg, protocol, { officialTraffic })) return { action: 'pass' }
   if (!inboundMatchesCacheModels(body, cfg)) return { action: 'pass' }
   if (isSnapshotValid(snapshot, cfg, now, resolvedPlatform) && hasCachedMessage(snapshot)) {
     return { action: 'cache', snapshot, via: HEALTH_VIA_CACHE }
@@ -706,7 +716,11 @@ export function isHealthProbeTarget(vm, now = Date.now()) {
   const status = String(vm.status || '').toLowerCase()
   if (HARD_UNAVAILABLE.has(status)) return false
   const grantErr = String(vm.claude?.refresh_error || vm.refresh_error || vm.schedule_disabled_reason || '')
-  if (/invalid_grant|refresh token not found|oauth_revoked|token has been revoked|token_revoked|invalidated oauth token/i.test(grantErr))
+  if (
+    /invalid_grant|refresh token not found|oauth_revoked|token has been revoked|token_revoked|invalidated oauth token/i.test(
+      grantErr,
+    )
+  )
     return false
   const coolUntil = Number(vm.cooldown_until || vm.claude?.temp_unschedulable_until) || 0
   if (
@@ -806,6 +820,7 @@ export function createHealthProbeMonitor(opts = {}) {
       snapshot: snapshots[platform],
       now,
       platform,
+      officialTraffic: decideOpts?.officialTraffic,
     })
     if (decision.action === 'fail') {
       if (platform === 'gemini') return { action: 'pass' }

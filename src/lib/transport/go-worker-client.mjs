@@ -745,7 +745,14 @@ function stripClientNonCcHeaders(reqHeaders) {
   const out = {}
   for (const [key, value] of Object.entries(reqHeaders)) {
     const lower = String(key || '').toLowerCase()
-    if (lower === 'anthropic-beta' || lower === 'user-agent') continue
+    if (
+      lower === 'anthropic-beta' ||
+      lower === 'user-agent' ||
+      lower === 'x-app' ||
+      lower === 'x-client-request-id' ||
+      lower.startsWith('x-claude-code-')
+    )
+      continue
     out[key] = value
   }
   return out
@@ -773,6 +780,7 @@ export function prepareWorkerPayload({
   dropSampling = false,
   strictPassthrough = false,
   officialPassthrough = null,
+  officialTraffic = null,
   safeguardsSanitized = false,
 } = {}) {
   const health = exec?.workerStatus
@@ -793,7 +801,9 @@ export function prepareWorkerPayload({
   // accept the panel's legacy cli-node beta body extension.
   const officialBetas = print && health?.capabilities?.includes('generation_controls_v3')
   const headlessBridge = print && isHeadlessBridgeCaps(health?.capabilities)
-  const callerHeaders = print ? extractCragCallerHeaders(reqHeaders, { includeUserAgent: headlessBridge }) : undefined
+  const verifiedOfficial = officialTraffic === true || officialPassthrough === true || strictCrag
+  const callerHeaders =
+    print && verifiedOfficial ? extractCragCallerHeaders(reqHeaders, { includeUserAgent: headlessBridge }) : undefined
   const nativeOwnsHeaders =
     cliHop &&
     cragPrint === true &&
@@ -809,16 +819,18 @@ export function prepareWorkerPayload({
     const nonPassthroughHeadless =
       headlessBridge &&
       !strictCrag &&
-      (officialPassthrough === false ||
+      (!verifiedOfficial ||
+        officialPassthrough === false ||
         body?.crag_persona_preset != null ||
         body?.crag_prompt != null ||
         body?.crag_env != null ||
         (body?.crag_prompt_spec != null && body.crag_prompt_spec?.passthrough !== true))
-    const headerReq = nonPassthroughHeadless ? stripClientNonCcHeaders(reqHeaders) : reqHeaders
+    const headerReq = !verifiedOfficial || nonPassthroughHeadless ? stripClientNonCcHeaders(reqHeaders) : reqHeaders
     headers = prepareOutboundHeaders(headerReq, exec?.homeDir, identity, canonicalBody?.model || '', {
       credentialMode: credentialModeFromOauth(exec?.vm?.claude || {}),
       routing,
       want1m: want1m === true,
+      officialTraffic: verifiedOfficial && !nonPassthroughHeadless,
     })
     if (callerHeaders) {
       for (const [k, v] of Object.entries(callerHeaders)) {
@@ -896,6 +908,8 @@ export async function workerEnvelope({
   repaired = false,
   dropSampling = false,
   strictPassthrough = false,
+  officialPassthrough = null,
+  officialTraffic = null,
   safeguardsSanitized = false,
   redactionPrincipal = '',
   redactionSession = '',
@@ -913,6 +927,8 @@ export async function workerEnvelope({
     repaired,
     dropSampling,
     strictPassthrough,
+    officialPassthrough,
+    officialTraffic,
     safeguardsSanitized,
   })
   const redaction = await redactionContext({ routing, exec, redactionPrincipal, redactionSession })
@@ -1122,6 +1138,8 @@ async function callGoWorkerRaw({
   callerCwd = null,
   repaired = false,
   strictPassthrough = false,
+  officialPassthrough = null,
+  officialTraffic = null,
   safeguardsSanitized = false,
   onEnvelope = null,
   redactionPrincipal = '',
@@ -1144,6 +1162,8 @@ async function callGoWorkerRaw({
       requestContext,
       repaired,
       strictPassthrough,
+      officialPassthrough,
+      officialTraffic,
       safeguardsSanitized,
     })
     const cleanPromptSpec = !nativeCragRequest(exec, cragPrint) && promptSpec ? sanitizePromptSpec(promptSpec) : null
@@ -1206,6 +1226,8 @@ async function callGoWorkerRaw({
           requestContext,
           repaired,
           strictPassthrough,
+          officialPassthrough,
+          officialTraffic,
           safeguardsSanitized,
           redactionPrincipal,
           redactionSession,
@@ -1365,6 +1387,8 @@ async function streamGoWorkerRaw({
   repaired = false,
   dropSampling = false,
   strictPassthrough = false,
+  officialPassthrough = null,
+  officialTraffic = null,
   safeguardsSanitized = false,
   onEnvelope = null,
   onOutboundHeaders = null,
@@ -1389,6 +1413,8 @@ async function streamGoWorkerRaw({
       repaired,
       dropSampling,
       strictPassthrough,
+      officialPassthrough,
+      officialTraffic,
       safeguardsSanitized,
     })
     const cleanPromptSpec = !nativeCragRequest(exec, cragPrint) && promptSpec ? sanitizePromptSpec(promptSpec) : null
@@ -1514,6 +1540,8 @@ async function streamGoWorkerRaw({
           repaired,
           dropSampling,
           strictPassthrough,
+          officialPassthrough,
+          officialTraffic,
           safeguardsSanitized,
           redactionPrincipal,
           redactionSession,

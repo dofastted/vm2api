@@ -145,8 +145,31 @@ test('official Claude Code is never a health shape', () => {
   assert.equal(isHealthShape(headers, body, cfg), false)
 })
 
-test('official UA skipped even without official body', () => {
-  assert.equal(isHealthShape({ 'user-agent': 'claude-cli/2.1.241 (external, sdk-cli)' }, hiBody, cfg), false)
+test('V13: bare official UA spoof is NOT skipped; complete verified CC headers or officialTraffic=true are skipped', () => {
+  assert.equal(isHealthShape({ 'user-agent': 'claude-cli/2.1.241 (external, sdk-cli)' }, hiBody, cfg), true)
+  assert.equal(
+    isHealthShape({ 'user-agent': 'claude-cli/2.1.241 (external, sdk-cli)' }, hiBody, cfg, 'anthropic.messages', {
+      officialTraffic: true,
+    }),
+    false,
+  )
+  const fullHeaders = {
+    'user-agent': 'claude-cli/2.1.321 (external, sdk-cli)',
+    'x-app': 'cli',
+    'anthropic-version': '2023-06-01',
+    'anthropic-dangerous-direct-browser-access': 'true',
+    'anthropic-beta': 'claude-code-20250219,interleaved-thinking-2025-05-14',
+    'x-stainless-lang': 'js',
+    'x-stainless-os': 'Linux',
+    'x-stainless-arch': 'x64',
+    'x-stainless-runtime': 'node',
+    'x-stainless-runtime-version': 'v26.12.1',
+    'x-stainless-package-version': '0.128.0',
+    'x-stainless-retry-count': '0',
+    'x-stainless-timeout': '600',
+    'x-claude-code-session-id': '11111111-2222-4333-8444-555555555555',
+  }
+  assert.equal(isHealthShape(fullHeaders, hiBody, cfg), false)
 })
 
 test('bypass header skips match', () => {

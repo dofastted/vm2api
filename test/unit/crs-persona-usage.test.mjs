@@ -130,12 +130,34 @@ test('official client same-object skip hides nothing', () => {
 })
 
 test('official Claude Code traffic keeps inbound system only when passthrough is on', () => {
+  const sessionId = '11111111-2222-4333-8444-555555555555'
   const body = {
     system: CRS_OFFICIAL_SYSTEM,
     messages: [{ role: 'user', content: 'hello' }],
-    metadata: { user_id: JSON.stringify({ device_id: 'dev-1', account_uuid: 'acc-1', session_id: 'sess-1' }) },
+    metadata: {
+      user_id: JSON.stringify({
+        device_id: 'd'.repeat(64),
+        account_uuid: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
+        session_id: sessionId,
+      }),
+    },
   }
-  const headers = { 'user-agent': 'claude-cli/2.1.241 (external, cli)' }
+  const headers = {
+    'user-agent': 'claude-cli/2.1.241 (external, cli)',
+    'x-app': 'cli',
+    'anthropic-version': '2023-06-01',
+    'anthropic-dangerous-direct-browser-access': 'true',
+    'anthropic-beta': 'claude-code-20250219,interleaved-thinking-2025-05-14',
+    'x-stainless-lang': 'js',
+    'x-stainless-os': 'Linux',
+    'x-stainless-arch': 'x64',
+    'x-stainless-runtime': 'node',
+    'x-stainless-runtime-version': 'v26.12.1',
+    'x-stainless-package-version': '0.128.0',
+    'x-stainless-retry-count': '0',
+    'x-stainless-timeout': '600',
+    'x-claude-code-session-id': sessionId,
+  }
   assert.equal(isOfficialClaudeCodeTraffic(headers, body), true)
   const kept = applyCrsUnofficialPersona(body, { headers, mode: 'rewrite', park: true, officialClient: true })
   assert.equal(kept.system, body.system)
