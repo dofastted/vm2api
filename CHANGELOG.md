@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.4.251 — 2026-11-28 · Codex 控制面对齐 `kin-codex-kernel v0.4.9`：UDS packed 增量、WS `ws_replay` 续接与实时中断
+
+- **Codex 传输与 Responses WebSocket 对齐 `kin-codex-kernel v0.4.9`（#2058）**：
+  - **UDS `/packed` 压缩与滚动增量（`src/lib/transport/{codex-kernel-client,go-worker-client}.mjs`）**：仅当 worker 状态声明 `uds_packed_v1` 能力时启用（旧内核走原路径）；发送 1 级 `gzip` 与 64B 滚动 Rabin-Karp copy-span 增量，基底缓存上限 32 MiB / 64 条 / 280s；遇到 UDS miss（`409` + `x-kin-uds-miss: 1` + `x-kin-upstream-sent: 0`）时自动以完整正文重试一次
+  - **WebSocket `ws_replay` 增量续接（`src/lib/protocol/{responses-ws,handle-codex}.mjs`）**：向内核传递 `options.ws_replay`（`{}` / `{ previous_response_id }`），请求侧保留完整展开的 `body.input`；`incomplete_details.reason === "interrupted"` 且有最终输出的回合与已完成回合一样进入连接重放缓存
+  - **实时 `response.interrupt` 转发**：`x-tap-interrupt === "websocket"` 时转发到 `POST /internal/v1/interrupt`，`204` 保持上游生成不中断，`409` 返回 `response.interrupt.failed` 且不中止连接
+  - **遥测与重试安全（`src/lib/pool/codex-slot-pool.mjs` 等）**：从客户端响应中剔除内部 `x-tap-*` / `x-kin-*` 头；`x-tap-turn-timing`（头与 trailer）记入 `logBag.hop_meta.codex_vm_timing.attempts[]`；`x-kin-upstream-sent: unknown` 时停止同账号、传输层与故障转移重试，避免重复提交
+- 部署说明：本次改动零数据库迁移；`deploy/payload.json` 未变，`kin-codex-kernel` 仍为既有钉选版本；UDS packed 仅在 worker 声明 `uds_packed_v1` 时启用，实时中断仅在内核返回 `x-tap-interrupt: websocket` 时转发，升级后无需额外操作。
+
 ## 1.4.250 — 2026-11-28 · 热修：钉选 CRAG `3.1.29` 修复 V4 工具续接 `409` 死锁与 `inline-tools-2026-09-15` 缺失 `400`
 
 - **CRAG V4 内核双项热修并钉选 `3.1.29` 延续载荷（`dofastted/crag#41`、`payload-2026.11.28-crag-3.1.29`）**：

@@ -445,3 +445,77 @@ for (const [name, cfg, routing, expected] of [
     assert.equal(fx.res.statusCode, 200)
   })
 }
+
+test('upstream_sent=unknown halts both same-account retry and cross-slot failover', async (t) => {
+  let hops = 0
+  const fx = fixture(t, {
+    body: { stream: false },
+    hop: async () => {
+      hops++
+      return {
+        ok: false,
+        status: 502,
+        committed: false,
+        transportError: true,
+        upstreamSent: 'unknown',
+        hopRequestId: 'kreq-unknown-1',
+        turnTiming: { transport: 'http', setup_ms: 3 },
+        body: { error: { type: 'api_error', code: 'upstream_transport', message: 'broken pipe' } },
+      }
+    },
+  })
+  await handleCodexProtocol(fx.args)
+  assert.equal(hops, 1)
+  assert.equal(fx.args.logBag.attempt_count, 1)
+  assert.equal(fx.res.statusCode, 502)
+  assert.equal(fx.args.logBag.hop_meta?.codex_vm_timing?.attempts?.length, 1)
+  assert.equal(fx.args.logBag.hop_meta.codex_vm_timing.attempts[0].upstream_sent, 'unknown')
+})
+
+test('handleCodexProtocol forwards ws_replay, workerStatus, onInterruptReady, and records codex_vm_timing attempts', async (t) => {
+  let captured = null
+  const readyPayloads = []
+  const fx = fixture(t, {
+    body: { stream: true },
+    hop: async (args) => {
+      captured = args
+      args.onInterruptReady?.({
+        requestId: 'kreq-ws-1',
+        interruptMode: 'websocket',
+        interrupt: async () => ({ ok: true, accepted: true, status: 204 }),
+      })
+      await args.onEvent(`data: ${JSON.stringify({ type: 'response.completed', response })}\n\n`)
+      return {
+        ok: true,
+        status: 200,
+        body: response,
+        usage: response.usage,
+        terminalState: 'verified',
+        hopRequestId: 'kreq-ws-1',
+        upstreamSent: '1',
+        turnTiming: { transport: 'websocket', setup_ms: 2, first_byte_ms: 9, first_text_ms: 12 },
+        udsPacked: { used: true, delta: true, retriedFull: false },
+        nodeTiming: {
+          firstGeneratedEventType: 'response.completed',
+          firstReleaseType: 'response.completed',
+          clientFirstWriteSourceType: 'response.completed',
+        },
+      }
+    },
+  })
+  fx.args.ops.ensureCodexKernel = async () => ({ ok: true, health: { ok: true, uds_packed_v1: true } })
+  fx.args.req._responsesWsReplay = { previous_response_id: 'resp_prev_9' }
+  fx.args.req._onCodexInterruptReady = (info) => readyPayloads.push(info)
+
+  await handleCodexProtocol(fx.args)
+  assert.equal(fx.res.statusCode, 200)
+  assert.deepEqual(captured?.exec?.workerStatus, { ok: true, uds_packed_v1: true })
+  assert.deepEqual(captured?.envelope?.options?.ws_replay, { previous_response_id: 'resp_prev_9' })
+  assert.equal(readyPayloads.length, 1)
+  assert.equal(readyPayloads[0].interruptMode, 'websocket')
+  const attempt = fx.args.logBag.hop_meta?.codex_vm_timing?.attempts?.[0]
+  assert.equal(attempt?.kernel_request_id, 'kreq-ws-1')
+  assert.equal(attempt?.upstream?.first_text_ms, 12)
+  assert.deepEqual(attempt?.uds_packed, { used: true, delta: true, retriedFull: false })
+  assert.equal(attempt?.node?.first_generated_event_type, 'response.completed')
+})
