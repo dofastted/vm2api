@@ -25,8 +25,13 @@ import {
   resolveSystemPromptSpec,
   sanitizePromptSpec,
 } from '../identity/system-prompt-spec.mjs'
-import { materializeAutomaticCache } from './cache-ttl.mjs'
-import { isOnlyOfficialCliIdentitySystem, sanitizeCragEnv, sanitizeSafeguardsForCrag } from './crag-whitelist.mjs'
+import { DEFAULT_CACHE_TTL, materializeAutomaticCache, repairCacheBreakpoints } from './cache-ttl.mjs'
+import {
+  cragV4TemplateCacheBreakpoints,
+  isOnlyOfficialCliIdentitySystem,
+  sanitizeCragEnv,
+  sanitizeSafeguardsForCrag,
+} from './crag-whitelist.mjs'
 import { normalizeImageContentBlocks } from './images.mjs'
 import { needsCragProviderCompatibility } from './kernel-request.mjs'
 import { isEmptyEffortValue } from './log-fields.mjs'
@@ -606,6 +611,22 @@ function toSpecCustomBlocks(action, blocks) {
   }
 }
 
+function budgetLegacyCragV4OfficialTemplateCache(
+  body,
+  capabilities,
+  health = null,
+  { routing = null, cacheTtl = null } = {},
+) {
+  const reserved = cragV4TemplateCacheBreakpoints(body, capabilities, health)
+  if (reserved <= 0) return body
+  const totalLimit = Number(routing?.compatibility?.cache_control_limit) || 4
+  return repairCacheBreakpoints(body, {
+    limit: Math.max(0, totalLimit - reserved),
+    fallbackTtl: cacheTtl || body?.cache_ttl || DEFAULT_CACHE_TTL,
+    fillMissing: false,
+  })
+}
+
 /**
  * @param {object} body caller body, before cli-node persona injection
  * @param {{ preset?: 'official' | 'official_full' | 'zero' | 'custom', promptSpec?: object | null, officialPassthrough?: boolean, capabilities?: string[], health?: object | null, promptPolicy?: object | null, agentSummary?: boolean, foldSystemMessages?: boolean }} [options]
@@ -822,7 +843,7 @@ export function prepareCragPrintBody(
         }
         out.crag_persona_preset = 'official_full'
         attachSpecEnv(spec)
-        return out
+        return budgetLegacyCragV4OfficialTemplateCache(out, capabilities, health, { routing, cacheTtl })
       }
     }
     // Priority 1: Native CC passthrough never touches system[] or injects persona/prompt/env controls.
@@ -907,7 +928,7 @@ export function prepareCragPrintBody(
     out.crag_persona_preset = 'official_full'
     attachPromptSpec(spec)
     attachSpecEnv(spec)
-    return out
+    return budgetLegacyCragV4OfficialTemplateCache(out, capabilities, health, { routing, cacheTtl })
   }
   if (needsCragProviderCompatibility(out, capabilities)) {
     if (poolApplied && (promptPolicy.mode === 'override' || promptPolicy.mode === 'append')) {
