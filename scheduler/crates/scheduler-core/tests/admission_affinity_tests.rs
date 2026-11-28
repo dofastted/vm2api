@@ -2727,3 +2727,111 @@ async fn ephemeral_summary_and_probe_follow_session_pin_without_sticking() {
         .unwrap();
     assert_eq!(r4.selected_node.node_key, "claude_vm:vm1");
 }
+
+/// 238 quotaGuardLevel `continuing` / filterByHostMemory: a node in the guard
+/// band or on a memory-critical host keeps the conversations pinned to it and
+/// refuses new ones.
+async fn continuing_only_case(update: NodeTelemetryUpdate, reason: ExcludeReason) {
+    let eng = two_node_engine();
+    let r1 = eng
+        .acquire(base_req(
+            "r1",
+            "pool_1",
+            "claude-opus-4-6",
+            ModelFamily::Claude,
+            "s1",
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r1.selected_node.node_key, "claude_vm:vm1");
+    eng.commit(CommitRequest {
+        lease_id: r1.lease_id.clone(),
+    });
+    release_ok(&eng, &r1.lease_id);
+
+    eng.update_telemetry(TelemetryBatchRequest {
+        nodes: vec![update],
+    });
+
+    let r2 = eng
+        .acquire(base_req(
+            "r2",
+            "pool_1",
+            "claude-opus-4-6",
+            ModelFamily::Claude,
+            "s1",
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        r2.selected_node.node_key, "claude_vm:vm1",
+        "pinned conversation stays"
+    );
+    release_ok(&eng, &r2.lease_id);
+
+    let mut sub = base_req(
+        "r3",
+        "pool_1",
+        "claude-opus-4-6",
+        ModelFamily::Claude,
+        "s1-sub",
+        None,
+    );
+    sub.parent_session_id = Some(CompactString::const_new("s1"));
+    let r3 = eng.acquire(sub).await.unwrap();
+    assert_eq!(
+        r3.selected_node.node_key, "claude_vm:vm1",
+        "subagent follows parent"
+    );
+    release_ok(&eng, &r3.lease_id);
+
+    let r4 = eng
+        .acquire(base_req(
+            "r4",
+            "pool_1",
+            "claude-opus-4-6",
+            ModelFamily::Claude,
+            "s2",
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        r4.selected_node.node_key, "claude_vm:vm2",
+        "new conversation goes elsewhere"
+    );
+    assert!(
+        r4.explain
+            .excluded
+            .iter()
+            .any(|e| e.reason == reason && e.node == "claude_vm:vm1")
+    );
+}
+
+#[tokio::test]
+async fn quota_guard_band_keeps_pinned_conversations_and_refuses_new_ones() {
+    continuing_only_case(
+        NodeTelemetryUpdate {
+            node_key: CompactString::const_new("claude_vm:vm1"),
+            new_sessions_blocked: Some(true),
+            ..Default::default()
+        },
+        ExcludeReason::NewSessionBlocked,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn host_memory_pressure_keeps_pinned_conversations_and_refuses_new_ones() {
+    continuing_only_case(
+        NodeTelemetryUpdate {
+            node_key: CompactString::const_new("claude_vm:vm1"),
+            host_memory_pressure: Some(true),
+            ..Default::default()
+        },
+        ExcludeReason::MemoryPressure,
+    )
+    .await;
+}

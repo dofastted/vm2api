@@ -74,7 +74,13 @@ import { isCodexVm } from '../vm/vm-kind.mjs'
 import { getVm, listVms } from '../vm/vm-registry.mjs'
 import { readWorkerEgressMode, readWorkerProxyEndpoint } from '../vm/vm-runtime.mjs'
 import { kernelFaults } from '../transport/rust-kernel-client.mjs'
-import { MODEL_GATE_REASONS, MODEL_WAIT_REASONS, accountIdOf } from '../pool/pool-scheduler.mjs'
+import {
+  MODEL_GATE_REASONS,
+  MODEL_WAIT_REASONS,
+  accountIdOf,
+  quotaGuardConfigOf,
+  quotaGuardLevel,
+} from '../pool/pool-scheduler.mjs'
 import { claudeNodeGate, claudeModelWaitGate } from './node-gates.mjs'
 
 export { SchedulerApiError, SchedulerUnavailableError }
@@ -1470,11 +1476,22 @@ export class SchedulerRuntime {
 
       // Node gates read vm.json, worker.json and cli-home under the project
       // root (as 238 did); without one there is nothing to read.
+      let newSessionsBlocked = false
       if (schedulable && !codex && gateCtx.projectRoot) {
         const gateReason = this.#claudeNodeGateReason(vm, acct, gateCtx, now)
         if (gateReason) {
           schedulable = false
           unschedReason = gateReason
+        } else {
+          // 238 quotaGuardLevel: `stop` removes the account, `continuing` keeps
+          // only conversations already pinned to it.
+          const guard = this.#claudeQuotaGuardLevel(vm, gateCtx, now)
+          if (guard === 'stop') {
+            schedulable = false
+            unschedReason = 'quota_guard_stop'
+          } else if (guard === 'continuing') {
+            newSessionsBlocked = true
+          }
         }
       }
 
@@ -1502,6 +1519,7 @@ export class SchedulerRuntime {
         unschedulable_reason: unschedReason,
         active_hours_ok: Boolean(activeHoursRes.active),
         host_memory_pressure: Boolean(hostMemoryPressure),
+        new_sessions_blocked: newSessionsBlocked,
         proxy_ready: !blockedProxy,
         crag_license_ok: cragLicenseOk,
         external_in_flight: Number.isFinite(extCount) && extCount > 0 ? Math.floor(extCount) : 0,
@@ -1623,6 +1641,20 @@ export class SchedulerRuntime {
       maxConcurrency,
       now,
     })
+  }
+
+  #claudeQuotaGuardLevel(vm, ctx, now) {
+    const raw = this.#rawVm(vm, { strict: true })
+    if (!raw) return 'open'
+    const accountId = accountIdOf(raw, ctx.projectRoot || null)
+    const account = rawAccountForVm(this.#accountQuota, raw, accountId)
+    if (!account?.unified) return 'open'
+    try {
+      const config = quotaGuardConfigOf(this.#getRoutingConfig()?.quota || {})
+      return quotaGuardLevel(account.unified, config, now)?.level || 'open'
+    } catch {
+      return 'open'
+    }
   }
 
   #buildBootstrapPayload({ controllerEpoch, role }) {

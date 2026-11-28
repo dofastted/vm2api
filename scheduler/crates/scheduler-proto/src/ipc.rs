@@ -98,6 +98,10 @@ pub struct NodeTelemetryUpdate {
     pub quota_util_7d_pct: Option<f32>,
     #[serde(default)]
     pub host_memory_pressure: Option<bool>,
+    /// 238 exhaustion_guard `continuing` band: only sessions already pinned to
+    /// this node may use it; new conversations go elsewhere.
+    #[serde(default)]
+    pub new_sessions_blocked: Option<bool>,
     #[serde(default)]
     pub proxy_ready: Option<bool>,
     #[serde(default)]

@@ -46,6 +46,9 @@ pub enum ExcludeReason {
     SubagentLimitExceeded,
     CrossPromptFallbackBlocked,
     CapabilityMismatch,
+    /// Node takes only conversations already pinned to it (quota guard band,
+    /// host memory pressure).
+    NewSessionBlocked,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

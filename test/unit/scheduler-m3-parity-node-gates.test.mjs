@@ -107,7 +107,11 @@ test('claudeModelWaitGate: per-model cooldown incl. Fable family key, Fable 7d_o
   assert.equal(claudeModelWaitGate({ accountId: 'a', model: 'claude-opus-4-6', accountQuota: split, now: NOW }), null)
 })
 
-function telemetryFixture(t, vms, { healthCache = new Map(), workerUnreachable = new Map(), accounts = {} } = {}) {
+function telemetryFixture(
+  t,
+  vms,
+  { healthCache = new Map(), workerUnreachable = new Map(), accounts = {}, routing = { pool: {} } } = {},
+) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vm2api-m3-gates-'))
   fs.mkdirSync(path.join(root, 'vms'), { recursive: true })
   for (const vm of vms) fs.writeFileSync(path.join(root, 'vms', `${vm.id}.json`), JSON.stringify(vm))
@@ -122,7 +126,7 @@ function telemetryFixture(t, vms, { healthCache = new Map(), workerUnreachable =
     cfg: { paths: { project: root } },
     getDb: () => null,
     getVms: () => vms,
-    getRoutingConfig: () => ({ pool: {} }),
+    getRoutingConfig: () => routing,
     accountQuota: { repo: { get: (id) => accounts[id] || null, list: () => [] }, snapshot: () => ({ accounts: [] }) },
     poolScheduler,
     telemetryIntervalMs: 0,
@@ -150,4 +154,37 @@ test('buildTelemetryBatch: concurrency 0 and disabled accounts row stop the slot
   const byKey = new Map(rt.buildTelemetryBatch({ now: Date.now() }).map((u) => [u.node_key, u]))
   assert.equal(byKey.get('claude_vm:vm-zero').unschedulable_reason, 'concurrency_disabled')
   assert.equal(byKey.get('claude_vm:vm-dis').unschedulable_reason, 'account_disabled')
+})
+
+test('buildTelemetryBatch: exhaustion_guard stop removes the slot, the new-session band blocks only new conversations (238 quotaGuardLevel)', (t) => {
+  const reset = Date.now() + 3_600_000
+  const acct = (id, utilization) => ({
+    account_id: id,
+    status: 'active',
+    unified: { headers: { '5h': { utilization, reset, status: 'allowed' } } },
+  })
+  const vms = [
+    slot({ id: 'vm-open', claude: { ...slot().claude, account_uuid: 'acct-open' } }),
+    slot({ id: 'vm-band', claude: { ...slot().claude, account_uuid: 'acct-band' } }),
+    slot({ id: 'vm-stop', claude: { ...slot().claude, account_uuid: 'acct-stop' } }),
+  ]
+  const accounts = {
+    'acct-open': acct('acct-open', 0.5),
+    'acct-band': acct('acct-band', 0.9),
+    'acct-stop': acct('acct-stop', 0.97),
+  }
+  const quota = { exhaustion_guard: true, exhaustion_guard_new_session: 0.85, exhaustion_guard_stop: 0.95 }
+  const on = telemetryFixture(t, vms, { accounts, routing: { pool: {}, quota } })
+  const byKey = new Map(on.buildTelemetryBatch({ now: Date.now() }).map((u) => [u.node_key, u]))
+  assert.equal(byKey.get('claude_vm:vm-open').schedulable, true)
+  assert.equal(byKey.get('claude_vm:vm-open').new_sessions_blocked, false)
+  assert.equal(byKey.get('claude_vm:vm-band').schedulable, true)
+  assert.equal(byKey.get('claude_vm:vm-band').new_sessions_blocked, true)
+  assert.equal(byKey.get('claude_vm:vm-stop').schedulable, false)
+  assert.equal(byKey.get('claude_vm:vm-stop').unschedulable_reason, 'quota_guard_stop')
+
+  const off = telemetryFixture(t, vms, { accounts, routing: { pool: {}, quota: { exhaustion_guard: false } } })
+  const offByKey = new Map(off.buildTelemetryBatch({ now: Date.now() }).map((u) => [u.node_key, u]))
+  assert.equal(offByKey.get('claude_vm:vm-band').new_sessions_blocked, false)
+  assert.equal(offByKey.get('claude_vm:vm-stop').schedulable, true)
 })

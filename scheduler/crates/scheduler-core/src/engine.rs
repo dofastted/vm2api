@@ -673,13 +673,32 @@ impl SchedulerEngine {
             visited_pools.push(cur_pool.id.clone());
             explain.resolved_pool_id = cur_pool.id.clone();
 
-            // Stage 0: Hard admission filter
-            let (admitted, excluded) =
-                admission::filter_members(snap, cur_pool, req, &self.nodes, now);
+            // Stage 0: Hard admission filter. The node this conversation (or its
+            // parent) is pinned to keeps the new-session-only gates open.
+            let s_key = ScopedSessionKey::new(&cur_pool.id, req.model_family, &req.session_id);
+            let continuing_node = if cur_pool.session_sticky_enabled {
+                affinity::get_live_session_stick(&self.session_sticks, &s_key, now)
+                    .map(|s| s.pinned_node)
+                    .or_else(|| {
+                        let pid = req.parent_session_id.as_deref().filter(|s| !s.is_empty())?;
+                        let p_key = ScopedSessionKey::new(&cur_pool.id, req.model_family, pid);
+                        affinity::get_live_session_stick(&self.session_sticks, &p_key, now)
+                            .map(|s| s.pinned_node)
+                    })
+            } else {
+                None
+            };
+            let (admitted, excluded) = admission::filter_members_for(
+                snap,
+                cur_pool,
+                req,
+                &self.nodes,
+                now,
+                continuing_node.as_ref(),
+            );
             explain.excluded.extend(excluded);
 
             if !admitted.is_empty() {
-                let s_key = ScopedSessionKey::new(&cur_pool.id, req.model_family, &req.session_id);
                 let mut skip_machine_stage = false;
                 let mut preserve_machine_home = is_downgraded;
                 let mut spill_exclude = SmallVec::<[NodeKey; 4]>::new();
