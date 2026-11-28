@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.4.258 — 2026-11-28 · 控制面 Gemini 熔断改按 `gemini.pool.circuit_*` 生效
+
+- **控制面 `gemini:<环境 id>` 单元熔断跟随 `gemini.pool.circuit_*`（#2084，外部贡献）**：此前 `gemini.pool.circuit_failure_threshold` / `circuit_open_ms` 只通过 `apply-policy` 下发给 CRAGGemini 内核，控制面这一层的 Gemini 环境熔断实际借用的是 Claude 的 `pool.circuit_*`——在面板里改 Gemini 的熔断阈值（包括设为 `0` 关闭）对控制面不生效，环境详情里显示的 threshold / open_ms 也是 Claude 的值。
+  - `src/lib/pool/unit-circuit.mjs`：新增按 id 前缀的作用域 `configureScope` / `clearScope` / `settingsFor`，`inspect` / `admit` / `recordFailure` / `view` 按单元所在作用域取阈值与冷却时长，取最长匹配前缀，无匹配时用全局值；作用域阈值为 `0` 时该作用域不熔断（不计失败、始终放行、面板显示 closed）
+  - `src/lib/admin/routing-runtime.mjs`：`configureUnitCircuit` 在配置全局值后，用 `normalizeGeminiRouting(routing.gemini).pool` 配置 `gemini:` 作用域；保存路由时 `body.pool` 或 `body.gemini` 任一存在即重新配置（此前只看 `body.pool`）
+  - Claude 单元仍按 `pool.circuit_*`，不受影响；两边保持默认 `3 / 30000` 时行为不变
+- 部署说明：本次改动零数据库迁移、零 Rust 变更、零前端改动；升级后重启控制面即可生效，若运营曾在面板把 Gemini 熔断阈值设为 `0`，升级后控制面这一层才会真正关闭 Gemini 熔断。
+
 ## 1.4.257 — 2026-11-28 · Gemini 多租户代理出口隔离、上游错误语义保留与 V4 headless 容量对齐
 
 - **Gemini 多租户代理出口隔离与目录过滤（#2079）**：
