@@ -371,7 +371,7 @@ describe('VM account column kernel label', () => {
       expect(html).toContain('上次宿主推理已取消')
       expect(html).toContain('上次宿主推理成功')
       expect(html).toContain('上次宿主推理失败')
-      expect(html).toContain('Google 地区资格受限')
+      expect(html).toContain('Google 403：地区或账号受限')
       expect(html).toContain('gemini-2.5-pro')
       expect(html).not.toContain('无效凭证')
       expect(html).toContain('role="switch"')
