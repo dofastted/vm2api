@@ -402,6 +402,11 @@ function invertsCacheTtl(moved, passed) {
   return long && passed.some((block) => block?.cache_control != null && block.cache_control.ttl !== '1h')
 }
 
+function hasCacheControl(message) {
+  if (message?.cache_control != null) return true
+  return contentBlocks(message?.content).some((block) => block?.cache_control != null)
+}
+
 function hasOutputConfig(message) {
   return message?.output_config != null && typeof message.output_config === 'object'
 }
@@ -477,7 +482,12 @@ function foldSystemTurns(messages) {
     }
     if (pendingSource.length) {
       const content = contentBlocks(message?.content)
-      if (message?.role === 'user' && !invertsCacheTtl(pending, content.slice(0, leadingToolResults(content)))) {
+      const toolResults = leadingToolResults(content)
+      // A post-assistant system turn carrying cache_control was emitted as a trailing
+      // system turn on the previous request; folding it forward into a subsequent plain
+      // user turn would mutate that cached message's role from system -> user (#2007).
+      const keepsCachedPrefix = toolResults === 0 && pendingSource.some(hasCacheControl)
+      if (message?.role === 'user' && !keepsCachedPrefix && !invertsCacheTtl(pending, content.slice(0, toolResults))) {
         out.push({
           ...message,
           content: prependAfterToolResults(content, pending),

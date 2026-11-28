@@ -1,3 +1,4 @@
+import { firstHistoryDiff } from '../../src/lib/protocol/cache-prefix.mjs'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -742,4 +743,61 @@ test('automatic caching still converts at the four-breakpoint budget', () => {
   )
   assert.equal('cache_control' in out, false)
   assert.deepEqual(out.messages[0].content[0].cache_control, mark)
+})
+
+test('trailing cached system turn after assistant stays role-stable when next user turn appends (#2007)', () => {
+  const block = (text, cache = false) => ({
+    type: 'text',
+    text,
+    ...(cache ? { cache_control: { type: 'ephemeral', ttl: '1h' } } : {}),
+  })
+  const turnA = {
+    model: 'claude-fable-5-2',
+    max_tokens: 64,
+    system: [block('Stable synthetic instructions.')],
+    messages: [
+      { role: 'user', content: [block('Read the synthetic input.')] },
+      { role: 'assistant', content: [block('Read complete.')] },
+      { role: 'system', content: [block('Synthetic background task notice.', true)] },
+    ],
+  }
+  const turnB = {
+    ...turnA,
+    messages: [...turnA.messages, { role: 'user', content: [block('Continue.', true)] }],
+  }
+  const turnC = {
+    ...turnB,
+    messages: [
+      ...turnB.messages,
+      { role: 'assistant', content: [block('Continued.')] },
+      { role: 'user', content: [block('Follow up.')] },
+      { role: 'system', content: [block('Regular post-user reminder.')] },
+    ],
+  }
+  const options = {
+    preset: 'official_full',
+    capabilities: [
+      'generation_controls_v3',
+      'prompt_append',
+      'system_text_cache_v3',
+      'linux_tui_native_queue',
+      'native_history_v3',
+    ],
+  }
+  const outA = prepareCragPrintBody(turnA, options)
+  const outB = prepareCragPrintBody(turnB, options)
+  const outC = prepareCragPrintBody(turnC, options)
+
+  assert.equal(firstHistoryDiff(turnA, turnB).section, null)
+  assert.equal(firstHistoryDiff(outA, outB).section, null)
+  assert.equal(firstHistoryDiff(outB, outC).section, null)
+  assert.deepEqual(
+    outB.messages.map((m) => m.role),
+    ['user', 'assistant', 'system', 'user'],
+  )
+  // Later regular post-user system notices still fold into their preceding user turn.
+  assert.deepEqual(
+    outC.messages.map((m) => m.role),
+    ['user', 'assistant', 'system', 'user', 'assistant', 'user'],
+  )
 })
