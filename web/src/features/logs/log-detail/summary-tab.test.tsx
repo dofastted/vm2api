@@ -135,4 +135,29 @@ describe('SummaryTab structured error diagnostics (#1845)', () => {
     expect(html).toContain('dev-audit-01')
     expect(html).toContain('sess-audit-01')
   })
+
+  it('renders upstream 400 classification category and action badges in risk audit card', () => {
+    const html = renderToStaticMarkup(
+      <TooltipProvider>
+        <SummaryTab
+          row={baseRow({
+            statusCode: 400,
+            upstreamStatus: 400,
+            via: 'go-worker-pool',
+            finalState: 'upstream_error',
+            errorCode: 'upstream_invalid_request',
+            errorDetails: {
+              risk_bucket: 'protocol',
+              upstream_400_category: 'tool_pair_broken',
+              upstream_400_action: 'session_10m',
+              punishment: 'session_10m_400',
+            },
+          })}
+          scrollToRedirect={false}
+        />
+      </TooltipProvider>
+    )
+    expect(html).toContain('400 分类：工具调用历史配对损坏')
+    expect(html).toContain('已封锁会话 10 分钟')
+  })
 })

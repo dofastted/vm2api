@@ -1,5 +1,52 @@
 # Changelog
 
+## 1.4.262 — 2026-11-28 · 上游 HTTP 400 按类别清洗，对会话相关的 400 封禁该会话 10 分钟
+
+- **终态上游 400 的分类与 10 分钟会话封禁（#2081）**：请求经过 failover / 修复重试后仍以真实上游 400 结束时，网关统一经 `classifyUpstream400`（`src/lib/core/refusal-guard.mjs`）分类，并只封当前租户下的该会话 10 分钟（不封设备、不降级已有的永久封禁、保留 `hit_count`）。封禁期内同一会话的请求在前置拦截处收到不可重试的 400（`x-should-retry: false`），不再继续冲击上游。
+  - **不封会话（清洗排除）**：`account_disabled`（账号/组织被禁用或受限）、`auth_credential`（凭据/鉴权失效）、`billing_credit`（余额或额度不足）、`model_unavailable`、`gateway_local`（网关/内核本地前置拒绝）、`auto_mode_classifier`
+  - **封 10 分钟**：`policy_refusal`、`third_party_client`、`context_too_long`（`prompt is too long` 等）、`tool_pair_broken`（`tool_use` 与 `tool_result` 配对损坏）、`thinking_history_broken`、`search_or_cache_invalid`、`media_invalid`、`message_structure_invalid`、`tool_schema_invalid`、`state_reference_invalid`、`beta_or_header_invalid`，以及未能归类的 `unknown`
+  - 覆盖 Anthropic 协议、Codex（含 Search / Images / Responses WS）、Gemini 公共路由与 `count_tokens`；Gemini 拦截分支补上 `x-should-retry: false`；中间的 failover / 修复重试跳不会误封，只在终态落盘；`findBan` 修复了会话封禁的过期判断
+  - 运营可见：封禁原因为 `upstream_400:<category>`，日志详情与风控面板显示类别与动作（`upstream_400_action`）
+- **行为取舍，升级前请知悉**：该功能随「封锁拒答会话」开关**默认开启**（设置项 `refusal_session_block_enabled`，在「前置 → 拒答与封禁」可关闭）。Claude Code 遇到 `prompt is too long` 的标准恢复是「压缩上下文后用同一会话 id 重发」，在该设计下这次重发会在 10 分钟内收到不可重试的 400，`tool_pair_broken` 同理；`max_tokens` 超限当前归入 `unknown`（同样封 10 分钟）。如不希望如此，关闭该开关即可。
+- 部署说明：本次改动零数据库迁移（沿用既有会话封禁表，无 DB 迁移）、零 Rust 变更、零 `deploy/payload.json` 变更；升级后重启控制面即可生效。
+
+## 1.4.261 — 2026-11-28 · 文档：vm2api 与 CRAG V4 的协议边界；内核目录标注历史 V4 载荷的升级建议
+
+- **`vm2api` ↔ CRAG 协议与整流边界文档与内核目录 label（#2093）**：
+  - `docs/PROTOCOL.md`：「CRAG native V2 部署边界」更新为「CRAG Native V4 部署与协议边界」；新增「`vm2api` ↔ CRAG 协议与整流边界（Claude Code `2.1.321`）」，写明网关入口的协议转译、第三方 `system` / `role=system|developer` 文本搬迁、CRAG 最终出口 `2.1.321` 结构整流（`src/lib/protocol/crag-321-rectifier.mjs`）与槽内 CRAG 的职责划分；新增「历史 CRAG V4 载荷升级策略（`3.1.26`–`3.1.30` → `3.1.31`）」
+  - `src/lib/admin/kernel-catalog.mjs`：仅更新 `CRAG_PINNED_RELEASES` 中 `3.1.31`（标注「推荐」）与 `3.1.30` / `3.1.29` / `3.1.27` / `3.1.26`（标注「历史·建议改用 3.1.31」）的展示 `label`；所有 `tag` / `size` / `sha256` / `manifestSha256` 保持不变，不覆写历史 Release 的不可变附件
+- 部署说明：本次改动零数据库迁移、零 Rust 变更、零 `deploy/payload.json` 变更、零协议行为变更；仅文档与面板内核列表中的展示文字，升级后重启控制面即可。
+
+## 1.4.260 — 2026-11-28 · CRAG 出口新增 Claude Code 2.1.321 结构整流器
+
+- **CRAG 最终出口统一执行 2.1.321 结构整流（#2089）**：新增 `src/lib/protocol/crag-321-rectifier.mjs` 作为单一真值，在 `prepareCragRequest`（严格官方透传与非严格/第三方两条分支）以及 `count_tokens`（`user-count-tokens.mjs`、`go-worker-client.mjs` 的 `countTokensViaKernel`）出口调用，把不合法或版本漂移的结构改写成 2.1.321 的合法等价形态，而不是放行到上游触发 400。
+  - **合法请求零修改**：已满足结构与 `cache_control` 不变量的请求原引用返回，不破坏官方缓存前缀与续传哈希；仓库内真实官方抓包夹具（2.1.303 骨架）在严格与非严格模式下均零修改且幂等
+  - **`role: "system"` 整流**：非指令的 `role: "system"` 不能位于首位，必须紧跟 `user`（或以服务端 `*_tool_result` 结尾的 `assistant`）之后；首部的 `tool_addition(tool_definition)` 提升到顶层 `tools[]`（按 `name` 去重），首部纯文本提升到顶层 `system[]`，`tool_removal` / `tool_reference` / `clear_at` 延后到首条 `user` 之后；中段与尾部的违规系统回合延后或前置 `user("continue")`；连续的非指令系统回合合并；`role: "developer"` 归一为 `system`；directive-only 的空 `system` 回合保留
+  - **非 `system` 回合中的工具块**：`user` / `assistant` 内的 `tool_addition` / `tool_removal` 抽出为合法的 `role: "system"` 回合
+  - **字段整流**：`thinking.budgetTokens` → 整型 `budget_tokens`；`output_config.effort` 清理并小写；`output_config.format` 的 object schema 补 `additionalProperties: false`；剥离 `annotations`；整流后统一执行 `repairCacheBreakpoints`（修复 `thinking.cache_control`、超 4 个断点与重排引发的 `5m → 1h` 倒挂）；`canonicalRequest` 校验 `tool_choice` 时识别内联 `tool_definition`
+  - **作用范围**：仅 CRAG 原生路径（`cragPrint` 为真）；`cli-node` 路径不经过整流器，输出保持不变
+- **测试修复（#2092）**：`go-worker-client.test.mjs` 的「worker canonicalizes passthrough bodies before either kernel」此前对两条内核路径共用同一期望，#2089 合入后在 dev 上失败 1 例；现按 `cragPrint` 分路径断言。纯测试改动，无用户可见变化
+- 部署说明：本次改动零数据库迁移、零 Rust 变更、零 `deploy/payload.json` 变更；协议层改动随控制面重启生效，CRAG 内核载荷字节未变。
+
+## 1.4.259 — 2026-11-28 · V4 协议纯度收口（内联 `tool_choice`、首部 `role: "system"` 控制回合）与 CRAG `3.1.31` 钉选
+
+- **内联工具与首部系统控制回合的协议不变量收口（#2085）**：
+  - `src/lib/protocol/model-policy.mjs`：`validateToolChoice` 识别 `body.messages` 中内联的 `tool_addition`（`tool.type === 'tool_definition'`）工具，`tool_choice`（`auto` / `any` / `tool`）指向内联定义的工具时不再在入口被误判为 400
+  - `src/lib/protocol/crag-whitelist.mjs`：`tool_choice.type === 'tool'` 只匹配顶层 `tools` 或内联 `tool_addition (tool_definition)`，缺少定义的裸 `tool_reference` 会被拒绝
+  - `src/lib/protocol/sanitize.mjs`：首部 `role: "system" | "developer"` 回合只上提纯文本块，`tool_addition` / `tool_removal` / `tool_reference` 等协议块原位保留；非空的首部 `clear_at` 回合保持原位且多遍处理幂等，空的 `clear_at` 回合不再绕过首部 user 守卫；`mergeConsecutiveAnthropicMessages` 新增 `preserveConsecutiveSystem` 选项
+  - `src/lib/protocol/outbound-attempt.mjs`：第三方 `role: "system"` 折叠时保留相邻系统控制回合各自的消息级 `cache_control`，不再合并成一回合
+  - `src/lib/protocol/anthropic-policy.mjs`：收紧内联 `tool_definition` 守卫（非数组、`name` 非空、未改动时不克隆、`tool_definition` 提前返回）
+- **CRAG `3.1.31` 载荷钉选（#2085，配套 `dofastted/crag#44`）**：`deploy/payload.json` 的 `crag_release` 升级至 `payload-2026.11.28-crag-3.1.31`，并在 `src/lib/admin/kernel-catalog.mjs` 注册 `3.1.31`（收口 `wire.rs` Beta SSOT、门控 diagnostics 注入、移除重复的 runtime beta 推导）；零密钥轮换，沿用现役 `issuer_public_key_id=9dbb4bc2…` / `payload_key_id=835451e2…`，CRAGGemini 载荷不变，`3.1.30` 及更早版本保留可回退
+- 部署说明：本次改动零数据库迁移、零 Rust `kin-scheduler` 变更；`deploy/payload.json` 仅更新 CRAG 载荷（`crag-v2` 三个资产与 `crag-v2-licensed-amd64.tar.gz`），`kin-kernel` / `cli-node` / `wrap-cli` 与 CRAGGemini 字节未变，既有 `wrap` / Codex / 老 `kincli` 槽位预期 **`SLOT_SYNC=skip`**；需要在 CRAG 槽位使用 `3.1.31` 时，按内核目录单独安装或切换。协议层改动随控制面重启生效。
+
+## 1.4.258 — 2026-11-28 · 控制面 Gemini 熔断改按 `gemini.pool.circuit_*` 生效
+
+- **控制面 `gemini:<环境 id>` 单元熔断跟随 `gemini.pool.circuit_*`（#2084，外部贡献）**：此前 `gemini.pool.circuit_failure_threshold` / `circuit_open_ms` 只通过 `apply-policy` 下发给 CRAGGemini 内核，控制面这一层的 Gemini 环境熔断实际借用的是 Claude 的 `pool.circuit_*`——在面板里改 Gemini 的熔断阈值（包括设为 `0` 关闭）对控制面不生效，环境详情里显示的 threshold / open_ms 也是 Claude 的值。
+  - `src/lib/pool/unit-circuit.mjs`：新增按 id 前缀的作用域 `configureScope` / `clearScope` / `settingsFor`，`inspect` / `admit` / `recordFailure` / `view` 按单元所在作用域取阈值与冷却时长，取最长匹配前缀，无匹配时用全局值；作用域阈值为 `0` 时该作用域不熔断（不计失败、始终放行、面板显示 closed）
+  - `src/lib/admin/routing-runtime.mjs`：`configureUnitCircuit` 在配置全局值后，用 `normalizeGeminiRouting(routing.gemini).pool` 配置 `gemini:` 作用域；保存路由时 `body.pool` 或 `body.gemini` 任一存在即重新配置（此前只看 `body.pool`）
+  - Claude 单元仍按 `pool.circuit_*`，不受影响；两边保持默认 `3 / 30000` 时行为不变
+- 部署说明：本次改动零数据库迁移、零 Rust 变更、零前端改动；升级后重启控制面即可生效，若运营曾在面板把 Gemini 熔断阈值设为 `0`，升级后控制面这一层才会真正关闭 Gemini 熔断。
+
 ## 1.4.257 — 2026-11-28 · Gemini 多租户代理出口隔离、上游错误语义保留与 V4 headless 容量对齐
 
 - **Gemini 多租户代理出口隔离与目录过滤（#2079）**：

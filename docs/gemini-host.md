@@ -84,7 +84,7 @@ OAuth 环境仍由 Gemini host 管理 token、HOME 和代理绑定；请求进�
 
 原生 OAuth 回合复用该环境已经完成官方 CLI 登录的私有 HOME，保留 CLI 的 onboarding、项目状态及令牌刷新；仅复制 token 到全新 HOME 不等价于复用登录环境。每回合仍有独立工作目录、原生 socket 和请求身份，并通过 CLI 的仅会话 `--settings` 保持严格工具权限及禁用额外 Credits。主题预览里的 `compilation failed` 是示例文案，不能据此判断运行故障。
 
-对已选中环境的失败回合，调度器必须保留宿主错误码；`gemini_location_unsupported`、`gemini_account_verification_required` 和 `gemini_account_ineligible` 返回 HTTP 403，与上游 `gemini_invalid_request`（HTTP 400）一并计入单账号熔断失败次数（半开探针命中时重新打开熔断）。排查公网 `503 gemini_host_unavailable` 时应单独跟踪该请求，不能仅凭另一回合的资格拒绝日志归因。
+对已选中环境的失败回合，调度器必须保留宿主错误码；`gemini_location_unsupported`、`gemini_account_verification_required` 和 `gemini_account_ineligible` 返回 HTTP 403，与上游 `gemini_invalid_request`（HTTP 400）一并计入单账号熔断失败次数（半开探针命中时重新打开熔断）。控制面这一层单账号熔断（`gemini:<环境 id>`）的阈值与冷却时长取 `routing.gemini.pool.circuit_failure_threshold` / `circuit_open_ms`，与下发给 CRAGGemini 内核的值相同，`0` 表示关闭；不跟随 Claude 的 `pool.circuit_*`。排查公网 `503 gemini_host_unavailable` 时应单独跟踪该请求，不能仅凭另一回合的资格拒绝日志归因。
 
 原生 CLI 通过 `--log-file` 写入私有目录的 FIFO，不写入或读取共享 profile 的 `cli.log`。独立排空线程每批最多读取 64 KiB，单行最多保留 4 KiB；不依赖同步宿主请求循环，避免另一条请求阻塞时卡住 CLI 日志写入。线程按固定规则提取结构化 `EligibilityDiagnostic`（地区受限 `gemini_location_unsupported`、需浏览器核验 `gemini_account_verification_required` 及可选 `accounts.google.com` 验证链接、账号无资格 `gemini_account_ineligible`）；未知、超长或跨环境文本不用于归因，原始日志不落盘、不返回客户端。失败终态最多等待 250 ms 获取已经排入 FIFO 的诊断快照；清理时停止并等待线程退出，再回收描述符，避免与 fd 复用竞争。已完成的模型结果优先；否则白名单诊断优先于通用错误。
 

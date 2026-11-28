@@ -29,6 +29,7 @@ import { ConfirmDialog } from '@/components/confirm-dialog'
 import { EmptyNotice, Group, ToggleItem, ToggleList } from './blocks'
 import { refusalGuardsQueryOptions } from './queries'
 import { RiskPolicyForm } from './risk-policy-form'
+import { formatBanReasonLabel } from './upstream-400'
 
 function CopyIdButton({ value, label }: { value: string; label: string }) {
   const [copied, setCopied] = useState(false)
@@ -572,7 +573,7 @@ export function RefusalRecords({
                       />
                     </div>
                     <p className='text-xs text-muted-foreground tabular-nums'>
-                      {item.reason || 'refusal_guard'} · 第 {item.violations}{' '}
+                      {formatBanReasonLabel(item.reason)} · 第 {item.violations}{' '}
                       次违规 · 命中 {item.hit_count} 次 ·{' '}
                       {item.expires_at
                         ? `${expired ? '已于' : '封禁至'} ${fmtExpiresAt(item.expires_at)}`

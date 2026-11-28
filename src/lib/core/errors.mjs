@@ -654,6 +654,10 @@ export function sanitizeErrorDetailsForLog(rawDetails, { status = null, upstream
   if (riskBucket) out.risk_bucket = riskBucket
   const punishment = sanitizeErrorToken(src.punishment, 64)
   if (punishment) out.punishment = punishment
+  const u400Category = sanitizeErrorToken(src.upstream_400_category, 48)
+  if (u400Category) out.upstream_400_category = u400Category
+  const u400Action = sanitizeErrorToken(src.upstream_400_action, 32)
+  if (u400Action) out.upstream_400_action = u400Action
   for (const [key, value] of Object.entries(src)) {
     if (!/^jev_score_[a-z][a-z0-9_-]{0,31}$/.test(key)) continue
     const num = Number(value)
@@ -676,6 +680,8 @@ export function sanitizeErrorDetailsForLog(rawDetails, { status = null, upstream
       'gate_miss',
       'risk_bucket',
       'punishment',
+      'upstream_400_category',
+      'upstream_400_action',
     ]) {
       if (Object.hasOwn(out, key)) compact[key] = out[key]
     }

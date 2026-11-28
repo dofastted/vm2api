@@ -29,6 +29,10 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from '@/components/ui/tooltip'
+import {
+  UPSTREAM_400_ACTION_LABELS,
+  upstream400CategoryLabel,
+} from '@/features/risk/upstream-400'
 import { ThinkingEffortBadge } from '../log-cells'
 import {
   actualCacheRate,
@@ -157,6 +161,14 @@ function RiskAuditCard({ row }: { row: UsageLogRow }) {
   ].includes(row.via || '')
   const riskBucket =
     typeof details.risk_bucket === 'string' ? details.risk_bucket : null
+  const u400Category =
+    typeof details.upstream_400_category === 'string'
+      ? details.upstream_400_category
+      : null
+  const u400Action =
+    typeof details.upstream_400_action === 'string'
+      ? details.upstream_400_action
+      : null
   const gateMiss = details.gate_miss === true
   const hasRisk =
     riskVia ||
@@ -164,6 +176,7 @@ function RiskAuditCard({ row }: { row: UsageLogRow }) {
     row.intercept?.kind === 'block' ||
     gateMiss ||
     !!riskBucket ||
+    !!u400Category ||
     jevScores.length > 0
   if (!hasRisk) return null
   const disguised429 =
@@ -209,6 +222,23 @@ function RiskAuditCard({ row }: { row: UsageLogRow }) {
           {riskBucket ? (
             <span className='rounded-md bg-[var(--status-caution-bg)] px-2 py-0.5 text-[11px] font-medium text-[var(--status-caution)]'>
               {RISK_BUCKET_LABELS[riskBucket] || riskBucket}
+            </span>
+          ) : null}
+          {u400Category ? (
+            <span className='rounded-md bg-[var(--status-warn-bg)] px-2 py-0.5 text-[11px] font-medium text-[var(--status-warn)]'>
+              400 分类：{upstream400CategoryLabel(u400Category)}
+            </span>
+          ) : null}
+          {u400Action ? (
+            <span
+              className={cn(
+                'rounded-md px-2 py-0.5 text-[11px] font-medium',
+                u400Action === 'session_10m' || u400Action === 'permanent_kept'
+                  ? 'bg-[var(--status-bad-bg)] text-[var(--status-bad)]'
+                  : 'bg-[var(--status-none-bg)] text-[var(--status-none)]'
+              )}
+            >
+              {UPSTREAM_400_ACTION_LABELS[u400Action] || u400Action}
             </span>
           ) : null}
         </div>

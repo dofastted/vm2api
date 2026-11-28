@@ -30,7 +30,12 @@ import { RefusalSessionBlocksRepo } from '../db/repos/refusal-session-blocks-rep
 import { SettingsRepo } from '../db/repos/settings-repo.mjs'
 import { makeApiKeyGateError } from '../admin/api-keys.mjs'
 import { readJevConfig } from './jev-intercept.mjs'
-import { invalidateRiskBanCache, observeUpstreamRisk, upstreamRiskClientError } from './intercept-gate.mjs'
+import {
+  invalidateRiskBanCache,
+  observeUpstreamRisk,
+  recordUpstream400SessionBlock,
+  upstreamRiskClientError,
+} from './intercept-gate.mjs'
 import {
   clientBlockErrorOf,
   isTrustedGateDecision,
@@ -2074,18 +2079,37 @@ export function createHandleProtocol(deps) {
     ) {
       return
     }
-    if (imageModel) return serveImageModelTurn({ req, res, protocol, body: ctx.body, logBag, keyScope })
     let observedHop = false
-    const afterHop = (result) => {
+    const recordFinal400 = (result) => {
+      if (!result || result.ok === true || isClientCancelledResult(result)) return null
+      return recordUpstream400SessionBlock({
+        ...riskState,
+        inbound,
+        body: inbound,
+        headers: req.headers,
+        identity: auditIdentity,
+        result,
+        logBag,
+        requestId: logCtx.request_id,
+        classifier: logBag.classifier,
+      })
+    }
+    if (imageModel) {
+      return serveImageModelTurn({ req, res, protocol, body: ctx.body, logBag, keyScope, recordFinal400 })
+    }
+    const afterHop = (result, { blockSessionOn400 = true } = {}) => {
       observedHop = true
       const reason = observeUpstreamRisk({
         ...riskState,
         inbound,
         body: inbound,
+        headers: req.headers,
         identity: auditIdentity,
         result,
         logBag,
         requestId: logCtx.request_id,
+        classifier: logBag.classifier,
+        blockSessionOn400,
       })
       const sessionBlock = refusalSessionBlockDecision(reason, logBag.classifier)
       if (sessionBlock.skipped) logBag.risk_session_block_skipped = sessionBlock.skipped
@@ -2230,6 +2254,7 @@ export function createHandleProtocol(deps) {
         pinVmId,
         keyScope,
         afterHop,
+        recordFinal400,
         poolAccess: activePoolAccess,
         originPoolId: activePoolAccess.originPool?.id || effectivePool?.id || null,
         jevDowngradePoolId:
@@ -3242,7 +3267,7 @@ export function createHandleProtocol(deps) {
       logBag.generation_ms = result?.generationMs ?? null
       logBag.final_state = result?.terminalState || null
       logBag.attempt_count = apiAttempts || (result?.endpointId ? 1 : 0)
-      if (result?.upstreamStatus != null) afterHop(result)
+      if (result?.upstreamStatus != null || (result && !result.ok && result.upstreamError)) afterHop(result)
       attachPricing(logBag, {
         managedKey,
         rateMultiplier: resolveGroupRate(req),
@@ -4149,7 +4174,7 @@ export function createHandleProtocol(deps) {
             },
           }
         },
-        onUpstreamRisk: afterHop,
+        onUpstreamRisk: (hopResult) => afterHop(hopResult, { blockSessionOn400: false }),
         callAttempt: async ({ candidate, body, attemptMeta, deliveryMode: attemptDelivery, signal, onCommit }) => {
           const attemptReqHeaders =
             attemptMeta?.stripClientBeta && outboundReqHeaders && typeof outboundReqHeaders === 'object'
@@ -4414,7 +4439,10 @@ export function createHandleProtocol(deps) {
       logBag.error_code = logBag.error_code || 'content_filter_refusal'
       logBag.error_message = logBag.error_message || 'upstream stop_reason=refusal'
     }
-    if (!observedHop && result?.attemptCount > 0) afterHop(result)
+    if (result?.attemptCount > 0 && !isClientCancelledResult(result)) {
+      if (!observedHop) afterHop(result, { blockSessionOn400: true })
+      else if (!result?.ok) recordFinal400(result)
+    }
 
     // Zero-execution rejections (e.g. session_home_slot_busy) and opaque CRAG 429s never reached generation.
     if (result?.accountId && result.attemptCount !== 0 && result.policy?.reason !== 'crag_opaque_429') {
@@ -4727,6 +4755,17 @@ export function createHandleProtocol(deps) {
         poolAccess: searchPoolAccess,
         originPoolId: searchPoolAccess.originPool?.id || searchPoolAccess.effectivePool?.id || null,
         schedulerRuntime: getSchedulerRuntime(req),
+        recordFinal400: (result) =>
+          recordUpstream400SessionBlock({
+            ...searchRiskState,
+            inbound: body,
+            body,
+            headers: req.headers,
+            identity: searchIdentity,
+            result,
+            logBag,
+            requestId: logCtx.request_id,
+          }),
         ops: deps.codexOps || {},
         ...(searchKeyScope ? { keyScope: searchKeyScope } : {}),
       }),
@@ -4749,7 +4788,7 @@ export function createHandleProtocol(deps) {
    * when the last user message carries images) answered in the caller's protocol. The row is
    * an Images row, so it bills image usage alone like /v1/images.
    */
-  async function serveImageModelTurn({ req, res, protocol, body, logBag, keyScope = null }) {
+  async function serveImageModelTurn({ req, res, protocol, body, logBag, keyScope = null, recordFinal400 = null }) {
     const turn = imagesRequestFromTurn(protocol, body)
     if (!turn.ok) {
       stats.errors++
@@ -4808,6 +4847,7 @@ export function createHandleProtocol(deps) {
           poolAccess: req._poolAccess || null,
           originPoolId: req._poolAccess?.originPool?.id || req._poolAccess?.effectivePool?.id || null,
           schedulerRuntime: getSchedulerRuntime(req),
+          recordFinal400,
           ops: deps.codexOps || {},
           ...(keyScope ? { keyScope } : {}),
         })
@@ -5006,6 +5046,17 @@ export function createHandleProtocol(deps) {
         poolAccess: imagesPoolAccess,
         originPoolId: imagesPoolAccess.originPool?.id || imagesPoolAccess.effectivePool?.id || null,
         schedulerRuntime: getSchedulerRuntime(req),
+        recordFinal400: (result) =>
+          recordUpstream400SessionBlock({
+            ...imagesRiskState,
+            inbound: body,
+            body,
+            headers: req.headers,
+            identity: imagesIdentity,
+            result,
+            logBag,
+            requestId: logCtx.request_id,
+          }),
         ops: deps.codexOps || {},
         ...(imagesKeyScope ? { keyScope: imagesKeyScope } : {}),
       }),
