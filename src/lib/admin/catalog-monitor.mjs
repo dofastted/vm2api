@@ -126,6 +126,7 @@ function collectGeminiSlotModels(env, out) {
 export async function syncGeminiCatalog({
   callGeminiHost = null,
   resolveGeminiProxy = null,
+  resolveGeminiProxyEgressOptions = null,
   apiEndpointStore = null,
   cfg = null,
   refreshModelsDev = false,
@@ -155,11 +156,21 @@ export async function syncGeminiCatalog({
           proxyUrl = null
         }
         if (!proxyUrl) continue
+        let egressOptions = null
+        try {
+          egressOptions =
+            typeof resolveGeminiProxyEgressOptions === 'function'
+              ? resolveGeminiProxyEgressOptions(env.proxy_id, env.id)
+              : null
+        } catch {
+          egressOptions = null
+        }
         try {
           const refreshed = await callGeminiHost('models', {
             id: env.id,
             proxy_id: env.proxy_id,
             proxy_url: proxyUrl,
+            ...(egressOptions ? { egress_options: egressOptions } : {}),
           })
           collectGeminiSlotModels(refreshed, discovered)
           liveFetched += 1
@@ -269,13 +280,14 @@ export async function syncGeminiCatalog({
 }
 
 /**
- * @param {{ projectRoot: string, codexCatalogVersion?: () => string, callGeminiHost?: Function | null, resolveGeminiProxy?: Function | null, getApiEndpointStore?: () => any, cfg?: any, log?: (event: object) => void }} opts
+ * @param {{ projectRoot: string, codexCatalogVersion?: () => string, callGeminiHost?: Function | null, resolveGeminiProxy?: Function | null, resolveGeminiProxyEgressOptions?: Function | null, getApiEndpointStore?: () => any, cfg?: any, log?: (event: object) => void }} opts
  */
 export function createCatalogMonitor({
   projectRoot,
   codexCatalogVersion = () => 'auto',
   callGeminiHost = null,
   resolveGeminiProxy = null,
+  resolveGeminiProxyEgressOptions = null,
   getApiEndpointStore = null,
   cfg = null,
   log = () => {},
@@ -297,6 +309,7 @@ export function createCatalogMonitor({
     await syncGeminiCatalog({
       callGeminiHost,
       resolveGeminiProxy,
+      resolveGeminiProxyEgressOptions,
       apiEndpointStore: typeof getApiEndpointStore === 'function' ? getApiEndpointStore() : null,
       cfg,
     })
