@@ -72,6 +72,8 @@ import {
   telemetryUploadInterval,
 } from '../vm/native-telemetry.mjs'
 
+const GEMINI_UNIT_PREFIX = 'gemini:'
+
 export function createRoutingRuntime(ctx) {
   const getRouting = () => (typeof ctx.getRoutingConfig === 'function' ? ctx.getRoutingConfig() : ctx.routingConfig)
   const setRouting = (next) => {
@@ -754,7 +756,7 @@ export function createRoutingRuntime(ctx) {
     // Pool and failover settings hot-reload into the live scheduler and runner.
     // Rebuilding them would drop the seat book and queues while their requests
     // still run (the panel sends `failover` with every routing save).
-    if (body.pool) configureUnitCircuit(routingConfig)
+    if (body.pool || body.gemini) configureUnitCircuit(routingConfig)
     if (body.failover) ctx.failoverRunner?.reloadConfig?.(routingConfig.failover || {})
     const kernelReload = await reloadNeeded
     let geminiSync = null
@@ -915,6 +917,13 @@ export function createRoutingRuntime(ctx) {
     unitCircuit.configure({
       failureThreshold: routingConfig.pool?.circuit_failure_threshold,
       openMs: routingConfig.pool?.circuit_open_ms,
+    })
+    // Gemini environments share the singleton under `gemini:<id>` but follow
+    // gemini.pool.circuit_*, the same values the host hands the CRAGGemini kernel.
+    const geminiPool = normalizeGeminiRouting(routingConfig.gemini).pool
+    unitCircuit.configureScope(GEMINI_UNIT_PREFIX, {
+      failureThreshold: geminiPool.circuit_failure_threshold,
+      openMs: geminiPool.circuit_open_ms,
     })
   }
 
