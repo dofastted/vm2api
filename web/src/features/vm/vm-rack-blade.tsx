@@ -222,7 +222,7 @@ export function GeminiSlotStatus({
 }
 
 /**
- * 席位容量：一条按「已用 / 设置上限」缩放的定宽条。
+ * 执行位容量：一条按「已用 / 设置上限」缩放的定宽条。
  * 已用只含正在跑的请求，以及已排在这台 VM 上的后续请求。对话结束即释放。
  * 悬浮列出实际占着槽的 session。上限可设到 20，容量条宽度与上限无关。
  */
@@ -245,7 +245,7 @@ export function VmSeats({
       className='inline-flex min-w-0 items-center gap-1.5 whitespace-nowrap'
       title={seatTitle(vm)}
     >
-      {compact ? null : <span>席位</span>}
+      {compact ? null : <span>执行位</span>}
       <span
         aria-hidden='true'
         className={cn(

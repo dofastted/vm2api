@@ -724,7 +724,7 @@ export function PoolPane({
                   <FamilyLimitSelect
                     label='每会话子代理上限'
                     min={0}
-                    emptyText='关闭(子代理各占一个席位)'
+                    emptyText='关闭(子代理各占一个执行位)'
                     value={
                       typeof poolDraft.max_subagents_per_session === 'number'
                         ? poolDraft.max_subagents_per_session

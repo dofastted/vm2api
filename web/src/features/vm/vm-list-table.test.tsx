@@ -122,13 +122,13 @@ describe('VM row interaction and health', () => {
     expect(block).toContain('本槽钉住；全局 关闭')
     expect(
       renderToStaticMarkup(<VmSchedulingBlock vm={{ id: 'legacy' }} />)
-    ).toContain('关闭(子代理各占一个席位)')
+    ).toContain('关闭(子代理各占一个执行位)')
     const editor = renderToStaticMarkup(
       <QueryClientProvider client={new QueryClient()}>
         <VmSchedulingEditor vm={vm} />
       </QueryClientProvider>
     )
-    expect(editor).toContain('默认控制同时占用的客户端会话席位数')
+    expect(editor).toContain('默认控制同时占用的物理执行位数')
     expect(editor).toContain('跟随 · 6')
     expect(editor).toMatch(/<select[^>]*aria-label="每会话子代理上限"/)
     expect(editor).toContain('<option value="20">20</option>')
@@ -371,7 +371,7 @@ describe('VM account column kernel label', () => {
       expect(html).toContain('上次宿主推理已取消')
       expect(html).toContain('上次宿主推理成功')
       expect(html).toContain('上次宿主推理失败')
-      expect(html).toContain('Google 地区资格受限')
+      expect(html).toContain('Google 403：地区或账号受限')
       expect(html).toContain('gemini-2.5-pro')
       expect(html).not.toContain('无效凭证')
       expect(html).toContain('role="switch"')
@@ -623,7 +623,7 @@ describe('Gemini VM page full UI alignment', () => {
     expect(rackL).toContain('$28.90')
     expect(rackL).toContain('刷新数据')
     expect(rackL).toContain('拉取模型')
-    expect(rackL).toContain('席位')
+    expect(rackL).toContain('执行位')
 
     const rackS = renderNode(<VmRack vms={[gemini]} filter='all' size='s' />)
     expect(rackS).toContain('--tier-gemini-solid')

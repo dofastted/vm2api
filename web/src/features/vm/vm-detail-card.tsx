@@ -133,7 +133,7 @@ function CardBody({ vm, accounts }: { vm: Vm; accounts?: UsageAccountRow[] }) {
             )}
             title={seatTitle(vm)}
           >
-            席位 {Number(vm.seats_used) || 0}/{vm.seats_max}
+            执行位 {Number(vm.seats_used) || 0}/{vm.seats_max}
             {queued > 0 ? ` · 排队 ${queued}` : ''}
           </span>
         ) : null}
