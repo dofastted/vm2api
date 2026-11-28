@@ -2266,6 +2266,19 @@ export function createGeminiScheduler({
             let passthroughProtocol = null
             let outboundBody = null
 
+            const lockedPromptMode = promptPolicy?.preset === 'zero' ? 'zero' : 'official_full'
+            const sanitizePassthroughInbound = (src) => {
+              const {
+                system_prompt_mode: _dropPromptMode,
+                crag_prompt: _dropCragPrompt,
+                gateway_policy: _dropGatewayPolicy,
+                restart_resume: _dropRestartResume,
+                request_id: _dropRequestId,
+                ...clean
+              } = src
+              return clean
+            }
+
             if (
               target === 'antigravity' &&
               inboundProtocol === 'anthropic' &&
@@ -2277,9 +2290,9 @@ export function createGeminiScheduler({
               wireProtocol = 'anthropic'
               passthroughProtocol = 'anthropic'
               outboundBody = {
-                ...rawInboundBody,
+                ...sanitizePassthroughInbound(rawInboundBody),
                 model: resolved.upstreamModel,
-                ...(promptPolicy?.preset === 'zero' ? { system_prompt_mode: 'zero' } : {}),
+                system_prompt_mode: lockedPromptMode,
               }
               onOutboundBody?.(outboundBody, { target, wireProtocol: 'anthropic', source: 'craggemini_anthropic' })
             } else if (
@@ -2291,10 +2304,10 @@ export function createGeminiScheduler({
               (supportsGeminiWire || (!targetBodyFor && !geminiBody))
             ) {
               const candidateBody = {
-                ...rawInboundBody,
+                ...sanitizePassthroughInbound(rawInboundBody),
                 model: resolved.upstreamModel,
                 ...(outboundConversationId ? { conversation_id: outboundConversationId } : {}),
-                ...(promptPolicy?.preset === 'zero' ? { system_prompt_mode: 'zero' } : {}),
+                system_prompt_mode: lockedPromptMode,
               }
               const preparedGemini = prepareDirectNativeTurnBody(resolved.upstreamModel, candidateBody, {
                 preserveThought: true,

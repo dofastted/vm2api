@@ -3486,11 +3486,23 @@ test('Anthropic native passthrough skips IR conversion, strips kin_provider_resu
   ]
 
   const resStream = ccMakeRes()
-  await handler(ccMakeReq({ url: '/v1/messages', body: rawBody }), resStream)
+  await handler(
+    ccMakeReq({
+      url: '/v1/messages',
+      body: { ...rawBody, system_prompt_mode: 'zero', crag_prompt: 'client-injected-bypass' },
+    }),
+    resStream,
+  )
   assert.equal(resStream.statusCode, 200)
   assert.equal(directCalls.length, 1)
   assert.equal(directCalls[0].wireProtocol, 'anthropic')
   assert.equal(directCalls[0].providerResult, true)
+  assert.equal(
+    directCalls[0].bodyObj.system_prompt_mode,
+    'official_full',
+    'client-supplied system_prompt_mode must never override operator promptPolicy',
+  )
+  assert.equal(directCalls[0].bodyObj.crag_prompt, undefined, 'client-supplied crag_prompt must be stripped')
   assert.match(directCalls[0].conversationId, /^cs_[a-f0-9]{24}$/)
   assert.notEqual(directCalls[0].conversationId, sessionUuid, 'outbound conversation_id must be tenant-scoped')
   // Native Anthropic payload passed through untouched (no contents[] conversion, no ZWSP, is_error preserved).
