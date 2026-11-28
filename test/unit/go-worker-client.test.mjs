@@ -238,7 +238,15 @@ test('worker canonicalizes passthrough bodies before either kernel', () => {
       cragPrint,
     })
     assert.equal(out.body.settings, undefined)
-    assert.deepEqual(out.body.output_config?.format, { type: 'json_schema', schema: { type: 'object' } })
+    // Only the CRAG boundary rectifier closes object schemas (a schema without
+    // `additionalProperties: false` is rejected upstream with a 400); the cli-node
+    // path keeps the converted schema as is.
+    assert.deepEqual(
+      out.body.output_config?.format,
+      cragPrint
+        ? { type: 'json_schema', schema: { type: 'object', additionalProperties: false } }
+        : { type: 'json_schema', schema: { type: 'object' } },
+    )
     assert.deepEqual(out.body.messages[0].content, [{ type: 'text', text: 'hello' }])
     assert.deepEqual(out.body.crag_prompt, cragPrint ? body.crag_prompt : undefined)
   }
