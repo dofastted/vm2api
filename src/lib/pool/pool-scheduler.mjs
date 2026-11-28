@@ -954,6 +954,18 @@ export class PoolScheduler extends EventEmitter {
     return true
   }
 
+  /**
+   * Clear the Rust scheduler-side penalty of a Codex VM node. A revoked grant parks the node
+   * indefinitely (`oauth_revoked`, until = MAX_SAFE_INTEGER); re-authorizing only reset the
+   * JS-side hold, so requests kept failing with `pinned node codex_vm:... is busy` until the
+   * scheduler restarted (#2086). `unrestVmNode` above stays Claude-only on purpose.
+   */
+  unrestCodexNode(vmId) {
+    if (!vmId || !this.schedulerRuntime?.unrestNode) return false
+    void this.schedulerRuntime.unrestNode(formatNodeKey('codex_vm', vmId)).catch(() => {})
+    return true
+  }
+
   /** Rust `node_cooldown` of Claude slots by vm id (see SchedulerRuntime#activeNodePenalties). */
   nodePenalties(nowMs = Date.now()) {
     return this.schedulerRuntime?.activeNodePenalties?.(nowMs) || new Map()
