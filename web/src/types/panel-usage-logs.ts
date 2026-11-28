@@ -110,11 +110,33 @@ export type ReasoningEffort =
   | 'max'
   | 'ultra'
 
+/** 进行中请求（Redis 实时态）元数据。全部可选，向后兼容。 */
+export type UsageLogLiveMeta = {
+  phase?: string
+  attempt_count?: number
+  attemptCount?: number
+  started_at?: number
+  startedAt?: number
+  ttft_ms?: number | null
+  ttftMs?: number | null
+  vm_id?: string | null
+  vmId?: string | null
+  account_id?: string | null
+  accountId?: string | null
+  active_provider?: string | null
+  activeProvider?: string | null
+}
+
 /** 滚动日志的一行。`null` = 本行该字段为空（vm2api 不产出的 hub 字段已整体删去）。 */
 export type UsageLogRow = {
   /** `usage_logs.id`（`log_<12hex>`），游标 tiebreaker。 */
   id: string
   requestId: string | null
+  /** 是否仍在处理中（Redis 在飞请求合并到第 1 页顶部时为 true）。 */
+  in_flight?: boolean
+  inFlight?: boolean
+  /** 进行中请求的实时阶段与当前尝试节点。 */
+  _live?: UsageLogLiveMeta | null
   /** ISO-8601，请求完成时刻。 */
   createdAt: string
   userId: string | null
@@ -329,7 +351,7 @@ export type UsageLogFilterOptions = {
 /** `GET /api/panel/usage-logs/session-suggestions?q=&limit=` 的 `data`：出站会话 id 前缀匹配，最新优先。 */
 export type UsageLogSessionSuggestions = string[]
 
-/** 近 N 分钟内有请求的出站会话（vm2api 只在请求完成时落库，没有「进行中」态）。 */
+/** 近 N 分钟内有请求（含进行中请求）的出站会话。 */
 export type ActiveSession = {
   sessionId: string
   /** 窗口内仅 1 次请求且无工具（旁路请求），不与其它会话合并。 */
@@ -350,6 +372,12 @@ export type ActiveSession = {
   lastDurationMs: number | null
   totalTokens: number
   totalCost: number
+  /** 该会话当前是否有进行中的请求。 */
+  in_progress?: boolean
+  inProgress?: boolean
+  /** 该会话当前在飞请求并发数。 */
+  inflight_count?: number
+  inflightCount?: number
 }
 
 /** `GET /api/panel/usage-logs/active-sessions?minutes=5&limit=50` 的 `data`。 */

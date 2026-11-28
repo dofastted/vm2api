@@ -13,7 +13,9 @@
  * migrations so this local addition cannot take a migration number later.
  */
 import crypto from 'node:crypto'
-import { getDb } from '../db/database.mjs'
+import { DB_INSTANCE_ID, getDb, isDbOpen } from '../db/database.mjs'
+import { enqueueWrite, writeBehindArmed } from '../db/write-behind.mjs'
+import { getCacheRuntime } from '../cache/index.mjs'
 import { mapThinkingBlocks } from '../protocol/anthropic-policy.mjs'
 import { mergeConsecutiveAnthropicMessages, messageHasTurnControls } from '../protocol/sanitize.mjs'
 
@@ -22,6 +24,10 @@ const MIN_SIGNATURE = 24
 const TTL_MS = 30 * 24 * 60 * 60 * 1000
 const PURGE_EVERY_MS = 60 * 60 * 1000
 const REFRESH_AFTER_MS = 24 * 60 * 60 * 1000
+const OWNER_CACHE_PREFIX = 'thinking:owner:'
+const OWNER_CACHE_TTL_MS = 10 * 60 * 1000
+const REFRESH_THROTTLE_MS = 60 * 1000
+const BATCH_INSERT_CHUNK = 100
 
 /** Stable key for one signed thinking block, or null when it carries no usable signature. */
 export function thinkingSignatureKey(block) {
@@ -34,11 +40,70 @@ export function thinkingSignatureKey(block) {
 
 export class ThinkingOwnerStore {
   /** `db` pins a connection (tests); otherwise the process database, re-read so a restore rebinds. */
-  constructor({ db = null, ttlMs = TTL_MS } = {}) {
+  constructor({ db = null, ttlMs = TTL_MS, writeBehind = null } = {}) {
     this.pinned = db
     this.ttlMs = ttlMs
+    this._explicitWriteBehind = typeof writeBehind === 'boolean' ? writeBehind : null
     this.boundDb = null
     this.lastPurge = 0
+    this._lastRefreshAt = new Map()
+  }
+
+  _isPrimaryDb(db) {
+    return isDbOpen() && db === getDb()
+  }
+
+  _cacheKey(db, sigKey) {
+    if (this._isPrimaryDb(db)) return `${OWNER_CACHE_PREFIX}${sigKey}`
+    return `${OWNER_CACHE_PREFIX}iso:${db?.[DB_INSTANCE_ID] || 'isolated'}:${sigKey}`
+  }
+
+  _shouldWriteBehind(db) {
+    if (this._explicitWriteBehind !== null) return this._explicitWriteBehind
+    return writeBehindArmed() && this._isPrimaryDb(db)
+  }
+
+  _batchInsertSync(db, keys, account, now) {
+    for (let i = 0; i < keys.length; i += BATCH_INSERT_CHUNK) {
+      const chunk = keys.slice(i, i + BATCH_INSERT_CHUNK)
+      if (chunk.length === 1) {
+        this.sql.insert.run(chunk[0], account, now)
+        continue
+      }
+      const placeholders = chunk.map(() => '(?, ?, ?)').join(', ')
+      const params = []
+      for (const k of chunk) params.push(k, account, now)
+      db.prepare(
+        `INSERT OR IGNORE INTO thinking_signature_owners (key, account_id, created_at) VALUES ${placeholders}`,
+      ).run(...params)
+    }
+  }
+
+  _scheduleRefresh(db, foundKeys, now) {
+    if (!foundKeys.length) return
+    const toRefresh = []
+    for (const k of foundKeys) {
+      const last = this._lastRefreshAt.get(k) || 0
+      if (now - last >= REFRESH_THROTTLE_MS) {
+        this._lastRefreshAt.set(k, now)
+        toRefresh.push(k)
+      }
+    }
+    if (this._lastRefreshAt.size > 8192) {
+      this._lastRefreshAt.clear()
+    }
+    if (!toRefresh.length) return
+    const list = JSON.stringify(toRefresh)
+    const run = () => {
+      try {
+        this.sql?.refresh?.run(now, list, now - REFRESH_AFTER_MS)
+      } catch {}
+    }
+    if (this._shouldWriteBehind(db)) {
+      enqueueWrite(run)
+    } else {
+      run()
+    }
   }
 
   statements() {
@@ -68,6 +133,7 @@ export class ThinkingOwnerStore {
       purge: db.prepare('DELETE FROM thinking_signature_owners WHERE created_at < ?'),
     }
     this.boundDb = db
+    this._lastRefreshAt.clear()
     return this.sql
   }
 
@@ -79,22 +145,173 @@ export class ThinkingOwnerStore {
     const sql = this.statements()
     if (!sql) return null
     const found = new Map()
-    if (!keys.length) return found
-    const list = JSON.stringify(keys)
-    for (const row of sql.owners.all(list)) found.set(row.key, row.account_id)
-    if (found.size) sql.refresh.run(now, list, now - REFRESH_AFTER_MS)
+    const unique = [...new Set((keys || []).filter(Boolean))]
+    if (!unique.length) return found
+
+    const db = this.boundDb
+    const client = getCacheRuntime()?.client
+    const useCache = Boolean(client?.enabled)
+    const isPrimary = this._isPrimaryDb(db)
+    const missing = []
+
+    if (useCache) {
+      for (const k of unique) {
+        const hit = client.getL1(this._cacheKey(db, k))
+        if (hit.hit && typeof hit.value === 'string' && hit.value) {
+          found.set(k, hit.value)
+        } else {
+          missing.push(k)
+        }
+      }
+    } else {
+      missing.push(...unique)
+    }
+
+    if (missing.length) {
+      const list = JSON.stringify(missing)
+      for (const row of sql.owners.all(list)) {
+        found.set(row.key, row.account_id)
+        if (useCache) {
+          const ck = this._cacheKey(db, row.key)
+          client.setL1(ck, row.account_id, OWNER_CACHE_TTL_MS, 0, true)
+          if (isPrimary && client.hasRedis) {
+            client
+              .set(ck, row.account_id, {
+                ttlMs: OWNER_CACHE_TTL_MS,
+                l1TtlMs: OWNER_CACHE_TTL_MS,
+                jitter: true,
+                prefixes: [OWNER_CACHE_PREFIX],
+              })
+              .catch(() => {})
+          }
+        }
+      }
+    }
+
+    if (found.size) this._scheduleRefresh(db, [...found.keys()], now)
+    return found
+  }
+
+  /**
+   * Async L1 -> Redis L2 MGET -> DB backfill lookup for thinking signature owners.
+   * Prewarms L1 so subsequent sync `filterThinkingForAccount` / `dropForeignThinkingForCrag`
+   * calls resolve with 0 DB RPCs.
+   */
+  async ownersOfAsync(keys, now = Date.now()) {
+    const sql = this.statements()
+    if (!sql) return null
+    const found = new Map()
+    const unique = [...new Set((keys || []).filter(Boolean))]
+    if (!unique.length) return found
+
+    const db = this.boundDb
+    const client = getCacheRuntime()?.client
+    const useCache = Boolean(client?.enabled)
+    const isPrimary = this._isPrimaryDb(db)
+    const missingL1 = []
+
+    if (useCache) {
+      for (const k of unique) {
+        const hit = client.getL1(this._cacheKey(db, k))
+        if (hit.hit && typeof hit.value === 'string' && hit.value) {
+          found.set(k, hit.value)
+        } else {
+          missingL1.push(k)
+        }
+      }
+    } else {
+      missingL1.push(...unique)
+    }
+
+    let missingDb = missingL1
+    if (missingL1.length && useCache && isPrimary && client.hasRedis) {
+      const l2Keys = missingL1.map((k) => this._cacheKey(db, k))
+      const l2Vals = await client.mget(l2Keys, { prefixes: [OWNER_CACHE_PREFIX] })
+      if (Array.isArray(l2Vals)) {
+        missingDb = []
+        for (let i = 0; i < missingL1.length; i += 1) {
+          const val = l2Vals[i]
+          if (typeof val === 'string' && val) {
+            found.set(missingL1[i], val)
+            client.setL1(l2Keys[i], val, OWNER_CACHE_TTL_MS, 0, true)
+          } else {
+            missingDb.push(missingL1[i])
+          }
+        }
+      }
+    }
+
+    if (missingDb.length) {
+      const list = JSON.stringify(missingDb)
+      for (const row of sql.owners.all(list)) {
+        found.set(row.key, row.account_id)
+        if (useCache) {
+          const ck = this._cacheKey(db, row.key)
+          client.setL1(ck, row.account_id, OWNER_CACHE_TTL_MS, 0, true)
+          if (isPrimary && client.hasRedis) {
+            client
+              .set(ck, row.account_id, {
+                ttlMs: OWNER_CACHE_TTL_MS,
+                l1TtlMs: OWNER_CACHE_TTL_MS,
+                jitter: true,
+                prefixes: [OWNER_CACHE_PREFIX],
+              })
+              .catch(() => {})
+          }
+        }
+      }
+    }
+
+    if (found.size) this._scheduleRefresh(db, [...found.keys()], now)
     return found
   }
 
   /** First writer wins: a signature belongs to the account that returned it. */
   record(keys, accountId, now = Date.now()) {
     const account = String(accountId || '')
-    const sql = keys.length && account ? this.statements() : null
+    const unique = [...new Set((keys || []).filter(Boolean))]
+    const sql = unique.length && account ? this.statements() : null
     if (!sql) return
-    for (const key of keys) sql.insert.run(key, account, now)
-    if (now - this.lastPurge >= PURGE_EVERY_MS) {
-      this.lastPurge = now
-      sql.purge.run(now - this.ttlMs)
+
+    const db = this.boundDb
+    const client = getCacheRuntime()?.client
+    const useCache = Boolean(client?.enabled)
+    const isPrimary = this._isPrimaryDb(db)
+
+    // Populate L1/L2 immediately (first-writer-wins: never overwrite an existing owner)
+    if (useCache) {
+      for (const key of unique) {
+        const ck = this._cacheKey(db, key)
+        if (!client.getL1(ck).hit) {
+          client.setL1(ck, account, OWNER_CACHE_TTL_MS, 0, true)
+          if (isPrimary && client.hasRedis) {
+            client
+              .set(ck, account, {
+                ttlMs: OWNER_CACHE_TTL_MS,
+                l1TtlMs: OWNER_CACHE_TTL_MS,
+                jitter: true,
+                prefixes: [OWNER_CACHE_PREFIX],
+              })
+              .catch(() => {})
+          }
+        }
+      }
+    }
+
+    const doPurge = now - this.lastPurge >= PURGE_EVERY_MS
+    if (doPurge) this.lastPurge = now
+
+    const persist = () => {
+      try {
+        this._batchInsertSync(db, unique, account, now)
+        if (doPurge) sql.purge.run(now - this.ttlMs)
+      } catch {}
+    }
+
+    if (this._shouldWriteBehind(db)) {
+      enqueueWrite(persist)
+    } else {
+      persist()
     }
   }
 }

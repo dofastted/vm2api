@@ -4,7 +4,8 @@
  * rate_multiplier / rpm_limit / description / status.
  */
 
-import { getDb } from '../database.mjs'
+import { DB_INSTANCE_ID, getDb, isDbOpen } from '../database.mjs'
+import { getCacheRuntime, notifyDbTablesMutated } from '../../cache/index.mjs'
 
 export const DEFAULT_GROUP_ID = 1
 
@@ -53,6 +54,12 @@ export class GroupsRepo {
     return this.getById(DEFAULT_GROUP_ID)
   }
 
+  _groupCacheKey(id) {
+    const gid = id ?? DEFAULT_GROUP_ID
+    if (isDbOpen() && this.db === getDb()) return String(gid)
+    return `${this.db?.[DB_INSTANCE_ID] || 'isolated'}:${gid}`
+  }
+
   /** Patch editable attributes only (name/platform/id are fixed). */
   update(id, patch = {}) {
     const cols = EDITABLE.filter((c) => patch[c] !== undefined)
@@ -66,12 +73,43 @@ export class GroupsRepo {
       new Date().toISOString(),
       id,
     )
+    const cacheKey = this._groupCacheKey(id)
+    getCacheRuntime()
+      .entity.invalidateGroup(cacheKey)
+      .catch(() => {})
+    if (isDbOpen() && this.db === getDb()) {
+      notifyDbTablesMutated(['groups'])
+    }
     return this.getById(id)
   }
 
-  /** Effective billing multiplier for a group id (missing group → 1). */
+  /** Effective billing multiplier for a group id (missing group → 1; explicit 0 preserved). */
   rateMultiplier(id) {
-    const g = this.getById(id ?? DEFAULT_GROUP_ID)
-    return g ? g.rate_multiplier : 1
+    const gid = id ?? DEFAULT_GROUP_ID
+    const cache = getCacheRuntime()
+    if (!cache?.client?.enabled) {
+      const g = this.getById(gid)
+      return g ? g.rate_multiplier : 1
+    }
+    const cacheKey = this._groupCacheKey(gid)
+    return cache.entity.getGroupRateMultiplierSync(cacheKey, () => {
+      const g = this.getById(gid)
+      return g ? g.rate_multiplier : 1
+    })
+  }
+
+  /** Async L1+Redis L2 billing multiplier lookup for request hot path. */
+  async rateMultiplierAsync(id) {
+    const gid = id ?? DEFAULT_GROUP_ID
+    const cache = getCacheRuntime()
+    if (!cache?.client?.enabled) {
+      const g = this.getById(gid)
+      return g ? g.rate_multiplier : 1
+    }
+    const cacheKey = this._groupCacheKey(gid)
+    return await cache.entity.getGroupRateMultiplier(cacheKey, () => {
+      const g = this.getById(gid)
+      return g ? g.rate_multiplier : 1
+    })
   }
 }

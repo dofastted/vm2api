@@ -7,6 +7,31 @@
  * Soft delete: rows with deleted_at are invisible to every query here.
  */
 
+import { DB_INSTANCE_ID, getDb, isDbOpen } from '../database.mjs'
+import { getCacheRuntime, notifyDbTablesMutated } from '../../cache/index.mjs'
+
+const USER_CACHE_TTL_MS = 60_000
+let lastPrimaryDbId = null
+
+function cloneRec(rec) {
+  return rec ? { ...rec } : null
+}
+
+function resolveCacheScope(db) {
+  const primary = isDbOpen() && db === getDb()
+  if (!primary) {
+    return { primary: false, prefix: `${db?.[DB_INSTANCE_ID] || 'isolated'}:` }
+  }
+  const dbId = db?.[DB_INSTANCE_ID] || null
+  if (dbId && lastPrimaryDbId && dbId !== lastPrimaryDbId) {
+    getCacheRuntime()
+      .entity.invalidateUsers()
+      .catch(() => {})
+  }
+  if (dbId) lastPrimaryDbId = dbId
+  return { primary: true, prefix: '' }
+}
+
 const COLUMNS = [
   'id',
   'email',
@@ -75,12 +100,78 @@ export class UsersRepo {
     return this._list.all().map(rowToRec)
   }
 
+  _cacheKeyId(id) {
+    const { prefix } = resolveCacheScope(this.db)
+    return `${prefix}${String(id)}`
+  }
+
+  _cacheKeyUsername(username) {
+    const { prefix } = resolveCacheScope(this.db)
+    return `${prefix}${String(username || '')
+      .trim()
+      .toLowerCase()}`
+  }
+
+  invalidateUser({ id = null, username = null, prevUsername = null } = {}, { notifyTable = true } = {}) {
+    const { primary, prefix } = resolveCacheScope(this.db)
+    const entity = getCacheRuntime().entity
+    const norm = String(username || '')
+      .trim()
+      .toLowerCase()
+    const prevNorm = String(prevUsername || '')
+      .trim()
+      .toLowerCase()
+    const cacheId = id ? `${prefix}${String(id)}` : null
+    const cacheName = norm ? `${prefix}${norm}` : null
+    if (cacheId || cacheName) {
+      entity.invalidateUser({ id: cacheId, username: cacheName }).catch(() => {})
+    }
+    if (prevNorm && prevNorm !== norm) {
+      entity.invalidateUser({ username: `${prefix}${prevNorm}` }).catch(() => {})
+    }
+    if (notifyTable && primary) {
+      notifyDbTablesMutated(['users'])
+    }
+  }
+
   getById(id) {
-    return rowToRec(this._get.get(id))
+    if (!id) return null
+    const key = this._cacheKeyId(id)
+    const val = getCacheRuntime().entity.getPanelUserByIdSync(key, () => rowToRec(this._get.get(id)), {
+      ttlMs: USER_CACHE_TTL_MS,
+    })
+    return cloneRec(val)
+  }
+
+  async getByIdAsync(id) {
+    if (!id) return null
+    const key = this._cacheKeyId(id)
+    const val = await getCacheRuntime().entity.getPanelUserById(key, () => rowToRec(this._get.get(id)), {
+      ttlMs: USER_CACHE_TTL_MS,
+    })
+    return cloneRec(val)
   }
 
   getByUsername(username) {
-    return rowToRec(this._getByName.get(String(username || '').trim()))
+    const trimmed = String(username || '').trim()
+    if (!trimmed) return null
+    const key = this._cacheKeyUsername(trimmed)
+    const val = getCacheRuntime().entity.getPanelUserByUsernameSync(key, () => rowToRec(this._getByName.get(trimmed)), {
+      ttlMs: USER_CACHE_TTL_MS,
+    })
+    return cloneRec(val)
+  }
+
+  async getByUsernameAsync(username) {
+    const trimmed = String(username || '').trim()
+    if (!trimmed) return null
+    const key = this._cacheKeyUsername(trimmed)
+    const val = await getCacheRuntime().entity.getPanelUserByUsername(
+      key,
+      () => rowToRec(this._getByName.get(trimmed)),
+      { ttlMs: USER_CACHE_TTL_MS },
+    )
+    return cloneRec(val)
   }
 
   insert(rec) {
@@ -96,10 +187,12 @@ export class UsersRepo {
         return rec[c] ?? null
       }),
     )
+    this.invalidateUser({ id: rec.id, username: rec.username })
     return this.getById(rec.id)
   }
 
   update(rec) {
+    const prev = this.getById(rec.id)
     const cols = COLUMNS.filter((c) => c !== 'id' && c !== 'deleted_at')
     const sql = `UPDATE users SET ${cols.map((c) => `${c} = ?`).join(', ')} WHERE id = ? AND deleted_at IS NULL`
     this.db.prepare(sql).run(
@@ -114,13 +207,19 @@ export class UsersRepo {
       }),
       rec.id,
     )
+    this.invalidateUser({ id: rec.id, username: rec.username, prevUsername: prev?.username })
     return this.getById(rec.id)
   }
 
   /** Soft-delete the user by setting `deleted_at`. */
   remove(id) {
+    const prev = this.getById(id)
     const now = new Date().toISOString()
-    return this._softDelete.run(now, now, id).changes > 0
+    const changed = this._softDelete.run(now, now, id).changes > 0
+    if (changed) {
+      this.invalidateUser({ id, username: prev?.username })
+    }
+    return changed
   }
 
   countEnabledRole(role) {
@@ -130,7 +229,9 @@ export class UsersRepo {
 
   /** Atomic balance credit/debit (redeem, billing). Negative delta = charge. */
   addBalance(id, delta) {
+    const prev = this.getById(id)
     this._addBalance.run(Number(delta) || 0, new Date().toISOString(), id)
+    this.invalidateUser({ id, username: prev?.username })
     return this.getById(id)
   }
 }

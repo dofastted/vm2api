@@ -6,6 +6,9 @@
  * Byte-level contract aligned with `web/src/features/pools/api.ts`,
  * `web/src/types/panel-pools.ts`, and PRD v4 (§4.2, §6.3, §7.3 D1-D4).
  */
+import { computeEtag, matchesEtag } from '../cache/cache-client.mjs'
+import { getCacheRuntime, notifyDbTablesMutated } from '../cache/index.mjs'
+import { DB_INSTANCE_ID, getDb as getPrimaryDb, isDbOpen } from '../db/database.mjs'
 import {
   SCHEDULER_POOL_DEFAULTS,
   SchedulerPoolsRepo,
@@ -14,6 +17,7 @@ import {
   normalizeProviderScope,
   slugifyPoolName,
 } from '../db/repos/scheduler-pools-repo.mjs'
+import { corsHeadersForRequest } from '../http/cors.mjs'
 import { resolveCredentialScheduleLevel } from '../pool/credential-weight.mjs'
 import {
   SchedulerApiError,
@@ -30,6 +34,7 @@ import { activeCragManifestForSlot, resolveKernelDataplane } from '../vm/slot-en
 import { isCodexVm } from '../vm/vm-kind.mjs'
 import { listVms } from '../vm/vm-registry.mjs'
 import { resolvePoolAccessForKey } from './key-scope.mjs'
+import { panelIdentity } from './panel-acl.mjs'
 import * as panel from './panel-api.mjs'
 import { PLATFORM_SCOPE, ownerScopeFromApiKey } from './resource-owner.mjs'
 
@@ -924,6 +929,40 @@ export function createSchedulerPoolsHandler({
   const resolveDb = () => (typeof getDb === 'function' ? getDb() : apiKeyStore?.db)
   const resolveRouting = () => (typeof getRouting === 'function' ? getRouting() || {} : {})
   const resolveRuntime = () => (typeof schedulerRuntime === 'function' ? schedulerRuntime() : schedulerRuntime)
+  const cacheScopeOf = (db) => {
+    if (db && isDbOpen() && db === getPrimaryDb()) {
+      return db.engine === 'postgres' ? 'pg' : db[DB_INSTANCE_ID] || 'sqlite'
+    }
+    return db?.[DB_INSTANCE_ID] || 'isolated'
+  }
+  const invalidatePoolsCache = (tables = ['scheduler_pools']) => {
+    notifyDbTablesMutated(tables)
+    const cache = getCacheRuntime()
+    cache.dashboard.invalidateNamespace('panel').catch(() => {})
+    cache.entity.invalidatePoolAccess().catch(() => {})
+  }
+  const sendCachedJson = (req, res, status, payload, { etag = null, cacheStatus = null } = {}) => {
+    const tag = etag || computeEtag(payload)
+    if (typeof res?.setHeader === 'function') {
+      res.setHeader('ETag', tag)
+      res.setHeader('Cache-Control', 'private, no-cache')
+      if (cacheStatus) res.setHeader('X-Snapshot-Cache', cacheStatus)
+    }
+    const inm = req?.headers?.['if-none-match']
+    if (inm && matchesEtag(inm, tag) && typeof res?.writeHead === 'function' && typeof res?.end === 'function') {
+      res.writeHead(
+        304,
+        corsHeadersForRequest(req, {
+          ETag: tag,
+          'Cache-Control': 'private, no-cache',
+          ...(cacheStatus ? { 'X-Snapshot-Cache': cacheStatus } : {}),
+        }),
+      )
+      res.end()
+      return true
+    }
+    return json(res, status, payload)
+  }
   const syncRuntimeConfig = async (reason) => {
     const rt = resolveRuntime()
     if (!rt || typeof rt.syncConfigNow !== 'function') return
@@ -1005,42 +1044,62 @@ export function createSchedulerPoolsHandler({
 
     // GET /api/panel/pools
     if (req.method === 'GET' && p === '/api/panel/pools') {
-      const liveCtx = buildLiveContext(repo)
-      const allBound = repo.listAllBoundKeySummaries()
-      const boundByPool = new Map()
-      for (const b of allBound) {
-        const list = boundByPool.get(b.pool_id) || []
-        list.push(b)
-        boundByPool.set(b.pool_id, list)
-      }
+      const ident = panelIdentity(req)
+      const filterScope = url?.searchParams?.get('provider_scope') || null
+      const filterRole = url?.searchParams?.get('pool_role') || null
+      const filterPrompt = url?.searchParams?.get('system_prompt_mode') || null
+      const filterTag = url?.searchParams?.get('plan_tag') || null
+      const filterEnabled = url?.searchParams?.get('enabled') || null
+      const bypass = url?.searchParams?.get('refresh') === '1'
+      const payload = await getCacheRuntime().dashboard.getOrSetSWR(
+        'panel',
+        {
+          ep: 'pools',
+          scope: cacheScopeOf(db),
+          project: cfg?.paths?.project || null,
+          role: ident.role,
+          provider_scope: filterScope ? normalizeProviderScope(filterScope) : null,
+          pool_role: filterRole,
+          system_prompt_mode: filterPrompt,
+          plan_tag: filterTag,
+          enabled: filterEnabled,
+        },
+        () => {
+          const liveCtx = buildLiveContext(repo)
+          const allBound = repo.listAllBoundKeySummaries()
+          const boundByPool = new Map()
+          for (const b of allBound) {
+            const list = boundByPool.get(b.pool_id) || []
+            list.push(b)
+            boundByPool.set(b.pool_id, list)
+          }
 
-      let pools = repo.list().map((pool) => enrichPoolView(pool, boundByPool.get(pool.id) || [], liveCtx))
+          let pools = repo.list().map((pool) => enrichPoolView(pool, boundByPool.get(pool.id) || [], liveCtx))
 
-      const filterScope = url?.searchParams?.get('provider_scope')
-      if (filterScope) {
-        const norm = normalizeProviderScope(filterScope)
-        pools = pools.filter((item) => item.provider_scope === norm)
-      }
-      const filterRole = url?.searchParams?.get('pool_role')
-      if (filterRole) {
-        pools = pools.filter((item) => item.pool_role === filterRole)
-      }
-      const filterPrompt = url?.searchParams?.get('system_prompt_mode')
-      if (filterPrompt) {
-        pools = pools.filter((item) => item.system_prompt_mode === filterPrompt)
-      }
-      const filterTag = url?.searchParams?.get('plan_tag')
-      if (filterTag) {
-        pools = pools.filter((item) => (item.plan_tags || []).includes(filterTag))
-      }
-      const filterEnabled = url?.searchParams?.get('enabled')
-      if (filterEnabled === '1' || filterEnabled === 'true') {
-        pools = pools.filter((item) => item.enabled)
-      } else if (filterEnabled === '0' || filterEnabled === 'false') {
-        pools = pools.filter((item) => !item.enabled)
-      }
+          if (filterScope) {
+            const norm = normalizeProviderScope(filterScope)
+            pools = pools.filter((item) => item.provider_scope === norm)
+          }
+          if (filterRole) {
+            pools = pools.filter((item) => item.pool_role === filterRole)
+          }
+          if (filterPrompt) {
+            pools = pools.filter((item) => item.system_prompt_mode === filterPrompt)
+          }
+          if (filterTag) {
+            pools = pools.filter((item) => (item.plan_tags || []).includes(filterTag))
+          }
+          if (filterEnabled === '1' || filterEnabled === 'true') {
+            pools = pools.filter((item) => item.enabled)
+          } else if (filterEnabled === '0' || filterEnabled === 'false') {
+            pools = pools.filter((item) => !item.enabled)
+          }
 
-      return json(res, 200, panel.ok({ pools }))
+          return panel.ok({ pools })
+        },
+        { freshTtlMs: 5_000, ttlMs: 15_000, bypass },
+      )
+      return sendCachedJson(req, res, 200, payload)
     }
 
     // POST /api/panel/pools
@@ -1084,6 +1143,7 @@ export function createSchedulerPoolsHandler({
           }
         }
         const enriched = enrichPoolView(created, repo.listBoundKeySummariesByPool(created.id), liveCtx)
+        invalidatePoolsCache(['scheduler_pools', 'scheduler_pool_members'])
         await syncRuntimeConfig('panel_pool_create')
         return json(res, 201, panel.ok({ pool: enriched, warnings }))
       } catch (e) {
@@ -1163,6 +1223,7 @@ export function createSchedulerPoolsHandler({
           )
         } catch {}
         const enriched = enrichPoolView(updated, repo.listBoundKeySummariesByPool(id), liveCtx)
+        invalidatePoolsCache(['scheduler_pools', 'vm_pools'])
         await syncRuntimeConfig('panel_pool_update')
         return json(res, 200, panel.ok({ pool: enriched, warnings }))
       } catch (e) {
@@ -1207,6 +1268,13 @@ export function createSchedulerPoolsHandler({
           db.prepare('DELETE FROM vm_pools WHERE id = ?').run(id)
         } catch {}
         apiKeyStore?.reload?.()
+        invalidatePoolsCache([
+          'scheduler_pools',
+          'scheduler_pool_members',
+          'api_key_pool_bindings',
+          'api_keys',
+          'vm_pools',
+        ])
         await syncRuntimeConfig('panel_pool_delete')
         return json(res, 200, { ok: true, deleted: Boolean(deleted), id })
       } catch (e) {
@@ -1237,6 +1305,7 @@ export function createSchedulerPoolsHandler({
         })
         const updated = repo.setMembers(id, members)
         const enriched = enrichPoolView(updated, repo.listBoundKeySummariesByPool(id), liveCtx)
+        invalidatePoolsCache(['scheduler_pool_members', 'scheduler_pools'])
         await syncRuntimeConfig('panel_pool_update')
         return json(res, 200, panel.ok({ pool: enriched, warnings }))
       } catch (e) {
@@ -1279,6 +1348,7 @@ export function createSchedulerPoolsHandler({
               : {}),
           })
           const cleared = Number(result?.deleted) || 0
+          invalidatePoolsCache(['scheduler_sticky_bindings'])
           return json(res, 200, {
             ok: true,
             cleared,
@@ -1292,6 +1362,7 @@ export function createSchedulerPoolsHandler({
         }
       }
       const cleared = repo.resetMachineStickyForPool(id, { nodeType, nodeId })
+      invalidatePoolsCache(['scheduler_sticky_bindings'])
       return json(res, 200, { ok: true, cleared, count: cleared, data: { cleared, count: cleared } })
     }
 
@@ -1340,6 +1411,7 @@ export function createSchedulerPoolsHandler({
           } catch {}
         }
         apiKeyStore?.reload?.()
+        invalidatePoolsCache(['api_key_pool_bindings', 'api_keys', 'scheduler_pools'])
         await syncRuntimeConfig('panel_pool_bind_key')
         return json(res, 200, panel.ok({ pool_id: id, api_key_id: apiKeyId, bindings }))
       }
@@ -1374,6 +1446,7 @@ export function createSchedulerPoolsHandler({
         } catch {}
       }
       apiKeyStore?.reload?.()
+      invalidatePoolsCache(['api_key_pool_bindings', 'api_keys', 'scheduler_pools'])
       await syncRuntimeConfig('panel_pool_unbind_key')
       return json(res, 200, panel.ok({ pool_id: id, api_key_id: apiKeyId, bindings }))
     }
@@ -1636,6 +1709,7 @@ export function createSchedulerPoolsHandler({
         const result = await rt.unrestNode(nodeKey, {
           modelScope: body?.model_scope ? String(body.model_scope).trim() : null,
         })
+        invalidatePoolsCache(['scheduler_node_penalties', 'scheduler_pools'])
         return json(
           res,
           200,
@@ -1837,6 +1911,7 @@ export function createSchedulerPoolsHandler({
           try {
             const result = await rt.deleteSticky(filter)
             const deleted = Number(result?.deleted) || 0
+            invalidatePoolsCache(['scheduler_sticky_bindings'])
             return json(res, 200, {
               ok: true,
               deleted,
@@ -1850,6 +1925,7 @@ export function createSchedulerPoolsHandler({
         }
         try {
           const deleted = repo.deleteStickyBindings(filter)
+          invalidatePoolsCache(['scheduler_sticky_bindings'])
           return json(res, 200, { ok: true, deleted, data: { deleted } })
         } catch (e) {
           return json(res, httpStatusForPoolError(e), {
