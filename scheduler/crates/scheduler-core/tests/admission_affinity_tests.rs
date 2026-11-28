@@ -86,6 +86,7 @@ fn base_req(
         exclude_nodes: vec![],
         keep_pin_on_model_gate: false,
         model_gated_node_keys: vec![],
+        skip_session_gate: false,
     }
 }
 

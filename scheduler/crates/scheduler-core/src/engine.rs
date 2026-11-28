@@ -454,22 +454,23 @@ impl SchedulerEngine {
         //    Key uses `start_pool.id` so Turn 1 fallback to P2 and Turn 2 share the exact same gate.
         let gate_key = ScopedSessionKey::new(&start_pool.id, req.model_family, &req.session_id);
         let mut gate_wait_ms = 0u64;
-        let gate_guard: Option<GateHoldGuard> = if !dry_run && !req.is_ephemeral_probe {
-            let t_gate = Instant::now();
-            let g = self
-                .session_gates
-                .acquire(
-                    &gate_key,
-                    req.no_queue,
-                    start_pool.session_queue_max,
-                    start_pool.session_queue_timeout_ms,
-                )
-                .await?;
-            gate_wait_ms = t_gate.elapsed().as_millis() as u64;
-            Some(g)
-        } else {
-            None
-        };
+        let gate_guard: Option<GateHoldGuard> =
+            if !dry_run && !req.is_ephemeral_probe && !req.skip_session_gate {
+                let t_gate = Instant::now();
+                let g = self
+                    .session_gates
+                    .acquire(
+                        &gate_key,
+                        req.no_queue,
+                        start_pool.session_queue_max,
+                        start_pool.session_queue_timeout_ms,
+                    )
+                    .await?;
+                gate_wait_ms = t_gate.elapsed().as_millis() as u64;
+                Some(g)
+            } else {
+                None
+            };
 
         self.plan_and_reserve_holding_gate(
             &snap,
@@ -654,7 +655,7 @@ impl SchedulerEngine {
         );
         explain.session_gate.wait_ms = gate_wait_ms;
 
-        if dry_run && !req.is_ephemeral_probe {
+        if dry_run && !req.is_ephemeral_probe && !req.skip_session_gate {
             let gk = ScopedSessionKey::new(&start_pool.id, req.model_family, &req.session_id);
             let (busy, depth) = self.session_gates.peek(&gk);
             explain.set_gate_peek(busy, depth);

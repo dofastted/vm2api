@@ -1039,7 +1039,12 @@ export class FailoverRunner {
       poolAccess?.effectivePool?.id ||
       keyScope?.vm_pool_id ||
       VIRTUAL_POOL_IDS.claude
-    const resolvedSessionId = inboundIdentity?.sessionId || (stickyKey ? String(stickyKey) : '') || crypto.randomUUID()
+    // A batch member's identity is its member key (238 scopeStickyKey(memberKey)).
+    const resolvedSessionId =
+      (batchMember === true && stickyKey ? String(stickyKey) : '') ||
+      inboundIdentity?.sessionId ||
+      (stickyKey ? String(stickyKey) : '') ||
+      crypto.randomUUID()
     const resolvedMachineId = inboundIdentity?.machineId || stickyDeviceId || deviceKey || null
     const isManagedPool = Boolean(poolAccess && poolAccess.legacy === false)
     const resolvedAllowedKeys = Array.isArray(allowedNodeKeys)
@@ -1067,9 +1072,10 @@ export class FailoverRunner {
       sessionId: resolvedSessionId,
       sessionIdSource: inboundIdentity?.sessionSource || null,
       parentSessionId: inboundIdentity?.parentSessionId || rootSessionId || null,
-      isEphemeralProbe: Boolean(
-        isEphemeralProbe || skipSessionSeat || batchMember === true || inboundIdentity?.isEphemeralProbe,
-      ),
+      // 238 batchMember: sticky to its member key and counted as a session,
+      // but members are not serialized (skipSessionGate), not ephemeral.
+      isEphemeralProbe: Boolean(isEphemeralProbe || skipSessionSeat || inboundIdentity?.isEphemeralProbe),
+      skipSessionGate: batchMember === true,
       noQueue: allowQueue === false,
       isAdminDiagnostic: resolvedAdminDiagnostic,
       pinNodeKey: pinVmId ? formatNodeKey('claude_vm', pinVmId) : null,

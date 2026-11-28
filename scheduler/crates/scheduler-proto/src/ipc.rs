@@ -224,6 +224,10 @@ pub struct AcquireRequest {
     /// (plan gate, per-model wait). Rust cannot tell these from scope filtering.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub model_gated_node_keys: Vec<NodeKey>,
+    /// Batch-group member (238 batchMember): sticky and counted like a session,
+    /// but concurrent requests of one member are not serialized by SessionGate.
+    #[serde(default)]
+    pub skip_session_gate: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

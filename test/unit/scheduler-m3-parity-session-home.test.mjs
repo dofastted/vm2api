@@ -185,3 +185,57 @@ test('keep_session_home on: home slot_busy with x-kin-queue off answers 529 sess
   assert.equal(res.result.status, 529)
   assert.equal(res.result.body?.error?.details?.reason, 'session_home_slot_busy')
 })
+
+test('batch member: sticky to one node across requests, two in flight at once are not serialized (238 batchMember)', async (t) => {
+  const runner = await boot(t, { keep_session_home: true })
+  const member = 'batch:key_x:seat:h:abc#0'
+  const calls = []
+  let release
+  const gate = new Promise((r) => {
+    release = r
+  })
+  let inFlight = 0
+  let peak = 0
+  const run = (n) =>
+    runner.run({
+      requestId: `req-batch-${n}`,
+      canonicalBody: { model: MODEL, messages: [{ role: 'user', content: 'hi' }] },
+      model: MODEL,
+      stickyKey: member,
+      stickyKeys: [member],
+      batchMember: true,
+      callAttempt: async ({ candidate, onFirstByte }) => {
+        calls.push(candidate.vmId)
+        inFlight += 1
+        peak = Math.max(peak, inFlight)
+        onFirstByte?.()
+        if (n === 1) await gate
+        inFlight -= 1
+        return ok(candidate.vmId)
+      },
+    })
+  // Pin the member to pro-b: the only node allowed for its first request.
+  const first = await runner.run({
+    requestId: 'req-batch-0',
+    canonicalBody: { model: MODEL, messages: [{ role: 'user', content: 'hi' }] },
+    model: MODEL,
+    stickyKey: member,
+    batchMember: true,
+    allowedNodeKeys: ['claude_vm:pro-b'],
+    callAttempt: async ({ candidate, onFirstByte }) => {
+      onFirstByte?.()
+      return ok(candidate.vmId)
+    },
+  })
+  assert.equal(first.ok, true)
+  const a = run(1)
+  await new Promise((r) => setTimeout(r, 50))
+  const b = run(2)
+  const rb = await b
+  release()
+  const ra = await a
+  assert.equal(ra.ok, true)
+  assert.equal(rb.ok, true)
+  assert.deepEqual(calls, ['pro-b', 'pro-b'], 'member stays on its node')
+  assert.equal(peak, 2, 'same member runs concurrently')
+})

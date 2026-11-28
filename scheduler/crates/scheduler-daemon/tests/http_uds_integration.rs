@@ -101,6 +101,7 @@ fn make_acquire(req_id: &str, sid: &str, mid: Option<&str>) -> AcquireRequest {
         exclude_nodes: vec![],
         keep_pin_on_model_gate: false,
         model_gated_node_keys: vec![],
+        skip_session_gate: false,
     }
 }
 

@@ -2123,6 +2123,7 @@ export class SchedulerRuntime {
       parent_session_id: params.parentSessionId ?? params.parent_session_id ?? null,
       is_ephemeral_probe: Boolean(params.isEphemeralProbe ?? params.is_ephemeral_probe ?? false),
       no_queue: Boolean(params.noQueue ?? params.no_queue ?? false),
+      skip_session_gate: Boolean(params.skipSessionGate ?? params.skip_session_gate ?? false),
       is_admin_diagnostic: isAdminDiagnostic,
       pin_node_key: pinNodeKey,
       exclude_nodes: Array.isArray(params.excludeNodes ?? params.exclude_nodes)
