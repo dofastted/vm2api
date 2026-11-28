@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.4.247 — 2026-11-28 · API 端点默认 `body_policy` 切为 `caller` 并修复 `/#/api` 开关即时持久化
+
+- **API 端点 `body_policy` 默认透传调用方原始正文并修复 `/#/api` 开关持久化（#2045）**：
+  - 后端 `src/lib/admin/api-endpoints.mjs`（`BODY_POLICIES` 顺位调整为 `['caller', 'persona']`）与 `src/lib/db/repos/api-endpoints-repo.mjs`（`rowEp` / `_epValues` 缺省回退）全链路将默认 `body_policy` 由 `'persona'` 切为 `'caller'`（透传调用方原始请求体，不额外注入项目 persona/system；`'persona'` 保留为显式可选）；新增 SQLite 迁移 `src/lib/db/migrations/073_api_endpoint_body_policy_default.sql` 与 PostgreSQL 迁移 `src/lib/db/pg/pg-migrations/010_api_endpoint_body_policy_default.sql`，在线幂等设置列默认值（PG `SET DEFAULT 'caller'`）并将既有 `'persona'` 行自动回填为 `'caller'`（保留 `CHECK` 约束）。
+  - 前端 `web/src/features/anthropic/{index.tsx,endpoint-save.ts}` 与 `web/src/types/panel-api-endpoints.ts` 将新建草稿与 `asBodyPolicy` 默认切为 `'caller'`；已保存端点在 `/#/api` 切换「转发调用方原始正文」开关时即时下发单字段 `PATCH /api/panel/api-endpoints/:id`（`{ body_policy }`），同步更新本地 `stored.bodyPolicy` 与 React Query 缓存（`patchCachedApiEndpoint`），失败时自动回滚并提示，且与完整保存回调保持一致；补齐 `test/unit/{anthropic-console,api-endpoints,database,scheduler-m0-migrations}.test.mjs` 与 `web/src/features/anthropic/endpoint-save.test.ts`。
+- 部署说明：本次改动新增 **SQLite 迁移 `073`** 与 **PostgreSQL 迁移 `010`**（在线幂等，启动控制面时自动执行），升级后会将数据库 `api_endpoints` 表中既有 `body_policy = 'persona'` 的端点行自动回填为 `'caller'`（如需项目协议注入，升级后可在 `/#/api` 手动切回 `'persona'`）；零 `deploy/payload.json`、`docker/`、`scripts/gemini-host.py`、`protofront` 或 Rust `kin-scheduler` 变更。
+
 ## 1.4.246 — 2026-11-28 · KVM 共享 Store CRAG 原子同步与回滚自愈、账号预热爬坡引擎（opt-in / M3 / PG 18）与 CRAG `3.1.26`/`3.1.27` 热修载荷钉选
 
 - **KVM `crag-debian13` 共享 Store CRAG 版本同步与回滚自愈（#2040）**：
