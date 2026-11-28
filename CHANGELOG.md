@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.4.272 — 2026-11-29 · 调度器幂等缓存不再回放已失效租约（外部贡献）
+
+- **acquire / switch 幂等缓存命中时先校验租约仍然有效（#2105，外部贡献 `DNAlec`）**：此前幂等缓存命中后会直接回放成功响应，即便对应租约已被释放或已过期，调用方拿到的租约 ID 实际上不再占用容量。例如控制面准入检查拒绝并释放了一个已授予的租约后，同一 `(request_id, attempt_no)` 的重复请求仍会收到“成功”。
+  - `scheduler/crates/scheduler-core/src/engine.rs`：新增 `cached_acquire_reply`，`acquire_inner` 与 `switch` 共用；缓存命中但租约不存在或已过期时返回 `lease_not_found`，调用方须使用新的 request 或 attempt。仍然有效的重复请求保持原有幂等行为。
+  - **行为变化，升级前请知悉**：对已释放/过期租约的重复 acquire/switch 现在返回 `lease_not_found`，不再返回旧的成功回复。本仓库 Node 侧每次切换都会推进 `attemptNo`，且 switch 失败不写入幂等缓存，未发现会在释放后复用同一 `(request_id, attempt_no)` 的路径；外部直接调用调度器 API 的调用方需自行确认。
+  - 测试 `scheduler-core/tests/tier_rank_health_tests.rs`：新增已释放 acquire 租约、已释放 switch 租约、过期未回收租约三个回归，均在未修补代码上失败。
+- 部署说明：零数据库迁移、零 `deploy/payload.json` 变更；仅 Rust 调度器变更，随控制面镜像升级后重启即可。
+
 ## 1.4.271 — 2026-11-29 · CRAG 本地能力拒绝不再冷却健康节点（外部贡献）
 
 - **本地创建的能力拒绝按 `request_protocol` 上报，不再让健康节点进入冷却（#2106，外部贡献 `DNAlec`）**：零注入要求在旧版 CRAG 槽位上做空提示替换时，`prepareCragPrintBody` 会在推理前本地拒绝；此前 `FailoverRunner` 把它当作 `transport` 报给 Rust，尽管 Node 策略明确要求不冷却，健康节点仍被冷却。
