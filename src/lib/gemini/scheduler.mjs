@@ -1311,6 +1311,7 @@ export function createGeminiScheduler({
           allowedNodeKeys,
           nodeTypes: ['gemini_env'],
           model: String(model || ''),
+          requestedEffort,
           modelFamily: inferModelFamily(model, 'google'),
           protocol: 'google.gemini',
           machineId: inboundIdentity?.machineId || null,
