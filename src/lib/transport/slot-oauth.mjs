@@ -23,6 +23,7 @@ import { isLocalEgressProxy } from '../vm/egress.mjs'
 import { proxyBlockedReason } from '../vm/proxy-policy.mjs'
 import { canRefreshCredential } from '../oauth/credential-mode.mjs'
 import {
+  assertSafeSlotCredentialPaths,
   hasRefreshPresence,
   mirrorWorkerCredentialsToVm,
   needsRefresh,
@@ -168,14 +169,32 @@ function lastJsonLine(stdout) {
   }
 }
 
+const allowTestEndpoints = () => process.env.KIN_WORKER_TEST_ENDPOINTS === '1'
+
 function readExistingWorkerConfig(slotDir) {
   if (!slotDir) return null
+  let fd = null
   try {
-    const raw = fs.readFileSync(path.join(slotDir, 'run', 'worker.json'), 'utf8')
+    const runDir = path.join(slotDir, 'run')
+    const dirStat = fs.lstatSync(runDir)
+    if (dirStat.isSymbolicLink() || !dirStat.isDirectory()) return null
+    const configPath = path.join(runDir, 'worker.json')
+    const fileStat = fs.lstatSync(configPath)
+    if (fileStat.isSymbolicLink() || !fileStat.isFile()) return null
+    const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0)
+    fd = fs.openSync(configPath, flags)
+    if (!fs.fstatSync(fd).isFile()) return null
+    const raw = fs.readFileSync(fd, 'utf8')
     const parsed = JSON.parse(raw)
     return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null
   } catch {
     return null
+  } finally {
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd)
+      } catch {}
+    }
   }
 }
 
@@ -214,7 +233,7 @@ export function resolvePanelOauthEgress(vm, { proxyUrl, existingConfig } = {}) {
   if (bound) {
     return { ok: true, egress_mode: 'socks', proxy_url: bound, proxy_required: true }
   }
-  if (existingConfig?.test_endpoints === true) {
+  if (allowTestEndpoints() && existingConfig?.test_endpoints === true) {
     return {
       ok: true,
       egress_mode: existingConfig.egress_mode || (existingConfig.proxy_url ? 'socks' : 'transparent'),
@@ -228,6 +247,17 @@ export function resolvePanelOauthEgress(vm, { proxyUrl, existingConfig } = {}) {
 export function buildPanelOauthConfig(exec, { proxyUrl } = {}) {
   const vmId = String(exec?.vmId || exec?.vm?.id || '').trim()
   const vm = { ...(exec?.vm || {}), id: vmId }
+  if (exec?.homeDir) {
+    try {
+      assertSafeSlotCredentialPaths(exec.homeDir)
+    } catch (error) {
+      return {
+        ok: false,
+        code: error?.code || 'unsafe_credential_path',
+        message: String(error?.message || 'slot credential path is unsafe'),
+      }
+    }
+  }
   const slotDir = exec?.homeDir ? path.dirname(exec.homeDir) : ''
   const existing = readExistingWorkerConfig(slotDir)
   const egress = resolvePanelOauthEgress(vm, { proxyUrl, existingConfig: existing })
@@ -235,6 +265,7 @@ export function buildPanelOauthConfig(exec, { proxyUrl } = {}) {
 
   const credPath = slotWorkerCredentialPath(exec?.homeDir) || '/tmp/kin-panel-missing-credentials.json'
   const socketPath = slotDir ? path.resolve(slotDir, 'run', 'worker.sock') : '/tmp/kin-panel-worker.sock'
+  const testEndpointsAllowed = allowTestEndpoints() && existing?.test_endpoints === true
   const config = {
     vm_id: vmId || existing?.vm_id || 'panel',
     socket_path: socketPath,
@@ -245,9 +276,11 @@ export function buildPanelOauthConfig(exec, { proxyUrl } = {}) {
     refresh_skew_seconds: Number(existing?.refresh_skew_seconds) > 0 ? Number(existing.refresh_skew_seconds) : 300,
     ...(existing?.oauth_user_agent ? { oauth_user_agent: existing.oauth_user_agent } : {}),
     ...(existing?.cli_version ? { cli_version: existing.cli_version } : {}),
-    ...(existing?.anthropic_base_url ? { anthropic_base_url: existing.anthropic_base_url } : {}),
-    ...(existing?.oauth_token_url ? { oauth_token_url: existing.oauth_token_url } : {}),
-    ...(existing?.test_endpoints === true ? { test_endpoints: true } : {}),
+    ...(testEndpointsAllowed && existing?.anthropic_base_url
+      ? { anthropic_base_url: existing.anthropic_base_url }
+      : {}),
+    ...(testEndpointsAllowed && existing?.oauth_token_url ? { oauth_token_url: existing.oauth_token_url } : {}),
+    ...(testEndpointsAllowed ? { test_endpoints: true } : {}),
   }
   return { ok: true, config }
 }
@@ -285,6 +318,17 @@ async function projectRefreshedCredential(host, vm, slotDir) {
 export async function runSlotOauth(exec, op, opts = {}) {
   if (process.env.KIN_CRS_MOCK === '1') return null
   if (!OPS.has(op)) return failure('worker_op_invalid', `unsupported oauth operation: ${op}`)
+
+  if (op !== 'guard-probe' && exec?.homeDir) {
+    try {
+      assertSafeSlotCredentialPaths(exec.homeDir)
+    } catch (error) {
+      return failure(
+        error?.code || 'unsafe_credential_path',
+        String(error?.message || 'slot credential path is unsafe'),
+      )
+    }
+  }
 
   // Non-refresh Go oauthcmd calls are strictly read-only; if the panel's credential is due
   // for refresh, rotate through the single panel SSOT refresh + one-way projection path first.

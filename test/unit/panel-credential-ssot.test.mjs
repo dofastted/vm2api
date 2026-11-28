@@ -4,9 +4,9 @@ import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 import { writeRemoteFile } from '../../src/lib/cluster/remote-fs.mjs'
-import { writeWorkerCredentialFile } from '../../src/lib/oauth/oauth-credentials.mjs'
+import { sealWorkerCredentialFile, writeWorkerCredentialFile } from '../../src/lib/oauth/oauth-credentials.mjs'
 import { PoolScheduler } from '../../src/lib/pool/pool-scheduler.mjs'
-import { runSlotOauth } from '../../src/lib/transport/slot-oauth.mjs'
+import { buildPanelOauthConfig, runSlotOauth } from '../../src/lib/transport/slot-oauth.mjs'
 import { pushCustomKvmSlotCredentials, slotHost } from '../../src/lib/vm/slot-host.mjs'
 
 function makeKvmSlot(t, vm = { id: 'vm-33', runtime: { type: 'kvm' }, kernel: 'crag-debian13', status: 'running' }) {
@@ -222,4 +222,91 @@ test('writeRemoteFile opens temp writable (0600) before fchmod to read-only 0400
     { op: 'close' },
     { op: 'rename', dest: '/srv/vms/vm-07/claude/credentials.json' },
   ])
+})
+
+test('host credential operations reject symlinked .claude and credentials.json while keeping .credentials.json alias valid', async (t) => {
+  const { root, homeDir } = makeKvmSlot(t, { id: 'vm-51', proxy: { id: 'px-local', kind: 'local' } })
+  const victimDir = path.join(root, 'vms', 'vm-victim', 'cli-home', '.claude')
+  fs.mkdirSync(victimDir, { recursive: true })
+  const victimCred = path.join(victimDir, 'credentials.json')
+  const victimBody = JSON.stringify({
+    claudeAiOauth: {
+      accessToken: 'victim-at',
+      refreshToken: 'victim-rt',
+      expiresAt: Date.now() + 3600_000,
+    },
+  })
+  fs.writeFileSync(victimCred, victimBody, { mode: 0o600 })
+
+  const vm = { id: 'vm-51', proxy: { id: 'px-local', kind: 'local' } }
+  const exec = { vmId: 'vm-51', projectRoot: root, homeDir, vm }
+  let workerInvoked = false
+  const runWorker = async () => {
+    workerInvoked = true
+    return { code: 0, stdout: '{"ok":true,"status":200,"body":{},"headers":{}}', stderr: '' }
+  }
+
+  // Case 1: .claude replaced with a symlink to another slot's .claude directory.
+  const claudeDir = path.join(homeDir, '.claude')
+  fs.rmSync(claudeDir, { recursive: true, force: true })
+  fs.symlinkSync(victimDir, claudeDir)
+
+  const builtDirLink = buildPanelOauthConfig(exec)
+  assert.equal(builtDirLink.ok, false)
+  assert.equal(builtDirLink.code, 'unsafe_credential_path')
+
+  const oauthDirLink = await runSlotOauth(exec, 'refresh', { runWorker })
+  assert.equal(oauthDirLink.ok, false)
+  assert.equal(oauthDirLink.body.error.code, 'unsafe_credential_path')
+  assert.equal(workerInvoked, false)
+
+  assert.throws(() => sealWorkerCredentialFile(homeDir), { code: 'unsafe_credential_path' })
+  assert.throws(
+    () =>
+      writeWorkerCredentialFile(homeDir, {
+        access_token: 'attacker-at',
+        refresh_token: 'attacker-rt',
+        expires_at: Date.now() + 3600_000,
+      }),
+    { code: 'unsafe_credential_path' },
+  )
+  assert.equal(fs.readFileSync(victimCred, 'utf8'), victimBody, 'victim credentials must remain untouched')
+
+  // Case 2: real .claude dir, but credentials.json is a symlink to another slot's credentials.json.
+  fs.unlinkSync(claudeDir)
+  fs.mkdirSync(claudeDir, { recursive: true })
+  fs.symlinkSync(victimCred, path.join(claudeDir, 'credentials.json'))
+
+  const builtFileLink = buildPanelOauthConfig(exec)
+  assert.equal(builtFileLink.ok, false)
+  assert.equal(builtFileLink.code, 'unsafe_credential_path')
+
+  const oauthFileLink = await runSlotOauth(exec, 'usage', { runWorker })
+  assert.equal(oauthFileLink.ok, false)
+  assert.equal(oauthFileLink.body.error.code, 'unsafe_credential_path')
+  assert.equal(workerInvoked, false)
+
+  assert.throws(() => sealWorkerCredentialFile(homeDir), { code: 'unsafe_credential_path' })
+  assert.throws(
+    () =>
+      writeWorkerCredentialFile(homeDir, {
+        access_token: 'attacker-at',
+        refresh_token: 'attacker-rt',
+        expires_at: Date.now() + 3600_000,
+      }),
+    { code: 'unsafe_credential_path' },
+  )
+  assert.equal(fs.readFileSync(victimCred, 'utf8'), victimBody, 'victim credentials must remain untouched')
+
+  // Case 3: legitimate regular credentials.json + relative `.credentials.json -> credentials.json` alias succeeds.
+  fs.unlinkSync(path.join(claudeDir, 'credentials.json'))
+  const written = writeWorkerCredentialFile(homeDir, {
+    access_token: 'legit-at',
+    refresh_token: 'legit-rt',
+    expires_at: Date.now() + 3600_000,
+  })
+  assert.equal(written, path.join(claudeDir, 'credentials.json'))
+  assert.equal(fs.readlinkSync(path.join(claudeDir, '.credentials.json')), 'credentials.json')
+  assert.equal(sealWorkerCredentialFile(homeDir).sealed, true)
+  assert.equal(buildPanelOauthConfig(exec).ok, true)
 })

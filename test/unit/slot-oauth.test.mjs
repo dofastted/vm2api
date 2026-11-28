@@ -283,24 +283,57 @@ test('runSlotOauth reports invalid worker output with stderr context', async (t)
   })
 })
 
-test('buildPanelOauthConfig allows test_endpoints override from existing worker.json', (t) => {
-  const { exec, slotDir } = makeSlotFixture(t, { id: 'vm-07' })
-  fs.writeFileSync(
-    path.join(slotDir, 'run', 'worker.json'),
-    JSON.stringify({
-      test_endpoints: true,
-      egress_mode: 'transparent',
-      proxy_url: '',
-      proxy_required: false,
-      anthropic_base_url: 'http://127.0.0.1:9999',
-      oauth_token_url: 'http://127.0.0.1:9999/v1/oauth/token',
-    }),
-  )
-  const built = buildPanelOauthConfig(exec)
+test('buildPanelOauthConfig ignores worker.json test_endpoints and custom URLs unless KIN_WORKER_TEST_ENDPOINTS=1', (t) => {
+  const prev = process.env.KIN_WORKER_TEST_ENDPOINTS
+  t.after(() => {
+    if (prev === undefined) delete process.env.KIN_WORKER_TEST_ENDPOINTS
+    else process.env.KIN_WORKER_TEST_ENDPOINTS = prev
+  })
+  delete process.env.KIN_WORKER_TEST_ENDPOINTS
+
+  const maliciousWorkerJson = JSON.stringify({
+    test_endpoints: true,
+    egress_mode: 'transparent',
+    proxy_url: '',
+    proxy_required: false,
+    anthropic_base_url: 'http://127.0.0.1:9999',
+    oauth_token_url: 'http://127.0.0.1:9999/v1/oauth/token',
+  })
+
+  // Unbound VM must still fail closed with proxy_required even if slot tampered with run/worker.json.
+  const unbound = makeSlotFixture(t, { id: 'vm-07' })
+  fs.writeFileSync(path.join(unbound.slotDir, 'run', 'worker.json'), maliciousWorkerJson)
+  const denied = buildPanelOauthConfig(unbound.exec)
+  assert.equal(denied.ok, false)
+  assert.equal(denied.code, 'proxy_required')
+
+  // Bound SOCKS5 VM must ignore injected test_endpoints / endpoint URLs from slot-writable run/worker.json.
+  const bound = makeSlotFixture(t, socksProxyVm)
+  fs.writeFileSync(path.join(bound.slotDir, 'run', 'worker.json'), maliciousWorkerJson)
+  const sanitized = buildPanelOauthConfig(bound.exec)
+  assert.equal(sanitized.ok, true)
+  assert.equal(sanitized.config.test_endpoints, undefined)
+  assert.equal(sanitized.config.anthropic_base_url, undefined)
+  assert.equal(sanitized.config.oauth_token_url, undefined)
+  assert.equal(sanitized.config.egress_mode, 'socks')
+  assert.equal(sanitized.config.proxy_url, 'socks5h://user:pass@10.0.0.2:1080')
+
+  // Explicit control-plane opt-in enables test_endpoints overrides from a regular worker.json.
+  process.env.KIN_WORKER_TEST_ENDPOINTS = '1'
+  const built = buildPanelOauthConfig(unbound.exec)
   assert.equal(built.ok, true)
   assert.equal(built.config.test_endpoints, true)
   assert.equal(built.config.anthropic_base_url, 'http://127.0.0.1:9999')
   assert.equal(built.config.oauth_token_url, 'http://127.0.0.1:9999/v1/oauth/token')
+
+  // Even when KIN_WORKER_TEST_ENDPOINTS=1, a symlinked run/worker.json is never followed.
+  const outsideFile = path.join(unbound.root, 'outside-worker.json')
+  fs.writeFileSync(outsideFile, maliciousWorkerJson)
+  const symlinked = makeSlotFixture(t, { id: 'vm-08' })
+  fs.symlinkSync(outsideFile, path.join(symlinked.slotDir, 'run', 'worker.json'))
+  const blockedLink = buildPanelOauthConfig(symlinked.exec)
+  assert.equal(blockedLink.ok, false)
+  assert.equal(blockedLink.code, 'proxy_required')
 })
 
 test('slot oauth guard prevents node-fetch Anthropic host calls', () => {
