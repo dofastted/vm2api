@@ -38,6 +38,11 @@ PAYLOAD=${KIN_KVM_PAYLOAD_DIR:-/opt/kin-guest}
 OPT_KVM=${KIN_KVM_OPT_DIR:-/opt/kin-kvm}
 KIN_KVM_SMBIOS_ARGS_FILE=${KIN_KVM_SMBIOS_ARGS_FILE:-$SLOT_KVM/fingerprint/qemu-smbios.args}
 KIN_KVM_HW_PLAN_FILE=${KIN_KVM_HW_PLAN_FILE:-$SLOT_KVM/fingerprint/hardware.json}
+KIN_KVM_IDENTITY_FILE=${KIN_KVM_IDENTITY_FILE:-$SLOT_KVM/fingerprint/identity.json}
+KIN_KVM_SYSTEM_ETC_DIR=${KIN_KVM_SYSTEM_ETC_DIR:-$SLOT_KVM/fingerprint/system/etc}
+KIN_KVM_ACPI_OEM_ID=${KIN_KVM_ACPI_OEM_ID:-}
+KIN_KVM_ACPI_OEM_TABLE_ID=${KIN_KVM_ACPI_OEM_TABLE_ID:-}
+KIN_KVM_KERNEL_TRACK=${KIN_KVM_KERNEL_TRACK:-official}
 KIN_KVM_STORE_MODE=${KIN_KVM_STORE_MODE:-auto}
 KIN_KVM_STORE_DIR=${KIN_KVM_STORE_DIR:-/opt/kin/store}
 KIN_KVM_STORE_BLK_IMAGE=${KIN_KVM_STORE_BLK_IMAGE:-}
@@ -46,6 +51,28 @@ KIN_KVM_AGENT_VSOCK_PORT=${KIN_KVM_AGENT_VSOCK_PORT:-7071}
 KIN_KVM_AGENT_SOCK=${KIN_KVM_AGENT_SOCK:-$SLOT_KVM/agent.sock}
 KIN_KVM_KERNEL_SOCK=${KIN_KVM_KERNEL_SOCK:-$SLOT_RUN/kernel.sock}
 KIN_KVM_DRY_RUN=${KIN_KVM_DRY_RUN:-0}
+
+KIN_KVM_KERNEL_TRACK=$(printf '%s' "$KIN_KVM_KERNEL_TRACK" | tr 'A-Z' 'a-z')
+case "$KIN_KVM_KERNEL_TRACK" in
+  official|custom) ;;
+  *) die "KIN_KVM_KERNEL_TRACK must be official or custom (got ${KIN_KVM_KERNEL_TRACK})" ;;
+esac
+
+KIN_SLOT_USER=${KIN_SLOT_USER:-kincli}
+if ! printf '%s' "$KIN_SLOT_USER" | grep -Eq '^[a-z][a-z0-9_-]{1,31}$' \
+   || printf '%s' "$KIN_SLOT_USER" | grep -Eq '(--|[-_]$)'; then
+  die "invalid KIN_SLOT_USER: ${KIN_SLOT_USER}"
+fi
+if [ -z "${KIN_SLOT_UID:-}" ]; then
+  if [ "$KIN_SLOT_USER" = kincli ]; then KIN_SLOT_UID=999; else KIN_SLOT_UID=1000; fi
+fi
+if [ -z "${KIN_SLOT_GID:-}" ]; then
+  if [ "$KIN_SLOT_USER" = kincli ]; then KIN_SLOT_GID=987; else KIN_SLOT_GID=1000; fi
+fi
+if ! printf '%s' "$KIN_SLOT_UID" | grep -Eq '^[1-9][0-9]*$' \
+   || ! printf '%s' "$KIN_SLOT_GID" | grep -Eq '^[1-9][0-9]*$'; then
+  die "KIN_SLOT_UID and KIN_SLOT_GID must be positive integers (got ${KIN_SLOT_UID}:${KIN_SLOT_GID})"
+fi
 
 require \
   KIN_VM_ID \
@@ -131,6 +158,28 @@ if [ -f "$KIN_KVM_HW_PLAN_FILE" ] && [ "${KIN_KVM_APPLY_HW_PLAN:-1}" != 0 ]; the
     KIN_KVM_VCPUS=$HOST_MAX_VCPUS
   fi
   log "qemu resources from hardware plan ($KIN_KVM_HW_PLAN_FILE); not applied: ${not_applied:-}"
+fi
+
+if [ "$KIN_KVM_MODE" = custom-erofs ]; then
+  # Ensure custom-erofs never exposes the hypervisor bit even when hardware.json is absent.
+  case ",${CPU_MODEL}," in
+    *,-hypervisor,*) ;;
+    *)
+      if [ "$KIN_KVM_ACCEL" = tcg ]; then
+        CPU_MODEL="${CPU_MODEL},-hypervisor"
+      else
+        _host_vendor="${KIN_KVM_HOST_CPU_VENDOR:-${KIN_HOST_CPU_VENDOR:-}}"
+        if [ -z "$_host_vendor" ] && [ -r /proc/cpuinfo ]; then
+          _host_vendor=$(awk -F': *' '/^vendor_id/{print $2; exit}' /proc/cpuinfo 2>/dev/null || true)
+        fi
+        case "$(printf '%s' "$_host_vendor" | tr 'A-Z' 'a-z')" in
+          amd|authenticamd) CPU_MODEL="${CPU_MODEL},kvm=off,-hypervisor,-svm" ;;
+          intel|genuineintel) CPU_MODEL="${CPU_MODEL},kvm=off,-hypervisor,-vmx" ;;
+          *) CPU_MODEL="${CPU_MODEL},kvm=off,-hypervisor" ;;
+        esac
+      fi
+      ;;
+  esac
 fi
 
 find_ovmf() {
@@ -289,6 +338,17 @@ ensure_agent_token() {
   AGENT_TOKEN=$(printf '%s' "$token" | tr 'A-F' 'a-f')
 }
 
+find_e2fs_tool() {
+  local tool=$1 cand
+  for cand in "/usr/sbin/$tool" "/sbin/$tool" "/usr/bin/$tool" "/bin/$tool"; do
+    if [ -x "$cand" ]; then
+      printf '%s' "$cand"
+      return 0
+    fi
+  done
+  PATH="$PATH:/usr/sbin:/sbin" command -v "$tool" 2>/dev/null || true
+}
+
 ensure_state_ext4() {
   local state_img="$SLOT_KVM/slot-state.ext4"
   local state_mb=${KIN_KVM_STATE_MB:-32}
@@ -296,7 +356,9 @@ ensure_state_ext4() {
   if [ -f "$state_img" ]; then
     return 0
   fi
-  command -v mke2fs >/dev/null 2>&1 || die "mke2fs (e2fsprogs) is required for custom-erofs state disk"
+  local mke2fs_bin
+  mke2fs_bin=$(find_e2fs_tool mke2fs)
+  [ -n "$mke2fs_bin" ] || die "mke2fs (e2fsprogs) is required for custom-erofs state disk"
   local mid stage tmp_img preset_src
   mid=$(printf '%s' "$KIN_KVM_MACHINE_ID" | tr -d '-' | tr 'A-F' 'a-f')
   if ! printf '%s' "$mid" | grep -Eq '^[0-9a-f]{32}$'; then
@@ -307,10 +369,10 @@ ensure_state_ext4() {
   stage=$(mktemp -d "${TMPDIR:-/tmp}/kin-state-stage.XXXXXX")
   chmod 0755 "$stage"
   tmp_img="$SLOT_KVM/.slot-state.ext4.tmp.$$"
-  mkdir -p "$stage/home/.claude" "$stage/run" "$stage/managed-settings.d" "$stage/ssh"
+  mkdir -p "$stage/home/.claude" "$stage/run" "$stage/managed-settings.d" "$stage/etc-override" "$stage/ssh"
   chmod 0750 "$stage/home" "$stage/run"
   chmod 0700 "$stage/home/.claude" "$stage/ssh"
-  chmod 0755 "$stage/managed-settings.d"
+  chmod 0755 "$stage/managed-settings.d" "$stage/etc-override"
   ln -sfn .claude/.claude.json "$stage/home/.claude.json"
   cp "$SLOT_KVM/id_ed25519.pub" "$stage/ssh/authorized_keys"
   chmod 0600 "$stage/ssh/authorized_keys"
@@ -331,20 +393,224 @@ TZ=$TZ
 LANG=$LANG
 EOF
   chmod 0644 "$stage/slot.env"
-  preset_src="$SLOT_KVM/fingerprint/system/etc/claude-code/managed-settings.d/10-slot-preset.json"
+  preset_src="$KIN_KVM_SYSTEM_ETC_DIR/claude-code/managed-settings.d/10-slot-preset.json"
   if [ -f "$preset_src" ]; then
-    cp "$preset_src" "$stage/managed-settings.d/10-slot-preset.json"
+    cp -L "$preset_src" "$stage/managed-settings.d/10-slot-preset.json"
     chmod 0644 "$stage/managed-settings.d/10-slot-preset.json"
   fi
   if [ "$(id -u)" = 0 ]; then
-    chown 0:0 "$stage" "$stage/ssh" "$stage/ssh/authorized_keys" "$stage/ssh/ssh_host_ed25519_key" "$stage/ssh/ssh_host_ed25519_key.pub" || true
-    chown -h 999:987 "$stage/home" "$stage/home/.claude" "$stage/home/.claude.json" "$stage/run" || true
+    chown 0:0 "$stage" "$stage/etc-override" "$stage/managed-settings.d" "$stage/ssh" "$stage/ssh/authorized_keys" "$stage/ssh/ssh_host_ed25519_key" "$stage/ssh/ssh_host_ed25519_key.pub" || true
+    chown -h "${KIN_SLOT_UID}:${KIN_SLOT_GID}" "$stage/home" "$stage/home/.claude" "$stage/home/.claude.json" "$stage/run" || true
   fi
   # Offline ext4 image build via mke2fs -d: zero root mount required, host never mounts RW during QEMU run.
-  mke2fs -t ext4 -q -F -L kinstate -d "$stage" "$tmp_img" "${state_mb}M"
+  "$mke2fs_bin" -t ext4 -q -F -L kinstate -d "$stage" "$tmp_img" "${state_mb}M"
   mv -f "$tmp_img" "$state_img"
   rm -rf "$stage"
-  log "initialized offline ext4 state disk $state_img (${state_mb} MiB, machine_id=${mid:0:8}...)"
+  log "initialized offline ext4 state disk $state_img (${state_mb} MiB, user=${KIN_SLOT_USER} ${KIN_SLOT_UID}:${KIN_SLOT_GID}, machine_id=${mid:0:8}...)"
+}
+
+load_identity_boot_metadata() {
+  [ -f "$KIN_KVM_IDENTITY_FILE" ] || return 0
+  local meta_json
+  meta_json=$(mktemp "${TMPDIR:-/tmp}/kin-id-meta.XXXXXX")
+  python3 - "$KIN_KVM_IDENTITY_FILE" "$meta_json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+src = Path(sys.argv[1])
+dst = Path(sys.argv[2])
+out = {}
+try:
+    data = json.loads(src.read_text(encoding="utf-8"))
+except Exception:
+    data = {}
+if isinstance(data, dict):
+    kp = data.get("kernel_profile")
+    if isinstance(kp, dict):
+        for k in ("release", "version", "proc_mid"):
+            val = kp.get(k)
+            if isinstance(val, str) and val.strip():
+                out[f"kernel_{k}"] = val.strip()
+    acpi = data.get("acpi")
+    if isinstance(acpi, dict):
+        for key, max_len in (("oem_id", 6), ("oem_table_id", 8)):
+            val = acpi.get(key)
+            if isinstance(val, str) and val.strip():
+                if not any(ord(c) < 32 or ord(c) >= 127 for c in val) and not any(c in val for c in (",", "=", '"', "\\")):
+                    out[f"acpi_{key}"] = val[:max_len]
+dst.write_text(json.dumps(out), encoding="utf-8")
+PY
+  _id_field() {
+    python3 -c 'import json,sys; d=json.load(open(sys.argv[1], encoding="utf-8")); v=d.get(sys.argv[2], ""); sys.stdout.write("" if v is None else str(v))' "$meta_json" "$1"
+  }
+  local krel kver kmid aoem atab
+  krel=$(_id_field kernel_release)
+  kver=$(_id_field kernel_version)
+  kmid=$(_id_field kernel_proc_mid)
+  aoem=$(_id_field acpi_oem_id)
+  atab=$(_id_field acpi_oem_table_id)
+  [ -z "${KIN_KERNEL_RELEASE:-}" ] && [ -n "$krel" ] && KIN_KERNEL_RELEASE=$krel
+  [ -z "${KIN_KERNEL_VERSION:-}" ] && [ -n "$kver" ] && KIN_KERNEL_VERSION=$kver
+  [ -z "${KIN_KERNEL_PROC_MID:-}" ] && [ -n "$kmid" ] && KIN_KERNEL_PROC_MID=$kmid
+  [ -z "${KIN_KVM_ACPI_OEM_ID:-}" ] && [ -n "$aoem" ] && KIN_KVM_ACPI_OEM_ID=$aoem
+  [ -z "${KIN_KVM_ACPI_OEM_TABLE_ID:-}" ] && [ -n "$atab" ] && KIN_KVM_ACPI_OEM_TABLE_ID=$atab
+  rm -f "$meta_json"
+}
+
+debugfs_path_exists() {
+  local dbg_bin=$1 img=$2 target=$3 out
+  out=$("$dbg_bin" -R "stat $target" "$img" 2>&1) || true
+  printf '%s\n' "$out" | grep -Eq '^Inode:[[:space:]]+[0-9]+'
+}
+
+debugfs_ensure_dir() {
+  local dbg_bin=$1 img=$2 dir=$3 cmdfile out
+  if debugfs_path_exists "$dbg_bin" "$img" "$dir"; then
+    return 0
+  fi
+  cmdfile=$(mktemp "${TMPDIR:-/tmp}/kin-dbg-dir.XXXXXX")
+  cat > "$cmdfile" <<EOF
+mkdir $dir
+set_inode_field $dir mode 040755
+set_inode_field $dir uid 0
+set_inode_field $dir gid 0
+EOF
+  out=$("$dbg_bin" -w -f "$cmdfile" "$img" 2>&1) || {
+    rm -f "$cmdfile"
+    die "debugfs mkdir $dir failed on $img: $out"
+  }
+  rm -f "$cmdfile"
+  debugfs_path_exists "$dbg_bin" "$img" "$dir" || die "debugfs failed to create directory $dir on $img: $out"
+}
+
+debugfs_replace_file() {
+  local dbg_bin=$1 img=$2 host_src=$3 dest=$4 mode_oct=$5 cmdfile out
+  cmdfile=$(mktemp "${TMPDIR:-/tmp}/kin-dbg-file.XXXXXX")
+  {
+    if debugfs_path_exists "$dbg_bin" "$img" "$dest"; then
+      printf 'rm %s\n' "$dest"
+    fi
+    printf 'write %s %s\n' "$host_src" "$dest"
+    printf 'set_inode_field %s mode %s\n' "$dest" "$mode_oct"
+    printf 'set_inode_field %s uid 0\n' "$dest"
+    printf 'set_inode_field %s gid 0\n' "$dest"
+  } > "$cmdfile"
+  out=$("$dbg_bin" -w -f "$cmdfile" "$img" 2>&1) || {
+    rm -f "$cmdfile"
+    die "debugfs write $dest failed on $img: $out"
+  }
+  rm -f "$cmdfile"
+  if printf '%s\n' "$out" | grep -Eqi 'Ext2 file already exists|File not found by ext2_lookup|Permission denied|Could not open|Invalid argument'; then
+    die "debugfs reported error writing $dest on $img: $out"
+  fi
+  debugfs_path_exists "$dbg_bin" "$img" "$dest" || die "debugfs post-write stat missing $dest on $img"
+}
+
+sync_state_ext4_boot_files() {
+  [ -f "$STATE_IMG" ] || die "state disk missing before boot sync: $STATE_IMG"
+  local e2fsck_bin debugfs_bin fsck_out fsck_rc=0 sync_dir verify_boot verify_stat
+  e2fsck_bin=$(find_e2fs_tool e2fsck)
+  debugfs_bin=$(find_e2fs_tool debugfs)
+  [ -n "$e2fsck_bin" ] || die "e2fsck (e2fsprogs) is required for custom-erofs boot sync"
+  [ -n "$debugfs_bin" ] || die "debugfs (e2fsprogs) is required for custom-erofs boot sync"
+
+  # 1. Replay any dirty journal from prior unclean stop; exit 0 (clean) or 1 (corrected) continues, >=2 fails closed.
+  fsck_out=$("$e2fsck_bin" -p "$STATE_IMG" 2>&1) || fsck_rc=$?
+  if [ "$fsck_rc" -ge 2 ]; then
+    die "e2fsck -p failed on $STATE_IMG (exit=$fsck_rc): $fsck_out"
+  fi
+
+  # 2. Stage clean single-line boot.env (zero eval/quotes) and optional /etc-override & preset files.
+  sync_dir=$(mktemp -d "${TMPDIR:-/tmp}/kin-boot-sync.XXXXXX")
+  chmod 0700 "$sync_dir"
+  python3 - "$sync_dir/boot.env" \
+    "$KIN_VM_ID" \
+    "$KIN_KVM_HOSTNAME" \
+    "$EFFECTIVE_STORE_MODE" \
+    "$EFFECTIVE_TRANSPORT" \
+    "$KIN_KVM_VSOCK_PORT" \
+    "$KIN_KVM_AGENT_VSOCK_PORT" \
+    "$TZ" \
+    "$LANG" \
+    "$KIN_SLOT_USER" \
+    "$KIN_SLOT_UID" \
+    "$KIN_SLOT_GID" \
+    "${KIN_KERNEL_RELEASE:-}" \
+    "${KIN_KERNEL_VERSION:-}" \
+    "${KIN_KERNEL_PROC_MID:-}" <<'PY'
+import sys
+from pathlib import Path
+
+dest = Path(sys.argv[1])
+keys = [
+    "KIN_VM_ID",
+    "KIN_HOSTNAME",
+    "KIN_STORE_MODE",
+    "KIN_AGENT_TRANSPORT",
+    "KIN_VSOCK_PORT",
+    "KIN_AGENT_VSOCK_PORT",
+    "KIN_TZ",
+    "KIN_LANG",
+    "KIN_SLOT_USER",
+    "KIN_SLOT_UID",
+    "KIN_SLOT_GID",
+    "KIN_KERNEL_RELEASE",
+    "KIN_KERNEL_VERSION",
+    "KIN_KERNEL_PROC_MID",
+]
+vals = sys.argv[2:]
+lines = []
+for k, v in zip(keys, vals):
+    clean = "".join(ch for ch in str(v or "") if 32 <= ord(ch) < 127)
+    lines.append(f"{k}={clean}")
+dest.write_text("\n".join(lines) + "\n", encoding="utf-8")
+PY
+
+  # 3. Idempotent directory ensure + remove-then-write + explicit inode mode/uid/gid.
+  debugfs_ensure_dir "$debugfs_bin" "$STATE_IMG" /etc-override
+  debugfs_ensure_dir "$debugfs_bin" "$STATE_IMG" /managed-settings.d
+  debugfs_replace_file "$debugfs_bin" "$STATE_IMG" "$sync_dir/boot.env" /boot.env 0100600
+
+  local src_file
+  for spec in \
+    "os-release:/etc-override/os-release" \
+    "localtime:/etc-override/localtime" \
+    "timezone:/etc-override/timezone"
+  do
+    local rel=${spec%%:*} target=${spec#*:}
+    src_file="$KIN_KVM_SYSTEM_ETC_DIR/$rel"
+    if [ -r "$src_file" ] && [ -f "$src_file" ]; then
+      cp -L "$src_file" "$sync_dir/$rel"
+      debugfs_replace_file "$debugfs_bin" "$STATE_IMG" "$sync_dir/$rel" "$target" 0100644
+    fi
+  done
+
+  src_file="$KIN_KVM_SYSTEM_ETC_DIR/claude-code/managed-settings.d/10-slot-preset.json"
+  if [ -r "$src_file" ] && [ -f "$src_file" ]; then
+    cp -L "$src_file" "$sync_dir/10-slot-preset.json"
+    debugfs_replace_file "$debugfs_bin" "$STATE_IMG" "$sync_dir/10-slot-preset.json" /managed-settings.d/10-slot-preset.json 0100644
+  fi
+
+  rm -rf "$sync_dir"
+
+  # 4. Fail-closed verification: confirm /boot.env carries current KIN_VM_ID and KIN_SLOT_USER with 0600 mode.
+  verify_boot=$("$debugfs_bin" -R "cat /boot.env" "$STATE_IMG" 2>/dev/null) || die "debugfs cat /boot.env failed on $STATE_IMG"
+  if ! printf '%s\n' "$verify_boot" | grep -Fxq "KIN_VM_ID=$KIN_VM_ID" \
+     || ! printf '%s\n' "$verify_boot" | grep -Fxq "KIN_SLOT_USER=$KIN_SLOT_USER"; then
+    die "post-write /boot.env verification mismatch on $STATE_IMG"
+  fi
+  verify_stat=$("$debugfs_bin" -R "stat /boot.env" "$STATE_IMG" 2>&1) || true
+  if ! printf '%s\n' "$verify_stat" | grep -Eq 'Type: regular[[:space:]]+Mode:[[:space:]]+0600'; then
+    die "post-write /boot.env mode check failed on $STATE_IMG: $verify_stat"
+  fi
+
+  # 5. Restore state disk ownership so dropped-privilege QEMU always retains read-write access.
+  if [ "$(id -u)" = 0 ]; then
+    chown "$UID_NUM:$GID_NUM" "$STATE_IMG" || die "chown $UID_NUM:$GID_NUM $STATE_IMG failed after boot sync"
+  fi
+  BOOT_ENV_SYNCED=1
+  log "synced /boot.env & /etc-override into $STATE_IMG (user=${KIN_SLOT_USER} ${KIN_SLOT_UID}:${KIN_SLOT_GID}, transport=${EFFECTIVE_TRANSPORT}, store=${EFFECTIVE_STORE_MODE})"
 }
 
 find_virtiofsd() {
@@ -423,16 +689,27 @@ SOCAT_AGENT_CMD=()
 EFFECTIVE_STORE_MODE=""
 EFFECTIVE_TRANSPORT=""
 STATE_IMG=""
+BOOT_ENV_SYNCED=0
 
 if [ "$KIN_KVM_MODE" = custom-erofs ]; then
-  KERNEL_IMG=${KIN_KVM_KERNEL:-$OPT_KVM/vmlinuz}
-  INITRD_IMG=${KIN_KVM_INITRD:-$OPT_KVM/initrd.img}
+  if [ "$KIN_KVM_KERNEL_TRACK" = custom ]; then
+    KERNEL_IMG=${KIN_KVM_KERNEL:-$OPT_KVM/vmlinuz-custom}
+    INITRD_IMG=${KIN_KVM_INITRD:-$OPT_KVM/initrd.img-custom}
+    [ -f "$KERNEL_IMG" ] || die "KIN_KVM_KERNEL_TRACK=custom requires custom kernel: $KERNEL_IMG"
+    [ -f "$INITRD_IMG" ] || die "KIN_KVM_KERNEL_TRACK=custom requires custom initrd: $INITRD_IMG"
+  else
+    KERNEL_IMG=${KIN_KVM_KERNEL:-$OPT_KVM/vmlinuz}
+    INITRD_IMG=${KIN_KVM_INITRD:-$OPT_KVM/initrd.img}
+    if [ "$KIN_KVM_DRY_RUN" != 1 ]; then
+      [ -f "$KERNEL_IMG" ] || die "missing custom-erofs kernel: $KERNEL_IMG"
+    fi
+  fi
   EROFS_IMG=${KIN_KVM_EROFS_IMAGE:-$OPT_KVM/kin-kvm-debian-13.erofs}
   if [ "$KIN_KVM_DRY_RUN" != 1 ]; then
-    [ -f "$KERNEL_IMG" ] || die "missing custom-erofs kernel: $KERNEL_IMG"
     [ -f "$EROFS_IMG" ] || die "missing custom-erofs rootfs: $EROFS_IMG"
   fi
 
+  load_identity_boot_metadata
   ensure_key
   ensure_state_ext4
   # Scrub authentication token from runner env before launching unprivileged virtiofsd/QEMU/socat.
@@ -489,22 +766,32 @@ if [ "$KIN_KVM_MODE" = custom-erofs ]; then
     EFFECTIVE_TRANSPORT=virtio-serial
   fi
 
-  CMDLINE="console=ttyS0 root=/dev/vda rootfstype=erofs ro init=/usr/local/sbin/kin-guest-init net.ifnames=0 biosdevname=0 quiet"
-  CMDLINE+=" kin.vm_id=$(sanitize_cmdline_val "$KIN_VM_ID")"
-  CMDLINE+=" kin.hostname=$(sanitize_cmdline_val "$KIN_KVM_HOSTNAME")"
-  CMDLINE+=" kin.store_mode=${EFFECTIVE_STORE_MODE}"
-  CMDLINE+=" kin.agent_transport=${EFFECTIVE_TRANSPORT}"
-  CMDLINE+=" kin.vsock_port=$(sanitize_cmdline_val "$KIN_KVM_VSOCK_PORT")"
-  CMDLINE+=" kin.agent_vsock_port=$(sanitize_cmdline_val "$KIN_KVM_AGENT_VSOCK_PORT")"
-  CMDLINE+=" kin.tz=$(sanitize_cmdline_val "$TZ")"
-  CMDLINE+=" kin.lang=$(sanitize_cmdline_val "$LANG")"
+  # Refresh /boot.env, /etc-override/*, and 10-slot-preset.json inside slot-state.ext4 before every boot.
+  sync_state_ext4_boot_files
 
-  # Custom EROFS mode: mem-merge=off disables KSM; zero cloud-init, zero virtio-9p.
+  # Clean /proc/cmdline: zero kin.* parameters (all slot boot parameters live in slot-state.ext4:/boot.env).
+  # On the custom kernel track, initrd.img-custom sets init=/usr/local/sbin/kin-guest-init via
+  # /conf/conf.d/99-kin-init so /proc/cmdline contains zero "kin" substrings; official track keeps init=.
+  if [ "$KIN_KVM_KERNEL_TRACK" = custom ]; then
+    CMDLINE="console=ttyS0 root=/dev/vda rootfstype=erofs ro net.ifnames=0 biosdevname=0 quiet"
+  else
+    CMDLINE="console=ttyS0 root=/dev/vda rootfstype=erofs ro init=/usr/local/sbin/kin-guest-init net.ifnames=0 biosdevname=0 quiet"
+  fi
+
+  MACHINE_ARG="q35,mem-merge=off,vmport=off"
+  if [ -n "${KIN_KVM_ACPI_OEM_ID:-}" ] && ! printf '%s' "$KIN_KVM_ACPI_OEM_ID" | grep -Eq '[,="\\]'; then
+    MACHINE_ARG+=",x-oem-id=${KIN_KVM_ACPI_OEM_ID}"
+  fi
+  if [ -n "${KIN_KVM_ACPI_OEM_TABLE_ID:-}" ] && ! printf '%s' "$KIN_KVM_ACPI_OEM_TABLE_ID" | grep -Eq '[,="\\]'; then
+    MACHINE_ARG+=",x-oem-table-id=${KIN_KVM_ACPI_OEM_TABLE_ID}"
+  fi
+
+  # Custom EROFS mode: mem-merge=off disables KSM; vmport=off + OEM ACPI; zero cloud-init, zero virtio-9p.
   QEMU=(
     qemu-system-x86_64
     -nodefaults
     -name "kin-$KIN_VM_ID"
-    -machine q35,mem-merge=off
+    -machine "$MACHINE_ARG"
     -accel "$ACCEL_ARG"
     -cpu "$CPU_MODEL"
     -m "$KIN_KVM_MEMORY_MB"
@@ -590,16 +877,31 @@ if [ "$KIN_KVM_MODE" = custom-erofs ]; then
 
   if [ "$KIN_KVM_DRY_RUN" = 1 ]; then
     python3 - "$KIN_KVM_MODE" "$EFFECTIVE_STORE_MODE" "$EFFECTIVE_TRANSPORT" "$STATE_IMG" "${not_applied:-}" \
+      "$KIN_KVM_KERNEL_TRACK" "$BOOT_ENV_SYNCED" "${KIN_KVM_ACPI_OEM_ID:-}" "${KIN_KVM_ACPI_OEM_TABLE_ID:-}" \
+      "$KIN_SLOT_USER" "$KIN_SLOT_UID" "$KIN_SLOT_GID" \
       --qemu "${QEMU[@]}" \
       --virtiofsd "${VIRTIOFSD_CMD[@]}" \
       --socat-kernel "${SOCAT_KERNEL_CMD[@]}" \
       --socat-agent "${SOCAT_AGENT_CMD[@]}" <<'PY'
 import json, os, sys
-mode, store_mode, transport, state_img, not_applied = sys.argv[1:6]
+(
+    mode,
+    store_mode,
+    transport,
+    state_img,
+    not_applied,
+    kernel_track,
+    boot_env_synced,
+    acpi_oem_id,
+    acpi_oem_table_id,
+    slot_user,
+    slot_uid,
+    slot_gid,
+) = sys.argv[1:13]
 sections = {"qemu": [], "virtiofsd": [], "socat_kernel": [], "socat_agent": []}
 cur = None
 mapping = {"--qemu": "qemu", "--virtiofsd": "virtiofsd", "--socat-kernel": "socat_kernel", "--socat-agent": "socat_agent"}
-for arg in sys.argv[6:]:
+for arg in sys.argv[13:]:
     if arg in mapping:
         cur = mapping[arg]
         continue
@@ -611,6 +913,13 @@ print(json.dumps({
     "transport": transport,
     "state_disk": state_img,
     "not_applied": not_applied,
+    "kernel_track": kernel_track,
+    "boot_env_synced": boot_env_synced == "1",
+    "acpi_oem_id": acpi_oem_id,
+    "acpi_oem_table_id": acpi_oem_table_id,
+    "slot_user": slot_user,
+    "slot_uid": int(slot_uid),
+    "slot_gid": int(slot_gid),
     "agent_token_in_env": ("KIN_AGENT_TOKEN" in os.environ or "AGENT_TOKEN" in os.environ),
     **sections,
 }))

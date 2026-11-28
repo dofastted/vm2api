@@ -74,6 +74,8 @@ unixTest('load-hw-plan.sh safely parses hardware.json without eval and validates
       '-ceu',
       `
       source "$1"
+      export KIN_KVM_HOST_CPU_VENDOR="intel"
+      export KIN_KVM_ACCEL="kvm"
       CPU_MODEL=""
       KIN_KVM_MEMORY_MB=""
       KIN_KVM_VCPUS=""
@@ -113,7 +115,7 @@ PY
   )
 
   const parsed = JSON.parse(out.trim())
-  assert.equal(parsed.cpu, 'max,family=6,model=158,stepping=0')
+  assert.equal(parsed.cpu, 'max,kvm=off,-hypervisor,-vmx,family=6,model=158,stepping=0')
   assert.equal(parsed.mem, '1024')
   assert.equal(parsed.vcpus, '4')
   assert.equal(parsed.mac, '98:fa:9b:12:34:56')
@@ -172,6 +174,7 @@ function runEntryDryRun(tmp, extraEnv = {}) {
     KIN_KVM_HOSTNAME: 'thinkcentre-123456',
     KIN_KVM_MACHINE_ID: '0123456789abcdef0123456789abcdef',
     KIN_KVM_ACCEL: 'kvm',
+    KIN_KVM_HOST_CPU_VENDOR: 'intel',
     KIN_KVM_SMBIOS_MANUFACTURER: 'LENOVO',
     KIN_KVM_SMBIOS_PRODUCT: '11T30025US',
     KIN_KVM_SMBIOS_VERSION: '1.0',
@@ -282,7 +285,7 @@ unixTest(
       KIN_KVM_DRY_RUN_VSOCK: '1',
     })
     const clampedJoined = clamped.qemu.join(' ')
-    assert.match(clampedJoined, /-cpu max,family=6,model=154,stepping=3\b/)
+    assert.match(clampedJoined, /-cpu max,kvm=off,-hypervisor,-vmx,family=6,model=154,stepping=3\b/)
     assert.match(clampedJoined, /-m 1536 -smp 2\b/)
     assert.match(clampedJoined, /memory-backend-memfd,id=mem0,size=1536M,share=on/)
     assert.ok(
@@ -378,10 +381,15 @@ test('Dockerfile, kin-guest-init, and build-custom-debian13-os.sh align with Pha
   assert.match(initCode, /RUN_GUEST=\/run\/kin-guest/)
   assert.match(initCode, /chmod 0700 "\$RUN_KIN\/crag-native-assets"/)
   assert.match(initCode, /chmod 0770 "\$RUN_GUEST"/)
-  assert.match(initCode, /\[ -d \/home\/kincli \]/)
-  assert.match(initCode, /mount --bind "\$STATE_DIR\/home" \/home\/kincli/)
+  assert.match(initCode, /mount -t tmpfs -o mode=0755,nosuid,nodev,noexec,size=4m tmpfs \/home/)
+  assert.match(initCode, /mount --bind "\$STATE_DIR\/home" "\$SLOT_HOME"/)
   assert.doesNotMatch(initCode, /mkdir -p \/home\/kincli/)
+  assert.match(initCode, /load_boot_env "\$STATE_DIR\/boot\.env"/)
+  assert.match(initCode, /apply_kernel_uts_once/)
   assert.match(initCode, /--claude-dir "\$STATE_DIR\/home\/\.claude"/)
+  assert.match(initCode, /--slot-uid "\$SLOT_UID"/)
+  assert.match(initCode, /--slot-gid "\$SLOT_GID"/)
+  assert.match(initCode, /--etc-tz-dir "\$ETC_TZ_DIR"/)
   assert.match(initCode, /mkdir -p \/run\/sshd/)
   assert.match(initCode, /"\$SSHD_BIN" -D -e -f "\$SSHD_CFG"/)
   assert.match(initCode, /kill -TERM "\$SSHD_PID"/)
@@ -393,13 +401,15 @@ test('Dockerfile, kin-guest-init, and build-custom-debian13-os.sh align with Pha
   assert.match(initCode, /modprobe virtio_net/)
   assert.match(initCode, /\/sys\/class\/net\/\*/)
   assert.match(initCode, /"\$KIN_AGENT_TRANSPORT" != vsock/)
-  assert.match(initCode, /setpriv --reuid="\$KINCLI_UID" --regid="\$KINCLI_GID"/)
+  assert.match(initCode, /setpriv --reuid="\$_eff_uid" --regid="\$_eff_gid"/)
   assert.match(initCode, /127\.0\.0\.1 localhost/)
   assert.match(initCode, /::1 localhost/)
   assert.match(initCode, /127\.0\.1\.1/)
   assert.match(initCode, /mount --bind "\$RUN_KIN\/hosts" \/etc\/hosts/)
   assert.match(initCode, /proc_alive\(\)/)
   assert.match(initCode, /mv -f "\$RUN_KIN\/\.crag\.pid\.tmp" "\$RUN_KIN\/crag\.pid"/)
+  assert.match(initCode, /umount "\$SLOT_HOME"/)
+  assert.match(initCode, /umount \/home/)
   assert.doesNotMatch(initCode, /cloud-init/)
   assert.doesNotMatch(initCode, /kin-crag-apparmor/)
   assert.doesNotMatch(initCode, /virtio-9p/)

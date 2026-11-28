@@ -39,7 +39,14 @@ import { profileForPreset } from '../identity/official-profiles.mjs'
 import { ensureSlotClaudeOwnership, chownSlotRuntimeFile, replaceSlotOwnedFile } from '../oauth/oauth-credentials.mjs'
 import { cragV2KernelWrapperScript, installedCragV2Root, materializeResolvedKernel } from './wrap-cli-runtime.mjs'
 import { ensureGuestMachineIdFile } from '../identity/workstation-fingerprint.mjs'
-import { ensureSlotComputer, rememberComputer } from '../identity/slot-computer.mjs'
+import {
+  ensureDockerSlotPasswdFiles,
+  ensureSlotComputer,
+  rememberComputer,
+  slotComputerRuntimeEtcDir,
+  syncSlotIdentityTimezoneAndPreset,
+} from '../identity/slot-computer.mjs'
+import { isCustomSlotUser, slotClaudeDir, slotGuestUidGid, slotHome, slotUser } from './slot-identity.mjs'
 import { coerceRfc4122Uuid } from '../identity/rfc4122-uuid.mjs'
 import {
   boundProxyUrl,
@@ -71,13 +78,12 @@ import {
   CUSTOM_OS_BRIDGE_TMPFS_DIR,
   CUSTOM_OS_BRIDGE_TMPFS_OPTS,
   CUSTOM_OS_EROFS_FILENAME,
-  CUSTOM_OS_INITRD_FILENAME,
-  CUSTOM_OS_KERNEL_FILENAME,
   CUSTOM_OS_MANAGED_SETTINGS_D,
   CUSTOM_OS_STORE_GUEST_DIR,
   DEFAULT_KVM_AGENT_VSOCK_PORT,
   DEFAULT_KVM_STORE_MODE,
   DEFAULT_KVM_VSOCK_PORT,
+  KVM_KERNEL_TRACK_CUSTOM,
   KVM_MODE_CUSTOM_EROFS,
   dockerLxcfsMountArgs,
   isCragDebian13Kernel,
@@ -86,6 +92,9 @@ import {
   isVhostVsockUsable,
   resolveHostCragDebian13OsDir,
   resolveHostSharedStoreDir,
+  resolveKvmKernelAssets,
+  resolveKvmKernelTrack,
+  verifyKvmKernelTrackFiles,
 } from './custom-os-runtime.mjs'
 import { allocateCid, attachCidOwnerPid, claimExistingCid, releaseCid } from './kvm-vsock-cid.mjs'
 import { ensureSlotAgentToken, readSlotAgentToken, syncCustomKvmSlotFiles } from './kvm-slot-agent-client.mjs'
@@ -449,7 +458,7 @@ function* subscriptionTargetChecks(projectRoot, vm, routing, { reclaim = false, 
     throw unsupported()
   }
   const capabilities = yield {
-    argv: ['docker', ...slotExecArgv(vm, ['/home/kincli/.kin/crag-v2/crag-v2', '--license-capabilities'])],
+    argv: ['docker', ...slotExecArgv(vm, [`${slotHome(vm)}/.kin/crag-v2/crag-v2`, '--license-capabilities'])],
     timeout: 5000,
   }
   try {
@@ -639,7 +648,7 @@ export const CODEX_SLOT_ROLE = 'codex'
 export function slotContainerCommand(vm, { wrapKernel = false, routing = {} } = {}) {
   if (isCodexVm(vm)) return ['sleep', 'infinity']
   const argv = [
-    wrapKernel ? '/home/kincli/.kin/kin-kernel' : '/usr/local/bin/kin-kernel',
+    wrapKernel ? `${slotHome(vm)}/.kin/kin-kernel` : '/usr/local/bin/kin-kernel',
     '--gateway-worker',
     '--config',
     '/run/kin/kernel.json',
@@ -1014,7 +1023,7 @@ export function writeWorkerFiles(vm, projectRoot, { transparent, routing, accel 
   const workerConfig = {
     vm_id: vm.id,
     socket_path: nodePaths ? `${nodePaths.run}/worker.sock` : '/run/kin/worker.sock',
-    credential_path: nodePaths ? `${nodePaths.claude}/credentials.json` : '/home/kincli/.claude/credentials.json',
+    credential_path: nodePaths ? `${nodePaths.claude}/credentials.json` : `${slotClaudeDir(vm)}/credentials.json`,
     proxy_url: proxyUrl,
     proxy_required: onEgress || local ? false : vm.proxy_required !== false,
     internal_token: token,
@@ -1350,10 +1359,32 @@ export function slotGuestBinMountArgs({
   return args
 }
 
+export const REGULAR_ETC_TARGETS_LABEL = 'org.vm2api.regular-etc-targets'
+export const DOCKER_HOME_TMPFS_OPTS = 'rw,noexec,nosuid,nodev,mode=0755,size=4m'
+
+function regularNonSymlinkFile(filePath) {
+  try {
+    const st = fs.lstatSync(filePath)
+    return !st.isSymbolicLink() && st.isFile()
+  } catch {
+    return false
+  }
+}
+
+export function dockerImageHasRegularEtcTargets(image, { run = sh } = {}) {
+  const ref = String(image || '').trim()
+  if (!ref) return false
+  const res = run(
+    ['docker', 'image', 'inspect', '--format', `{{index .Config.Labels "${REGULAR_ETC_TARGETS_LABEL}"}}`, ref],
+    { timeout: 5_000 },
+  )
+  return res.ok === true && String(res.stdout || '').trim() === '1'
+}
+
 /** Read-only persona mounts for a non-KVM kin-os container. */
-export function computerDockerArgs({ dir, mac, hostOf = (p) => p }) {
+export function computerDockerArgs({ dir, mac, hostOf = (p) => p, regularEtcTargets = false }) {
   const etc = path.join(dir, 'system', 'etc')
-  return [
+  const args = [
     '--mac-address',
     mac,
     '-v',
@@ -1367,9 +1398,87 @@ export function computerDockerArgs({ dir, mac, hostOf = (p) => p }) {
     '-v',
     `${hostOf(path.join(dir, 'system', 'hardware'))}:/etc/kin-hardware:ro`,
   ]
+  if (regularEtcTargets) {
+    for (const name of ['os-release', 'localtime', 'timezone']) {
+      const src = path.join(etc, name)
+      if (regularNonSymlinkFile(src)) {
+        args.push('-v', `${hostOf(src)}:/etc/${name}:ro`)
+      }
+    }
+  }
+  return args
+}
+
+/**
+ * Per-slot home / passwd / group mounts and env for local Docker slots.
+ * Legacy `kincli` slots keep their historical `/home/kincli` bind with zero extra tmpfs/passwd mounts.
+ * Custom-username slots shadow `/home` via tmpfs, nest `cli-home` at `/home/<user>`, and bind `:ro`
+ * runtime-etc `{passwd,group}` mapping the actual `--user uid:gid` to `<username>`.
+ */
+export function dockerSlotUserArgs({
+  vm,
+  home,
+  projectRoot,
+  uid,
+  gid,
+  hostOf = (p) => p,
+  ensurePasswdFiles = ensureDockerSlotPasswdFiles,
+  runtimeEtcDirOf = slotComputerRuntimeEtcDir,
+}) {
+  const user = slotUser(vm)
+  const userHome = slotHome(vm)
+  const claudeDir = slotClaudeDir(vm)
+  const customUser = isCustomSlotUser(vm)
+  const mountArgs = []
+  if (customUser) {
+    mountArgs.push('--tmpfs', `/home:${DOCKER_HOME_TMPFS_OPTS}`)
+    mountArgs.push('-v', `${hostOf(home)}:${userHome}`)
+    if (projectRoot && vm?.id) {
+      ensurePasswdFiles(projectRoot, vm, { uid, gid })
+      const runtimeEtcDir = runtimeEtcDirOf(projectRoot, vm.id)
+      mountArgs.push(
+        '-v',
+        `${hostOf(path.join(runtimeEtcDir, 'passwd'))}:/etc/passwd:ro`,
+        '-v',
+        `${hostOf(path.join(runtimeEtcDir, 'group'))}:/etc/group:ro`,
+      )
+    }
+  } else {
+    mountArgs.push('-v', `${hostOf(home)}:/home/kincli`)
+  }
+  const envArgs = [
+    '-e',
+    `HOME=${userHome}`,
+    '-e',
+    `USER=${user}`,
+    '-e',
+    `LOGNAME=${user}`,
+    '-e',
+    `CLAUDE_CONFIG_DIR=${claudeDir}`,
+  ]
+  return { user, userHome, claudeDir, customUser, mountArgs, envArgs }
 }
 
 /** Test seam: kvm `docker run` argv (including `docker`). */
+export function verifyLocalKvmKernelTrack(projectRoot, vm, options = {}) {
+  const track = resolveKvmKernelTrack({ vm, ...options })
+  if (track !== KVM_KERNEL_TRACK_CUSTOM) {
+    return { ok: true, track }
+  }
+  const osAssetsHost = resolveHostCragDebian13OsDir(projectRoot, {
+    osAssetsHostDir: options.osAssetsHostDir,
+  })
+  if (!osAssetsHost) {
+    return {
+      ok: false,
+      code: 'kvm_custom_kernel_missing',
+      track,
+      error: 'KIN_KVM_KERNEL_TRACK=custom requires local crag-debian13 OS assets directory',
+    }
+  }
+  return verifyKvmKernelTrackFiles(osAssetsHost, { vm, ...options })
+}
+
 export function buildKvmRunArgs({
   vm,
   name,
@@ -1404,6 +1513,7 @@ export function buildKvmRunArgs({
   storeBlkImage = '',
   agentToken = '',
   vsockLeaseFile = '',
+  kernelTrack = '',
 }) {
   const slotName = displayName(vm.id)
   const mem = kvmContainerMemory(memory)
@@ -1432,8 +1542,18 @@ export function buildKvmRunArgs({
   if (customKvm) {
     const resolvedStoreMode = String(storeMode || process.env.KIN_KVM_STORE_MODE || DEFAULT_KVM_STORE_MODE).trim()
     const resolvedStoreBlk = String(storeBlkImage || process.env.KIN_KVM_STORE_BLK_IMAGE || '').trim()
+    const guestUser = slotUser(vm)
+    const guestIds = slotGuestUidGid(vm)
+    const kernelAssets = resolveKvmKernelAssets(CUSTOM_OS_ASSETS_GUEST_DIR, {
+      vm,
+      ...(kernelTrack ? { kernelTrack } : {}),
+    })
     env.push(
       `KIN_KVM_MODE=${KVM_MODE_CUSTOM_EROFS}`,
+      `KIN_SLOT_USER=${guestUser}`,
+      `KIN_SLOT_UID=${guestIds.uid}`,
+      `KIN_SLOT_GID=${guestIds.gid}`,
+      `KIN_KVM_KERNEL_TRACK=${kernelAssets.track}`,
       `KIN_KVM_VSOCK_PORT=${Number(vsockPort || DEFAULT_KVM_VSOCK_PORT)}`,
       `KIN_KVM_AGENT_VSOCK_PORT=${Number(agentVsockPort || DEFAULT_KVM_AGENT_VSOCK_PORT)}`,
       `KIN_KVM_STORE_MODE=${resolvedStoreMode}`,
@@ -1469,16 +1589,19 @@ export function buildKvmRunArgs({
     const hasOsCoreAssets =
       Boolean(osAssetsHost) &&
       fs.existsSync(path.join(osAssetsHost, CUSTOM_OS_EROFS_FILENAME)) &&
-      fs.existsSync(path.join(osAssetsHost, CUSTOM_OS_KERNEL_FILENAME))
+      fs.existsSync(path.join(osAssetsHost, kernelAssets.kernelFilename))
     if (osAssetsHost && (explicitOsAssets || hasOsCoreAssets)) {
       // Mount under a dedicated read-only path so `/opt/kin-kvm/guest` inside the runner image is never shadowed.
       customMounts.push('-v', `${hostOf(osAssetsHost)}:${CUSTOM_OS_ASSETS_GUEST_DIR}:ro`)
       env.push(
         `KIN_KVM_EROFS_IMAGE=${CUSTOM_OS_ASSETS_GUEST_DIR}/${CUSTOM_OS_EROFS_FILENAME}`,
-        `KIN_KVM_KERNEL=${CUSTOM_OS_ASSETS_GUEST_DIR}/${CUSTOM_OS_KERNEL_FILENAME}`,
+        `KIN_KVM_KERNEL=${kernelAssets.kernelPath}`,
       )
-      if (fs.existsSync(path.join(osAssetsHost, CUSTOM_OS_INITRD_FILENAME))) {
-        env.push(`KIN_KVM_INITRD=${CUSTOM_OS_ASSETS_GUEST_DIR}/${CUSTOM_OS_INITRD_FILENAME}`)
+      if (
+        kernelAssets.track === KVM_KERNEL_TRACK_CUSTOM ||
+        fs.existsSync(path.join(osAssetsHost, kernelAssets.initrdFilename))
+      ) {
+        env.push(`KIN_KVM_INITRD=${kernelAssets.initrdPath}`)
       }
     }
   }
@@ -1792,6 +1915,16 @@ async function startVmRuntimeAdmitted(
     runtimePatch(vm, existing, { ...workerRuntimeExtra(worker), memory: mem, routing: resolvedRouting })
     return { ok: true, action: 'already-running', runtime: vm.runtime }
   }
+  if (kvm && isCustomKvmMode({ vm })) {
+    const trackCheck = verifyLocalKvmKernelTrack(projectRoot, vm)
+    if (!trackCheck.ok) {
+      return {
+        ok: false,
+        code: trackCheck.code || 'kvm_custom_kernel_missing',
+        error: trackCheck.error || 'custom KVM kernel verification failed',
+      }
+    }
+  }
   if (existing) {
     const r = sh(['docker', 'start', name])
     if (!r.ok) {
@@ -1826,6 +1959,9 @@ async function startVmRuntimeAdmitted(
   try {
     computer = ensureSlotComputer(projectRoot, vm)
     rememberComputer(projectRoot, vm, computer)
+    try {
+      syncSlotIdentityTimezoneAndPreset(projectRoot, vm)
+    } catch {}
   } catch (e) {
     return { ok: false, error: e.message || 'computer identity failed' }
   }
@@ -1911,6 +2047,15 @@ async function startVmRuntimeAdmitted(
       !codex && resolveKernelDataplane(vm, resolvedRouting) === 'crag'
         ? activeCragManifestForSlot(projectRoot, vm, home)?.capabilities
         : undefined
+    const regularEtcTargets = dockerImageHasRegularEtcTargets(image)
+    const slotIdentityArgs = dockerSlotUserArgs({
+      vm,
+      home,
+      projectRoot,
+      uid: runtimeUidNum(vm),
+      gid: Number(GID),
+      hostOf,
+    })
     args = [
       'docker',
       'run',
@@ -1945,8 +2090,7 @@ async function startVmRuntimeAdmitted(
       '--label',
       'kin.vm.runtime=docker',
       ...(codex ? ['--label', `kin.vm.role=${CODEX_SLOT_ROLE}`] : []),
-      '-v',
-      `${hostOf(home)}:/home/kincli`,
+      ...slotIdentityArgs.mountArgs,
       '-v',
       `${hostOf(worker.runDir)}:/run/kin`,
       ...slotGuestBinMountArgs({
@@ -1957,7 +2101,7 @@ async function startVmRuntimeAdmitted(
         projectRoot,
       }),
       ...machineMounts,
-      ...computerDockerArgs({ dir: computer.dir, mac: computer.mac, hostOf }),
+      ...computerDockerArgs({ dir: computer.dir, mac: computer.mac, hostOf, regularEtcTargets }),
       ...cragCustomOsDockerMountArgs(vm, {
         routing: resolvedRouting,
         projectRoot,
@@ -1966,14 +2110,13 @@ async function startVmRuntimeAdmitted(
         capabilities: activeCragCaps,
       }),
       ...dockerLxcfsMountArgs({ hostOf }),
-      '-e',
-      'HOME=/home/kincli',
-      '-e',
-      'CLAUDE_CONFIG_DIR=/home/kincli/.claude',
+      ...slotIdentityArgs.envArgs,
       '-e',
       `TZ=${zone || 'UTC'}`,
       '-e',
       `LANG=${vm.locale}`,
+      '-e',
+      `LC_ALL=${vm.locale}`,
       '-e',
       `KIN_VM_ID=${vm.id}`,
       '-e',
@@ -1986,7 +2129,7 @@ async function startVmRuntimeAdmitted(
       '--dns-opt',
       'use-vc',
       '-w',
-      '/home/kincli',
+      slotIdentityArgs.userHome,
       image,
       ...slotContainerCommand(vm, { wrapKernel: fs.existsSync(wrapKernel), routing: resolvedRouting }),
     ]

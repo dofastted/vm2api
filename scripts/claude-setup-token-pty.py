@@ -136,15 +136,19 @@ def build_argv() -> list[str]:
     tz = os.environ.get("TZ", "UTC")
     lang = os.environ.get("LANG", "en_US.UTF-8")
     cli = os.environ["KIN_CLI_BIN"]
+    slot_home = os.environ.get("KIN_SLOT_HOME", "").strip() or "/home/kincli"
+    slot_user = os.environ.get("KIN_SLOT_USER", "").strip()
+    user_env = ["-e", f"USER={slot_user}", "-e", f"LOGNAME={slot_user}"] if slot_user else []
     return [
         "docker", "exec", "-it",
         "-u", f"{uid}:{gid}",
-        "-e", "HOME=/home/kincli",
-        "-e", "TMPDIR=/home/kincli/.cache/tmp",
+        "-e", f"HOME={slot_home}",
+        *user_env,
+        "-e", f"TMPDIR={slot_home}/.cache/tmp",
         "-e", f"TZ={tz}",
         "-e", f"LANG={lang}",
         "-e", f"LC_ALL={lang}",
-        "-e", "PATH=/home/kincli/.local/bin:/usr/bin:/bin",
+        "-e", f"PATH={slot_home}/.local/bin:/usr/bin:/bin",
         "-e", "CLAUDE_CODE_HOST_REFRESH=1",
         "-e", f"CLAUDE_CODE_VERSION={os.environ.get('KIN_CLI_VERSION', '2.1.296')}",
         "-e", "USER_TYPE=external",
@@ -161,7 +165,7 @@ def build_argv() -> list[str]:
         "-e", "TERM=xterm-256color",
         "-e", "COLUMNS=220",
         "-e", "LINES=40",
-        "-w", "/home/kincli",
+        "-w", slot_home,
         container,
         cli,
         "setup-token",

@@ -34,7 +34,13 @@ import {
   kernelForIndex,
 } from '../../src/lib/vm/vm-runtime.mjs'
 import { inspectKernelChanges, materializeCragV2 } from '../../src/lib/vm/wrap-cli-runtime.mjs'
-import { CRAG_DEBIAN13_ASSETS, cragDebian13Files, isCragDebian13Pinned } from '../../scripts/fetch-payload.mjs'
+import {
+  CRAG_DEBIAN13_ASSETS,
+  CRAG_DEBIAN13_CUSTOM_KERNEL_ASSETS,
+  cragDebian13Files,
+  isCragDebian13CustomKernelPinned,
+  isCragDebian13Pinned,
+} from '../../scripts/fetch-payload.mjs'
 import { seedEncryptedPackage } from '../fixtures/crag-license.mjs'
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..')
@@ -590,7 +596,11 @@ test('deploy/payload.json crag_debian13_release & scripts/fetch-payload.mjs enfo
   assert.ok(realManifest.crag_debian13_release)
   assert.equal(isCragDebian13Pinned(realManifest), true)
   const pinnedOsFiles = cragDebian13Files(realManifest)
-  assert.equal(pinnedOsFiles.length, CRAG_DEBIAN13_ASSETS.length)
+  const customPinned = isCragDebian13CustomKernelPinned(realManifest)
+  assert.equal(
+    pinnedOsFiles.length,
+    CRAG_DEBIAN13_ASSETS.length + (customPinned ? CRAG_DEBIAN13_CUSTOM_KERNEL_ASSETS.length : 0),
+  )
   assert.match(realManifest.crag_debian13_release.tag, /^payload-/)
   for (const name of CRAG_DEBIAN13_ASSETS) {
     const entry = realManifest.crag_debian13_release.assets[name]
@@ -598,6 +608,17 @@ test('deploy/payload.json crag_debian13_release & scripts/fetch-payload.mjs enfo
     assert.deepEqual(Object.keys(entry).sort(), ['sha256', 'size'])
     assert.ok(Number.isInteger(entry.size) && entry.size > 0, `invalid size for ${name}`)
     assert.match(entry.sha256, /^[a-f0-9]{64}$/, `invalid sha256 for ${name}`)
+  }
+  if (customPinned) {
+    const customAssets =
+      realManifest.crag_debian13_release.custom_kernel?.assets || realManifest.crag_debian13_release.assets
+    for (const name of CRAG_DEBIAN13_CUSTOM_KERNEL_ASSETS) {
+      const entry = customAssets[name]
+      assert.ok(entry, `missing custom kernel asset ${name}`)
+      assert.deepEqual(Object.keys(entry).sort(), ['sha256', 'size'])
+      assert.ok(Number.isInteger(entry.size) && entry.size > 0, `invalid size for ${name}`)
+      assert.match(entry.sha256, /^[a-f0-9]{64}$/, `invalid sha256 for ${name}`)
+    }
   }
 
   // Real HTTP download + --pin-crag-debian13 + --check + tamper fail-closed.

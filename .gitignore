@@ -30,7 +30,8 @@ __pycache__/
 crates/
 !/scheduler/crates/
 /scheduler/target/
-patches/
+patches/*
+!/patches/kernel-6.12/
 .local/
 /local-src/
 /skills/

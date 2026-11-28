@@ -6,8 +6,12 @@ load_hw_plan() {
   local hardware_json=$1
   local plan_json
   plan_json=$(mktemp)
+  KIN_KVM_ACCEL="${KIN_KVM_ACCEL:-}" \
+  KIN_KVM_HOST_CPU_VENDOR="${KIN_KVM_HOST_CPU_VENDOR:-}" \
+  KIN_HOST_CPU_VENDOR="${KIN_HOST_CPU_VENDOR:-}" \
   python3 - "$hardware_json" "$plan_json" <<'PY'
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -18,11 +22,24 @@ raw = json.loads(source.read_text(encoding="utf-8")) if source.is_file() else {}
 if not isinstance(raw, dict):
     raw = {}
 
+identity_path = source.parent / "identity.json"
+identity = {}
+if identity_path.is_file():
+    try:
+        parsed_id = json.loads(identity_path.read_text(encoding="utf-8"))
+        if isinstance(parsed_id, dict):
+            identity = parsed_id
+    except Exception:
+        identity = {}
+
 # Support both flat hardware.json and slot-hardware-manifest.json resources section.
 if "resources" in raw and isinstance(raw["resources"], dict) and "cpu_family" not in raw:
     res = raw["resources"]
     disk_obj = res.get("disk") if isinstance(res.get("disk"), dict) else {}
+    acpi_obj = raw.get("acpi") if isinstance(raw.get("acpi"), dict) else {}
     hardware = {
+        "cpu_vendor": res.get("cpu_vendor") or res.get("cpuid_vendor") or raw.get("cpu_vendor") or raw.get("cpuid_vendor"),
+        "cpu_model_id": res.get("cpu_model_id") or res.get("cpu_brand") or raw.get("cpu_model_id") or raw.get("cpu_brand"),
         "cpu_family": res.get("cpu_family"),
         "cpu_model": res.get("cpu_model"),
         "cpu_stepping": res.get("cpu_stepping"),
@@ -31,26 +48,143 @@ if "resources" in raw and isinstance(raw["resources"], dict) and "cpu_family" no
         "ram_gb": res.get("memory_gb"),
         "en0_mac": res.get("mac"),
         "disk_serial": disk_obj.get("serial"),
+        "acpi_oem_id": res.get("acpi_oem_id") or acpi_obj.get("oem_id"),
+        "acpi_oem_table_id": res.get("acpi_oem_table_id") or acpi_obj.get("oem_table_id"),
     }
 else:
-    hardware = raw
+    hardware = dict(raw)
+    if isinstance(raw.get("acpi"), dict):
+        hardware.setdefault("acpi_oem_id", raw["acpi"].get("oem_id"))
+        hardware.setdefault("acpi_oem_table_id", raw["acpi"].get("oem_table_id"))
+
+id_acpi = identity.get("acpi") if isinstance(identity.get("acpi"), dict) else {}
+if not hardware.get("cpu_vendor") and not hardware.get("cpuid_vendor"):
+    hardware["cpu_vendor"] = identity.get("cpuid_vendor") or identity.get("cpu_vendor")
+if not hardware.get("cpu_model_id") and not hardware.get("cpu_brand"):
+    hardware["cpu_model_id"] = identity.get("cpu_model_id") or identity.get("cpu_brand")
+if not hardware.get("acpi_oem_id"):
+    hardware["acpi_oem_id"] = id_acpi.get("oem_id")
+if not hardware.get("acpi_oem_table_id"):
+    hardware["acpi_oem_table_id"] = id_acpi.get("oem_table_id")
 
 def num_text(value):
     if value is None or value == "" or isinstance(value, bool):
         return ""
     return str(value).strip()
 
+def norm_vendor(raw_vendor):
+    v = str(raw_vendor or "").strip().lower()
+    if v in ("amd", "authenticamd", "advanced micro devices, inc.") or "amd" in v or "ryzen" in v or "epyc" in v:
+        return "AuthenticAMD"
+    if v in ("intel", "genuineintel", "intel(r) corporation") or "intel" in v or "core(tm)" in v or "xeon" in v:
+        return "GenuineIntel"
+    return ""
+
+def detect_host_vendor():
+    override = os.environ.get("KIN_KVM_HOST_CPU_VENDOR", "") or os.environ.get("KIN_HOST_CPU_VENDOR", "")
+    if override.strip().lower() == "any":
+        return ""
+    v = norm_vendor(override)
+    if v:
+        return v
+    try:
+        for line in Path("/proc/cpuinfo").read_text(encoding="utf-8", errors="ignore").splitlines():
+            if line.startswith("vendor_id"):
+                parts = line.split(":", 1)
+                if len(parts) == 2:
+                    return norm_vendor(parts[1])
+    except OSError:
+        pass
+    return ""
+
+def sanitize_model_id(raw_model):
+    text = str(raw_model or "").strip()
+    if not text:
+        return ""
+    # Strip control characters and clamp to x86 CPUID brand string limit (48 bytes).
+    cleaned = "".join(ch for ch in text if 32 <= ord(ch) < 127).strip()
+    if not cleaned:
+        return ""
+    cleaned = cleaned.encode("ascii", "ignore")[:48].decode("ascii").rstrip()
+    # QEMU QemuOpts separates properties with ','; escape literal commas as ',,'.
+    return cleaned.replace(",", ",,")
+
+def sanitize_acpi_id(raw_val, max_len):
+    text = str(raw_val or "")
+    if not text or any(ord(ch) < 32 or ord(ch) >= 127 for ch in text):
+        return ""
+    if any(ch in text for ch in (",", "=", '"', "\\")):
+        return ""
+    cleaned = text[:max_len]
+    return cleaned if cleaned.strip() else ""
+
 not_applied = ["smc_version", "rom_hex"]
 plan = {}
 
+accel = str(os.environ.get("KIN_KVM_ACCEL", "") or "").strip().lower()
 family = num_text(hardware.get("cpu_family"))
 model = num_text(hardware.get("cpu_model"))
 stepping = num_text(hardware.get("cpu_stepping"))
-if family.isdigit() and model.isdigit() and stepping.isdigit():
-    # Use max (not qemu64) so KVM/TCG guests expose SSE4.2/AVX/AVX2 needed by Bun/claude while spoofing CPUID.
-    plan["cpu"] = f"max,family={int(family)},model={int(model)},stepping={int(stepping)}"
+has_cpuid_tuple = family.isdigit() and model.isdigit() and stepping.isdigit()
+
+raw_model_id = hardware.get("cpu_model_id") or hardware.get("cpu_brand") or ""
+escaped_model_id = sanitize_model_id(raw_model_id)
+
+profile_vendor = norm_vendor(hardware.get("cpu_vendor") or hardware.get("cpuid_vendor"))
+if not profile_vendor and raw_model_id:
+    profile_vendor = norm_vendor(raw_model_id)
+if not profile_vendor and family.isdigit():
+    fam_num = int(family)
+    if fam_num in (23, 24, 25, 26):
+        profile_vendor = "AuthenticAMD"
+    elif fam_num == 6:
+        profile_vendor = "GenuineIntel"
+
+if accel == "tcg":
+    # Under TCG software emulation there is no host KVM vendor mismatch constraint.
+    cpu_parts = ["max", "-hypervisor"]
+    if profile_vendor:
+        cpu_parts.append(f"vendor={profile_vendor}")
+    if has_cpuid_tuple:
+        cpu_parts.extend([f"family={int(family)}", f"model={int(model)}", f"stepping={int(stepping)}"])
+    else:
+        not_applied.append("cpu_id")
+    if escaped_model_id:
+        cpu_parts.append(f"model-id={escaped_model_id}")
+    plan["cpu"] = ",".join(cpu_parts)
 else:
-    not_applied.append("cpu_id")
+    # Under KVM, enforce same-vendor CPUID to prevent AMD/Intel flag leakage & wrong kernel errata.
+    host_vendor = detect_host_vendor()
+    cpu_parts = ["max", "kvm=off", "-hypervisor"]
+    if host_vendor == "AuthenticAMD":
+        cpu_parts.append("-svm")
+    elif host_vendor == "GenuineIntel":
+        cpu_parts.append("-vmx")
+
+    if host_vendor and profile_vendor and profile_vendor != host_vendor:
+        not_applied.append("cross_vendor_cpu")
+        fallback_model = (
+            "AMD Ryzen 7 5800X 8-Core Processor"
+            if host_vendor == "AuthenticAMD"
+            else "12th Gen Intel(R) Core(TM) i7-12700"
+        )
+        cpu_parts.append(f"model-id={fallback_model}")
+    else:
+        if has_cpuid_tuple:
+            cpu_parts.extend([f"family={int(family)}", f"model={int(model)}", f"stepping={int(stepping)}"])
+        else:
+            not_applied.append("cpu_id")
+        if escaped_model_id:
+            cpu_parts.append(f"model-id={escaped_model_id}")
+    plan["cpu"] = ",".join(cpu_parts)
+
+acpi_oem_id = sanitize_acpi_id(hardware.get("acpi_oem_id"), 6)
+if acpi_oem_id:
+    plan["acpi_oem_id"] = acpi_oem_id
+
+acpi_oem_table_id = sanitize_acpi_id(hardware.get("acpi_oem_table_id"), 8)
+if acpi_oem_table_id:
+    plan["acpi_oem_table_id"] = acpi_oem_table_id
 
 logical = num_text(hardware.get("logical_cpus"))
 if logical.isdigit() and 1 <= int(logical) <= 256:
@@ -87,18 +221,22 @@ PY
   _hw_field() {
     python3 -c 'import json,sys; data=json.load(open(sys.argv[1], encoding="utf-8")); value=data.get(sys.argv[2], ""); sys.stdout.write(",".join(value) if isinstance(value, list) else "" if value is None else str(value))' "$plan_json" "$1"
   }
-  local cpu memory vcpus mac serial skipped
+  local cpu memory vcpus mac serial skipped acpi_oem acpi_table
   cpu=$(_hw_field cpu)
   memory=$(_hw_field memory_mb)
   vcpus=$(_hw_field smp)
   mac=$(_hw_field mac)
   serial=$(_hw_field disk_serial)
+  acpi_oem=$(_hw_field acpi_oem_id)
+  acpi_table=$(_hw_field acpi_oem_table_id)
   skipped=$(_hw_field not_applied)
   [ -n "$cpu" ] && CPU_MODEL=$cpu
   [ -n "$memory" ] && KIN_KVM_MEMORY_MB=$memory
   [ -n "$vcpus" ] && KIN_KVM_VCPUS=$vcpus
   [ -n "$mac" ] && KIN_KVM_MAC=$mac
   [ -n "$serial" ] && KIN_KVM_DISK_SERIAL=$serial
+  [ -n "$acpi_oem" ] && KIN_KVM_ACPI_OEM_ID=$acpi_oem
+  [ -n "$acpi_table" ] && KIN_KVM_ACPI_OEM_TABLE_ID=$acpi_table
   not_applied=$skipped
   rm -f "$plan_json"
 }

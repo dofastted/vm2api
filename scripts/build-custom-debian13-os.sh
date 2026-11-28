@@ -82,6 +82,7 @@ import_oci_tarball() {
     --change 'LABEL kin.os.codename=trixie' \
     --change 'LABEL kin.os.custom=debian-13-baked' \
     --change 'LABEL kin.os.glibc_unified=1' \
+    --change 'LABEL org.vm2api.regular-etc-targets=1' \
     --change 'WORKDIR /home/kincli' \
     --change 'USER kincli' \
     --change 'CMD ["sleep", "infinity"]' \
@@ -263,6 +264,29 @@ printf '%s\n' 'debian-13' > "${ROOTFS_DIR}/etc/kin-os"
 printf '%s\n' 'claude-code=2.1.321' > "${ROOTFS_DIR}/etc/kin-claude"
 rm -f "${ROOTFS_DIR}/etc/claude-code/CLAUDE.md"
 
+ensure_regular_etc_targets() {
+  local root=$1
+  # Replace Debian symlinks (/etc/os-release, /etc/localtime) with regular 0644 placeholder files
+  # so Docker :ro bind mounts and RO EROFS guest bind mounts never follow symlinks or pollute tzdata.
+  if [ -e "${root}/usr/lib/os-release" ]; then
+    cp -L "${root}/usr/lib/os-release" "${root}/etc/.os-release.reg"
+    rm -f "${root}/etc/os-release"
+    mv -f "${root}/etc/.os-release.reg" "${root}/etc/os-release"
+    if [ -L "${root}/usr/lib/os-release" ]; then
+      cp -L "${root}/etc/os-release" "${root}/usr/lib/.os-release.reg"
+      rm -f "${root}/usr/lib/os-release"
+      mv -f "${root}/usr/lib/.os-release.reg" "${root}/usr/lib/os-release"
+    fi
+    chmod 0644 "${root}/etc/os-release" "${root}/usr/lib/os-release"
+  fi
+  rm -f "${root}/etc/localtime" "${root}/etc/timezone"
+  cp -L "${root}/usr/share/zoneinfo/UTC" "${root}/etc/localtime"
+  printf '%s\n' 'UTC' > "${root}/etc/timezone"
+  chmod 0644 "${root}/etc/localtime" "${root}/etc/timezone"
+}
+
+ensure_regular_etc_targets "$ROOTFS_DIR"
+
 if [ "$SKIP_SECRET_SCAN" != "1" ]; then
   log "running fail-closed secret & compliance gate on staged rootfs..."
   node "$SECRET_SCANNER" --dir "$ROOTFS_DIR"
@@ -402,6 +426,12 @@ EOF
   : > "${ROOTFS_DIR}/etc/hosts"
   chmod 0444 "${ROOTFS_DIR}/etc/machine-id" "${ROOTFS_DIR}/var/lib/dbus/machine-id"
   chmod 0644 "${ROOTFS_DIR}/etc/resolv.conf" "${ROOTFS_DIR}/etc/hosts"
+  ensure_regular_etc_targets "$ROOTFS_DIR"
+  for etc_reg in etc/os-release usr/lib/os-release etc/localtime etc/timezone etc/passwd etc/group etc/shadow; do
+    if [ -L "${ROOTFS_DIR}/${etc_reg}" ] || [ ! -f "${ROOTFS_DIR}/${etc_reg}" ]; then
+      die "EROFS mountpoint target /${etc_reg} must be a regular non-symlink file"
+    fi
+  done
   if [ "$SKIP_SECRET_SCAN" != "1" ]; then
     log "re-running fail-closed secret & compliance gate on EROFS rootfs..."
     node "$SECRET_SCANNER" --dir "$ROOTFS_DIR"

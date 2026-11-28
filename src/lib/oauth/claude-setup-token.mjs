@@ -10,7 +10,8 @@ import { fileURLToPath } from 'node:url'
 import { containerName } from '../vm/vm-runtime.mjs'
 import { AUTH_SCHEME_BEARER } from './auth-scheme.mjs'
 import { officialCcUidGid, officialCcHome, officialCcHostCli } from './official-cc-bootstrap.mjs'
-import { CONTAINER_CLI_NODE_BIN } from '../vm/slot-engine.mjs'
+import { slotCliNodeBin } from '../vm/slot-engine.mjs'
+import { slotHome, slotUser } from '../vm/slot-identity.mjs'
 import { OFFICIAL_CLI_VERSION } from '../identity/vm-identity.mjs'
 import { slotExecArgv } from '../vm/slot-exec.mjs'
 import { getVm } from '../vm/vm-registry.mjs'
@@ -180,7 +181,7 @@ export async function stopClaudeSetupTokenSession(projectRoot, vmId, { spawn = s
     if (pid && pidAlive(pid)) {
       try {
         process.kill(pid, 'SIGTERM')
-      } catch { }
+      } catch {}
     }
   }
   const vm = { ...(getVm(projectRoot, vmId) || {}), id: vmId }
@@ -188,14 +189,14 @@ export async function stopClaudeSetupTokenSession(projectRoot, vmId, { spawn = s
     const env = slotHost(vm).dockerEnv()
     spawn(
       'docker',
-      slotExecArgv(vm, ['sh', '-lc', `pkill -f '${CONTAINER_CLI_NODE_BIN} setup-token' >/dev/null 2>&1 || true`]),
+      slotExecArgv(vm, ['sh', '-lc', `pkill -f '${slotCliNodeBin(vm)} setup-token' >/dev/null 2>&1 || true`]),
       {
         stdio: 'ignore',
         timeout: 5000,
         ...(env ? { env } : {}),
       },
     )
-  } catch { }
+  } catch {}
 
   const deadline = Date.now() + 3000
   while (Date.now() < deadline) {
@@ -206,13 +207,13 @@ export async function stopClaudeSetupTokenSession(projectRoot, vmId, { spawn = s
     if (pid && pidAlive(pid)) {
       try {
         process.kill(pid, 'SIGKILL')
-      } catch { }
+      } catch {}
     }
   }
   for (const name of ['code.inbox', 'token', 'pty.pid', 'child.pid', 'pty.out', 'status.json']) {
     try {
       fs.unlinkSync(path.join(dir, name))
-    } catch { }
+    } catch {}
   }
   return { ok: true }
 }
@@ -234,6 +235,57 @@ async function waitFor(fn, timeoutMs, intervalMs = 200) {
 function ensureCli(projectRoot, vmId) {
   if (!fs.existsSync(officialCcHostCli(officialCcHome(projectRoot, vmId)))) {
     throw fail('cli_node_missing', '当前槽没有 cli-node，请先同步 wrap-cli')
+  }
+}
+
+export function buildClaudeSetupTokenLaunch(vm, { vmId = vm?.id } = {}) {
+  const ids = officialCcUidGid(vmId)
+  const userHome = slotHome(vm)
+  const userName = slotUser(vm)
+  const cliBin = slotCliNodeBin(vm)
+  const execUser = slotHost(vm).execUser(vm) || `${ids.uid}:${ids.gid}`
+  const [rawUid, rawGid] = String(execUser).split(':')
+  const execUid = rawUid || String(ids.uid)
+  const execGid = rawGid || String(ids.gid)
+  const execArgv = slotExecArgv(vm, [cliBin, 'setup-token'], {
+    user: execUser,
+    env: [
+      `HOME=${userHome}`,
+      `USER=${userName}`,
+      `LOGNAME=${userName}`,
+      `TMPDIR=${userHome}/.cache/tmp`,
+      `TZ=${vm.timezone || vm.fingerprint?.timezone || 'UTC'}`,
+      `LANG=${vm.locale || vm.fingerprint?.locale || 'en_US.UTF-8'}`,
+      `LC_ALL=${vm.locale || vm.fingerprint?.locale || 'en_US.UTF-8'}`,
+      `PATH=${userHome}/.local/bin:/usr/bin:/bin`,
+      'CLAUDE_CODE_HOST_REFRESH=1',
+      `CLAUDE_CODE_VERSION=${OFFICIAL_CLI_VERSION}`,
+      'USER_TYPE=external',
+      'KIN_SETUP_TOKEN=1',
+      'CLAUDE_CODE_USE_BEDROCK=0',
+      'CLAUDE_CODE_USE_VERTEX=0',
+      'DISABLE_TELEMETRY=1',
+      'DO_NOT_TRACK=1',
+      'ANTHROPIC_BASE_URL=',
+      'ANTHROPIC_API_KEY=',
+      'ANTHROPIC_AUTH_TOKEN=',
+      'CLAUDE_CODE_OAUTH_TOKEN=',
+      'TERM=xterm-256color',
+      'COLUMNS=220',
+      'LINES=40',
+    ],
+    workdir: userHome,
+    interactive: true,
+    tty: true,
+  })
+  return {
+    execUser,
+    execUid,
+    execGid,
+    userHome,
+    userName,
+    cliBin,
+    execArgv,
   }
 }
 
@@ -269,37 +321,8 @@ export async function startClaudeSetupTokenSession({ vm, projectRoot, force = fa
   const sessionId = crypto.randomBytes(16).toString('hex')
   const createdAt = Date.now()
   const expiresAt = createdAt + SETUP_TOKEN_SESSION_TTL_MS
-  const ids = officialCcUidGid(vmId)
+  const launch = buildClaudeSetupTokenLaunch(vm, { vmId })
   const ptyScript = path.join(scriptsDir(), 'claude-setup-token-pty.py')
-  const execArgv = slotExecArgv(vm, [CONTAINER_CLI_NODE_BIN, 'setup-token'], {
-    user: `${ids.uid}:${ids.gid}`,
-    env: [
-      'HOME=/home/kincli',
-      'TMPDIR=/home/kincli/.cache/tmp',
-      `TZ=${vm.timezone || vm.fingerprint?.timezone || 'UTC'}`,
-      `LANG=${vm.locale || vm.fingerprint?.locale || 'en_US.UTF-8'}`,
-      `LC_ALL=${vm.locale || vm.fingerprint?.locale || 'en_US.UTF-8'}`,
-      'PATH=/home/kincli/.local/bin:/usr/bin:/bin',
-      'CLAUDE_CODE_HOST_REFRESH=1',
-      `CLAUDE_CODE_VERSION=${OFFICIAL_CLI_VERSION}`,
-      'USER_TYPE=external',
-      'KIN_SETUP_TOKEN=1',
-      'CLAUDE_CODE_USE_BEDROCK=0',
-      'CLAUDE_CODE_USE_VERTEX=0',
-      'DISABLE_TELEMETRY=1',
-      'DO_NOT_TRACK=1',
-      'ANTHROPIC_BASE_URL=',
-      'ANTHROPIC_API_KEY=',
-      'ANTHROPIC_AUTH_TOKEN=',
-      'CLAUDE_CODE_OAUTH_TOKEN=',
-      'TERM=xterm-256color',
-      'COLUMNS=220',
-      'LINES=40',
-    ],
-    workdir: '/home/kincli',
-    interactive: true,
-    tty: true,
-  })
   const child = spawn('python3', [ptyScript], {
     env: {
       PATH: process.env.PATH || '/usr/bin:/bin',
@@ -309,9 +332,11 @@ export async function startClaudeSetupTokenSession({ vm, projectRoot, force = fa
       TZ: vm.timezone || vm.fingerprint?.timezone || 'UTC',
       TERM: 'xterm-256color',
       KIN_CONTAINER: containerName(vmId),
-      KIN_UID: String(ids.uid),
-      KIN_GID: String(ids.gid),
-      KIN_CLI_BIN: CONTAINER_CLI_NODE_BIN,
+      KIN_UID: launch.execUid,
+      KIN_GID: launch.execGid,
+      KIN_SLOT_HOME: launch.userHome,
+      KIN_SLOT_USER: launch.userName,
+      KIN_CLI_BIN: launch.cliBin,
       KIN_CLI_VERSION: OFFICIAL_CLI_VERSION,
       KIN_SESSION_DIR: dir,
       KIN_SESSION_ID: sessionId,
@@ -319,7 +344,7 @@ export async function startClaudeSetupTokenSession({ vm, projectRoot, force = fa
       KIN_CREATED_AT: String(createdAt),
       KIN_EXPIRES_AT: String(expiresAt),
       KIN_SESSION_TTL_MS: String(SETUP_TOKEN_SESSION_TTL_MS),
-      KIN_DOCKER_ARGV: JSON.stringify(execArgv),
+      KIN_DOCKER_ARGV: JSON.stringify(launch.execArgv),
     },
     detached: true,
     stdio: 'ignore',
@@ -370,7 +395,7 @@ export async function completeClaudeSetupToken({ projectRoot, vmId, sessionId, c
       fromPty = extractSetupTokenValue(
         fs.readFileSync(path.join(setupTokenSessionDir(projectRoot, vmId), 'token'), 'utf8'),
       )
-    } catch { }
+    } catch {}
     const found = pickPreferredSetupToken(fromDisk, fromPty)
     if (found) {
       await stopClaudeSetupTokenSession(projectRoot, vmId)
@@ -411,7 +436,7 @@ export async function completeClaudeSetupToken({ projectRoot, vmId, sessionId, c
   let fromPty = ''
   try {
     fromPty = extractSetupTokenValue(fs.readFileSync(path.join(dir, 'token'), 'utf8'))
-  } catch { }
+  } catch {}
   const latest = pickPreferredSetupToken(token, readFreshOfficialSetupToken(home, fedAt), fromPty)
   if (!latest) {
     const s = readSetupTokenSession(projectRoot, vmId)
