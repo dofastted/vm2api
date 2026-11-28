@@ -49,7 +49,8 @@ import {
   normalizeProviderScope,
 } from '../db/repos/scheduler-pools-repo.mjs'
 import { SettingsRepo } from '../db/repos/settings-repo.mjs'
-import { resolveUpstreamModel, stripAntigravityPrefix } from '../gemini/model-catalog.mjs'
+import { indexAccountModelCatalog, resolveUpstreamModel, stripAntigravityPrefix } from '../gemini/model-catalog.mjs'
+import { isGeminiSeriesId, resolveGeminiDefaultEffort } from '../protocol/gemini-model-policy.mjs'
 import { OFFICIAL_303_PRESET, normalizePersonaPreset } from '../identity/persona-template.mjs'
 import { activeHoursOf, evaluateActiveHours } from '../pool/active-hours.mjs'
 import { endpointMatchesModel, stripPrefix } from '../pool/api-scheduler.mjs'
@@ -545,7 +546,7 @@ function endpointServesModelLocal(ep, model) {
   return models.length === 0
 }
 
-function geminiEnvServesModelLocal(env, model, { allowUnprefixedGemini3p = false } = {}) {
+function geminiEnvServesModelLocal(env, model, { allowUnprefixedGemini3p = false, requestedEffort = null } = {}) {
   const rawModels = Array.isArray(env?.models)
     ? env.models.map((x) => (typeof x === 'string' ? x : String(x?.id ?? x?.name ?? ''))).filter(Boolean)
     : []
@@ -554,7 +555,14 @@ function geminiEnvServesModelLocal(env, model, { allowUnprefixedGemini3p = false
     .trim()
     .replace(/^models\//i, '')
   if (!cleaned) return true
-  if (resolveUpstreamModel(cleaned, rawModels, { allowUnprefixedNonGemini: allowUnprefixedGemini3p })) {
+  if (
+    resolveUpstreamModel(cleaned, rawModels, {
+      allowUnprefixedNonGemini: allowUnprefixedGemini3p,
+      catalogIndex: indexAccountModelCatalog(env.account),
+      requestedEffort,
+      defaultEffort: isGeminiSeriesId(cleaned) ? resolveGeminiDefaultEffort(cleaned) : null,
+    })
+  ) {
     return true
   }
   const wantLower = cleaned.toLowerCase()
@@ -2667,6 +2675,7 @@ export class SchedulerRuntime {
    */
   #computeAllowedNodeKeys({
     model,
+    requestedEffort,
     modelFamily,
     nodeTypes,
     explicitAllowedNodeKeys,
@@ -2794,7 +2803,8 @@ export class SchedulerRuntime {
           }
         } else if (nodeCfg.node_type === 'gemini_env') {
           if (!allowUnprefixedGemini3p && (modelFamily === 'claude' || modelFamily === 'openai')) continue
-          if (inv?.item && !geminiEnvServesModelLocal(inv.item, model, { allowUnprefixedGemini3p })) continue
+          if (inv?.item && !geminiEnvServesModelLocal(inv.item, model, { allowUnprefixedGemini3p, requestedEffort }))
+            continue
         } else if (nodeCfg.node_type === 'api_endpoint') {
           if (inv?.item && !endpointServesModelLocal(inv.item, model)) continue
         }
@@ -2848,6 +2858,7 @@ export class SchedulerRuntime {
       const explicitKeys = params.allowedNodeKeys || params.allowed_node_keys || null
       const allowedNodeKeys = this.#computeAllowedNodeKeys({
         model,
+        requestedEffort: params.requestedEffort ?? params.requested_effort,
         modelFamily,
         nodeTypes,
         explicitAllowedNodeKeys: explicitKeys,
