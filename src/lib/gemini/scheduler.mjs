@@ -207,7 +207,7 @@ const SHORT_RATE_LIMIT_MAX_MS = 5_000
 const MAX_LOCAL_BRIDGE_DISCONNECT_ATTEMPTS = 2
 
 function isLocalBridgeDisconnectFailure(failure, failureCode, attemptUpstreamStatus) {
-  if (failure?.bridgeDisconnected === true || failure?.workerCode === 'bridge_disconnected') return true
+  if (failure?.bridgeDisconnected === true) return true
   if (
     failureCode === 'gemini_inference_failed' &&
     (attemptUpstreamStatus == null || attemptUpstreamStatus === 502) &&
