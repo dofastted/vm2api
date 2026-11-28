@@ -494,7 +494,7 @@ const COLS: Col[] = [
     cell: (r) => (r.today ? fmtNum(r.today) : <span className={TERT}>0</span>),
   },
   {
-    label: '执行位',
+    label: '席位',
     sort: 'seats',
     num: true,
     cell: (r) =>
@@ -772,7 +772,7 @@ function SummaryBar({ a }: { a: Agg }) {
         x={a.top ? `最高 ${a.top.vm.id} ${fmtUsd(a.top.spend, 0)}` : ''}
       />
       <Kpi
-        k='执行位占用'
+        k='席位占用'
         v={
           <>
             {a.used}
@@ -1064,7 +1064,7 @@ export function VmTable({
                         </b>
                       </span>
                       <span>
-                        执行位{' '}
+                        席位{' '}
                         <b className='font-mono text-foreground'>
                           {sec.agg.used}/{sec.agg.cap}
                         </b>
