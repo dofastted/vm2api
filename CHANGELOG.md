@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.4.260 — 2026-11-28 · CRAG 出口新增 Claude Code 2.1.321 结构整流器
+
+- **CRAG 最终出口统一执行 2.1.321 结构整流（#2089）**：新增 `src/lib/protocol/crag-321-rectifier.mjs` 作为单一真值，在 `prepareCragRequest`（严格官方透传与非严格/第三方两条分支）以及 `count_tokens`（`user-count-tokens.mjs`、`go-worker-client.mjs` 的 `countTokensViaKernel`）出口调用，把不合法或版本漂移的结构改写成 2.1.321 的合法等价形态，而不是放行到上游触发 400。
+  - **合法请求零修改**：已满足结构与 `cache_control` 不变量的请求原引用返回，不破坏官方缓存前缀与续传哈希；仓库内真实官方抓包夹具（2.1.303 骨架）在严格与非严格模式下均零修改且幂等
+  - **`role: "system"` 整流**：非指令的 `role: "system"` 不能位于首位，必须紧跟 `user`（或以服务端 `*_tool_result` 结尾的 `assistant`）之后；首部的 `tool_addition(tool_definition)` 提升到顶层 `tools[]`（按 `name` 去重），首部纯文本提升到顶层 `system[]`，`tool_removal` / `tool_reference` / `clear_at` 延后到首条 `user` 之后；中段与尾部的违规系统回合延后或前置 `user("continue")`；连续的非指令系统回合合并；`role: "developer"` 归一为 `system`；directive-only 的空 `system` 回合保留
+  - **非 `system` 回合中的工具块**：`user` / `assistant` 内的 `tool_addition` / `tool_removal` 抽出为合法的 `role: "system"` 回合
+  - **字段整流**：`thinking.budgetTokens` → 整型 `budget_tokens`；`output_config.effort` 清理并小写；`output_config.format` 的 object schema 补 `additionalProperties: false`；剥离 `annotations`；整流后统一执行 `repairCacheBreakpoints`（修复 `thinking.cache_control`、超 4 个断点与重排引发的 `5m → 1h` 倒挂）；`canonicalRequest` 校验 `tool_choice` 时识别内联 `tool_definition`
+  - **作用范围**：仅 CRAG 原生路径（`cragPrint` 为真）；`cli-node` 路径不经过整流器，输出保持不变
+- **测试修复（#2092）**：`go-worker-client.test.mjs` 的「worker canonicalizes passthrough bodies before either kernel」此前对两条内核路径共用同一期望，#2089 合入后在 dev 上失败 1 例；现按 `cragPrint` 分路径断言。纯测试改动，无用户可见变化
+- 部署说明：本次改动零数据库迁移、零 Rust 变更、零 `deploy/payload.json` 变更；协议层改动随控制面重启生效，CRAG 内核载荷字节未变。
+
 ## 1.4.259 — 2026-11-28 · V4 协议纯度收口（内联 `tool_choice`、首部 `role: "system"` 控制回合）与 CRAG `3.1.31` 钉选
 
 - **内联工具与首部系统控制回合的协议不变量收口（#2085）**：
