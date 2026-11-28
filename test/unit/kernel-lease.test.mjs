@@ -68,12 +68,12 @@ test('kernel lease helpers', () => {
   assert.equal(leaseVerdict({ capacity: null, inflight: 9 }), 'unknown')
 })
 
-test('normalizePoolRouting keeps kernel_lease and clamps kernel_lease_queue_grace_ms', () => {
+test('normalizePoolRouting keeps kernel_lease and no longer defaults kernel_lease_queue_grace_ms', () => {
   assert.equal(normalizePoolRouting({ kernel_lease: 'observe' }).kernel_lease, 'observe')
   assert.equal(normalizePoolRouting({ kernel_lease: 'enforce' }).kernel_lease, 'enforce')
   assert.equal(normalizePoolRouting({}).kernel_lease, 'off')
-  assert.equal(normalizePoolRouting({ kernel_lease_queue_grace_ms: 0 }).kernel_lease_queue_grace_ms, 0)
-  assert.equal(normalizePoolRouting({ kernel_lease_queue_grace_ms: 999_999 }).kernel_lease_queue_grace_ms, 120_000)
+  assert.equal(Object.hasOwn(normalizePoolRouting({}), 'kernel_lease_queue_grace_ms'), false)
+  assert.equal(normalizePoolRouting({ kernel_lease_queue_grace_ms: 999_999 }).kernel_lease_queue_grace_ms, 999_999)
 })
 
 test('KernelLeaseStats records observe/enforce grants, denials, slot_busy desyncs, and summary flush', () => {
