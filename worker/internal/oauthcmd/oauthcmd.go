@@ -93,17 +93,17 @@ func Run(args []string, stdin io.Reader, stdout io.Writer) int {
 		return writeAndReturn(stdout, errorEnvelope(0, code, errorMessage(code)), 0)
 	}
 	store := credential.NewStore(cfg.CredentialPath)
-	refresher := &kinoauth.Refresher{
-		Store:     store,
-		Client:    httpClient,
-		TokenURL:  cfg.OAuthTokenURL,
-		Skew:      cfg.RefreshSkew,
-		OnAttempt: func(attempt kinoauth.Attempt) { _ = json.NewEncoder(stdout).Encode(attempt) },
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
 	defer cancel()
 
 	if op == "refresh" {
+		refresher := &kinoauth.Refresher{
+			Store:     store,
+			Client:    httpClient,
+			TokenURL:  cfg.OAuthTokenURL,
+			Skew:      cfg.RefreshSkew,
+			OnAttempt: func(attempt kinoauth.Attempt) { _ = json.NewEncoder(stdout).Encode(attempt) },
+		}
 		result, err := refresher.Ensure(ctx, force)
 		if err != nil {
 			return writeAndReturn(stdout, errorEnvelope(refreshErrorStatus(err), classifyError(err), errorMessage(classifyError(err))), 0)
@@ -125,10 +125,12 @@ func Run(args []string, stdin io.Reader, stdout io.Writer) int {
 	if err != nil {
 		return writeAndReturn(stdout, errorEnvelope(0, "config_failed", errorMessage("config_failed")), 0)
 	}
+	// Non-refresh operations are strictly read-only on credentials.json: the panel
+	// orchestrates refresh explicitly before probing so tokens never rotate silently.
 	client := &upstream.Client{
 		HTTP:          httpClient,
 		Store:         store,
-		Refresher:     refresher,
+		Refresher:     nil,
 		AnthropicBase: baseURL,
 	}
 	headers := requestHeaders(cfg, op)

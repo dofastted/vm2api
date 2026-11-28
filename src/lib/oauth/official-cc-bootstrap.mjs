@@ -749,7 +749,7 @@ export function wipeOfficialFirstUseHome(homeDir, { uid, gid } = {}) {
  * that name onto host-owned credentials.json so wrap cannot copy RT.
  */
 export function materializeOfficialClaudeCredentials(homeDir, { uid, gid } = {}) {
-  return ensureOfficialCredentialLink(homeDir, { uid, gid })
+  return ensureOfficialCredentialLink(homeDir, { uid, gid, adoptOfficial: false })
 }
 
 /** Init may run only when the on-disk grant is inside its expiry and the alias is the relative symlink. */

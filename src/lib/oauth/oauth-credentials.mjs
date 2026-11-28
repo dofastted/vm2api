@@ -23,6 +23,33 @@ import {
 import { resolveAuthScheme } from './auth-scheme.mjs'
 import { flattenOauthIdentity, normalizeSubscriptionType } from './oauth-identity.mjs'
 
+const credentialRefreshTail = new Map()
+
+/**
+ * Process-local per-key refresh serialization (SSOT shared across Claude & Codex).
+ * Prevents concurrent panel refreshes, imports, and pre-probe refreshes from
+ * racing on the same refresh token or read-modify-write credential file.
+ */
+export function withCredentialRefreshLock(key, fn) {
+  const prev = credentialRefreshTail.get(key) || Promise.resolve()
+  let release
+  const gate = new Promise((resolve) => {
+    release = resolve
+  })
+  const tail = prev.catch(() => {}).then(() => gate)
+  credentialRefreshTail.set(key, tail)
+  return prev
+    .catch(() => {})
+    .then(async () => {
+      try {
+        return await fn()
+      } finally {
+        release()
+        if (credentialRefreshTail.get(key) === tail) credentialRefreshTail.delete(key)
+      }
+    })
+}
+
 export const REFRESH_SKEW_MS = 5 * 60 * 1000
 
 /**
@@ -494,10 +521,25 @@ function chownSlotCredentialFile(homeDir, file) {
 
 function sealSlotCredentialFile(file) {
   if (!file) return
-  // Slot Claude must not rewrite the shared RT; that drops kinGeneration.
+  // Slot processes must never rewrite panel credentials.json.
   try {
     fs.chmodSync(file, 0o444)
   } catch {}
+}
+
+/**
+ * Restore panel SSOT invariants after an in-place panel refresh: strip any email,
+ * keep slot ownership + 0444 read-only seal, and relink `.credentials.json` without
+ * ever adopting a slot-written regular file.
+ */
+export function sealWorkerCredentialFile(homeDir) {
+  const file = slotWorkerCredentialPath(homeDir)
+  if (!file || !fs.existsSync(file)) return { sealed: false, reason: 'missing' }
+  stripWorkerCredentialEmail(homeDir)
+  chownSlotCredentialFile(homeDir, file)
+  sealSlotCredentialFile(file)
+  ensureOfficialCredentialLink(homeDir, { ...slotUidGidFromHomeDir(homeDir), adoptOfficial: false })
+  return { sealed: true, path: file }
 }
 
 /** Write slot credentials.json for imports and worker-owned credential updates. */
@@ -894,9 +936,9 @@ export function clearVmAuthCooldown(vmPath) {
   return vm
 }
 
-// The control plane lost track of the worker: the refresh may or may not have run.
+// The control plane lost track of the worker or slot projection failed after rotation.
 const WORKER_TRANSPORT_CODES =
-  /^(worker_output_invalid|worker_exec_failed|worker_timeout|worker_output_limit|credential_pull_failed)$/i
+  /^(worker_output_invalid|worker_exec_failed|worker_timeout|worker_output_limit|credential_pull_failed|credential_sync_failed)$/i
 
 /** Lost answers are retryable only when the worker's attempt journal guards the refresh token. */
 const unguardedTransportFailure = (result) =>

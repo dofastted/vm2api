@@ -21,8 +21,9 @@
  *                   slot gets a loopback SOCKS5 that dials from the node itself
  *   syncRun(vm, slotDir)        publish run/ (kernel.json, worker.json, token) where the slot reads it
  *   queueSyncRun(vm, slotDir)   fire-and-forget syncRun
- *   onImport(vm, slotDir)       an imported credential replaces the slot's copy
- *   afterRefresh(vm, slotDir)   the slot rotated its credential; mirror it back
+ *   syncCredentials(vm, slotDir) one-way Panel SSOT read-only projection of credentials to the slot
+ *   onImport(vm, slotDir)       alias of syncCredentials (imported credential replaces the slot's copy)
+ *   afterRefresh(vm, slotDir)   no-op under Panel SSOT (slots never rotate credentials or push back)
  *   syncTelemetry(vm, slotDir)  acknowledge run/seed publication for VM-native telemetry
  *   seedFiles(vm, slotDir)      read owner seed bytes plus actual HOME; null means missing, errors never fall back
  *   syncSeed(vm, slotDir)       acknowledge all three seed files without claiming native telemetry support
@@ -39,7 +40,7 @@
  * with vm-runtime / the kernel supervisor, so bindings are read at call time.
  */
 
-import { localDocker } from '../cluster/docker-remote.mjs'
+import { inspectContainerOrNull, localDocker } from '../cluster/docker-remote.mjs'
 import fs from 'node:fs'
 import path from 'node:path'
 import { nodeSession, remoteSlotDir } from '../cluster/placement.mjs'
@@ -63,12 +64,7 @@ import {
   stopNativeSlot,
 } from '../cluster/native-slot.mjs'
 import { ClusterError } from '../cluster/ssh-link.mjs'
-import {
-  pullSlotCredentials,
-  pushSlotCredentials,
-  pushSlotFiles,
-  queueSlotPush,
-} from '../cluster/remote-slot-files.mjs'
+import { pushSlotCredentials, pushSlotFiles, queueSlotPush } from '../cluster/remote-slot-files.mjs'
 import {
   destroyRemoteSlot,
   reloadRemoteSlot,
@@ -85,7 +81,14 @@ import {
   slotCliNodeBin,
 } from './slot-engine.mjs'
 import { isCustomSlotUser, slotGuestUidGid } from './slot-identity.mjs'
-import { destroyVmRuntime, officialCcUidGid, reloadSlotWorker, startVmRuntime, stopVmRuntime } from './vm-runtime.mjs'
+import {
+  containerName,
+  destroyVmRuntime,
+  officialCcUidGid,
+  reloadSlotWorker,
+  startVmRuntime,
+  stopVmRuntime,
+} from './vm-runtime.mjs'
 import {
   boundProxyUrl,
   ensureProxyEgress,
@@ -98,10 +101,73 @@ import { isCodexVm } from './vm-kind.mjs'
 import { nodeEgressProxyUrl } from '../cluster/node-egress-socks.mjs'
 import { isKvmRuntime } from './runtime-kind.mjs'
 import { isCustomKvmMode } from './custom-os-runtime.mjs'
+import { resolveSlotAgentConnection, syncCustomKvmSlotFiles } from './kvm-slot-agent-client.mjs'
+import { stripWorkerCredentialEmail } from '../oauth/oauth-credentials.mjs'
 import { stopCodexKernel } from '../transport/codex-kernel-supervisor.mjs'
 import { readLocalSlotSeedFiles } from './slot-seed.mjs'
 
 const noop = async () => ({ skipped: true })
+
+async function isLocalSlotContainerRunning(vm, { dockerApi = localDocker, inspect = inspectContainerOrNull } = {}) {
+  const name = vm?.runtime?.container_name || (vm?.id ? containerName(vm.id) : '')
+  if (!name) return false
+  try {
+    const info = await inspect(dockerApi(), name)
+    return info?.State?.Running === true
+  } catch {
+    return String(vm?.status || '').toLowerCase() === 'running'
+  }
+}
+
+/**
+ * One-way Panel SSOT credential projection for local custom-erofs KVM slots.
+ * Pushes sanitized `credentials.json` over `kin-slot-agent` (guest writes 0440
+ * root:<slot-gid> + relative `.credentials.json` symlink). Skips cleanly when
+ * the slot container is stopped (next boot syncs via rust-kernel-supervisor);
+ * fails closed when the slot is running and the agent is unreachable or rejects.
+ */
+export async function pushCustomKvmSlotCredentials(vm, slotDir, deps = {}) {
+  const homeDir = path.join(slotDir, 'cli-home')
+  const localCred = path.join(homeDir, '.claude', 'credentials.json')
+  if (!fs.existsSync(localCred)) return { pushed: false, reason: 'local_missing' }
+  stripWorkerCredentialEmail(homeDir)
+
+  const projectRoot = path.dirname(path.dirname(slotDir))
+  const syncFn = deps.syncFiles || syncCustomKvmSlotFiles
+  const checkRunning = () =>
+    typeof deps.isRunning === 'function' ? deps.isRunning(vm) : isLocalSlotContainerRunning(vm, deps)
+
+  if (!deps.client && !deps.syncFiles) {
+    const conn = resolveSlotAgentConnection(projectRoot, vm, deps)
+    const missingSocket = !conn.socketPath || !fs.existsSync(conn.socketPath)
+    if (missingSocket || !conn.token) {
+      if (!(await checkRunning())) return { pushed: false, skipped: true, reason: 'slot_stopped' }
+      const code = missingSocket ? 'agent_socket_missing' : 'agent_token_missing'
+      throw new ClusterError(502, code, `Custom-EROFS KVM slot agent is unavailable (${code})`)
+    }
+  }
+
+  const synced = await syncFn(projectRoot, vm, {
+    homeDir,
+    targets: ['credentials'],
+    requiredTargets: ['credentials'],
+    ...(deps.client ? { client: deps.client } : {}),
+    ...(deps.socketPath ? { socketPath: deps.socketPath } : {}),
+    ...(deps.token ? { token: deps.token } : {}),
+    ...(deps.timeoutMs != null ? { timeoutMs: deps.timeoutMs } : {}),
+  })
+  if (!synced?.ok) {
+    if (synced?.error === 'agent_unreachable' && !(await checkRunning())) {
+      return { pushed: false, skipped: true, reason: 'slot_stopped' }
+    }
+    throw new ClusterError(
+      502,
+      synced?.error || 'kvm_credential_sync_failed',
+      synced?.message || 'Failed to sync credentials to custom-erofs KVM guest',
+    )
+  }
+  return { pushed: true, synced: synced.synced || ['credentials'] }
+}
 
 const LOCAL_HOST = Object.freeze({
   kind: 'local',
@@ -197,6 +263,7 @@ const LOCAL_HOST = Object.freeze({
     }
   },
   queueSyncRun: () => null,
+  syncCredentials: noop,
   onImport: noop,
   afterRefresh: noop,
 })
@@ -274,8 +341,9 @@ function nodeHost(nodeId) {
       return bytes?.toString('utf8') || ''
     },
     queueSyncRun: (vm, slotDir) => queueSlotPush(vm, slotDir, ['run']),
+    syncCredentials: (vm, slotDir) => pushSlotCredentials(vm, slotDir),
     onImport: (vm, slotDir) => pushSlotCredentials(vm, slotDir),
-    afterRefresh: (vm, slotDir) => pullSlotCredentials(vm, slotDir),
+    afterRefresh: noop,
   }
 }
 
@@ -363,6 +431,13 @@ export function slotHost(vm) {
             const { uid, gid } = slotGuestUidGid(targetVm || vm)
             return `${uid}:${gid}`
           },
+          ...(!nodeId
+            ? {
+                syncCredentials: (targetVm, slotDir) => pushCustomKvmSlotCredentials(targetVm || vm, slotDir),
+                onImport: (targetVm, slotDir) => pushCustomKvmSlotCredentials(targetVm || vm, slotDir),
+                afterRefresh: noop,
+              }
+            : {}),
         }
       : {}),
     ownsSocketFiles: false,
