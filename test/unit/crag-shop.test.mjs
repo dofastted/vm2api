@@ -10,7 +10,11 @@ import { createPanelHandler } from '../../src/lib/admin/panel-routes.mjs'
 import {
   buyerOwner,
   createCragShopHandler,
+  createGeminiCragShopHandler,
   cragShopRoute,
+  GEMINI_CATALOG_CACHE_KEY,
+  GEMINI_SHOP_OWNER_PREFIX,
+  geminiCragShopRoute,
   sameOriginPost,
   sessionBuyerOwner,
 } from '../../src/lib/admin/crag-shop.mjs'
@@ -2008,4 +2012,246 @@ test('direct-credit purchase injects host_id, auto-syncs host rights on fulfillm
   const claimDirect = await call('POST', `/orders/${buy.data.order_id}/claim`, {})
   assert.equal(claimDirect.http, 409)
   assert.equal(claimDirect.error.code, 'shop_direct_credit_no_voucher')
+})
+
+test('Gemini shop supplier prefix, ACL, order/cache/expiry isolation, and direct-credit sync({ sync: true })', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'crag-gemini-shop-'))
+  const db = createDatabase({ dbPath: path.join(root, 'kin.db') })
+  t.after(() => {
+    db.close()
+    fs.rmSync(root, { recursive: true, force: true })
+  })
+
+  // 1. Supplier pathPrefix validation & callback URL pairing
+  assert.throws(() => createShopSupplier(globalThis.fetch, { pathPrefix: 'gemini' }))
+  assert.throws(() => createShopSupplier(globalThis.fetch, { pathPrefix: '/gemini/nested' }))
+
+  const geminiOrderId = randomUUID()
+  const geminiRow = { order_id: geminiOrderId, sku: 'gemini-monthly', payment_method: 'alipay' }
+  const geminiPlan = {
+    sku: 'gemini-monthly',
+    term: '1m',
+    amount_minor: 9900,
+    slot_limit: 10,
+    product: 'craggemini',
+    stackable: true,
+  }
+  const geminiFields = {
+    ...fields(geminiOrderId),
+    money: '99.00',
+    notify_url: `${SHOP}/gemini/shop/epay/notify`,
+    return_url: `${SHOP}/gemini/shop/return`,
+  }
+  let supplierFields = geminiFields
+  const seenUrls = []
+  const geminiSupplier = createShopSupplier(
+    async (url) => {
+      seenUrls.push(url)
+      if (url.endsWith('/gemini/shop/plans')) {
+        return Response.json({ plans: [geminiPlan], payment_methods: ['alipay'] })
+      }
+      if (url.endsWith('/gemini/shop/orders')) {
+        return Response.json({
+          ...geminiPlan,
+          order_id: geminiOrderId,
+          status: 'pending',
+          payment_method: 'alipay',
+          created_at: 1_800_000_000,
+          url: ACTION,
+          data: supplierFields,
+        })
+      }
+      throw new Error(`unexpected supplier url: ${url}`)
+    },
+    { pathPrefix: '/gemini' },
+  )
+  const plans = await geminiSupplier.plans()
+  assert.equal(plans.plans[0].product, 'craggemini')
+  assert.equal(plans.plans[0].stackable, true)
+  const created = await geminiSupplier.create(geminiRow, PROOF)
+  assert.equal(created.form.data.notify_url, `${SHOP}/gemini/shop/epay/notify`)
+  assert.deepEqual(seenUrls, [`${SHOP}/gemini/shop/plans`, `${SHOP}/gemini/shop/orders`])
+
+  // Non-prefixed Claude callbacks must be rejected by the Gemini supplier.
+  supplierFields = { ...geminiFields, notify_url: `${SHOP}/shop/epay/notify`, return_url: `${SHOP}/shop/return` }
+  await assert.rejects(() => geminiSupplier.create(geminiRow, PROOF), { code: 'shop_invalid_reply' })
+
+  // 2. Route & ACL checks for /api/panel/gemini/crag-shop/*
+  const GEMINI_BASE = '/api/panel/gemini/crag-shop'
+  assert.equal(geminiCragShopRoute('GET', `${GEMINI_BASE}/plans`), 'plans')
+  assert.equal(geminiCragShopRoute('POST', `${GEMINI_BASE}/quote`), 'quote')
+  assert.equal(geminiCragShopRoute('POST', `${GEMINI_BASE}/orders`), 'create')
+  assert.equal(geminiCragShopRoute('POST', `${GEMINI_BASE}/orders/${geminiOrderId}/claim`), 'claim')
+  assert.equal(geminiCragShopRoute('POST', `${GEMINI_BASE}/orders/${geminiOrderId}/apply-renewal`), 'apply-renewal')
+  assert.equal(geminiCragShopRoute('GET', `${GEMINI_BASE}/activation-targets`), null)
+  assert.equal(geminiCragShopRoute('POST', `${GEMINI_BASE}/device/orders`), null)
+  for (const role of ['user', 'super', 'admin']) {
+    assert.equal(authorizePanelRoute('POST', `${GEMINI_BASE}/orders`, role).ok, true)
+  }
+  assert.equal(authorizePanelRoute('POST', `${GEMINI_BASE}/orders/${geminiOrderId}/apply-renewal`, 'user').ok, false)
+  assert.equal(authorizePanelRoute('POST', `${GEMINI_BASE}/orders/${geminiOrderId}/apply-renewal`, 'admin').ok, true)
+
+  // 3. Handler isolation: ownerPrefix, catalogCacheKey, sync({ sync: true }), pollOrderExpiry
+  const geminiHostId = 'e'.repeat(64)
+  const syncArgs = []
+  let geminiRemoteStatus = 'pending'
+  let claudeExpiryPolls = 0
+  let geminiExpiryPolls = 0
+
+  const claudeHandler = createCragShopHandler({
+    dataDir: root,
+    publicBaseUrl: PANEL,
+    getDb: () => db,
+    json: (_, http, body) => ({ http, ...body }),
+    readRawBody: (req) => req.raw,
+    isCurrentAdmin: () => true,
+    supplier: {
+      async plans() {
+        return { plans: [PLAN], payment_methods: ['alipay'] }
+      },
+      async status() {
+        claudeExpiryPolls++
+        throw new Error('Claude expiry poll must not query Gemini orders')
+      },
+    },
+  })
+
+  const geminiHandler = createGeminiCragShopHandler({
+    dataDir: root,
+    publicBaseUrl: PANEL,
+    getDb: () => db,
+    json: (_, http, body) => ({ http, ...body }),
+    readRawBody: (req) => req.raw,
+    isCurrentAdmin: () => true,
+    subscription: {
+      purchaseDeviceId: () => geminiHostId,
+      async status(opts) {
+        syncArgs.push(opts)
+        return { active: true, host_id: geminiHostId, slot_limit: 10 }
+      },
+    },
+    supplier: {
+      async plans() {
+        return { plans: [geminiPlan], payment_methods: ['alipay'] }
+      },
+      async quote() {
+        return { ...geminiPlan, months: 1, subtotal_minor: 9900, discount_minor: 0 }
+      },
+      async create(row, _receipt, _proof, purchase) {
+        assert.equal(purchase.host_id, geminiHostId)
+        return {
+          order: {
+            ...geminiPlan,
+            order_id: row.order_id,
+            status: geminiRemoteStatus,
+            payment_method: row.payment_method,
+            created_at: 1_800_000_000,
+            host_id: geminiHostId,
+            direct_credit: true,
+          },
+        }
+      },
+      async status(row) {
+        geminiExpiryPolls++
+        return {
+          ...geminiPlan,
+          order_id: row.order_id,
+          status: geminiRemoteStatus,
+          payment_method: row.payment_method,
+          created_at: 1_800_000_000,
+          host_id: geminiHostId,
+          direct_credit: true,
+        }
+      },
+    },
+  })
+
+  const callGemini = (method, endpoint, body) => {
+    const url = new URL(`${PANEL}${GEMINI_BASE}${endpoint}`)
+    return geminiHandler(
+      {
+        ...PERSON,
+        method,
+        raw: Buffer.from(body === undefined ? '' : JSON.stringify(body)),
+        headers: {
+          host: 'panel.example.test',
+          origin: PANEL,
+          'sec-fetch-site': 'same-origin',
+          'content-type': 'application/json',
+        },
+      },
+      {},
+      url,
+      geminiCragShopRoute(method, url.pathname),
+    )
+  }
+
+  // Catalog caches are stored under separate keys.
+  assert.equal((await callGemini('GET', '/plans')).http, 200)
+  const claudePlansUrl = new URL(`${PANEL}${BASE}/plans`)
+  assert.equal((await claudeHandler({ ...PERSON, method: 'GET', headers: {} }, {}, claudePlansUrl, 'plans')).http, 200)
+  assert.ok(db.prepare('SELECT value FROM settings WHERE key = ?').get('crag_shop_catalog_cache_v1'))
+  assert.ok(db.prepare('SELECT value FROM settings WHERE key = ?').get(GEMINI_CATALOG_CACHE_KEY))
+
+  // activation_target is rejected on Gemini orders.
+  const badTarget = await callGemini('POST', '/orders', {
+    sku: 'gemini-monthly',
+    payment_method: 'alipay',
+    request_id: 'gemini-bad-target',
+    expected_amount_minor: 9900,
+    activation_target: { vm_id: 'vm-1' },
+  })
+  assert.equal(badTarget.http, 400)
+  assert.equal(badTarget.error.code, 'shop_invalid_request')
+
+  // Create Gemini order -> stored with craggemini: owner prefix, invisible to Claude order list.
+  const buy = await callGemini('POST', '/orders', {
+    sku: 'gemini-monthly',
+    payment_method: 'alipay',
+    request_id: 'gemini-buy-1',
+    expected_amount_minor: 9900,
+  })
+  assert.equal(buy.http, 200)
+  const rowInDb = db.prepare('SELECT owner FROM crag_shop_orders WHERE order_id = ?').get(buy.data.order_id)
+  assert.equal(rowInDb.owner, `${GEMINI_SHOP_OWNER_PREFIX}${PERSON.panelBuyerOwner}`)
+
+  const claudeListUrl = new URL(`${PANEL}${BASE}/orders`)
+  const claudeList = await claudeHandler({ ...PERSON, method: 'GET', headers: {} }, {}, claudeListUrl, 'list')
+  assert.equal(claudeList.data.orders.length, 0)
+
+  // Age the Gemini order past PAYMENT_WINDOW: Claude pollOrderExpiry must ignore it!
+  db.prepare('UPDATE crag_shop_orders SET reserved_at = 1 WHERE order_id = ?').run(buy.data.order_id)
+  await claudeHandler.pollOrderExpiry()
+  assert.equal(claudeExpiryPolls, 0)
+  assert.equal(
+    db.prepare('SELECT closed_at FROM crag_shop_orders WHERE order_id = ?').get(buy.data.order_id).closed_at,
+    null,
+  )
+
+  // Now fulfill on supplier: Gemini status poll triggers subscription.status({ sync: true })!
+  geminiRemoteStatus = 'fulfilled'
+  const synced = await callGemini('GET', `/orders/${buy.data.order_id}`)
+  assert.equal(synced.http, 200)
+  assert.equal(synced.data.status, 'fulfilled')
+  assert.equal(synced.data.activation.state, 'active')
+  assert.deepEqual(syncArgs, [{ sync: true }])
+
+  // Gemini expiry poll checks only Gemini orders (and leaves fulfilled ones open).
+  const expireOrder = await callGemini('POST', '/orders', {
+    sku: 'gemini-monthly',
+    payment_method: 'alipay',
+    request_id: 'gemini-expire-1',
+    expected_amount_minor: 9900,
+  })
+  assert.equal(expireOrder.http, 200)
+  geminiRemoteStatus = 'pending'
+  db.prepare("UPDATE crag_shop_orders SET status = 'pending', reserved_at = 1 WHERE order_id = ?").run(
+    expireOrder.data.order_id,
+  )
+  const beforeGeminiPolls = geminiExpiryPolls
+  await geminiHandler.pollOrderExpiry()
+  assert.equal(geminiExpiryPolls, beforeGeminiPolls + 1)
+  assert.ok(
+    db.prepare('SELECT closed_at FROM crag_shop_orders WHERE order_id = ?').get(expireOrder.data.order_id).closed_at,
+  )
 })

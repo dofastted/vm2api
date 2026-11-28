@@ -11,7 +11,9 @@ const MAX_SUBSCRIPTION_TOKEN_BYTES = 8192
 const MAX_HOST_ROSTER_ENTRIES = 10_000
 const MAX_HOST_GRANTS = 10_000
 const HEX64 = /^[a-f0-9]{64}$/
+const ORDER_ID_RE = /^[0-9a-zA-Z_-]{1,64}$/
 const VOUCHER_RE = /^CRAGR1\.[A-Za-z0-9_-]{43}$/
+const RENEWAL_PROOF_RE = /^CRAGRP1\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/
 
 const AUTHORITY_ERRORS = new Map([
   ['redeem_unavailable', 404],
@@ -96,6 +98,18 @@ function fail(code, status = 500, extra = {}) {
 }
 
 const sha256Hex = (data) => createHash('sha256').update(data).digest('hex')
+
+function normalizeDeviceUuid(value) {
+  if (typeof value !== 'string') return null
+  const clean = value.trim().toLowerCase().replaceAll('-', '')
+  if (!/^[a-f0-9]{32}$/.test(clean) || /^(0{32}|f{32})$/.test(clean)) return null
+  return clean
+}
+
+function uuidToHostId(value) {
+  const clean = normalizeDeviceUuid(value)
+  return clean ? sha256Hex(`${HOST_DOMAIN}${clean}`) : null
+}
 
 function decodeBase64Url(value, expectedLength = null) {
   if (typeof value !== 'string' || !/^[A-Za-z0-9_-]+$/.test(value)) throw fail('license_invalid', 403)
@@ -581,7 +595,7 @@ export function createGeminiCragSubscription({
         cache: 'no-store',
         signal: AbortSignal.timeout(10_000),
         headers,
-        body: JSON.stringify({ host_id: hostId, ...body }),
+        body: JSON.stringify(action === 'migrate' ? body : { host_id: hostId, ...body }),
       })
       status = response.status
       requestId = response.headers.get('x-request-id') || null
@@ -597,6 +611,45 @@ export function createGeminiCragSubscription({
     }
     if (code) throw fail(code, AUTHORITY_ERRORS.get(code) || status, { authorityRequestId: requestId })
     throw fail('gemini_subscription_authority_unavailable', 502, { authorityRequestId: requestId })
+  }
+
+  async function callAuthorityWithRecovery(action, hostId, credential, body, local, allowRecovery = true) {
+    try {
+      return await callAuthority(action, hostId, credential, body)
+    } catch (error) {
+      if (error?.code !== 'auth_forbidden' || !allowRecovery || !credential) throw error
+      if (!local) {
+        error.recovery = 'host_id_collision'
+        throw error
+      }
+      const replacement = randomBytes(32).toString('base64url')
+      try {
+        await callAuthority('recover', hostId, replacement, { entitlement: local.code })
+      } catch (recoveryError) {
+        error.recovery =
+          recoveryError?.code === 'auth_forbidden'
+            ? 'host_id_collision'
+            : recoveryError?.code === 'gemini_subscription_authority_unavailable'
+              ? 'unavailable'
+              : 'failed'
+        throw error
+      }
+      ensureStorage()
+      publishFile(credentialFile, `${replacement}\n`, 0o600)
+      return callAuthority(action, hostId, replacement, body)
+    }
+  }
+
+  function rebuildLocalIdentity() {
+    ensureStorage()
+    const nextHostId = sha256Hex(`${HOST_DOMAIN}${randomBytes(16).toString('hex')}`)
+    removeFile(entitlementFile)
+    removeFile(syncMarkerFile)
+    removeFile(credentialFile)
+    publishFile(hostIdFile, `${nextHostId}\n`, 0o644)
+    autoBindBackoff.clear()
+    lastExpiryRefresh = null
+    return nextHostId
   }
 
   async function withLock(fn) {
@@ -649,7 +702,7 @@ export function createGeminiCragSubscription({
     return true
   }
 
-  function formatStatus({ hostId, authority, local, remote = null }) {
+  function formatStatus({ hostId, authority, local, remote = null, credentialRecovery = null }) {
     const now = Math.floor(Date.now() / 1000)
     const syncPending = fs.existsSync(syncMarkerFile)
     if (!local) {
@@ -669,6 +722,7 @@ export function createGeminiCragSubscription({
         used_slots: 0,
         available_slots: 0,
         reclaim_supported: false,
+        ...(credentialRecovery ? { credential_recovery: credentialRecovery } : {}),
       }
     }
     const { claims } = local
@@ -700,6 +754,7 @@ export function createGeminiCragSubscription({
       available_slots: availableSlots,
       reclaim_supported: claims.version === 2,
       ...(Array.isArray(remote?.quota_grants) ? { quota_grants: remote.quota_grants } : {}),
+      ...(credentialRecovery ? { credential_recovery: credentialRecovery } : {}),
     }
   }
 
@@ -744,7 +799,13 @@ export function createGeminiCragSubscription({
           error?.code === 'auth_forbidden' ||
           error?.code === 'host_subscription_inactive'
         ) {
-          return { hostId, local: null, remote: null, clearedOrphan: false }
+          return {
+            hostId,
+            local: null,
+            remote: null,
+            clearedOrphan: false,
+            credentialRecovery: error?.code === 'auth_forbidden' ? 'host_id_collision' : null,
+          }
         }
         throw error
       }
@@ -770,17 +831,7 @@ export function createGeminiCragSubscription({
     }
 
     try {
-      let data
-      try {
-        data = await callAuthority('status', hostId, cred, {})
-      } catch (error) {
-        if (error?.code === 'auth_forbidden' && local) {
-          await callAuthority('recover', hostId, cred, { entitlement: local.code })
-          data = await callAuthority('status', hostId, cred, {})
-        } else {
-          throw error
-        }
-      }
+      const data = await callAuthorityWithRecovery('status', hostId, cred, {}, local)
       if (typeof data?.entitlement === 'string' && data.entitlement.trim()) {
         const trimmed = data.entitlement.trim()
         const nextClaims = verifyCragGeminiHostEntitlement(trimmed, hostId, authority.publicKey, {
@@ -809,7 +860,16 @@ export function createGeminiCragSubscription({
       ) {
         removeFile(syncMarkerFile)
         autoBindBackoff.clear()
-        return { hostId, local: null, remote: null, clearedOrphan: true }
+        return {
+          hostId,
+          local: null,
+          remote: null,
+          clearedOrphan: true,
+          credentialRecovery: error?.code === 'auth_forbidden' ? 'host_id_collision' : null,
+        }
+      }
+      if (error?.code === 'auth_forbidden' && error?.recovery && local) {
+        return { hostId, local, remote: null, clearedOrphan: false, credentialRecovery: error.recovery }
       }
       throw error
     }
@@ -817,6 +877,10 @@ export function createGeminiCragSubscription({
 
   return {
     publicDir,
+
+    purchaseDeviceId() {
+      return resolveHostId(true)
+    },
 
     hasSyncPending() {
       return fs.existsSync(syncMarkerFile)
@@ -838,6 +902,7 @@ export function createGeminiCragSubscription({
           authority,
           local: synced.local,
           remote: synced.remote,
+          credentialRecovery: synced.credentialRecovery ?? null,
         })
         if (synced.clearedOrphan) return { recovered: true, cleared_orphan: true, status }
         return { recovered: true, status }
@@ -870,6 +935,7 @@ export function createGeminiCragSubscription({
           authority,
           local: synced.local,
           remote: synced.remote,
+          credentialRecovery: synced.credentialRecovery ?? null,
         })
         if (status.active) {
           lastExpiryRefresh = null
@@ -895,6 +961,7 @@ export function createGeminiCragSubscription({
             authority,
             local: synced.local,
             remote: synced.remote,
+            credentialRecovery: synced.credentialRecovery ?? null,
           })
         })
       }
@@ -913,11 +980,17 @@ export function createGeminiCragSubscription({
         const previous = readLocalEntitlement(authority)
         publishFile(syncMarkerFile, 'pending\n', 0o644)
         try {
-          const data = await callAuthority('redeem', hostId, cred, {
-            redemption_code: code,
-            issuer_public_key_id: authority.issuerId,
-            payload_key_id: authority.payloadKeyId,
-          })
+          const data = await callAuthorityWithRecovery(
+            'redeem',
+            hostId,
+            cred,
+            {
+              redemption_code: code,
+              issuer_public_key_id: authority.issuerId,
+              payload_key_id: authority.payloadKeyId,
+            },
+            previous,
+          )
           const claims = verifyCragGeminiHostEntitlement(data.entitlement, hostId, authority.publicKey, {
             allowExpired: true,
           })
@@ -934,6 +1007,201 @@ export function createGeminiCragSubscription({
           }
           throw error
         }
+      })
+    },
+
+    async redeemRenewal(redemptionCode) {
+      return this.redeem(redemptionCode)
+    },
+
+    async renewalProof() {
+      const authority = await ensurePackageAuthority()
+      const hostId = resolveHostId(false)
+      const local = readLocalEntitlement(authority)
+      if (!local) throw fail('host_subscription_inactive', 409)
+      const cred = resolveCredential(hostId, false)
+      const data = await callAuthorityWithRecovery('renewal-proof', hostId, cred, {}, local)
+      const proof = data?.proof
+      if (typeof proof !== 'string' || proof.length > 2048 || !RENEWAL_PROOF_RE.test(proof)) {
+        throw fail('gemini_subscription_invalid_entitlement', 502)
+      }
+      return proof
+    },
+
+    async orders({ limit = 50, offset = 0 } = {}) {
+      const safeLimit = Number.isInteger(limit) && limit >= 1 && limit <= 200 ? limit : 50
+      const safeOffset = Number.isInteger(offset) && offset >= 0 && offset <= 1_000_000 ? offset : 0
+      const hostId = resolveHostId(false)
+      const rawCred = readOptionalFile(credentialFile, 128)?.trim()
+      const cred = rawCred && validVoucher(`CRAGR1.${rawCred}`) ? rawCred : null
+      let local = null
+      try {
+        local = readLocalEntitlement(packageAuthority())
+      } catch {
+        local = null
+      }
+      const data = await callAuthorityWithRecovery(
+        'orders',
+        hostId,
+        cred,
+        { limit: safeLimit, offset: safeOffset },
+        local,
+      )
+      return {
+        host_id: typeof data.host_id === 'string' ? data.host_id : hostId,
+        product: typeof data.product === 'string' ? data.product : CRAG_GEMINI_PRODUCT,
+        orders: Array.isArray(data.orders) ? data.orders : [],
+        vouchers: Array.isArray(data.vouchers) ? data.vouchers : [],
+        total: Number.isSafeInteger(data.total) ? data.total : 0,
+        limit: Number.isSafeInteger(data.limit) ? data.limit : safeLimit,
+        offset: Number.isSafeInteger(data.offset) ? data.offset : safeOffset,
+      }
+    },
+
+    async claimByOrder(orderId) {
+      const trimmed = typeof orderId === 'string' ? orderId.trim() : ''
+      if (!ORDER_ID_RE.test(trimmed)) throw fail('invalid_request', 400)
+      return withLock(async () => {
+        const authority = await ensurePackageAuthority()
+        let hostId = resolveHostId(true)
+        let previous = readLocalEntitlement(authority)
+        let cred = resolveCredential(hostId, true)
+        publishFile(syncMarkerFile, 'pending\n', 0o644)
+        try {
+          let data
+          try {
+            data = await callAuthorityWithRecovery(
+              'claim-by-order',
+              hostId,
+              cred,
+              {
+                order_id: trimmed,
+                issuer_public_key_id: authority.issuerId,
+                payload_key_id: authority.payloadKeyId,
+              },
+              previous,
+            )
+          } catch (error) {
+            if (error?.code !== 'auth_forbidden' || error?.recovery !== 'host_id_collision' || previous) {
+              throw error
+            }
+            hostId = rebuildLocalIdentity()
+            previous = null
+            cred = resolveCredential(hostId, true)
+            publishFile(syncMarkerFile, 'pending\n', 0o644)
+            data = await callAuthority('claim-by-order', hostId, cred, {
+              order_id: trimmed,
+              issuer_public_key_id: authority.issuerId,
+              payload_key_id: authority.payloadKeyId,
+            })
+          }
+          const claims = verifyCragGeminiHostEntitlement(data.entitlement, hostId, authority.publicKey, {
+            allowExpired: true,
+          })
+          if (previous && claims.revision < previous.claims.revision) {
+            throw fail('gemini_subscription_invalid_entitlement', 502)
+          }
+          publishFile(entitlementFile, `${data.entitlement}\n`, 0o644)
+          removeFile(syncMarkerFile)
+          autoBindBackoff.clear()
+          return formatStatus({ hostId, authority, local: { hostId, code: data.entitlement, claims }, remote: data })
+        } catch (error) {
+          if (error?.code !== 'gemini_subscription_authority_unavailable') {
+            removeFile(syncMarkerFile)
+          }
+          throw error
+        }
+      })
+    },
+
+    async migrate(fromHostInput, proofInput) {
+      const trimmed = typeof fromHostInput === 'string' ? fromHostInput.trim().toLowerCase() : ''
+      const fromHostId = HEX64.test(trimmed) ? trimmed : uuidToHostId(trimmed)
+      if (!fromHostId) throw fail('invalid_request', 400)
+      const proofObj =
+        typeof proofInput === 'string'
+          ? { proof: proofInput }
+          : proofInput && typeof proofInput === 'object'
+            ? proofInput
+            : {}
+      const proofBody = {}
+      if (typeof proofObj.proof === 'string' && proofObj.proof.trim()) {
+        const p = proofObj.proof.trim()
+        if (p.startsWith('CRAGR1.')) {
+          proofBody.proof_redemption_code = p
+        } else if (ORDER_ID_RE.test(p)) {
+          proofBody.proof_order_id = p
+        } else {
+          throw fail('invalid_request', 400)
+        }
+      }
+      if (typeof proofObj.proof_order_id === 'string' && proofObj.proof_order_id.trim()) {
+        const oid = proofObj.proof_order_id.trim()
+        if (!ORDER_ID_RE.test(oid)) throw fail('invalid_request', 400)
+        proofBody.proof_order_id = oid
+      }
+      if (typeof proofObj.proof_redemption_code === 'string' && proofObj.proof_redemption_code.trim()) {
+        const code = proofObj.proof_redemption_code.trim()
+        if (!code.startsWith('CRAGR1.')) throw fail('invalid_request', 400)
+        proofBody.proof_redemption_code = code
+      }
+      if (Object.keys(proofBody).length === 0) throw fail('invalid_request', 400)
+
+      return withLock(async () => {
+        const authority = await ensurePackageAuthority()
+        const hostId = resolveHostId(true)
+        if (fromHostId === hostId) throw fail('invalid_request', 400)
+        const previous = readLocalEntitlement(authority)
+        const rawCred = readOptionalFile(credentialFile, 128)?.trim()
+        const existingCred = rawCred && validVoucher(`CRAGR1.${rawCred}`) ? rawCred : null
+        const destCred = existingCred ?? resolveCredential(hostId, true)
+        const data = await callAuthorityWithRecovery(
+          'migrate',
+          hostId,
+          destCred,
+          {
+            from_host_id: fromHostId,
+            to_host_id: hostId,
+            ...proofBody,
+          },
+          previous,
+        )
+        let local = previous
+        let remote = null
+        if (typeof data?.rights?.entitlement === 'string' && data.rights.entitlement.trim()) {
+          const trimmedEnt = data.rights.entitlement.trim()
+          const nextClaims = verifyCragGeminiHostEntitlement(trimmedEnt, hostId, authority.publicKey, {
+            allowExpired: true,
+          })
+          if (previous && nextClaims.revision < previous.claims.revision) {
+            throw fail('gemini_subscription_invalid_entitlement', 502)
+          }
+          publishFile(entitlementFile, `${trimmedEnt}\n`, 0o644)
+          removeFile(syncMarkerFile)
+          autoBindBackoff.clear()
+          local = { hostId, code: trimmedEnt, claims: nextClaims }
+          remote = data.rights
+        }
+        return {
+          from_host_id: typeof data.from_host_id === 'string' ? data.from_host_id : fromHostId,
+          to_host_id: typeof data.to_host_id === 'string' ? data.to_host_id : hostId,
+          migrated_vouchers: Number.isSafeInteger(data.migrated_vouchers) ? data.migrated_vouchers : 0,
+          migrated_orders: Number.isSafeInteger(data.migrated_orders) ? data.migrated_orders : 0,
+          status: formatStatus({ hostId, authority, local, remote }),
+        }
+      })
+    },
+
+    async rebuildIdentity() {
+      return withLock(async () => {
+        const nextHostId = rebuildLocalIdentity()
+        let authority = null
+        try {
+          authority = packageAuthority()
+        } catch {
+          authority = null
+        }
+        return formatStatus({ hostId: nextHostId, authority, local: null })
       })
     },
 

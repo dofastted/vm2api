@@ -365,9 +365,12 @@ import { readRawBody as defaultReadRawBody } from '../http/respond.mjs'
 import { corsHeadersForRequest } from '../http/cors.mjs'
 import {
   createCragShopHandler,
+  createGeminiCragShopHandler,
   cragShopRoute,
+  geminiCragShopRoute,
   isCragDeviceShopPath,
   isCragShopPath,
+  isGeminiCragShopPath,
   sameOriginPost,
 } from './crag-shop.mjs'
 import { createCragSubscriptionHandler, cragSubscriptionRoute } from './crag-subscription-routes.mjs'
@@ -822,6 +825,7 @@ export function createPanelHandler(ctx) {
     panelUsers: ctx.panelUsers || null,
     requestLog: ctx.requestLog || null,
     billingReady: Boolean(ctx.requestLog),
+    publicBaseUrl: ctx.cfg?.base_url || null,
   })
   // A checkout can change under a live Node process; report its boot version.
   const runningVersion = readLocalVersion(ctx.cfg?.paths?.project)
@@ -844,16 +848,28 @@ export function createPanelHandler(ctx) {
   const refreshCluster = ctx.refreshClusterSlotPayloads || refreshClusterSlotPayloads
   const requireAuth = (...args) => ctx.requireAuth(...args)
   const cfg = ctx.cfg
+  const isShopCurrentAdmin = (req) => {
+    const record = ctx.panelUsers.getByUsername(req.panelUser)
+    if (record) return record.enabled && record.role === 'admin' && req.panelBuyerOwner === `panel:${record.id}`
+    return req.panelBuyerOwner === `configured-admin:${req.panelUser}`
+  }
   const handleCragShop =
     ctx.handleCragShop ??
     createCragShopHandler({
       getDb: ctx.getDb,
       subscription: ctx.cragSubscription,
-      isCurrentAdmin: (req) => {
-        const record = ctx.panelUsers.getByUsername(req.panelUser)
-        if (record) return record.enabled && record.role === 'admin' && req.panelBuyerOwner === `panel:${record.id}`
-        return req.panelBuyerOwner === `configured-admin:${req.panelUser}`
-      },
+      isCurrentAdmin: isShopCurrentAdmin,
+      dataDir: cfg?.paths?.data,
+      publicBaseUrl: cfg?.base_url,
+      json,
+      readRawBody,
+    })
+  const handleGeminiCragShop =
+    ctx.handleGeminiCragShop ??
+    createGeminiCragShopHandler({
+      getDb: ctx.getDb,
+      subscription: ctx.geminiCragSubscription,
+      isCurrentAdmin: isShopCurrentAdmin,
       dataDir: cfg?.paths?.data,
       publicBaseUrl: cfg?.base_url,
       json,
@@ -2129,6 +2145,21 @@ export function createPanelHandler(ctx) {
         return json(res, 403, { ok: false, error: { code: 'forbidden', message: 'Forbidden' } })
       }
       return handleCragShop(req, res, url, route)
+    }
+
+    if (isGeminiCragShopPath(p)) {
+      res.setHeader('Cache-Control', 'no-store')
+      const route = geminiCragShopRoute(req.method, p)
+      if (route === 'plans') {
+        requireAuth(req, res, { buyer: true, optionalBuyer: true })
+        if (res.headersSent) return true
+        return handleGeminiCragShop(req, res, url, route)
+      }
+      if (!requireAuth(req, res, { buyer: true })) return true
+      if (route && !authorizePanelRoute(req.method, p, panelIdentity(req).role).ok) {
+        return json(res, 403, { ok: false, error: { code: 'forbidden', message: 'Forbidden' } })
+      }
+      return handleGeminiCragShop(req, res, url, route)
     }
 
     if (p.startsWith('/api/panel')) {
