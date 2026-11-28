@@ -33,6 +33,10 @@ import {
   finalizeOfficialCcTelemetry,
   officialCcNativeReady,
   ensureOfficialCcNativeCli,
+  officialCcArchMismatch,
+  runOfficialCcBootstrap,
+  summarizeOfficialCcStderr,
+  wrapOfficialCcNoCoreCmd,
 } from '../../src/lib/oauth/official-cc-bootstrap.mjs'
 import { seedEncryptedPackage } from '../fixtures/crag-license.mjs'
 
@@ -157,7 +161,9 @@ test('docker args always run packaged native Claude Code', () => {
   )
   assert.ok(args.includes('USER_TYPE=external'))
   assert.equal(args.includes('CI=1'), false)
-  assert.equal(args[args.indexOf('kin-30') + 1], '/home/kincli/.kin/crag-v2/claude-code-2.1.321/claude')
+  const cmdStart = args.indexOf('kin-30') + 1
+  assert.deepEqual(args.slice(cmdStart, cmdStart + 4), ['sh', '-c', 'ulimit -c 0 2>/dev/null; exec "$@"', '_'])
+  assert.equal(args[cmdStart + 4], '/home/kincli/.kin/crag-v2/claude-code-2.1.321/claude')
   assert.equal(args.includes('--append-system-prompt'), false)
   const usageArgs = buildOfficialCcDockerArgs({
     vmId: 'vm-30',
@@ -180,8 +186,10 @@ test('native bootstrap uses the same packaged CLI on local and cluster slots', (
       gid: 987,
       routing: { inference: { dataplane: 'wrap' } },
     })
+    const cmdStart = args.indexOf('kin-30') + 1
+    assert.deepEqual(args.slice(cmdStart, cmdStart + 4), ['sh', '-c', 'ulimit -c 0 2>/dev/null; exec "$@"', '_'])
     assert.equal(
-      args[args.indexOf('kin-30') + 1],
+      args[cmdStart + 4],
       vm.node_id
         ? '/opt/kin-live/crag-v2/claude-code-2.1.321/claude'
         : '/home/kincli/.kin/crag-v2/claude-code-2.1.321/claude',
@@ -763,6 +771,77 @@ test('bootstrap stages native Claude Code from pulled CRAG on ARM64 hosts with x
     const staged = ensureOfficialCcNativeCli(root, vm, home, runtimeEnv)
     assert.equal(fs.existsSync(staged), true)
     assert.equal(fs.readFileSync(path.join(home, '.kin', 'kin-kernel'), 'utf8'), '#!/bin/sh\nexec wrap\n')
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('official CC bootstrap disables core dumps, skips cross-arch qemu-user emulation, and surfaces crash stderr (#1987)', async () => {
+  assert.deepEqual(wrapOfficialCcNoCoreCmd(['/path/to/claude', '--version']), [
+    'sh',
+    '-c',
+    'ulimit -c 0 2>/dev/null; exec "$@"',
+    '_',
+    '/path/to/claude',
+    '--version',
+  ])
+
+  const bunStderr = [
+    'ASSERTION FAILED: MemoryExhaustion: Crash intentionally because memory is exhausted.',
+    'failureMode != AllocationFailureMode::Assert',
+    '============================================================',
+    'Bun v1.4.4 (424a542a9) Linux x64',
+    'panic(main thread): abort() called',
+    'oh no: Bun has crashed. This indicates a bug in Bun, not your code.',
+    'qemu: uncaught target signal 6 (Aborted)',
+  ].join('\n')
+  const summary = summarizeOfficialCcStderr(bunStderr, 137)
+  assert.match(summary, /official claude exit 137:/)
+  assert.match(summary, /ASSERTION FAILED: MemoryExhaustion/)
+  assert.match(summary, /panic\(main thread\): abort\(\) called/)
+  assert.equal(summarizeOfficialCcStderr('   \n===\n  ', 137), null)
+
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-cc-arm64-'))
+  try {
+    const vmId = 'vm-arm64'
+    const vm = { id: vmId, dataplane: 'wrap', runtime: { arch: 'amd64' } }
+    fs.mkdirSync(path.join(root, 'vms', vmId, 'cli-home', '.claude'), { recursive: true })
+    fs.writeFileSync(path.join(root, 'vms', vmId + '.json'), JSON.stringify(vm))
+    const markerFile = path.join(root, 'vms', vmId, 'cli-home', '.claude', 'projects-sentinel')
+    fs.writeFileSync(markerFile, 'keep')
+
+    const mismatch = officialCcArchMismatch(root, vm, { arch: 'arm64' })
+    assert.equal(mismatch?.reason, 'arch_mismatch_emulated')
+    assert.equal(mismatch?.hostArch, 'arm64')
+    assert.equal(mismatch?.slotArch, 'amd64')
+
+    assert.equal(officialCcArchMismatch(root, vm, { arch: 'amd64' }), null)
+    assert.equal(officialCcArchMismatch(root, { ...vm, runtime_type: 'kvm' }, { arch: 'arm64' }), null)
+
+    const scheduled = scheduleOfficialCcBootstrap({
+      vmId,
+      vm,
+      projectRoot: root,
+      config: { enabled: true },
+      arch: 'arm64',
+    })
+    assert.equal(scheduled.scheduled, false)
+    assert.equal(scheduled.reason, 'arch_mismatch_emulated')
+    assert.match(scheduled.error, /host arm64, slot amd64/)
+
+    const res = await runOfficialCcBootstrap({
+      vmId,
+      projectRoot: root,
+      config: { enabled: true },
+      arch: 'arm64',
+    })
+    assert.equal(res.ok, false)
+    assert.equal(res.skipped, true)
+    assert.equal(res.reason, 'arch_mismatch_emulated')
+    assert.equal(res.status?.status, 'skipped')
+    assert.equal(res.status?.step, 'arch_check')
+    assert.match(res.status?.error || '', /cross-arch emulation/)
+    assert.equal(fs.existsSync(markerFile), true, 'must not wipe home when failing fast on arch mismatch')
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }
