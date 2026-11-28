@@ -5,6 +5,7 @@ import {
   assertNoUnrepresentableCragFields,
   sanitizeCragBodyWhitelist,
 } from './crag-whitelist.mjs'
+import { rectifyCrag321Request } from './crag-321-rectifier.mjs'
 import { isSmallTextTurn, messageHasTurnControls, reusableContentBlock, sanitizeAnthropicBody } from './sanitize.mjs'
 import { normalizeToolInputSchemas } from './tool-input-schema.mjs'
 
@@ -124,6 +125,23 @@ function validateMessages(messages, checkReuse = false) {
   return reusable
 }
 
+function hasInlineToolDefinition(messages, name) {
+  if (!Array.isArray(messages) || typeof name !== 'string' || !name) return false
+  for (const message of messages) {
+    if (!Array.isArray(message?.content)) continue
+    for (const block of message.content) {
+      if (
+        block?.type === 'tool_addition' &&
+        block.tool?.type === 'tool_definition' &&
+        block.tool.definition?.name === name
+      ) {
+        return true
+      }
+    }
+  }
+  return false
+}
+
 function canonicalRequest(body, { reuseCanonicalHistory = false, preserveConsecutiveUser = false } = {}) {
   if (!object(body)) invalid('body', 'must be an object')
   const tools = normalizeToolInputSchemas(body.tools, invalid)
@@ -151,7 +169,11 @@ function canonicalRequest(body, { reuseCanonicalHistory = false, preserveConsecu
       }
       names.add(tool.name)
     }
-    if (body.tool_choice?.type === 'tool' && !names.has(body.tool_choice.name)) {
+    if (
+      body.tool_choice?.type === 'tool' &&
+      !names.has(body.tool_choice.name) &&
+      !hasInlineToolDefinition(body.messages, body.tool_choice.name)
+    ) {
       invalid('tool_choice.name', 'must identify a supplied tool')
     }
   }
@@ -221,7 +243,12 @@ export function prepareCragRequest(
       if (value === undefined || STRICT_PRIVATE_FIELDS.has(key)) continue
       out[key] = value
     }
-    return out
+    const rectified = rectifyCrag321Request(out, {
+      strictPassthrough: true,
+      capabilities: health?.capabilities,
+    })
+    if (!rectified.messages.some((message) => message.role === 'user')) invalid('messages', 'must include a user turn')
+    return rectified
   }
   assertNoUnrepresentableCragFields(body)
   const isClassifier = requestContext?.purpose === 'auto_mode_classifier'
@@ -246,6 +273,10 @@ export function prepareCragRequest(
     if (Object.keys(aliases).length) out.crag_options = aliases
     else delete out.crag_options
   }
-  if (!out.messages.some((message) => message.role === 'user')) invalid('messages', 'must include a user turn')
-  return out
+  const rectified = rectifyCrag321Request(out, {
+    strictPassthrough: false,
+    capabilities: health?.capabilities,
+  })
+  if (!rectified.messages.some((message) => message.role === 'user')) invalid('messages', 'must include a user turn')
+  return rectified
 }
