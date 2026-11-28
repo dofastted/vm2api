@@ -32,6 +32,15 @@ import {
   formatNodeKey,
 } from '../../src/lib/scheduler/scheduler-runtime.mjs'
 import { listVms } from '../../src/lib/vm/vm-registry.mjs'
+import { atomicWriteJson, setVmWriteHook } from '../../src/lib/vm/vm-file.mjs'
+import {
+  flushVmDbSyncAsync,
+  resetVmDbSyncState,
+  setVmDbSyncPgPool,
+  startVmWatch,
+  stopVmWatch,
+  syncVmFile,
+} from '../../src/lib/vm/vm-db-sync.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const REPO_ROOT = path.resolve(__dirname, '../..')
@@ -554,4 +563,117 @@ test('FailoverRunner enforces admin-only pinVmId and PoolScheduler quota restric
   assert.equal(scoped.vmId, 'vm-2')
   scoped.release()
   activePoolsRepo = null
+})
+
+test('PoolScheduler.markSuccess skips clearVmAuthCooldown on clean VMs and clears active auth cooldown once', (t) => {
+  const root = makeProject([
+    { id: 'vm-clean', accountId: 'acc-clean' },
+    {
+      id: 'vm-parked',
+      accountId: 'acc-parked',
+      claude: {
+        temp_unschedulable_until: Date.now() + 60_000,
+        temp_unschedulable_reason: 'authentication_failed_after_refresh',
+        oauth_401_generation: 7,
+      },
+    },
+  ])
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+
+  const repo = new MemoryRuntimeRepo()
+  const pool = new PoolScheduler({ projectRoot: root, runtimeRepo: repo })
+
+  // 1. Clean VM: markSuccess must NOT rewrite vms/vm-clean.json (0 fs write / 0 vmWriteHook)
+  const cleanPath = path.join(root, 'vms', 'vm-clean.json')
+  const cleanBefore = fs.readFileSync(cleanPath, 'utf8')
+  const cleanVm = JSON.parse(cleanBefore)
+  const hookedPaths = []
+  setVmWriteHook((fp) => hookedPaths.push(fp))
+  t.after(() => setVmWriteHook(null))
+
+  pool.markSuccess({ accountId: 'acc-clean', vmId: 'vm-clean', vm: cleanVm })
+  assert.equal(hookedPaths.length, 0, 'clean VM markSuccess must not rewrite vms/*.json')
+  assert.equal(fs.readFileSync(cleanPath, 'utf8'), cleanBefore)
+
+  // 2. Parked VM with active auth cooldown: first markSuccess clears it once, second is a no-op
+  const parkedPath = path.join(root, 'vms', 'vm-parked.json')
+  const parkedVm = JSON.parse(fs.readFileSync(parkedPath, 'utf8'))
+  pool.markSuccess({ accountId: 'acc-parked', vmId: 'vm-parked', vm: parkedVm })
+  assert.equal(hookedPaths.length, 1, 'VM with active auth cooldown must clear vms/*.json once')
+  const afterClear = JSON.parse(fs.readFileSync(parkedPath, 'utf8'))
+  assert.equal(afterClear.claude.temp_unschedulable_until, undefined)
+  assert.equal(afterClear.claude.temp_unschedulable_reason, undefined)
+  assert.equal(afterClear.claude.oauth_401_generation, undefined)
+
+  // Second markSuccess on the now-clean VM must not rewrite disk again
+  pool.markSuccess({ accountId: 'acc-parked', vmId: 'vm-parked', vm: parkedVm })
+  assert.equal(hookedPaths.length, 1, 'subsequent markSuccess after clear must be a no-op')
+})
+
+test('vm-db-sync PG mode offloads single-VM writes to async pgPool UNNEST and avoids 200-VM fs.watch storms', async (t) => {
+  const root = makeProject([
+    { id: 'vm-01', accountId: 'acc-01' },
+    { id: 'vm-02', accountId: 'acc-02' },
+    { id: 'vm-03', accountId: 'acc-03' },
+  ])
+  const pgQueries = []
+  const mockPgPool = {
+    async query(sql, params) {
+      const text = String(sql)
+      pgQueries.push({ sql: text, params })
+      if (/SELECT id, file_mtime_ms FROM vms/i.test(text)) {
+        return { rows: [] }
+      }
+      return { rows: [], rowCount: 1 }
+    },
+  }
+  resetVmDbSyncState()
+  setVmDbSyncPgPool(mockPgPool)
+  setVmWriteHook((fp) => {
+    syncVmFile(fp)
+  })
+  t.after(async () => {
+    stopVmWatch()
+    setVmWriteHook(null)
+    await flushVmDbSyncAsync().catch(() => {})
+    setVmDbSyncPgPool(null)
+    resetVmDbSyncState()
+    fs.rmSync(root, { recursive: true, force: true })
+  })
+
+  // 1. Write-through on a single VM upserts ONLY that single vmId asynchronously via pgPool UNNEST
+  const vm1Path = path.join(root, 'vms', 'vm-01.json')
+  const vm1 = JSON.parse(fs.readFileSync(vm1Path, 'utf8'))
+  vm1.name = 'vm-01-updated'
+  atomicWriteJson(vm1Path, vm1, { mode: 0o600 })
+  const res = await flushVmDbSyncAsync()
+  assert.equal(res.upserted, 1)
+  const upsertCall = pgQueries.find((q) => /INSERT INTO vms[\s\S]*UNNEST/i.test(q.sql))
+  assert.ok(upsertCall, 'PG vm-db-sync must use async UNNEST upsert')
+  assert.deepEqual(upsertCall.params[0], ['vm-01'], 'must only upsert the single changed vmId')
+  assert.deepEqual(upsertCall.params[1], ['vm-01-updated'])
+  assert.equal(upsertCall.params[7][0], null, 'access_token column must stay null')
+  const storedJson = JSON.parse(upsertCall.params[18][0])
+  assert.equal(storedJson.claude.access_token, undefined, 'vm_json must strip credential secrets')
+  assert.equal(storedJson.claude.has_access, true)
+
+  // 2. fs.watch ignores temp files & only syncs externally edited VM (never all VMs)
+  pgQueries.length = 0
+  assert.equal(startVmWatch(root), true)
+  // Temp file write must be ignored without hitting PG
+  const tmpFile = path.join(root, 'vms', '.vm-02.json.tmp')
+  fs.writeFileSync(tmpFile, '{"id":"vm-02"}')
+  fs.rmSync(tmpFile, { force: true })
+  // External edit to vm-02.json (bypassing atomicWriteJson hook) with advancing mtime
+  await new Promise((r) => setTimeout(r, 25))
+  const vm2Path = path.join(root, 'vms', 'vm-02.json')
+  const vm2 = JSON.parse(fs.readFileSync(vm2Path, 'utf8'))
+  vm2.name = 'vm-02-external'
+  fs.writeFileSync(vm2Path, JSON.stringify(vm2))
+  // Wait past 500ms debounce window
+  await new Promise((r) => setTimeout(r, 700))
+  await flushVmDbSyncAsync()
+  const watchUpserts = pgQueries.filter((q) => /INSERT INTO vms[\s\S]*UNNEST/i.test(q.sql))
+  assert.equal(watchUpserts.length, 1, 'external edit should trigger a single async PG upsert')
+  assert.deepEqual(watchUpserts[0].params[0], ['vm-02'], 'fs.watch must sync ONLY changed vm-02, not vm-01 or vm-03')
 })

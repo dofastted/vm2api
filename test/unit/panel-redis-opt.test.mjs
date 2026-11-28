@@ -975,3 +975,214 @@ test('panel-routes & scheduler-pools-routes: ETag/304, single api-keys scan, ten
     fs.rmSync(dir, { recursive: true, force: true })
   }
 })
+
+test('Stage 2B dashboard: no sync clearExpired, scheduler L1 / PG async runtime prefetch, and async SWR totals/windowStats/sticky', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-stage2b-dash-'))
+  const vmsDir = path.join(dir, 'vms')
+  fs.mkdirSync(vmsDir, { recursive: true })
+  fs.writeFileSync(
+    path.join(vmsDir, 'vm-1.json'),
+    JSON.stringify({ id: 'vm-1', name: 'Slot 1', status: 'running', platform: 'anthropic' }),
+  )
+  const db = createDatabase({ dbPath: path.join(dir, 'app.db') })
+  try {
+    const pgQueries = []
+    const mockPgPool = {
+      async query(sql, params = []) {
+        pgQueries.push({ sql: String(sql), params })
+        if (/SELECT COUNT\(\*\)::bigint AS requests[\s\S]*input_cost/i.test(sql)) {
+          return {
+            rows: [
+              {
+                requests: '12',
+                errors: '1',
+                input_tokens: '1000',
+                output_tokens: '250',
+                cache_read_tokens: '400',
+                cache_creation_tokens: '100',
+                prompt_tokens: '1500',
+                input_cost: 0.1,
+                output_cost: 0.2,
+                cache_read_cost: 0.01,
+                cache_creation_cost: 0.02,
+                total_cost: 0.33,
+              },
+            ],
+          }
+        }
+        if (/PERCENTILE_CONT/i.test(sql)) {
+          return {
+            rows: [
+              {
+                requests: '5',
+                success: '5',
+                errors: '0',
+                status_429: '0',
+                status_529: '0',
+                status_503: '0',
+                stream_requests: '5',
+                ttft_samples: '5',
+                input_tokens: '500',
+                output_tokens: '100',
+                cache_read_tokens: '200',
+                cache_creation_tokens: '50',
+                prompt_tokens: '750',
+                total_cost: 0.15,
+                dur_samples: '5',
+                dur_avg: 120.4,
+                dur_max: 240,
+                dur_p50: 100,
+                dur_p90: 200,
+                dur_p95: 220,
+                dur_p99: 238,
+                ttft_count: '5',
+                ttft_avg: 30,
+                ttft_max: 60,
+                ttft_p50: 25,
+                ttft_p90: 50,
+                ttft_p95: 55,
+                ttft_p99: 59,
+              },
+            ],
+          }
+        }
+        if (/SUBSTR\(created_at, 1, 16\)/i.test(sql)) {
+          return { rows: [{ minute: '2026-06-15T12:00', requests: '5', tokens: '850' }] }
+        }
+        if (/GROUP BY 1[\s\S]*LIMIT 12/i.test(sql)) {
+          return {
+            rows: [
+              {
+                model: 'claude-sonnet-4-6',
+                requests: '5',
+                errors: '0',
+                ttft_samples: '5',
+                avg_first_token_ms: 30,
+                avg_duration_ms: 120,
+              },
+            ],
+          }
+        }
+        if (/FROM request_attempts/i.test(sql)) {
+          return {
+            rows: [
+              { selection_reason: 'sticky', n: '4' },
+              { selection_reason: 'balanced', n: '1' },
+            ],
+          }
+        }
+        return { rows: [] }
+      },
+    }
+
+    const pgDb = new Proxy(db, {
+      get(target, prop) {
+        if (prop === 'engine') return 'postgres'
+        const v = Reflect.get(target, prop)
+        return typeof v === 'function' ? v.bind(target) : v
+      },
+    })
+
+    const cacheClient = new MultiTierCacheClient({ redisConfig: null, cacheConfig: { enabled: true } })
+    const cache = { client: cacheClient, dashboard: new DashboardCache(cacheClient) }
+    const reqLog = new RequestLogStore({ dataDir: dir, db: pgDb, cache, pgPool: mockPgPool })
+
+    let syncTotalsCalls = 0
+    let syncWindowCalls = 0
+    reqLog.repo.totals = () => {
+      syncTotalsCalls += 1
+      throw new Error('sync totals() must not run in PG async path')
+    }
+    reqLog.repo.windowStats = () => {
+      syncWindowCalls += 1
+      throw new Error('sync windowStats() must not run in PG async path')
+    }
+
+    let clearExpiredCalls = 0
+    let syncRuntimeCalls = 0
+    let asyncListSnapCalls = 0
+    let stickyAsyncCalls = 0
+    let stickySyncCalls = 0
+    let snapshotAsyncCalls = 0
+
+    const accountQuota = {
+      _resolvePgPool: () => mockPgPool,
+      runtimeRepo: {
+        db: pgDb,
+        clearExpired() {
+          clearExpiredCalls += 1
+          throw new Error('buildDashboard must not call sync clearExpired()')
+        },
+        get() {
+          syncRuntimeCalls += 1
+          return null
+        },
+        getMany() {
+          syncRuntimeCalls += 1
+          return new Map()
+        },
+        async listAllSnapshotsAsync(pool) {
+          assert.equal(pool, mockPgPool)
+          asyncListSnapCalls += 1
+          return new Map([['vm-1', { account: null, state: { account_id: 'vm-1', vm_id: 'vm-1', status: 'ready' } }]])
+        },
+      },
+      snapshot() {
+        throw new Error('buildDashboard should prefer snapshotAsync when available')
+      },
+      async snapshotAsync() {
+        snapshotAsyncCalls += 1
+        return { accounts: [], safety_ratio: 0.85 }
+      },
+    }
+
+    const stickyRouter = {
+      stats() {
+        stickySyncCalls += 1
+        throw new Error('buildDashboard must prefer statsAsync()')
+      },
+      async statsAsync(opts) {
+        stickyAsyncCalls += 1
+        assert.equal(opts.includeSessions, false)
+        return { enabled: true, mode: 'conversation', active_sessions: 9, total_hits: 42, sessions: {} }
+      },
+    }
+
+    const res1 = await panel.buildDashboard({
+      cfg: { paths: { project: dir, data: dir }, rewrite: { enabled: false }, base_url: 'http://x' },
+      accountQuota,
+      stickyRouter,
+      routingConfig: { sticky: { enabled: true } },
+      stats: { requests: 12 },
+      requestLog: reqLog,
+    })
+    assert.equal(res1.ok, true)
+    assert.equal(clearExpiredCalls, 0)
+    assert.equal(syncRuntimeCalls, 0)
+    assert.equal(asyncListSnapCalls, 1)
+    assert.equal(snapshotAsyncCalls, 1)
+    assert.equal(stickyAsyncCalls, 1)
+    assert.equal(stickySyncCalls, 0)
+    assert.equal(syncTotalsCalls, 0)
+    assert.equal(syncWindowCalls, 0)
+    assert.equal(res1.data.routing.sticky_sessions, 9)
+    assert.equal(res1.data.db_totals.requests, 12)
+    assert.equal(res1.data.ops.requests, 5)
+    assert.equal(res1.data.ops.duration.p95_ms, 220)
+    assert.equal(res1.data.ops.ttft.p95_ms, 55)
+    assert.equal(res1.data.ops.sticky.hits, 4)
+
+    // Second call within SWR window reuses cached totalsAsync & windowStatsAsync with 0 new PG queries
+    const beforeQueries = pgQueries.length
+    const t2 = await reqLog.totalsAsync()
+    const w2 = await reqLog.windowStatsAsync({ since: new Date(Date.now() - 3600_000).toISOString() })
+    assert.equal(t2.requests, 12)
+    assert.equal(w2.requests, 5)
+    assert.equal(pgQueries.length, beforeQueries, 'SWR cache must serve repeated totals/windowStats with 0 PG queries')
+  } finally {
+    try {
+      db.close()
+    } catch {}
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})

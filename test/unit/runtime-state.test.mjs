@@ -17,6 +17,7 @@ import {
 } from '../../src/lib/db/repos/account-runtime-repo.mjs'
 import { VmsRepo } from '../../src/lib/db/repos/vms-repo.mjs'
 import { SchedulerSnapshotCache } from '../../src/lib/cache/scheduler-cache.mjs'
+import { closeCacheRuntime, initCacheRuntime, invalidateAllCaches } from '../../src/lib/cache/index.mjs'
 import { VIRTUAL_POOL_IDS, createSchedulerRuntime } from '../../src/lib/scheduler/scheduler-runtime.mjs'
 
 for (const type of ['docker', 'kvm']) {
@@ -603,4 +604,170 @@ test('SchedulerRuntime 200-VM hot path: 0 Atomics.wait / 0 N+1 DB calls, shared 
   assert.ok(pgQueries.some((q) => /DELETE FROM scheduler_sticky_bindings[\s\S]*UNNEST/i.test(q.sql)))
   assert.ok(pgQueries.some((q) => /INSERT INTO scheduler_node_penalties[\s\S]*UNNEST/i.test(q.sql)))
   assert.ok(pgQueries.some((q) => /DELETE FROM scheduler_node_penalties[\s\S]*UNNEST/i.test(q.sql)))
+})
+
+test('SchedulerRuntime caches empty/live api_endpoints and gemini_environment_owners with PG async load and write invalidation', async (t) => {
+  await closeCacheRuntime()
+  const cacheRt = await initCacheRuntime({ redisConfig: null })
+  t.after(async () => {
+    await closeCacheRuntime()
+  })
+
+  const pgQueries = []
+  let pgEndpointRows = []
+  let pgGeminiOwnerRows = []
+  const mockPgPool = {
+    async query(sql, params) {
+      const text = String(sql)
+      pgQueries.push({ sql: text, params })
+      if (/FROM api_endpoints\b/i.test(text)) return { rows: pgEndpointRows }
+      if (/FROM api_endpoint_keys\b/i.test(text)) {
+        return {
+          rows: [
+            {
+              id: 'ek-1',
+              endpoint_id: 'ep-1',
+              proxy_url: '',
+              proxy_id: '',
+              disabled: 0,
+              cooldown_until: null,
+              created_at: '2026-11-28T00:00:00.000Z',
+            },
+          ],
+        }
+      }
+      if (/FROM api_endpoint_models\b/i.test(text)) return { rows: [] }
+      if (/FROM gemini_environment_owners\b/i.test(text)) return { rows: pgGeminiOwnerRows }
+      if (/FROM accounts a FULL JOIN account_runtime/i.test(text)) return { rows: [] }
+      if (/FROM vms\b/i.test(text)) return { rows: [] }
+      return { rows: [] }
+    },
+  }
+
+  let syncAuxCalls = 0
+  let syncDbPrepareCalls = 0
+  const forbidSyncDb = {
+    engine: 'postgres',
+    prepare(sql) {
+      syncDbPrepareCalls += 1
+      throw new Error(`Must NOT run sync PgSyncDb.prepare on aux hot path: ${sql}`)
+    },
+  }
+
+  const syncedConfigs = []
+  const pushedTelemetries = []
+  const mockClient = {
+    stopped: false,
+    isStandby: false,
+    role: 'leader',
+    controllerEpoch: 'epoch-aux',
+    async syncConfig(payload) {
+      syncedConfigs.push(payload)
+      return { ok: true, applied: true, config_version: payload.config_version }
+    },
+    async pushTelemetry(batch) {
+      pushedTelemetries.push(batch)
+      return { ok: true, updated: batch.length }
+    },
+  }
+
+  const snapCache = new SchedulerSnapshotCache(null, { freshTtlMs: 10_000, staleTtlMs: 30_000 })
+  const runtime = createSchedulerRuntime({
+    cfg: { paths: { project: '/nonexistent-aux-root' } },
+    client: mockClient,
+    getDb: () => forbidSyncDb,
+    pgPool: mockPgPool,
+    schedulerCache: snapCache,
+    auxCacheTtlMs: 10_000,
+    getVms: () => [],
+    apiEndpointStore: {
+      db: forbidSyncDb,
+      listRaw() {
+        syncAuxCalls += 1
+        throw new Error('PG pushTelemetryNow/syncConfigNow must NOT call sync apiEndpointStore.listRaw')
+      },
+    },
+    geminiOwnersRepo: {
+      db: forbidSyncDb,
+      ownerMap() {
+        syncAuxCalls += 1
+        throw new Error('PG syncConfigNow must NOT call sync geminiOwnersRepo.ownerMap')
+      },
+    },
+    geminiScheduler: {
+      listEnvironments: () => [{ id: 'gem-1', enabled: true, healthy: true, schedulable: true }],
+    },
+    telemetryIntervalMs: 0,
+  })
+  t.after(() => runtime.shutdown({ drain: false, stopProcess: false }))
+
+  // 1. 5 consecutive pushTelemetryNow() calls on empty api_endpoints -> only 1 async PG query, 0 sync calls, 0 child table queries!
+  for (let i = 0; i < 5; i += 1) {
+    await runtime.pushTelemetryNow()
+  }
+  assert.equal(syncAuxCalls, 0)
+  assert.equal(syncDbPrepareCalls, 0, 'pushTelemetryNow must execute 0 sync PgSyncDb.prepare calls')
+  assert.equal(
+    pgQueries.filter((q) => /FROM api_endpoints\b/i.test(q.sql)).length,
+    1,
+    '5 telemetry ticks within 10s TTL must hit api_endpoints at most once',
+  )
+  assert.equal(
+    pgQueries.filter((q) => /FROM api_endpoint_(keys|models)\b/i.test(q.sql)).length,
+    0,
+    'empty api_endpoints must skip api_endpoint_keys and api_endpoint_models queries',
+  )
+
+  // 2. syncConfigNow() loads gemini_environment_owners asynchronously via pgPool (0 sync calls) and caches it
+  pgGeminiOwnerRows = [{ env_id: 'gem-1', owner_user_id: 'tenant-42' }]
+  await runtime.syncConfigNow('bootstrap_refresh')
+  await runtime.syncConfigNow('bootstrap_refresh')
+  assert.equal(syncAuxCalls, 0)
+  assert.equal(
+    pgQueries.filter((q) => /FROM gemini_environment_owners\b/i.test(q.sql)).length,
+    1,
+    'repeated non-mutating syncConfigNow within 10s TTL must reuse L1 gemini_environment_owners cache',
+  )
+  const gemNode = syncedConfigs.at(-1).config_snapshot.nodes.find((n) => n.node_key === 'gemini_env:gem-1')
+  assert.equal(gemNode?.owner_id, 'tenant-42')
+
+  // 3. Invalidation (via invalidateAllCaches / cache prefix) refreshes newly inserted endpoint without exposing api_key
+  pgEndpointRows = [
+    {
+      id: 'ep-1',
+      name: 'EP 1',
+      disabled: 0,
+      prefix: '',
+      base_url: 'https://example.invalid',
+      headers_json: '{}',
+      disable_cooling: 0,
+      priority: 5,
+      kind: 'claude',
+      protocol: 'anthropic',
+      risk_review_enabled: 0,
+      body_policy: 'caller',
+      owner_user_id: null,
+      created_at: '2026-11-28T00:00:00.000Z',
+      updated_at: '2026-11-28T00:00:00.000Z',
+    },
+  ]
+  await invalidateAllCaches({ broadcast: false })
+  await runtime.pushTelemetryNow()
+  assert.equal(
+    pgQueries.filter((q) => /FROM api_endpoints\b/i.test(q.sql)).length,
+    2,
+    'invalidateAllCaches must force refresh on next telemetry tick',
+  )
+  const keysQuery = pgQueries.find((q) => /FROM api_endpoint_keys\b/i.test(q.sql))
+  assert.ok(keysQuery)
+  assert.equal(/\bapi_key\b/i.test(keysQuery.sql), false, 'scheduler aux cache must never select raw api_key secret')
+  const epTele = pushedTelemetries.at(-1).find((u) => u.node_key === 'api_endpoint:ep-1')
+  assert.equal(epTele?.schedulable, true)
+
+  // Verify cache.client invalidation event also clears aux cache
+  pgGeminiOwnerRows = [{ env_id: 'gem-1', owner_user_id: 'tenant-99' }]
+  await cacheRt.client.invalidate({ prefixes: ['sched:aux:'], broadcast: false })
+  await runtime.syncConfigNow('bootstrap_refresh')
+  const gemNode2 = syncedConfigs.at(-1).config_snapshot.nodes.find((n) => n.node_key === 'gemini_env:gem-1')
+  assert.equal(gemNode2?.owner_id, 'tenant-99')
 })

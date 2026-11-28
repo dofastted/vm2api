@@ -16,6 +16,8 @@ import { CRAGGEMINI_PERSONA_PRESETS, CRAGGEMINI_SYSTEM_PROMPT_MAX } from '../gem
 import { readSlotProcessStatus } from '../vm/slot-process-status.mjs'
 import { openaiUsageAccountId } from '../vm/codex-slot.mjs'
 import os from 'node:os'
+import { getDb, getPgPool, isDbOpen } from '../db/database.mjs'
+import { getCacheRuntime } from '../cache/index.mjs'
 import { usagePoolEnabled, usageRead } from '../db/sqlite-pool.mjs'
 import path from 'node:path'
 import {
@@ -692,6 +694,72 @@ function liveAccounts(accounts, vms) {
   return (accounts || []).filter((a) => !a.vm_id || ids.has(String(a.vm_id)))
 }
 
+async function readAccountSnapshotAsync(accountQuota, { fresh = false } = {}) {
+  if (typeof accountQuota?.snapshotAsync === 'function') {
+    return accountQuota.snapshotAsync({ fresh })
+  }
+  return readAccountSnapshot(accountQuota)
+}
+
+async function readDashboardTotalsAsync(requestLog, { bypass = false } = {}) {
+  if (!requestLog) return null
+  if (typeof requestLog.totalsAsync === 'function') {
+    try {
+      return (await requestLog.totalsAsync({ bypass })) || null
+    } catch {}
+  }
+  if (usagePoolEnabled()) {
+    try {
+      const res = await usageRead({ kind: 'repo', method: 'totals' })
+      if (res) return res
+    } catch (err) {
+      console.warn(`[sqlite-pool] dashboard totals: ${err?.message || err}`)
+    }
+  }
+  try {
+    return requestLog.totals?.() || null
+  } catch {
+    return null
+  }
+}
+
+async function readWindowStatsAsync(requestLog, opts = {}) {
+  if (!requestLog) return null
+  if (typeof requestLog.windowStatsAsync === 'function') {
+    try {
+      return (await requestLog.windowStatsAsync(opts)) || null
+    } catch {}
+  }
+  const { bypass: _bypass, ...queryOpts } = opts
+  if (usagePoolEnabled()) {
+    try {
+      const res = await usageRead({ kind: 'repo', method: 'windowStats', args: [queryOpts] })
+      if (res) return res
+    } catch (err) {
+      console.warn(`[sqlite-pool] dashboard windowStats: ${err?.message || err}`)
+    }
+  }
+  try {
+    return requestLog.windowStats?.(queryOpts) || null
+  } catch {
+    return null
+  }
+}
+
+async function readStickyStatsAsync(stickyRouter, { includeSessions = false, bypass = false } = {}) {
+  if (!stickyRouter) return null
+  if (typeof stickyRouter.statsAsync === 'function') {
+    try {
+      return await stickyRouter.statsAsync({ includeSessions, bypass })
+    } catch {}
+  }
+  try {
+    return stickyRouter.stats?.({ includeSessions }) || null
+  } catch {
+    return null
+  }
+}
+
 export async function buildDashboard({
   cfg,
   accountQuota,
@@ -704,19 +772,28 @@ export async function buildDashboard({
   clusterNodes = [],
   bypass = false,
 }) {
-  try {
-    accountQuota?.runtimeRepo?.clearExpired?.(Date.now())
-  } catch {}
+  // Expired runtime windows are cleared asynchronously by `pool-scheduler.maintain()`;
+  // panel read paths never perform synchronous DB writes.
   const active = getActiveVmId(cfg.paths.project)
   const pool = poolScheduler?.snapshot?.() || {}
   const nodePenalties = poolScheduler?.nodePenalties?.() || null
   const poolSnap = snapshotPool(proxyPool)
   const listed = listVms(cfg.paths.project, routingConfig)
-  const liveById = await collectLivePanelCredentials(cfg.paths.project, listed)
-  // One snapshot + one batched runtime lookup for the whole response:
-  // avoids per-slot account/runtime N+1 queries (#1043).
-  const snap = accountQuota.snapshot()
-  const runtimeById = prefetchRuntimeMap(accountQuota, listed, snap)
+  const opsSince = new Date(Date.now() - 3600_000).toISOString()
+
+  // Launch independent async I/O in parallel so panel reads never serialize or block the event loop.
+  const dbTotalsPromise = readDashboardTotalsAsync(requestLog, { bypass })
+  const opsWindowPromise = readWindowStatsAsync(requestLog, { since: opsSince, bypass })
+  const stickyStatsPromise = readStickyStatsAsync(stickyRouter, { includeSessions: false, bypass })
+  const [liveById, snap] = await Promise.all([
+    collectLivePanelCredentials(cfg.paths.project, listed),
+    typeof accountQuota?.snapshotAsync === 'function'
+      ? accountQuota.snapshotAsync({ fresh: bypass })
+      : accountQuota.snapshot(),
+  ])
+  // One snapshot + one batched async runtime lookup for the whole response:
+  // consumes scheduler L1 snapshot or async pgPool listAllSnapshotsAsync (#1043).
+  const runtimeById = await prefetchRuntimeMapAsync(accountQuota, listed, snap, { bypass })
   const vms = listed.map((v) =>
     enrichVm(v, accountQuota, active, {
       routingConfig,
@@ -751,45 +828,19 @@ export async function buildDashboard({
   ).length
   const proxy_pool = summarizeProxyPool(proxyPool)
 
-  const billing = stampVmBilling(
-    vms,
-    await (async () => {
+  const [rawBilling, dbTotals, opsWindow, stickyStats] = await Promise.all([
+    (async () => {
       try {
         return await panelBillingStatsAsync(requestLog, accountQuota, vms, snap, { bypass })
       } catch {
         return null
       }
     })(),
-    snap.accounts || [],
-  )
-
-  let dbTotals = null
-  let opsWindow = null
-  const opsSince = new Date(Date.now() - 3600_000).toISOString()
-  if (usagePoolEnabled()) {
-    try {
-      ;[dbTotals, opsWindow] = await Promise.all([
-        usageRead({ kind: 'repo', method: 'totals' }),
-        usageRead({ kind: 'repo', method: 'windowStats', args: [{ since: opsSince }] }),
-      ])
-    } catch (err) {
-      console.warn(`[sqlite-pool] dashboard: ${err?.message || err}`)
-    }
-  }
-  if (!dbTotals) {
-    try {
-      dbTotals = requestLog?.totals() || null
-    } catch {
-      dbTotals = null
-    }
-  }
-  if (!opsWindow) {
-    try {
-      opsWindow = requestLog?.windowStats?.({ since: opsSince }) || null
-    } catch {
-      opsWindow = null
-    }
-  }
+    dbTotalsPromise,
+    opsWindowPromise,
+    stickyStatsPromise,
+  ])
+  const billing = stampVmBilling(vms, rawBilling, snap.accounts || [])
 
   return ok({
     health: {
@@ -830,7 +881,7 @@ export async function buildDashboard({
     vms,
     routing: {
       sticky_enabled: !!routingConfig?.sticky?.enabled,
-      sticky_sessions: stickyRouter.stats()?.active_sessions ?? 0,
+      sticky_sessions: stickyStats?.active_sessions ?? 0,
       safety_ratio: routingConfig?.quota?.safety_ratio ?? 0.85,
       weekly_safety_ratio: routingConfig?.quota?.weekly_safety_ratio ?? 0.8,
       tiers: normalizeTiers(routingConfig?.tiers, routingConfig?.quota, routingConfig?.concurrency),
@@ -858,17 +909,16 @@ export async function buildVmList({
   clusterNodes = [],
   bypass = false,
 } = {}) {
-  try {
-    accountQuota?.runtimeRepo?.clearExpired?.(Date.now())
-  } catch {}
   const active = getActiveVmId(cfg.paths.project)
   const pool = poolScheduler?.snapshot?.() || {}
   const nodePenalties = poolScheduler?.nodePenalties?.() || null
   const poolSnap = snapshotPool(proxyPool)
   const listed = filterVmsForPanel(listVms(cfg.paths.project, routingConfig), { role, userId: ownerUserId })
-  const liveById = await collectLivePanelCredentials(cfg.paths.project, listed)
-  const snap = readAccountSnapshot(accountQuota)
-  const runtimeById = prefetchRuntimeMap(accountQuota, listed, snap)
+  const [liveById, snap] = await Promise.all([
+    collectLivePanelCredentials(cfg.paths.project, listed),
+    readAccountSnapshotAsync(accountQuota, { fresh: bypass }),
+  ])
+  const runtimeById = await prefetchRuntimeMapAsync(accountQuota, listed, snap, { bypass })
   const vms = listed.map((v) =>
     enrichVm(v, accountQuota, active, {
       routingConfig,
@@ -937,9 +987,11 @@ export async function buildVmDetail({
   const nodePenalties = poolScheduler?.nodePenalties?.() || null
   const poolSnap = snapshotPool(proxyPool)
   const listed = [summarizeVm(vm, cfg.paths.project, routingConfig)]
-  const liveById = await collectLivePanelCredentials(cfg.paths.project, listed, { cacheMs: 0 })
-  const snap = readAccountSnapshot(accountQuota)
-  const runtimeById = prefetchRuntimeMap(accountQuota, listed, snap)
+  const [liveById, snap] = await Promise.all([
+    collectLivePanelCredentials(cfg.paths.project, listed, { cacheMs: 0 }),
+    readAccountSnapshotAsync(accountQuota, { fresh: bypass }),
+  ])
+  const runtimeById = await prefetchRuntimeMapAsync(accountQuota, listed, snap, { bypass })
   const summary = enrichVm(listed[0], accountQuota, active, {
     routingConfig,
     pool,
@@ -1756,22 +1808,23 @@ export async function snapshotAccountPool({
   requestLog = null,
   bypass = false,
 }) {
-  try {
-    accountQuota?.runtimeRepo?.clearExpired?.(Date.now())
-  } catch {}
   const active = getActiveVmId(cfg.paths.project)
   const pool = poolScheduler?.snapshot?.() || {}
   const nodePenalties = poolScheduler?.nodePenalties?.() || null
   const poolSnap = snapshotPool(proxyPool)
   const listed = listVms(cfg.paths.project, routingConfig)
-  let liveById = null
-  try {
-    liveById = await collectLivePanelCredentials(cfg.paths.project, listed)
-  } catch {
-    liveById = null
-  }
-  const snap = readAccountSnapshot(accountQuota)
-  const runtimeById = prefetchRuntimeMap(accountQuota, listed, snap)
+  const todayPromise = readWindowStatsAsync(requestLog, { since: shanghaiDayStartIso(), bypass })
+  const [liveById, snap] = await Promise.all([
+    (async () => {
+      try {
+        return await collectLivePanelCredentials(cfg.paths.project, listed)
+      } catch {
+        return null
+      }
+    })(),
+    readAccountSnapshotAsync(accountQuota, { fresh: bypass }),
+  ])
+  const runtimeById = await prefetchRuntimeMapAsync(accountQuota, listed, snap, { bypass })
   const vms = listed.map((v) =>
     enrichVm(v, accountQuota, active, {
       routingConfig,
@@ -1785,23 +1838,17 @@ export async function snapshotAccountPool({
     }),
   )
   const accounts = snap?.accounts || []
-  const billing = stampVmBilling(
-    vms,
-    await (async () => {
+  const [rawBilling, today] = await Promise.all([
+    (async () => {
       try {
         return await panelBillingStatsAsync(requestLog, accountQuota, vms, snap, { bypass })
       } catch {
         return null
       }
     })(),
-    accounts,
-  )
-  let today = null
-  try {
-    today = requestLog?.windowStats?.({ since: shanghaiDayStartIso() }) || null
-  } catch {
-    today = null
-  }
+    todayPromise,
+  ])
+  const billing = stampVmBilling(vms, rawBilling, accounts)
   return summarizePoolAvailability(vms, Date.now(), { billing, today })
 }
 
@@ -2547,6 +2594,89 @@ export function findAccount(accountQuota, vm, snap = null) {
   )
 }
 
+function collectRuntimeKeys(accountQuota, vms = [], snap = null) {
+  const keys = new Set()
+  for (const vm of vms || []) {
+    if (!vm) continue
+    const acc = findAccount(accountQuota, vm, snap)
+    for (const key of [vm.account_uuid, vm.claude?.account_uuid, acc?.account_id, vm.id]) {
+      if (key) keys.add(String(key))
+    }
+  }
+  return keys
+}
+
+function runtimeMapFromSnapshot(byAccountId, keys) {
+  const out = new Map()
+  if (!(byAccountId instanceof Map)) return out
+  for (const key of keys) {
+    const entry = byAccountId.get(key)
+    const state = entry?.state ?? entry?.runtime ?? null
+    if (state) out.set(key, state)
+  }
+  return out
+}
+
+function canUseSharedSchedulerSnapshot(repo) {
+  const db = repo?.db
+  if (!db) return false
+  if (db.engine === 'postgres') return true
+  return isDbOpen() && db === getDb()
+}
+
+/**
+ * Async batch-prefetch of account runtime states for panel rendering:
+ * 1. Consumes `cache.scheduler` L1 scheduling snapshot (0 DB, 0 `Atomics.wait`);
+ * 2. Falls back to async PostgreSQL `accountRuntimeRepo.listAllSnapshotsAsync(pgPool)`
+ *    (or `schedulingSnapshotAsync`) so main thread never blocks on `PgSyncDb`;
+ * 3. Falls back to synchronous `prefetchRuntimeMap` on SQLite / unit-test mocks.
+ */
+async function prefetchRuntimeMapAsync(accountQuota, vms = [], snap = null, { bypass = false } = {}) {
+  try {
+    const repo = accountQuota?.runtimeRepo
+    if (!repo) return null
+    const keys = collectRuntimeKeys(accountQuota, vms, snap)
+    if (!keys.size) return new Map()
+
+    if (!bypass && canUseSharedSchedulerSnapshot(repo)) {
+      try {
+        const scheduler = getCacheRuntime()?.scheduler
+        let schedSnap = null
+        if (typeof scheduler?.peekSchedulingSnapshot === 'function') {
+          const peek = scheduler.peekSchedulingSnapshot()
+          if (peek?.hit && peek.snapshot?.byAccountId instanceof Map) schedSnap = peek.snapshot
+        }
+        if (!schedSnap && typeof scheduler?.getSchedulingSnapshotSync === 'function') {
+          const got = scheduler.getSchedulingSnapshotSync(null)
+          if (got?.byAccountId instanceof Map) schedSnap = got
+        }
+        if (schedSnap && schedSnap.byAccountId.size > 0) {
+          return runtimeMapFromSnapshot(schedSnap.byAccountId, keys)
+        }
+      } catch {}
+    }
+
+    const isPg = repo?.db?.engine === 'postgres'
+    if (isPg) {
+      const pgPool = typeof accountQuota?._resolvePgPool === 'function' ? accountQuota._resolvePgPool() : getPgPool()
+      if (pgPool && typeof pgPool.query === 'function') {
+        if (typeof repo.listAllSnapshotsAsync === 'function') {
+          const allSnaps = await repo.listAllSnapshotsAsync(pgPool)
+          if (allSnaps instanceof Map) return runtimeMapFromSnapshot(allSnaps, keys)
+        }
+        if (typeof repo.schedulingSnapshotAsync === 'function') {
+          const batchSnaps = await repo.schedulingSnapshotAsync([...keys], pgPool)
+          if (batchSnaps instanceof Map) return runtimeMapFromSnapshot(batchSnaps, keys)
+        }
+      }
+    }
+
+    return prefetchRuntimeMap(accountQuota, vms, snap)
+  } catch {
+    return null
+  }
+}
+
 /**
  * Batch-prefetch account runtime states for a VM list in a single DB query,
  * replacing per-VM `runtimeRepo.get()` N+1 calls during panel rendering.
@@ -2557,14 +2687,7 @@ function prefetchRuntimeMap(accountQuota, vms = [], snap = null) {
     if (!repo) return null
     const canBatch = typeof repo.getMany === 'function' || typeof repo.schedulingSnapshot === 'function'
     if (!canBatch) return null
-    const keys = new Set()
-    for (const vm of vms || []) {
-      if (!vm) continue
-      const acc = findAccount(accountQuota, vm, snap)
-      for (const key of [vm.account_uuid, vm.claude?.account_uuid, acc?.account_id, vm.id]) {
-        if (key) keys.add(String(key))
-      }
-    }
+    const keys = collectRuntimeKeys(accountQuota, vms, snap)
     if (!keys.size) return new Map()
     if (typeof repo.getMany === 'function') {
       return repo.getMany([...keys])

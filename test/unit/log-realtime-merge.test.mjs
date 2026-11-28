@@ -11,7 +11,7 @@ import { createDatabase } from '../../src/lib/db/database.mjs'
 import { PgLogWriter, getPgLogWriter, setPgLogWriter } from '../../src/lib/db/pg/pg-log-writer.mjs'
 import { RequestAttemptsRepo } from '../../src/lib/db/repos/request-attempts-repo.mjs'
 import { UsageLogsRepo } from '../../src/lib/db/repos/usage-logs-repo.mjs'
-import { UsageLogsView, lookupNamesAsync } from '../../src/lib/db/repos/usage-logs-view.mjs'
+import { UsageLogsView, loadOwnerKeyIdsAsync, lookupNamesAsync } from '../../src/lib/db/repos/usage-logs-view.mjs'
 
 function createIsolatedCache() {
   const client = new MultiTierCacheClient({ redisConfig: null, cacheConfig: { enabled: true } })
@@ -1194,4 +1194,155 @@ test('client disconnect, premature close, and handler errors clean up live:infli
   )
   await Promise.resolve()
   assert.equal(await cache.liveLogs.getInflightCount(), 0, 'uncaught handler throw must not leak live:inflight')
+})
+
+test('Stage 2B tenant active-sessions: loadOwnerKeyIdsAsync caches + invalidates on api_keys mutation & UNION SQL preserves 4-way isolation', async (t) => {
+  const { db } = createFixtureDb(t)
+  const cache = createIsolatedCache()
+  const now = Date.now()
+
+  // Seed rows covering all 3 DB tenant ownership paths for u1 (user_id, vm_owner_user_id, api_key_id)
+  // plus a u2 row that must stay isolated and an overlap row matching multiple paths (must dedup via UNION).
+  seedUsageRows(db, [
+    {
+      id: 'log_s1_1',
+      request_id: 'req-s1-1',
+      created_at: new Date(now - 20_000).toISOString(),
+      session_id: 'sess-u1-direct',
+      outbound_session_id: 'out-u1-direct',
+      user_id: 'u1',
+      api_key_id: 'k1',
+      vm_id: 'vm-a',
+      vm_owner_user_id: 'u1',
+      account_id: 'acc-a',
+      has_tools: 1,
+      input_tokens: 100,
+      output_tokens: 50,
+      total_cost: 0.01,
+    },
+    {
+      id: 'log_s1_2',
+      request_id: 'req-s1-2',
+      created_at: new Date(now - 15_000).toISOString(),
+      session_id: 'sess-u1-vm-owner',
+      outbound_session_id: 'out-u1-vm-owner',
+      user_id: null,
+      api_key_id: null,
+      vm_id: 'vm-a',
+      vm_owner_user_id: 'u1',
+      account_id: 'acc-a',
+      has_tools: 0,
+      input_tokens: 40,
+      output_tokens: 10,
+      total_cost: 0.005,
+    },
+    {
+      id: 'log_s1_3',
+      request_id: 'req-s1-3',
+      created_at: new Date(now - 10_000).toISOString(),
+      session_id: 'sess-u1-key-only',
+      outbound_session_id: 'out-u1-key-only',
+      user_id: null,
+      api_key_id: 'k1',
+      vm_id: 'vm-b',
+      vm_owner_user_id: 'u2',
+      account_id: 'acc-b',
+      has_tools: 1,
+      input_tokens: 60,
+      output_tokens: 20,
+      total_cost: 0.008,
+    },
+    {
+      id: 'log_s2_1',
+      request_id: 'req-s2-1',
+      created_at: new Date(now - 5_000).toISOString(),
+      session_id: 'sess-u2-private',
+      outbound_session_id: 'out-u2-private',
+      user_id: 'u2',
+      api_key_id: 'k2',
+      vm_id: 'vm-b',
+      vm_owner_user_id: 'u2',
+      account_id: 'acc-b',
+      has_tools: 1,
+      input_tokens: 80,
+      output_tokens: 30,
+      total_cost: 0.02,
+    },
+  ])
+
+  let apiKeySelects = 0
+  const executedSql = []
+  const origPrepare = db.prepare.bind(db)
+  db.prepare = (sql) => {
+    const text = String(sql)
+    executedSql.push(text)
+    const stmt = origPrepare(sql)
+    if (/FROM api_keys WHERE user_id = \?/i.test(text)) {
+      const origAll = stmt.all.bind(stmt)
+      stmt.all = (...args) => {
+        apiKeySelects += 1
+        return origAll(...args)
+      }
+    }
+    return stmt
+  }
+
+  // 1. loadOwnerKeyIdsAsync caches in L1 and invalidates when entity.invalidateNames('api_keys') fires
+  const keys1 = await loadOwnerKeyIdsAsync(db, 'u1', { cache })
+  const keys2 = await loadOwnerKeyIdsAsync(db, 'u1', { cache })
+  assert.deepEqual([...keys1], ['k1'])
+  assert.deepEqual([...keys2], ['k1'])
+  assert.equal(apiKeySelects, 1, 'repeated loadOwnerKeyIdsAsync calls should hit L1 cache')
+
+  db.exec(`INSERT INTO api_keys (id, name, key, user_id) VALUES ('k1-new', 'alice-key-2', 'sk-1b', 'u1')`)
+  await cache.entity.invalidateNames('api_keys')
+  const keys3 = await loadOwnerKeyIdsAsync(db, 'u1', { cache })
+  assert.equal(keys3.has('k1'), true)
+  assert.equal(keys3.has('k1-new'), true)
+  assert.equal(apiKeySelects, 2, 'api_keys invalidation must immediately refresh cached owner key IDs')
+
+  // 2. activeSessionsAsync with live 4-way isolation (owner_user_id + api_key_id) and UNION index pushdown
+  await cache.liveLogs.startRequest('req-live-u1-key', {
+    started_at: now - 2_000,
+    created_at: new Date(now - 2_000).toISOString(),
+    session_id: 'sess-u1-live-only',
+    api_key_id: 'k1-new',
+    vm_id: 'vm-b',
+    model: 'claude-sonnet-4-6',
+  })
+  await cache.liveLogs.startRequest('req-live-u2-secret', {
+    started_at: now - 1_000,
+    created_at: new Date(now - 1_000).toISOString(),
+    session_id: 'sess-u2-live-secret',
+    user_id: 'u2',
+    api_key_id: 'k2',
+    vm_id: 'vm-b',
+    model: 'claude-sonnet-4-6',
+  })
+
+  const view = new UsageLogsView(db, { cache })
+  const resU1 = await view.activeSessionsAsync({ minutes: 5, limit: 50, owner_user_id: 'u1', now })
+  const sidsU1 = resU1.sessions.map((s) => s.sessionId)
+  assert.equal(sidsU1.includes('sess-u1-direct'), true)
+  assert.equal(sidsU1.includes('sess-u1-vm-owner'), true)
+  assert.equal(sidsU1.includes('sess-u1-key-only'), true)
+  assert.equal(sidsU1.includes('sess-u1-live-only'), true)
+  assert.equal(sidsU1.includes('sess-u2-private'), false, 'must not leak u2 DB sessions to u1')
+  assert.equal(sidsU1.includes('sess-u2-live-secret'), false, 'must not leak u2 live sessions to u1')
+  // Overlap row log_s1_1 matched all 3 UNION branches but must be counted once
+  const directRow = resU1.sessions.find((s) => s.sessionId === 'sess-u1-direct')
+  assert.equal(directRow.requests, 1)
+  assert.equal(directRow.totalTokens, 150)
+  assert.equal(resU1.oneOffTotal, 1)
+
+  // Verify SQL uses index-pushdown UNION (no OR + IFNULL(api_key_id, '') subquery seq_scan)
+  const activeSqls = executedSql.filter((s) => s.includes('ROW_NUMBER() OVER'))
+  assert.ok(activeSqls.length >= 1)
+  assert.match(activeSqls[0], /UNION/)
+  assert.doesNotMatch(activeSqls[0], /IFNULL\(api_key_id/i)
+  assert.equal(
+    apiKeySelects,
+    2,
+    'activeSessionsAsync polling must reuse cached ownerKeyIds with 0 extra api_keys queries',
+  )
 })
