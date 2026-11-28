@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.4.252 — 2026-11-28 · 补回 M3 切换丢失的 238 调度规则（Fable 闸、节点闸、借号不搬 pin、续聊不跨号等）
+
+- **恢复 Rust `kin-scheduler` 切换（v1.4.243，#1994）时丢失的 v1.4.238 JS 调度规则（#2056）**：规则加在 Rust 调度器或调用它的 JS 边界上，未回退到 JS 调度；逐条对照表见 `docs/scheduler-m3-parity.md`。
+  - **Fable 闸**：`pool.fable_requires_max` 与 `model_denied_until` 恢复生效，Fable 只派到 Max 槽位，池内无 Max 时立即返回 `429 fable_requires_max`，不再把请求派到 Pro 槽后挂满 600s 才 `504`；面板角标与派发共用同一判断（`src/lib/pool/slot-model-gate.mjs`、`src/lib/admin/panel-api.mjs`）
+  - **按模型等待闸与节点闸**：冷却中的模型、Fable 族冷却、`7d_oi`、周额度拆分会跳过对应账号；代理未绑定或失配、账号停用、凭据异常、并发为 0、内核故障、离线、worker 不可达的槽位带原因排除，不再接流量（`src/lib/scheduler/{node-gates,scheduler-runtime}.mjs`，遥测新增 `schedulable` / `unschedulable_reason` / `new_sessions_blocked`）
+  - **会话与 pin 语义**：`keep_pin_on_model_gate` 借号不搬 pin 与 machine；ephemeral 请求（摘要分叉、短探针）只读地跟随本会话或父会话的 pin；`keep_session_home` 续聊出错不再跨号重放，home 槽 `slot_busy` 时等待，超时返回 `529 session_home_slot_busy`（`src/lib/pool/failover-runner.mjs`）；batch 成员按成员键粘号且不被 SessionGate 串行
+  - **耗尽保护分档**：`exhaustion_guard` 的 continuing 档只接已 pin 的续聊、stop 档整槽排除；宿主内存告急时续聊豁免新会话带
+  - **Rust 协议**：`AcquireRequest` 新增 `keep_pin_on_model_gate`、`model_gated_node_keys`、`skip_session_gate`，`NodeTelemetryUpdate` 新增 `new_sessions_blocked`，均带 `serde(default)`，旧调用方不受影响
+- 部署说明：本次改动零数据库迁移、`deploy/payload.json` 未变；包含 Rust `kin-scheduler` 变更，`v1.4.252` 的控制面镜像会随发布重新构建调度器二进制，升级后重启控制面即可生效。
+
 ## 1.4.251 — 2026-11-28 · Codex 控制面对齐 `kin-codex-kernel v0.4.9`：UDS packed 增量、WS `ws_replay` 续接与实时中断
 
 - **Codex 传输与 Responses WebSocket 对齐 `kin-codex-kernel v0.4.9`（#2058）**：

@@ -427,6 +427,9 @@ export class PoolScheduler extends EventEmitter {
     this.kernelLeaseStats = new KernelLeaseStats()
     this.changePending = false
     this.healthCache = new Map()
+    // 238 `node_offline`: last probe could not reach the worker. Read by the
+    // scheduler telemetry batch so the 2s push does not undo the exclusion.
+    this.workerUnreachable = new Map()
     this.healthFlights = new Map()
     this.healthWrites = new Map()
     this.maintenanceTimer = null
@@ -741,6 +744,7 @@ export class PoolScheduler extends EventEmitter {
       (dataPath === 'ssh' && value?.status === 0 && value.ok !== true)
     ) {
       if (this.healthCache.get(exec.vmId)?.dataPath === dataPath) this.healthCache.delete(exec.vmId)
+      this.workerUnreachable.set(exec.vmId, { at: Date.now(), dataPath })
       this.schedulerRuntime?.enqueueTelemetry?.([
         {
           node_key: formatNodeKey('claude_vm', exec.vmId),
@@ -791,6 +795,7 @@ export class PoolScheduler extends EventEmitter {
         }
       }
     }
+    this.workerUnreachable.delete(exec.vmId)
     this.healthCache.set(exec.vmId, {
       at: Date.now(),
       value,
