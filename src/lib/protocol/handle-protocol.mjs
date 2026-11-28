@@ -1260,6 +1260,10 @@ export function createHandleProtocol(deps) {
       threw = true
       throw err
     } finally {
+      if (req && typeof req === 'object') {
+        if ('rawBodyBytes' in req) req.rawBodyBytes = null
+        if ('rawBody' in req) req.rawBody = null
+      }
       settleProtocolLogOnExit(res, logCtx, threw)
     }
   }
@@ -1337,6 +1341,19 @@ export function createHandleProtocol(deps) {
         })
       } catch {
         requestLog.abort?.(logCtx)
+      } finally {
+        // Release large payload references immediately once log entry is enqueued
+        // so 100K-context requests do not pin V8 old-space memory under high concurrency.
+        logBag.inbound_body = null
+        logBag.outbound_body = null
+        logBag.inbound_summary = null
+        logBag.outbound_summary = null
+        logBag.cache_prefix = null
+        logBag.cache_continuity = null
+        if (req && typeof req === 'object') {
+          if ('rawBodyBytes' in req) req.rawBodyBytes = null
+          if ('rawBody' in req) req.rawBody = null
+        }
       }
     })
     if (!(await authenticateRequest(req, res))) {
@@ -1379,8 +1396,9 @@ export function createHandleProtocol(deps) {
     ) {
       if (!inbound.model) inbound = { ...inbound, model: effectiveRouteModel }
     }
-    logBag.inbound_body = logCtx.mode === 'debug' ? inbound : null
-    logBag.inbound_summary = summarizeBody(inbound)
+    const isDebugLog = logCtx.mode === 'debug'
+    logBag.inbound_body = isDebugLog ? inbound : null
+    logBag.inbound_summary = isDebugLog ? summarizeBody(inbound) : null
     logBag.model = inbound?.model || effectiveRouteModel || null
     logBag.requested_model = inbound?.model || effectiveRouteModel || null
     logBag.stream = protocol === 'google.gemini' ? effectiveRouteStream : isClientStream(inbound, req.headers)
@@ -1401,7 +1419,7 @@ export function createHandleProtocol(deps) {
       user_id: req.apiKeyRecord?.user_id ?? null,
     })
     const fp = fingerprintRequest(req, inbound)
-    const rawBodyBytes = Buffer.isBuffer(req?.rawBodyBytes)
+    let rawBodyBytes = Buffer.isBuffer(req?.rawBodyBytes)
       ? req.rawBodyBytes
       : Buffer.isBuffer(req?.rawBody)
         ? req.rawBody
@@ -1685,6 +1703,13 @@ export function createHandleProtocol(deps) {
       logBag.error_message = errorResult.body?.error?.message || null
       res.statusCode = errorResult.status
       return json(res, errorResult.status, errorResult.body)
+    }
+    // `rawBodyBytes` is only needed by ingress official-client verification; drop it
+    // before upstream streaming so 400KB+ buffers are reclaimed promptly under load.
+    rawBodyBytes = undefined
+    if (req && typeof req === 'object') {
+      if ('rawBodyBytes' in req) req.rawBodyBytes = null
+      if ('rawBody' in req) req.rawBody = null
     }
     // Per-client switches, independent of claude_code_only: some clients run the official
     // CLI and append their own agent prompt, which Anthropic bills as a third-party app.
@@ -3294,7 +3319,7 @@ export function createHandleProtocol(deps) {
       // The api backend forwards the converted body untouched: its session is the outbound one.
       logBag.outbound_session_id = sessionIdForLog(sessionIdFromOutboundBody(ctx.body) || logBag.session_id)
       if (result?.outboundBody != null) {
-        logBag.outbound_summary = summarizeBody(result.outboundBody)
+        if (isDebugLog) logBag.outbound_summary = summarizeBody(result.outboundBody)
         if (logCtx.capture_outbound) {
           logBag.outbound_body = result.outboundBody
           if (result.outboundBodySource) logBag.outbound_body_source = result.outboundBodySource
@@ -3487,22 +3512,32 @@ export function createHandleProtocol(deps) {
         logBag.outbound_body_truncated = extra.body_truncated === true
       }
     }
-    // Prewarm thinking signature owners from Redis L2 in one MGET when Redis is ready.
-    if (
-      thinkingOwnerStore?.ownersOfAsync &&
-      getCacheRuntime()?.client?.hasRedis &&
-      Array.isArray(canonicalBody?.messages)
-    ) {
-      const sigKeys = []
-      for (const message of canonicalBody.messages) {
-        if (message?.role !== 'assistant' || !Array.isArray(message.content)) continue
-        for (const block of message.content) {
-          const k = thinkingSignatureKey(block)
-          if (k) sigKeys.push(k)
+    // Prewarm thinking signature owners asynchronously (Redis L2 + PG pgPool + L1 negative cache)
+    // so downstream sync thinking filters never trigger main-thread Atomics.wait.
+    const prewarmThinkingOwners =
+      typeof thinkingOwnerStore?.prewarmOwnersAsync === 'function'
+        ? (keys) => thinkingOwnerStore.prewarmOwnersAsync(keys)
+        : typeof thinkingOwnerStore?.ownersOfAsync === 'function'
+          ? (keys) => thinkingOwnerStore.ownersOfAsync(keys)
+          : null
+    if (prewarmThinkingOwners) {
+      const thinkingMessages = Array.isArray(canonicalBody?.messages)
+        ? canonicalBody.messages
+        : Array.isArray(ctx?.body?.messages)
+          ? ctx.body.messages
+          : null
+      if (thinkingMessages) {
+        const sigKeySet = new Set()
+        for (const message of thinkingMessages) {
+          if (message?.role !== 'assistant' || !Array.isArray(message.content)) continue
+          for (const block of message.content) {
+            const k = thinkingSignatureKey(block)
+            if (k) sigKeySet.add(k)
+          }
         }
-      }
-      if (sigKeys.length) {
-        await thinkingOwnerStore.ownersOfAsync(sigKeys).catch(() => {})
+        if (sigKeySet.size > 0) {
+          await prewarmThinkingOwners([...sigKeySet]).catch(() => {})
+        }
       }
     }
     let result
@@ -3895,7 +3930,7 @@ export function createHandleProtocol(deps) {
               logBag.official_cc_inference = 'crag-print'
               logBag.provider = 'local_cli'
               if (!strictPassthrough) hopBody = noteCachePrefix(selected, attemptSessionId, hopBody)
-              logBag.outbound_summary = summarizeBody(hopBody)
+              if (isDebugLog) logBag.outbound_summary = summarizeBody(hopBody)
               logBag.outbound_session_id = sessionIdForLog(sessionIdFromOutboundBody(hopBody) || attemptSessionId)
               return {
                 body: hopBody,
@@ -4039,18 +4074,20 @@ export function createHandleProtocol(deps) {
             logBag.official_cc_inference = 'cli-hop'
             logBag.provider = 'local_cli'
             hopBody = noteCachePrefix(selected, attemptSessionId, hopBody)
-            logBag.outbound_summary = summarizeBody(hopBody)
-            logBag.cache_continuity = describeCacheContinuity({
-              inbound,
-              outbound: hopBody,
-              layer: 'node_object',
-              ttl: requestedCacheTtl,
-              sessionId: attemptSessionId,
-              vmId: selected.vmId,
-              accountId: selected.accountId,
-              requestId: logCtx.request_id,
-              ctx: bodyCtx,
-            })
+            if (isDebugLog) {
+              logBag.outbound_summary = summarizeBody(hopBody)
+              logBag.cache_continuity = describeCacheContinuity({
+                inbound,
+                outbound: hopBody,
+                layer: 'node_object',
+                ttl: requestedCacheTtl,
+                sessionId: attemptSessionId,
+                vmId: selected.vmId,
+                accountId: selected.accountId,
+                requestId: logCtx.request_id,
+                ctx: bodyCtx,
+              })
+            }
             const cliPoolSystemApplied =
               attemptPoolPrompt.applies &&
               (attemptPoolPrompt.mode === 'append' || attemptPoolPrompt.mode === 'override')
@@ -4202,18 +4239,20 @@ export function createHandleProtocol(deps) {
             dropSampling,
           })
           const outbound = noteCachePrefix(selected, attemptSessionId, prepared.body)
-          logBag.outbound_summary = summarizeBody(outbound)
-          logBag.cache_continuity = describeCacheContinuity({
-            inbound,
-            outbound,
-            layer: 'node_object',
-            ttl: cacheTtl,
-            sessionId: attemptSessionId,
-            vmId: selected.vmId,
-            accountId: selected.accountId,
-            requestId: logCtx.request_id,
-            ctx: bodyCtx,
-          })
+          if (isDebugLog) {
+            logBag.outbound_summary = summarizeBody(outbound)
+            logBag.cache_continuity = describeCacheContinuity({
+              inbound,
+              outbound,
+              layer: 'node_object',
+              ttl: cacheTtl,
+              sessionId: attemptSessionId,
+              vmId: selected.vmId,
+              accountId: selected.accountId,
+              requestId: logCtx.request_id,
+              ctx: bodyCtx,
+            })
+          }
           logBag.outbound_session_id = sessionIdForLog(sessionIdFromOutboundBody(outbound) || attemptSessionId)
           return {
             body: outbound,
@@ -4725,6 +4764,19 @@ export function createHandleProtocol(deps) {
         })
       } catch {
         requestLog.abort?.(logCtx)
+      } finally {
+        // Release large payload references immediately once log entry is enqueued
+        // so 100K-context requests do not pin V8 old-space memory under high concurrency.
+        logBag.inbound_body = null
+        logBag.outbound_body = null
+        logBag.inbound_summary = null
+        logBag.outbound_summary = null
+        logBag.cache_prefix = null
+        logBag.cache_continuity = null
+        if (req && typeof req === 'object') {
+          if ('rawBodyBytes' in req) req.rawBodyBytes = null
+          if ('rawBody' in req) req.rawBody = null
+        }
       }
     })
     if (!(await authenticateRequest(req, res))) {
@@ -4753,7 +4805,7 @@ export function createHandleProtocol(deps) {
       )
     }
     logBag.model = typeof body?.model === 'string' ? body.model : null
-    logBag.inbound_summary = summarizeBody(body)
+    logBag.inbound_summary = logCtx.mode === 'debug' ? summarizeBody(body) : null
     if (rejectKeyModel(req, res, protocol, body?.model, logBag)) return
     const searchOwnerScope = ownerScopeFromRequest(req, apiKeyStore?.users)
     const searchPoolAccess = resolveRequestPoolAccess(req, {
@@ -5006,6 +5058,19 @@ export function createHandleProtocol(deps) {
         })
       } catch {
         requestLog.abort?.(logCtx)
+      } finally {
+        // Release large payload references immediately once log entry is enqueued
+        // so 100K-context requests do not pin V8 old-space memory under high concurrency.
+        logBag.inbound_body = null
+        logBag.outbound_body = null
+        logBag.inbound_summary = null
+        logBag.outbound_summary = null
+        logBag.cache_prefix = null
+        logBag.cache_continuity = null
+        if (req && typeof req === 'object') {
+          if ('rawBodyBytes' in req) req.rawBodyBytes = null
+          if ('rawBody' in req) req.rawBody = null
+        }
       }
     })
     if (!(await authenticateRequest(req, res))) {
@@ -5016,10 +5081,11 @@ export function createHandleProtocol(deps) {
     }
     let body
     try {
-      const raw = await readRawBody(req, inboundBodyLimit(getRouting(), cfg.limits.max_body_bytes))
+      let raw = await readRawBody(req, inboundBodyLimit(getRouting(), cfg.limits.max_body_bytes))
       const contentType = req.headers?.['content-type']
       if (kind === 'edits' && isMultipartFormData(contentType)) {
         const converted = await normalizeImageEditBody(raw, contentType)
+        raw = null
         if (!converted.ok) {
           stats.errors++
           logBag.error_code = 'invalid_image_edit'
@@ -5038,6 +5104,7 @@ export function createHandleProtocol(deps) {
         body = converted.body
       } else {
         const text = raw.toString('utf8')
+        raw = null
         body = text ? JSON.parse(text) : {}
       }
     } catch (error) {

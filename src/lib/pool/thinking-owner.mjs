@@ -13,9 +13,10 @@
  * migrations so this local addition cannot take a migration number later.
  */
 import crypto from 'node:crypto'
-import { DB_INSTANCE_ID, getDb, isDbOpen } from '../db/database.mjs'
+import { DB_INSTANCE_ID, getDb, getPgPool, isDbOpen } from '../db/database.mjs'
 import { enqueueWrite, writeBehindArmed } from '../db/write-behind.mjs'
-import { getCacheRuntime } from '../cache/index.mjs'
+import { getCacheRuntime, registerLocalCacheClearer } from '../cache/index.mjs'
+import { BoundedLruCache } from '../cache/cache-client.mjs'
 import { mapThinkingBlocks } from '../protocol/anthropic-policy.mjs'
 import { mergeConsecutiveAnthropicMessages, messageHasTurnControls } from '../protocol/sanitize.mjs'
 
@@ -26,8 +27,28 @@ const PURGE_EVERY_MS = 60 * 60 * 1000
 const REFRESH_AFTER_MS = 24 * 60 * 60 * 1000
 const OWNER_CACHE_PREFIX = 'thinking:owner:'
 const OWNER_CACHE_TTL_MS = 10 * 60 * 1000
+const NEG_CACHE_TTL_MS = 60_000
+const NEG_CACHE_MAX_ITEMS = 16_384
 const REFRESH_THROTTLE_MS = 60 * 1000
 const BATCH_INSERT_CHUNK = 100
+const QUERY_BATCH_CHUNK = 500
+
+const _isolatedDbIds = new WeakMap()
+let _isolatedDbSeq = 0
+let _storeSeq = 0
+
+function isolatedDbTag(db, storeId) {
+  if (db && typeof db === 'object') {
+    if (db[DB_INSTANCE_ID]) return String(db[DB_INSTANCE_ID])
+    let tag = _isolatedDbIds.get(db)
+    if (!tag) {
+      tag = `adhoc:${++_isolatedDbSeq}`
+      _isolatedDbIds.set(db, tag)
+    }
+    return tag
+  }
+  return `store:${storeId}`
+}
 
 /** Stable key for one signed thinking block, or null when it carries no usable signature. */
 export function thinkingSignatureKey(block) {
@@ -40,27 +61,108 @@ export function thinkingSignatureKey(block) {
 
 export class ThinkingOwnerStore {
   /** `db` pins a connection (tests); otherwise the process database, re-read so a restore rebinds. */
-  constructor({ db = null, ttlMs = TTL_MS, writeBehind = null } = {}) {
+  constructor({
+    db = null,
+    pgPool = null,
+    ttlMs = TTL_MS,
+    writeBehind = null,
+    negCacheTtlMs = NEG_CACHE_TTL_MS,
+    negCacheMaxItems = NEG_CACHE_MAX_ITEMS,
+  } = {}) {
     this.pinned = db
+    this._explicitPgPool = pgPool || null
+    this._storeId = ++_storeSeq
     this.ttlMs = ttlMs
     this._explicitWriteBehind = typeof writeBehind === 'boolean' ? writeBehind : null
+    this.negCacheTtlMs = Math.max(0, Number(negCacheTtlMs) || 0)
+    this._negCache = new BoundedLruCache(Math.max(64, Number(negCacheMaxItems) || NEG_CACHE_MAX_ITEMS))
     this.boundDb = null
     this.lastPurge = 0
     this._lastRefreshAt = new Map()
+    this._pgWriteChain = Promise.resolve()
+  }
+
+  _resolvePgPool() {
+    if (this._explicitPgPool && typeof this._explicitPgPool.query === 'function') {
+      return this._explicitPgPool
+    }
+    if (this.pinned) {
+      if (this.pinned.engine === 'postgres' && isDbOpen() && this.pinned === getDb()) {
+        const pool = getPgPool()
+        if (pool && typeof pool.query === 'function') return pool
+      }
+      return null
+    }
+    if (isDbOpen() && getDb()?.engine === 'postgres') {
+      const pool = getPgPool()
+      if (pool && typeof pool.query === 'function') return pool
+    }
+    return null
   }
 
   _isPrimaryDb(db) {
+    if (!db && this._resolvePgPool()) return !this.pinned
     return isDbOpen() && db === getDb()
   }
 
   _cacheKey(db, sigKey) {
     if (this._isPrimaryDb(db)) return `${OWNER_CACHE_PREFIX}${sigKey}`
-    return `${OWNER_CACHE_PREFIX}iso:${db?.[DB_INSTANCE_ID] || 'isolated'}:${sigKey}`
+    return `${OWNER_CACHE_PREFIX}iso:${isolatedDbTag(db, this._storeId)}:${sigKey}`
+  }
+
+  _negKey(db, sigKey) {
+    if (this._isPrimaryDb(db)) return sigKey
+    return `iso:${isolatedDbTag(db, this._storeId)}:${sigKey}`
   }
 
   _shouldWriteBehind(db) {
     if (this._explicitWriteBehind !== null) return this._explicitWriteBehind
     return writeBehindArmed() && this._isPrimaryDb(db)
+  }
+
+  clearLocalCaches() {
+    this._negCache.clear()
+    this._lastRefreshAt.clear()
+  }
+
+  /** Wait for any in-flight async PostgreSQL writes to finish (tests / graceful shutdown). */
+  flushPgWrites() {
+    return this._pgWriteChain
+  }
+
+  _enqueuePgWrite(task) {
+    const next = this._pgWriteChain.then(task, task)
+    this._pgWriteChain = next.catch(() => {})
+    return next
+  }
+
+  _queryOwnersInSync(db, ownerOne, keys) {
+    if (!keys.length) return []
+    if (keys.length === 1) {
+      const row = ownerOne.get(keys[0])
+      return row ? [row] : []
+    }
+    const rows = []
+    for (let i = 0; i < keys.length; i += QUERY_BATCH_CHUNK) {
+      const chunk = keys.slice(i, i + QUERY_BATCH_CHUNK)
+      const placeholders = chunk.map(() => '?').join(', ')
+      const batch = db
+        .prepare(`SELECT key, account_id FROM thinking_signature_owners WHERE key IN (${placeholders})`)
+        .all(...chunk)
+      for (const r of batch) rows.push(r)
+    }
+    return rows
+  }
+
+  _refreshInSync(db, keys, now) {
+    const cutoff = now - REFRESH_AFTER_MS
+    for (let i = 0; i < keys.length; i += QUERY_BATCH_CHUNK) {
+      const chunk = keys.slice(i, i + QUERY_BATCH_CHUNK)
+      const placeholders = chunk.map(() => '?').join(', ')
+      db.prepare(
+        `UPDATE thinking_signature_owners SET created_at = ? WHERE key IN (${placeholders}) AND created_at < ?`,
+      ).run(now, ...chunk, cutoff)
+    }
   }
 
   _batchInsertSync(db, keys, account, now) {
@@ -79,7 +181,7 @@ export class ThinkingOwnerStore {
     }
   }
 
-  _scheduleRefresh(db, foundKeys, now) {
+  _scheduleRefresh(db, foundKeys, now, pgPool = null) {
     if (!foundKeys.length) return
     const toRefresh = []
     for (const k of foundKeys) {
@@ -93,10 +195,22 @@ export class ThinkingOwnerStore {
       this._lastRefreshAt.clear()
     }
     if (!toRefresh.length) return
-    const list = JSON.stringify(toRefresh)
+    if (pgPool) {
+      const cutoff = now - REFRESH_AFTER_MS
+      this._enqueuePgWrite(async () => {
+        for (let i = 0; i < toRefresh.length; i += QUERY_BATCH_CHUNK) {
+          const chunk = toRefresh.slice(i, i + QUERY_BATCH_CHUNK)
+          await pgPool.query(
+            'UPDATE thinking_signature_owners SET created_at = $1::bigint WHERE key = ANY($2::text[]) AND created_at < $3::bigint',
+            [now, chunk, cutoff],
+          )
+        }
+      })
+      return
+    }
     const run = () => {
       try {
-        this.sql?.refresh?.run(now, list, now - REFRESH_AFTER_MS)
+        this._refreshInSync(db, toRefresh, now)
       } catch {}
     }
     if (this._shouldWriteBehind(db)) {
@@ -120,13 +234,29 @@ export class ThinkingOwnerStore {
       created_at INTEGER NOT NULL
     )`)
     db.exec('CREATE INDEX IF NOT EXISTS idx_thinking_owner_created ON thinking_signature_owners(created_at)')
+    const ownerOne = db.prepare('SELECT key, account_id FROM thinking_signature_owners WHERE key = ?')
     this.sql = {
-      owners: db.prepare(
-        'SELECT key, account_id FROM thinking_signature_owners WHERE key IN (SELECT value FROM json_each(?))',
-      ),
-      refresh: db.prepare(
-        'UPDATE thinking_signature_owners SET created_at = ? WHERE key IN (SELECT value FROM json_each(?)) AND created_at < ?',
-      ),
+      ownerOne,
+      owners: {
+        all: (keysOrJson) => {
+          const list = Array.isArray(keysOrJson)
+            ? keysOrJson
+            : typeof keysOrJson === 'string'
+              ? JSON.parse(keysOrJson)
+              : []
+          return this._queryOwnersInSync(db, ownerOne, list)
+        },
+      },
+      refresh: {
+        run: (now, keysOrJson) => {
+          const list = Array.isArray(keysOrJson)
+            ? keysOrJson
+            : typeof keysOrJson === 'string'
+              ? JSON.parse(keysOrJson)
+              : []
+          this._refreshInSync(db, list, now)
+        },
+      },
       insert: db.prepare(
         'INSERT OR IGNORE INTO thinking_signature_owners (key, account_id, created_at) VALUES (?, ?, ?)',
       ),
@@ -134,6 +264,7 @@ export class ThinkingOwnerStore {
     }
     this.boundDb = db
     this._lastRefreshAt.clear()
+    this._negCache.clear()
     return this.sql
   }
 
@@ -142,35 +273,49 @@ export class ThinkingOwnerStore {
    * reachable, so the caller can leave history alone instead of guessing.
    */
   ownersOf(keys, now = Date.now()) {
-    const sql = this.statements()
-    if (!sql) return null
+    const pgPool = this._resolvePgPool()
+    let sql = null
+    let db = null
+    if (pgPool) {
+      db = this.pinned || (isDbOpen() ? getDb() : null)
+    } else {
+      sql = this.statements()
+      if (!sql) return null
+      db = this.boundDb
+    }
+
     const found = new Map()
     const unique = [...new Set((keys || []).filter(Boolean))]
     if (!unique.length) return found
 
-    const db = this.boundDb
     const client = getCacheRuntime()?.client
     const useCache = Boolean(client?.enabled)
     const isPrimary = this._isPrimaryDb(db)
     const missing = []
 
-    if (useCache) {
-      for (const k of unique) {
+    for (const k of unique) {
+      if (useCache) {
         const hit = client.getL1(this._cacheKey(db, k))
         if (hit.hit && typeof hit.value === 'string' && hit.value) {
           found.set(k, hit.value)
-        } else {
-          missing.push(k)
+          continue
         }
       }
-    } else {
-      missing.push(...unique)
+      if (this.negCacheTtlMs > 0 && this._negCache.get(this._negKey(db, k), now).hit) {
+        continue
+      }
+      missing.push(k)
     }
 
     if (missing.length) {
-      const list = JSON.stringify(missing)
-      for (const row of sql.owners.all(list)) {
+      if (!sql) {
+        sql = this.statements()
+        if (!sql) return null
+        db = this.boundDb
+      }
+      for (const row of sql.owners.all(missing)) {
         found.set(row.key, row.account_id)
+        this._negCache.delete(this._negKey(db, row.key))
         if (useCache) {
           const ck = this._cacheKey(db, row.key)
           client.setL1(ck, row.account_id, OWNER_CACHE_TTL_MS, 0, true)
@@ -186,41 +331,57 @@ export class ThinkingOwnerStore {
           }
         }
       }
+      if (this.negCacheTtlMs > 0) {
+        for (const k of missing) {
+          if (!found.has(k)) {
+            this._negCache.set(this._negKey(db, k), true, this.negCacheTtlMs, now)
+          }
+        }
+      }
     }
 
-    if (found.size) this._scheduleRefresh(db, [...found.keys()], now)
+    if (found.size) this._scheduleRefresh(db, [...found.keys()], now, pgPool)
     return found
   }
 
   /**
-   * Async L1 -> Redis L2 MGET -> DB backfill lookup for thinking signature owners.
-   * Prewarms L1 so subsequent sync `filterThinkingForAccount` / `dropForeignThinkingForCrag`
-   * calls resolve with 0 DB RPCs.
+   * Async L1 -> L1 NegCache -> Redis L2 MGET -> PG `pgPool` indexed lookup (`WHERE key = ANY($1::text[])`).
+   * Prewarms both positive L1 and bounded negative L1 so subsequent sync `filterThinkingForAccount` /
+   * `dropForeignThinkingForCrag` / `inspectForeignThinking` calls resolve with 0 DB RPCs & 0 `Atomics.wait`.
    */
   async ownersOfAsync(keys, now = Date.now()) {
-    const sql = this.statements()
-    if (!sql) return null
+    const pgPool = this._resolvePgPool()
+    let sql = null
+    let db = null
+    if (pgPool) {
+      db = this.pinned || (isDbOpen() ? getDb() : null)
+    } else {
+      sql = this.statements()
+      if (!sql) return null
+      db = this.boundDb
+    }
+
     const found = new Map()
     const unique = [...new Set((keys || []).filter(Boolean))]
     if (!unique.length) return found
 
-    const db = this.boundDb
     const client = getCacheRuntime()?.client
     const useCache = Boolean(client?.enabled)
     const isPrimary = this._isPrimaryDb(db)
     const missingL1 = []
 
-    if (useCache) {
-      for (const k of unique) {
+    for (const k of unique) {
+      if (useCache) {
         const hit = client.getL1(this._cacheKey(db, k))
         if (hit.hit && typeof hit.value === 'string' && hit.value) {
           found.set(k, hit.value)
-        } else {
-          missingL1.push(k)
+          continue
         }
       }
-    } else {
-      missingL1.push(...unique)
+      if (this.negCacheTtlMs > 0 && this._negCache.get(this._negKey(db, k), now).hit) {
+        continue
+      }
+      missingL1.push(k)
     }
 
     let missingDb = missingL1
@@ -233,6 +394,7 @@ export class ThinkingOwnerStore {
           const val = l2Vals[i]
           if (typeof val === 'string' && val) {
             found.set(missingL1[i], val)
+            this._negCache.delete(this._negKey(db, missingL1[i]))
             client.setL1(l2Keys[i], val, OWNER_CACHE_TTL_MS, 0, true)
           } else {
             missingDb.push(missingL1[i])
@@ -242,9 +404,23 @@ export class ThinkingOwnerStore {
     }
 
     if (missingDb.length) {
-      const list = JSON.stringify(missingDb)
-      for (const row of sql.owners.all(list)) {
+      let rows = []
+      if (pgPool) {
+        for (let i = 0; i < missingDb.length; i += QUERY_BATCH_CHUNK) {
+          const chunk = missingDb.slice(i, i + QUERY_BATCH_CHUNK)
+          const res = await pgPool.query(
+            'SELECT key, account_id FROM thinking_signature_owners WHERE key = ANY($1::text[])',
+            [chunk],
+          )
+          for (const row of res?.rows || []) rows.push(row)
+        }
+      } else {
+        rows = sql.owners.all(missingDb)
+      }
+
+      for (const row of rows) {
         found.set(row.key, row.account_id)
+        this._negCache.delete(this._negKey(db, row.key))
         if (useCache) {
           const ck = this._cacheKey(db, row.key)
           client.setL1(ck, row.account_id, OWNER_CACHE_TTL_MS, 0, true)
@@ -260,27 +436,49 @@ export class ThinkingOwnerStore {
           }
         }
       }
+      if (this.negCacheTtlMs > 0) {
+        for (const k of missingDb) {
+          if (!found.has(k)) {
+            this._negCache.set(this._negKey(db, k), true, this.negCacheTtlMs, now)
+          }
+        }
+      }
     }
 
-    if (found.size) this._scheduleRefresh(db, [...found.keys()], now)
+    if (found.size) this._scheduleRefresh(db, [...found.keys()], now, pgPool)
     return found
+  }
+
+  /** Prewarm L1 positive & negative caches asynchronously (PG `pgPool` + Redis L2). */
+  prewarmOwnersAsync(keys, now = Date.now()) {
+    return this.ownersOfAsync(keys, now)
   }
 
   /** First writer wins: a signature belongs to the account that returned it. */
   record(keys, accountId, now = Date.now()) {
     const account = String(accountId || '')
     const unique = [...new Set((keys || []).filter(Boolean))]
-    const sql = unique.length && account ? this.statements() : null
-    if (!sql) return
+    if (!unique.length || !account) return
 
-    const db = this.boundDb
+    const pgPool = this._resolvePgPool()
+    let sql = null
+    let db = null
+    if (pgPool) {
+      db = this.pinned || (isDbOpen() ? getDb() : null)
+    } else {
+      sql = this.statements()
+      if (!sql) return
+      db = this.boundDb
+    }
+
     const client = getCacheRuntime()?.client
     const useCache = Boolean(client?.enabled)
     const isPrimary = this._isPrimaryDb(db)
 
-    // Populate L1/L2 immediately (first-writer-wins: never overwrite an existing owner)
-    if (useCache) {
-      for (const key of unique) {
+    // Always evict any negative-cache entry for recorded signatures; populate L1/L2 (first-writer-wins)
+    for (const key of unique) {
+      this._negCache.delete(this._negKey(db, key))
+      if (useCache) {
         const ck = this._cacheKey(db, key)
         if (!client.getL1(ck).hit) {
           client.setL1(ck, account, OWNER_CACHE_TTL_MS, 0, true)
@@ -301,6 +499,26 @@ export class ThinkingOwnerStore {
     const doPurge = now - this.lastPurge >= PURGE_EVERY_MS
     if (doPurge) this.lastPurge = now
 
+    if (pgPool) {
+      const purgeCutoff = now - this.ttlMs
+      this._enqueuePgWrite(async () => {
+        for (let i = 0; i < unique.length; i += QUERY_BATCH_CHUNK) {
+          const chunk = unique.slice(i, i + QUERY_BATCH_CHUNK)
+          await pgPool.query(
+            `INSERT INTO thinking_signature_owners (key, account_id, created_at)
+            SELECT v.key, $2::text, $3::bigint
+            FROM UNNEST($1::text[]) AS v(key)
+            ON CONFLICT (key) DO NOTHING`,
+            [chunk, account, now],
+          )
+        }
+        if (doPurge) {
+          await pgPool.query('DELETE FROM thinking_signature_owners WHERE created_at < $1::bigint', [purgeCutoff])
+        }
+      })
+      return
+    }
+
     const persist = () => {
       try {
         this._batchInsertSync(db, unique, account, now)
@@ -317,6 +535,7 @@ export class ThinkingOwnerStore {
 }
 
 export const thinkingOwners = new ThinkingOwnerStore()
+registerLocalCacheClearer(() => thinkingOwners.clearLocalCaches())
 
 function historyKeys(body) {
   const keys = []

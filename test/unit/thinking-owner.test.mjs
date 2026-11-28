@@ -203,3 +203,145 @@ test('dropping the only signed block merges the neighbouring turns', () => {
   )
   assert.equal(out.body.messages.length, 1)
 })
+
+test('ThinkingOwnerStore L1 negative cache absorbs repeated unknown signatures, evicts on record(), and sync SQL avoids json_each', () => {
+  const db = new DatabaseSync(':memory:')
+  const executedSql = []
+  const origPrepare = db.prepare.bind(db)
+  db.prepare = (sql) => {
+    const stmt = origPrepare(sql)
+    return new Proxy(stmt, {
+      get(target, prop) {
+        const val = Reflect.get(target, prop, target)
+        if (['get', 'all', 'run'].includes(prop)) {
+          return (...args) => {
+            executedSql.push(String(sql))
+            return val.apply(target, args)
+          }
+        }
+        return typeof val === 'function' ? val.bind(target) : val
+      },
+    })
+  }
+
+  const owners = new ThinkingOwnerStore({ db, negCacheTtlMs: 60_000, negCacheMaxItems: 128 })
+  const k1 = thinkingSignatureKey({ type: 'thinking', signature: UNKNOWN })
+  const k2 = thinkingSignatureKey({ type: 'thinking', signature: `${UNKNOWN}-2` })
+  const t0 = 1_750_000_000_000
+
+  // First miss hits DB once using PK `IN (?, ?)` (NO json_each!)
+  const m1 = owners.ownersOf([k1, k2], t0)
+  assert.equal(m1.size, 0)
+  const selectSqls = executedSql.filter((s) => /SELECT key, account_id FROM thinking_signature_owners/i.test(s))
+  assert.equal(selectSqls.length, 1)
+  assert.equal(/json_each/i.test(selectSqls[0]), false, 'sync query must not use json_each')
+  const plan = origPrepare(`EXPLAIN QUERY PLAN ${selectSqls[0]}`).all(k1, k2)
+  assert.equal(
+    /SCAN thinking_signature_owners\b/i.test(plan.map((r) => r.detail || '').join('\n')),
+    false,
+    'sync query must use primary key index',
+  )
+
+  // Second call within TTL hits bounded L1 negative cache -> 0 DB queries!
+  executedSql.length = 0
+  const m2 = owners.ownersOf([k1, k2], t0 + 10_000)
+  assert.equal(m2.size, 0)
+  assert.equal(executedSql.length, 0, 'repeated unknown signatures must hit L1 negative cache')
+
+  // Recording k1 evicts it from negative cache immediately while k2 stays negatively cached
+  owners.record([k1], 'account-new', t0 + 15_000)
+  executedSql.length = 0
+  const m3 = owners.ownersOf([k1, k2], t0 + 20_000)
+  assert.equal(m3.get(k1), 'account-new')
+  assert.equal(m3.has(k2), false)
+  assert.equal(
+    executedSql.filter((s) => /SELECT key, account_id/i.test(s)).length,
+    0,
+    'recorded key hits positive L1 and unrecorded key stays on negative L1',
+  )
+
+  // Past negative cache TTL -> re-queries DB for k2
+  executedSql.length = 0
+  owners.ownersOf([k2], t0 + 70_000)
+  assert.equal(executedSql.filter((s) => /SELECT key, account_id/i.test(s)).length, 1)
+  db.close()
+})
+
+test('ThinkingOwnerStore PG mode runs ownersOfAsync/prewarmOwnersAsync/record on pgPool with 0 sync DB calls', async () => {
+  const knownKey = thinkingSignatureKey({ type: 'thinking', signature: OWN })
+  const unknownKey = thinkingSignatureKey({ type: 'thinking', signature: UNKNOWN })
+  const pgQueries = []
+  const mockPgPool = {
+    async query(sql, params) {
+      const text = String(sql)
+      pgQueries.push({ sql: text, params })
+      if (/SELECT key, account_id FROM thinking_signature_owners WHERE key = ANY/i.test(text)) {
+        const requested = params[0] || []
+        return {
+          rows: requested.includes(knownKey) ? [{ key: knownKey, account_id: 'pg-acc-1' }] : [],
+        }
+      }
+      return { rows: [], rowCount: 1 }
+    },
+  }
+  const forbidSyncDb = {
+    engine: 'postgres',
+    prepare(sql) {
+      throw new Error(`PG mode must not call sync db.prepare: ${sql}`)
+    },
+    exec(sql) {
+      throw new Error(`PG mode must not call sync db.exec: ${sql}`)
+    },
+  }
+
+  const owners = new ThinkingOwnerStore({ db: forbidSyncDb, pgPool: mockPgPool, negCacheTtlMs: 60_000 })
+  const t0 = Date.now()
+
+  // 1. prewarmOwnersAsync queries PG asynchronously with `WHERE key = ANY($1::text[])`
+  const warmed = await owners.prewarmOwnersAsync([knownKey, unknownKey], t0)
+  assert.equal(warmed.get(knownKey), 'pg-acc-1')
+  assert.equal(warmed.has(unknownKey), false)
+  assert.equal(
+    pgQueries.filter((q) => /WHERE key = ANY\(\$1::text\[\]\)/i.test(q.sql)).length,
+    1,
+    'must execute 1 indexed PG ANY($1::text[]) lookup',
+  )
+
+  // 2. Subsequent sync ownersOf() & filterThinkingForAccount() resolve with 0 PG queries & 0 sync calls!
+  pgQueries.length = 0
+  const syncLookup = owners.ownersOf([knownKey, unknownKey], t0 + 1_000)
+  assert.equal(syncLookup.get(knownKey), 'pg-acc-1')
+  assert.equal(syncLookup.has(unknownKey), false)
+  assert.equal(pgQueries.length, 0)
+
+  const filtered = filterThinkingForAccount(
+    {
+      messages: [
+        { role: 'user', content: 'hi' },
+        {
+          role: 'assistant',
+          content: [
+            { type: 'thinking', thinking: 'mine', signature: OWN },
+            { type: 'thinking', thinking: 'mystery', signature: UNKNOWN },
+          ],
+        },
+      ],
+    },
+    'pg-acc-1',
+    owners,
+  )
+  assert.equal(filtered.kept, 1)
+  assert.equal(filtered.converted, 1)
+  assert.equal(filtered.unknown, 1)
+
+  // 3. record() in PG mode evicts negative cache and writes via UNNEST ... ON CONFLICT DO NOTHING
+  owners.record([unknownKey], 'pg-acc-2', t0 + 2_000)
+  await owners.flushPgWrites()
+  const insertCall = pgQueries.find((q) =>
+    /INSERT INTO thinking_signature_owners[\s\S]*UNNEST[\s\S]*ON CONFLICT \(key\) DO NOTHING/i.test(q.sql),
+  )
+  assert.ok(insertCall, 'PG record() must use async UNNEST ON CONFLICT DO NOTHING')
+  assert.deepEqual(insertCall.params[0], [unknownKey])
+  assert.equal(insertCall.params[1], 'pg-acc-2')
+  assert.equal(owners.ownersOf([unknownKey], t0 + 3_000).get(unknownKey), 'pg-acc-2')
+})

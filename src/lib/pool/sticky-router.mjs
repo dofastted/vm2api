@@ -15,6 +15,9 @@ const STICKY_L1_MAX = 16_384
 const STICKY_L1_NEG_MAX = 16_384
 const STICKY_L1_NEG_TTL_MS = 15_000
 const STICKY_RENEW_MIN_GAP_MS = 60_000
+const STICKY_STATS_TTL_MS = 5_000
+const STICKY_STATS_SESSIONS_LIMIT = 500
+const STICKY_STATS_REDIS_PREFIX = 'dash:sticky:stats:'
 
 function rowToStickyEntry(row) {
   if (!row) return null
@@ -305,6 +308,8 @@ export class StickyRouter {
     this._l1Neg = new Map() // key -> expiresAtMs
     this._latestByDevice = new Map() // `${prefix}\0${device}` -> { key, bound_at, expires_at }
     this._pendingPgWrites = new Set()
+    this._statsCache = null
+    this._statsRefreshPromises = null
     this._stmtLatestByDevice = null
     this._prepareAuxStatements()
     const resolvedPg = this._resolvePgPool()
@@ -1248,7 +1253,193 @@ export class StickyRouter {
     this.purgeExpired(Date.now())
   }
 
-  stats() {
+  _statsFromL1(now = Date.now(), { includeSessions = false } = {}) {
+    this._pruneLocalExpired(now)
+    let activeSessions = 0
+    let totalHits = 0
+    const sessions = {}
+    for (const [key, { ent }] of this._l1) {
+      if (!ent) continue
+      if (ent.expires_at && now > ent.expires_at) continue
+      activeSessions += 1
+      totalHits += Number(ent.hits) || 0
+      if (includeSessions && activeSessions <= STICKY_STATS_SESSIONS_LIMIT) {
+        sessions[key] = { ...ent }
+      }
+    }
+    return {
+      enabled: !!this.config.enabled,
+      mode: this.config.mode,
+      active_sessions: activeSessions,
+      total_hits: totalHits,
+      sessions,
+    }
+  }
+
+  _statsCacheBucket(includeSessions) {
+    return includeSessions ? 'full' : 'counts'
+  }
+
+  _getCachedStatsL1(includeSessions, now = Date.now()) {
+    const store = this._statsCache
+    if (!store) return null
+    const entry = store[this._statsCacheBucket(includeSessions)] || (!includeSessions ? store.full : null)
+    if (!entry || now - entry.at >= STICKY_STATS_TTL_MS) return null
+    return {
+      ...entry.value,
+      enabled: !!this.config.enabled,
+      mode: this.config.mode,
+      sessions: includeSessions ? entry.value.sessions || {} : {},
+    }
+  }
+
+  _setCachedStatsL1(includeSessions, value, now = Date.now()) {
+    if (!this._statsCache) this._statsCache = { counts: null, full: null }
+    const bucket = this._statsCacheBucket(includeSessions)
+    this._statsCache[bucket] = { value, at: now }
+    if (includeSessions) {
+      this._statsCache.counts = {
+        value: {
+          enabled: value.enabled,
+          mode: value.mode,
+          active_sessions: value.active_sessions,
+          total_hits: value.total_hits,
+          sessions: {},
+        },
+        at: now,
+      }
+    }
+  }
+
+  /**
+   * Async sticky session statistics.
+   * - PostgreSQL mode: runs off-main-thread `pgPool` aggregate COUNT/SUM (+ optional
+   *   bounded rows when `includeSessions` is true) with 5s L1/Redis cache, avoiding
+   *   synchronous `DELETE` + full-table `SELECT * FROM sticky_sessions`.
+   * - SQLite mode: preserves original synchronous `purgeExpired` + `repo.all()` semantics.
+   */
+  async statsAsync({ includeSessions = false, bypass = false, now = Date.now() } = {}) {
+    const pgPool = this._resolvePgPool()
+    if (!pgPool || typeof pgPool.query !== 'function') {
+      return this.stats({ includeSessions, now })
+    }
+
+    if (!bypass) {
+      const l1 = this._getCachedStatsL1(includeSessions, now)
+      if (l1) return l1
+    }
+
+    const bucket = this._statsCacheBucket(includeSessions)
+    const cache = getCacheRuntime()
+    const useRedis = !bypass && this._isPrimaryDb() && Boolean(cache?.client?.hasRedis)
+    const redisKey = `${STICKY_STATS_REDIS_PREFIX}${bucket}`
+    if (useRedis) {
+      try {
+        const hit = await cache.client.get(redisKey, {
+          useL2: true,
+          prefixes: ['dash:', STICKY_STATS_REDIS_PREFIX],
+          maxL1TtlMs: STICKY_STATS_TTL_MS,
+        })
+        if (hit?.hit && hit.value && typeof hit.value === 'object') {
+          const hydrated = {
+            enabled: !!this.config.enabled,
+            mode: this.config.mode,
+            active_sessions: Number(hit.value.active_sessions) || 0,
+            total_hits: Number(hit.value.total_hits) || 0,
+            sessions: includeSessions && hit.value.sessions ? hit.value.sessions : {},
+          }
+          this._setCachedStatsL1(includeSessions, hydrated, Date.now())
+          return hydrated
+        }
+      } catch {}
+    }
+
+    if (!this._statsRefreshPromises) this._statsRefreshPromises = { counts: null, full: null }
+    if (!bypass && this._statsRefreshPromises[bucket]) {
+      return this._statsRefreshPromises[bucket]
+    }
+
+    const loadPromise = (async () => {
+      try {
+        const queryNow = Date.now()
+        const aggPromise = pgPool.query(
+          `SELECT COUNT(*)::bigint AS active_sessions,
+                  COALESCE(SUM(hits), 0)::bigint AS total_hits
+           FROM sticky_sessions
+           WHERE expires_at IS NULL OR expires_at >= $1`,
+          [queryNow],
+        )
+        const rowsPromise = includeSessions
+          ? pgPool.query(
+              `SELECT *
+               FROM sticky_sessions
+               WHERE expires_at IS NULL OR expires_at >= $1
+               ORDER BY bound_at DESC NULLS LAST
+               LIMIT $2`,
+              [queryNow, STICKY_STATS_SESSIONS_LIMIT],
+            )
+          : null
+
+        const [aggRes, rowsRes] = await Promise.all([aggPromise, rowsPromise])
+        const aggRow = aggRes?.rows?.[0] || {}
+        const sessions = {}
+        if (includeSessions && rowsRes?.rows) {
+          for (const row of rowsRes.rows) {
+            if (!row?.key) continue
+            const ent = rowToStickyEntry(row)
+            if (ent) sessions[row.key] = ent
+          }
+        }
+        const value = {
+          enabled: !!this.config.enabled,
+          mode: this.config.mode,
+          active_sessions: Math.max(0, Number(aggRow.active_sessions) || 0),
+          total_hits: Math.max(0, Number(aggRow.total_hits) || 0),
+          sessions,
+        }
+        this._setCachedStatsL1(includeSessions, value, Date.now())
+        if (this._isPrimaryDb() && cache?.client?.hasRedis) {
+          cache.client
+            .set(redisKey, value, {
+              ttlMs: STICKY_STATS_TTL_MS,
+              l1TtlMs: STICKY_STATS_TTL_MS,
+              prefixes: ['dash:', STICKY_STATS_REDIS_PREFIX],
+            })
+            .catch(() => {})
+        }
+        return value
+      } catch {
+        return this._statsFromL1(now, { includeSessions })
+      } finally {
+        if (this._statsRefreshPromises?.[bucket] === loadPromise) {
+          this._statsRefreshPromises[bucket] = null
+        }
+      }
+    })()
+
+    if (!bypass) this._statsRefreshPromises[bucket] = loadPromise
+    return loadPromise
+  }
+
+  stats({ includeSessions = false, now = Date.now() } = {}) {
+    const pgPool = this._resolvePgPool()
+    if (pgPool && typeof pgPool.query === 'function') {
+      const cached = this._getCachedStatsL1(includeSessions, now)
+      if (cached) return cached
+      // Non-blocking background refresh; never block the main thread with sync repo.all() in PG mode.
+      void this.statsAsync({ includeSessions, now }).catch(() => {})
+      const bucket = this._statsCacheBucket(includeSessions)
+      const stale = this._statsCache?.[bucket]?.value || (!includeSessions ? this._statsCache?.full?.value : null)
+      if (stale) {
+        return {
+          ...stale,
+          enabled: !!this.config.enabled,
+          mode: this.config.mode,
+          sessions: includeSessions ? stale.sessions || {} : {},
+        }
+      }
+      return this._statsFromL1(now, { includeSessions })
+    }
     this._purge()
     const sessions = this.repo.all()
     const list = Object.values(sessions || {})

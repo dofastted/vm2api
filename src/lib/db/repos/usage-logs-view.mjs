@@ -9,7 +9,7 @@
  * Shape: `web/src/types/panel-usage-logs.ts`.
  */
 
-import { getDb, isDbOpen } from '../database.mjs'
+import { getDb, getPgPool, isDbOpen } from '../database.mjs'
 import { getCacheRuntime } from '../../cache/index.mjs'
 import {
   DEFAULT_MUTED_ERROR_CLASSES,
@@ -47,6 +47,10 @@ const EXPORT_SCAN_CAP = 10000
 const DEFAULT_VIA = 'go-worker-pool'
 const FAILED_ONLY_PRED = `((status IS NULL OR status < 200 OR status >= 300) OR (final_state IS NOT NULL AND final_state != '' AND final_state != 'verified') OR ${ERROR_PRED})`
 const ENTITY_NAMES_TTL_MS = 60_000
+const OWNER_KEYS_TTL_MS = 30_000
+const OWNER_KEYS_L1_TTL_MS = 15_000
+const OWNER_KEYS_KEY_PREFIX = 'entity:names:api_keys:owner-keys:'
+const OWNER_KEYS_INVALIDATION_PREFIXES = ['entity:', 'entity:names:', 'entity:names:api_keys:']
 const ACTIVE_SESSIONS_FRESH_TTL_MS = 5_000
 const ACTIVE_SESSIONS_HARD_TTL_MS = 15_000
 const OVERVIEW_FRESH_TTL_MS = 5_000
@@ -99,18 +103,22 @@ function placeholders(list) {
 const NAME_TABLE_QUERIES = {
   users: {
     sql: 'SELECT id, username, email FROM users WHERE id IN ($IN)',
+    pgSql: 'SELECT id, username, email FROM users WHERE id = ANY($1::text[])',
     nameOf: (r) => r.username || r.email || r.id,
   },
   api_keys: {
     sql: 'SELECT id, name FROM api_keys WHERE id IN ($IN)',
+    pgSql: 'SELECT id, name FROM api_keys WHERE id = ANY($1::text[])',
     nameOf: (r) => r.name || r.id,
   },
   vms: {
     sql: 'SELECT id, name FROM vms WHERE id IN ($IN)',
+    pgSql: 'SELECT id, name FROM vms WHERE id = ANY($1::text[])',
     nameOf: (r) => r.name || r.id,
   },
   accounts: {
     sql: 'SELECT id, email, name FROM accounts WHERE id IN ($IN)',
+    pgSql: 'SELECT id, email, name FROM accounts WHERE id = ANY($1::text[])',
     nameOf: (r) => r.email || r.name || r.id,
   },
 }
@@ -145,6 +153,24 @@ function dbLoadEntityNames(db, table, ids) {
     map.set(String(r.id), cfg.nameOf(r))
   }
   return map
+}
+
+async function dbLoadEntityNamesAsync(db, table, ids) {
+  const cfg = NAME_TABLE_QUERIES[table]
+  const list = uniq(ids)
+  if (!cfg || !list.length) return new Map()
+  if (db?.engine === 'postgres') {
+    const pgPool = getPgPool()
+    if (pgPool && typeof pgPool.query === 'function') {
+      const map = new Map()
+      const res = await pgPool.query(cfg.pgSql, [list.map(String)])
+      for (const r of res?.rows || []) {
+        map.set(String(r.id), cfg.nameOf(r))
+      }
+      return map
+    }
+  }
+  return dbLoadEntityNames(db, table, list)
 }
 
 /**
@@ -192,11 +218,11 @@ export async function lookupNamesAsync(
     const list = uniq(ids)
     if (!list.length) return new Map()
     if (entity && typeof entity.getEntityNames === 'function') {
-      return entity.getEntityNames(table, list, (missing) => dbLoadEntityNames(db, table, missing), {
+      return entity.getEntityNames(table, list, (missing) => dbLoadEntityNamesAsync(db, table, missing), {
         ttlMs: ENTITY_NAMES_TTL_MS,
       })
     }
-    return dbLoadEntityNames(db, table, list)
+    return dbLoadEntityNamesAsync(db, table, list)
   }
   const [users, keys, vms, accounts] = await Promise.all([
     resolve('users', userIds),
@@ -554,16 +580,95 @@ function conversationKeyOf(entry) {
   return null
 }
 
-function loadOwnerKeyIds(db, ownerUserId) {
-  const set = new Set()
-  if (!ownerUserId || !db?.prepare) return set
+function queryOwnerKeyIdsSync(db, owner) {
+  const ids = []
+  if (!owner || !db?.prepare) return ids
   try {
-    const rows = db.prepare('SELECT id FROM api_keys WHERE user_id = ? AND deleted_at IS NULL').all(String(ownerUserId))
+    const rows = db.prepare('SELECT id FROM api_keys WHERE user_id = ? AND deleted_at IS NULL').all(owner)
     for (const r of rows) {
-      if (r?.id != null) set.add(String(r.id))
+      if (r?.id != null) ids.push(String(r.id))
     }
   } catch {}
-  return set
+  return ids
+}
+
+async function queryOwnerKeyIdsAsync(db, owner) {
+  if (!owner) return []
+  if (db?.engine === 'postgres') {
+    const pgPool = getPgPool()
+    if (pgPool && typeof pgPool.query === 'function') {
+      try {
+        const res = await pgPool.query('SELECT id FROM api_keys WHERE user_id = $1 AND deleted_at IS NULL', [owner])
+        const ids = []
+        for (const r of res?.rows || []) {
+          if (r?.id != null) ids.push(String(r.id))
+        }
+        return ids
+      } catch {}
+    }
+  }
+  return queryOwnerKeyIdsSync(db, owner)
+}
+
+/**
+ * Load active API key IDs owned by `ownerUserId`, backed by the shared L1/L2 cache
+ * (30s L2 / 15s L1) under the `entity:names:api_keys:` invalidation prefix so any
+ * structural `api_keys` write invalidates it immediately across instances.
+ */
+function loadOwnerKeyIds(db, ownerUserId, { cache = null, bypass = false } = {}) {
+  const owner = String(ownerUserId || '').trim()
+  if (!owner) return new Set()
+  const useCache = !bypass && shouldUseSharedCache(db, cache)
+  const client = useCache ? resolveCacheRuntime(cache)?.client : null
+  const cacheKey = `${OWNER_KEYS_KEY_PREFIX}${owner}`
+  if (client?.enabled) {
+    const hit = client.getL1(cacheKey)
+    if (hit?.hit) {
+      const list = Array.isArray(hit.value?.v) ? hit.value.v : Array.isArray(hit.value) ? hit.value : []
+      return new Set(list)
+    }
+  }
+  const ids = queryOwnerKeyIdsSync(db, owner)
+  if (client?.enabled) {
+    const wrapped = { v: ids }
+    client.setL1(cacheKey, wrapped, OWNER_KEYS_L1_TTL_MS, 0, true)
+    if (client.hasRedis) {
+      client
+        .set(cacheKey, wrapped, {
+          ttlMs: OWNER_KEYS_TTL_MS,
+          l1TtlMs: OWNER_KEYS_L1_TTL_MS,
+          jitter: true,
+          prefixes: OWNER_KEYS_INVALIDATION_PREFIXES,
+        })
+        .catch(() => {})
+    }
+  }
+  return new Set(ids)
+}
+
+/**
+ * Async L1 + Redis L2 cached owner API key IDs loader. Uses native async `pgPool`
+ * on cache miss in PostgreSQL mode (0 main-thread `Atomics.wait`) and auto-invalidates
+ * whenever `api_keys` is mutated (`entity.invalidateNames('api_keys')`).
+ */
+export async function loadOwnerKeyIdsAsync(db, ownerUserId, { cache = null, bypass = false } = {}) {
+  const owner = String(ownerUserId || '').trim()
+  if (!owner) return new Set()
+  const useCache = !bypass && shouldUseSharedCache(db, cache)
+  const client = useCache ? resolveCacheRuntime(cache)?.client : null
+  const cacheKey = `${OWNER_KEYS_KEY_PREFIX}${owner}`
+  if (client?.enabled && typeof client.getOrLoad === 'function') {
+    const wrapped = await client.getOrLoad(cacheKey, async () => ({ v: await queryOwnerKeyIdsAsync(db, owner) }), {
+      ttlMs: OWNER_KEYS_TTL_MS,
+      l1TtlMs: OWNER_KEYS_L1_TTL_MS,
+      jitter: true,
+      prefixes: OWNER_KEYS_INVALIDATION_PREFIXES,
+      maxL1TtlMs: OWNER_KEYS_L1_TTL_MS,
+    })
+    const list = Array.isArray(wrapped?.v) ? wrapped.v : Array.isArray(wrapped) ? wrapped : []
+    return new Set(list)
+  }
+  return new Set(await queryOwnerKeyIdsAsync(db, owner))
 }
 
 function entryBelongsToOwner(entry, ownerUserId, getOwnerKeyIds) {
@@ -955,14 +1060,18 @@ export class UsageLogsView {
       }
     }
 
-    const [baseRes, rawLiveEntries] = await Promise.all([loadBase(), loadLive()])
+    const [baseRes, rawLiveEntries, preloadedOwnerKeys] = await Promise.all([
+      loadBase(),
+      loadLive(),
+      ownerUserId && !hasCursor ? loadOwnerKeyIdsAsync(this.db, ownerUserId, { cache }) : Promise.resolve(null),
+    ])
 
-    let ownerKeyIdsLoaded = false
-    let ownerKeyIds = null
+    let ownerKeyIdsLoaded = preloadedOwnerKeys != null
+    let ownerKeyIds = preloadedOwnerKeys
     const getOwnerKeyIds = () => {
       if (!ownerKeyIdsLoaded) {
         ownerKeyIdsLoaded = true
-        ownerKeyIds = loadOwnerKeyIds(this.db, ownerUserId)
+        ownerKeyIds = loadOwnerKeyIds(this.db, ownerUserId, { cache })
       }
       return ownerKeyIds
     }
@@ -1408,6 +1517,123 @@ export class UsageLogsView {
       .map((r) => r.sid)
   }
 
+  _buildActiveSessionsSql({ sinceIso, ownerId, ownerKeyIds, pg = false }) {
+    const cols =
+      'id, session_id, outbound_session_id, created_at, has_tools, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, total_cost, user_id, api_key_id, vm_id, model, status, duration_ms, final_account_id, account_id'
+    let scopedSql
+    const params = []
+    let limitPlaceholder
+    if (ownerId) {
+      if (pg) {
+        // 3-way index-friendly UNION (each branch pushes `created_at >= $1` into its composite index:
+        // idx_usage_logs_user_created, idx_usage_logs_vm_owner, idx_reqlog_key) — eliminates OR + subquery seq_scan.
+        params.push(sinceIso, ownerId)
+        const branches = [
+          `SELECT ${cols} FROM usage_logs WHERE user_id = $2 AND created_at >= $1 AND outbound_session_id IS NOT NULL`,
+          `SELECT ${cols} FROM usage_logs WHERE vm_owner_user_id = $2 AND created_at >= $1 AND outbound_session_id IS NOT NULL`,
+        ]
+        if (ownerKeyIds.length > 0) {
+          params.push(ownerKeyIds)
+          branches.push(
+            `SELECT ${cols} FROM usage_logs WHERE api_key_id = ANY($3::text[]) AND created_at >= $1 AND outbound_session_id IS NOT NULL`,
+          )
+          limitPlaceholder = '$4'
+        } else {
+          limitPlaceholder = '$3'
+        }
+        scopedSql = branches.join('\n          UNION\n          ')
+      } else {
+        const branches = [
+          `SELECT ${cols} FROM usage_logs WHERE user_id = ? AND created_at >= ? AND outbound_session_id IS NOT NULL`,
+          `SELECT ${cols} FROM usage_logs WHERE vm_owner_user_id = ? AND created_at >= ? AND outbound_session_id IS NOT NULL`,
+        ]
+        params.push(ownerId, sinceIso, ownerId, sinceIso)
+        if (ownerKeyIds.length > 0) {
+          branches.push(
+            `SELECT ${cols} FROM usage_logs WHERE api_key_id IN (${placeholders(ownerKeyIds)}) AND created_at >= ? AND outbound_session_id IS NOT NULL`,
+          )
+          params.push(...ownerKeyIds, sinceIso)
+        }
+        scopedSql = branches.join('\n          UNION\n          ')
+        limitPlaceholder = '?'
+      }
+    } else if (pg) {
+      params.push(sinceIso)
+      scopedSql = `SELECT ${cols} FROM usage_logs WHERE created_at >= $1 AND outbound_session_id IS NOT NULL`
+      limitPlaceholder = '$2'
+    } else {
+      params.push(sinceIso)
+      scopedSql = `SELECT ${cols} FROM usage_logs WHERE created_at >= ? AND outbound_session_id IS NOT NULL`
+      limitPlaceholder = '?'
+    }
+
+    // Single-pass CTE: computes exact totals, one-off counts, per-session aggregates,
+    // and latest row metadata via ROW_NUMBER() without correlated per-session subqueries.
+    const sql = `
+      WITH scoped AS (
+        ${scopedSql}
+      ),
+      ranked AS (
+        SELECT *,
+               ${CONVERSATION_KEY_SQL} AS sid,
+               ROW_NUMBER() OVER (
+                 PARTITION BY ${CONVERSATION_KEY_SQL}
+                 ORDER BY created_at DESC, id DESC
+               ) AS rn
+        FROM scoped
+      ),
+      agg AS (
+        SELECT sid,
+               MAX(created_at) AS last_at,
+               MIN(created_at) AS first_at,
+               COUNT(*) AS requests,
+               SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0) + COALESCE(cache_read_tokens, 0) + COALESCE(cache_creation_tokens, 0)) AS tokens,
+               COALESCE(SUM(total_cost), 0) AS cost,
+               CASE WHEN COUNT(*) = 1 AND SUM(COALESCE(has_tools, 0)) = 0 THEN 1 ELSE 0 END AS one_off
+        FROM ranked
+        GROUP BY sid
+      ),
+      totals AS (
+        SELECT COUNT(*) AS total,
+               COALESCE(SUM(one_off), 0) AS one_off_total
+        FROM agg
+      )
+      SELECT a.sid, a.last_at, a.first_at, a.requests, a.tokens, a.cost, a.one_off,
+             r.session_id AS client_session_id, r.user_id, r.api_key_id, r.vm_id, r.model, r.status, r.duration_ms,
+             COALESCE(r.final_account_id, r.account_id) AS account,
+             t.total AS _total, t.one_off_total AS _one_off_total
+      FROM agg a
+      JOIN ranked r ON r.sid = a.sid AND r.rn = 1
+      CROSS JOIN totals t
+      ORDER BY a.one_off ASC, a.last_at DESC
+      LIMIT ${limitPlaceholder}
+    `
+    return { sql, params }
+  }
+
+  async _activeSessionsPgAsync(
+    pgPool,
+    { minutes = 5, limit = 50, owner_user_id = null, now = Date.now(), cache = this._cache } = {},
+  ) {
+    const mins = clampInt(minutes, 1, 1440, 5)
+    const n = clampInt(limit, 1, 200, 50)
+    const ownerId = owner_user_id ? String(owner_user_id).trim() : null
+    const sinceIso = new Date(now - mins * 60_000).toISOString()
+    const ownerKeyIds = ownerId ? [...(await loadOwnerKeyIdsAsync(this.db, ownerId, { cache }))] : []
+    const { sql, params } = this._buildActiveSessionsSql({ sinceIso, ownerId, ownerKeyIds, pg: true })
+    const res = await pgPool.query(sql, [...params, n])
+    const rows = res?.rows || []
+    const total = rows.length ? num(rows[0]._total) : 0
+    const oneOffTotal = rows.length ? num(rows[0]._one_off_total) : 0
+    return {
+      _rawRows: true,
+      minutes: mins,
+      total,
+      oneOffTotal,
+      rows,
+    }
+  }
+
   /**
    * Conversations with a completed request in the last `minutes`, grouped by the
    * caller's session_id (falling back to the outbound id). Grouping by outbound id
@@ -1417,62 +1643,19 @@ export class UsageLogsView {
   activeSessions({ minutes = 5, limit = 50, owner_user_id = null, now = Date.now(), _rawRows = false } = {}) {
     const mins = clampInt(minutes, 1, 1440, 5)
     const n = clampInt(limit, 1, 200, 50)
-    const where = ['created_at >= ?', 'outbound_session_id IS NOT NULL']
-    const params = [new Date(now - mins * 60_000).toISOString()]
-    const own = ownerPred(owner_user_id)
-    if (own.sql) {
-      where.push(own.sql)
-      params.push(...own.params)
-    }
-    const cond = `WHERE ${where.join(' AND ')}`
-    // "One-off" = a conversation key seen once with no tools: side requests (title /
-    // topic forks) that mint their own session id. Counted apart, never merged.
-    const counts = this.db
-      .prepare(`
-      SELECT COUNT(*) AS total,
-             COALESCE(SUM(CASE WHEN c.requests = 1 AND c.tools = 0 THEN 1 ELSE 0 END), 0) AS one_off
-      FROM (
-        SELECT COUNT(*) AS requests, SUM(IFNULL(has_tools, 0)) AS tools
-        FROM usage_logs ${cond}
-        GROUP BY ${CONVERSATION_KEY_SQL}
-      ) c
-    `)
-      .get(...params)
-    const total = counts.total
-    // Aggregate first, then pull the newest row per session by id; SQLite's
-    // bare-column-with-MAX shortcut is undefined once MIN() is also present.
-    const rows = this.db
-      .prepare(`
-      WITH s AS (
-        SELECT ${CONVERSATION_KEY_SQL} AS sid,
-               MAX(created_at) AS last_at,
-               MIN(created_at) AS first_at,
-               COUNT(*) AS requests,
-               SUM(IFNULL(input_tokens, 0) + IFNULL(output_tokens, 0) + IFNULL(cache_read_tokens, 0) + IFNULL(cache_creation_tokens, 0)) AS tokens,
-               COALESCE(SUM(total_cost), 0) AS cost,
-               CASE WHEN COUNT(*) = 1 AND SUM(IFNULL(has_tools, 0)) = 0 THEN 1 ELSE 0 END AS one_off
-        FROM usage_logs ${cond}
-        GROUP BY ${CONVERSATION_KEY_SQL}
-        ORDER BY one_off ASC, last_at DESC
-        LIMIT ?
-      )
-      SELECT s.*, l.session_id AS client_session_id, l.user_id, l.api_key_id, l.vm_id, l.model, l.status, l.duration_ms,
-             COALESCE(l.final_account_id, l.account_id) AS account
-      FROM s
-      JOIN usage_logs l ON l.id = (
-        SELECT id FROM usage_logs
-        WHERE ${CONVERSATION_KEY_SQL} = s.sid AND created_at = s.last_at${own.sql ? ` AND ${own.sql}` : ''}
-        ORDER BY id DESC LIMIT 1
-      )
-      ORDER BY s.one_off ASC, s.last_at DESC
-    `)
-      .all(...params, n, ...own.params)
+    const ownerId = owner_user_id ? String(owner_user_id).trim() : null
+    const sinceIso = new Date(now - mins * 60_000).toISOString()
+    const ownerKeyIds = ownerId ? [...loadOwnerKeyIds(this.db, ownerId, { cache: this._cache })] : []
+    const { sql, params } = this._buildActiveSessionsSql({ sinceIso, ownerId, ownerKeyIds, pg: false })
+    const rows = this.db.prepare(sql).all(...params, n)
+    const total = rows.length ? num(rows[0]._total) : 0
+    const oneOffTotal = rows.length ? num(rows[0]._one_off_total) : 0
     if (_rawRows === true) {
       return {
         _rawRows: true,
         minutes: mins,
-        total: num(total),
-        oneOffTotal: num(counts.one_off),
+        total,
+        oneOffTotal,
         rows,
       }
     }
@@ -1488,8 +1671,8 @@ export class UsageLogsView {
     )
     return {
       minutes: mins,
-      total: num(total),
-      oneOffTotal: num(counts.one_off),
+      total,
+      oneOffTotal,
       sessions: rows.map((r) => mapRawActiveSessionRow(r, names)),
     }
   }
@@ -1513,7 +1696,18 @@ export class UsageLogsView {
 
     const loadBase = async () => {
       const opts = { minutes: mins, limit: n, owner_user_id: ownerId, now, _rawRows: true }
-      const raw = typeof baseLoader === 'function' ? await baseLoader(opts) : this.activeSessions(opts)
+      let raw
+      if (typeof baseLoader === 'function') {
+        raw = await baseLoader(opts)
+      } else if (this.db?.engine === 'postgres') {
+        const pgPool = getPgPool()
+        raw =
+          pgPool && typeof pgPool.query === 'function'
+            ? await this._activeSessionsPgAsync(pgPool, { ...opts, cache })
+            : this.activeSessions(opts)
+      } else {
+        raw = this.activeSessions(opts)
+      }
       if (raw && raw._rawRows === true) {
         const rows = Array.isArray(raw.rows) ? raw.rows : []
         const names = await lookupNamesAsync(
@@ -1551,8 +1745,9 @@ export class UsageLogsView {
 
     let concMap = new Map()
     let rawLiveInflight = []
+    let preloadedOwnerKeys = null
     if (liveLogs) {
-      const [countsRes, liveRes] = await Promise.all([
+      const [countsRes, liveRes, ownerKeysRes] = await Promise.all([
         !ownerId && sessionKeys.length && typeof liveLogs.getActiveSessionCounts === 'function'
           ? liveLogs.getActiveSessionCounts(sessionKeys).catch(() => new Map())
           : Promise.resolve(new Map()),
@@ -1566,17 +1761,19 @@ export class UsageLogsView {
               })
               .catch(() => [])
           : Promise.resolve([]),
+        ownerId ? loadOwnerKeyIdsAsync(this.db, ownerId, { cache }) : Promise.resolve(null),
       ])
       if (countsRes instanceof Map) concMap = countsRes
       if (Array.isArray(liveRes)) rawLiveInflight = liveRes
+      preloadedOwnerKeys = ownerKeysRes
     }
 
-    let ownerKeyIdsLoaded = false
-    let ownerKeyIds = null
+    let ownerKeyIdsLoaded = preloadedOwnerKeys != null
+    let ownerKeyIds = preloadedOwnerKeys
     const getOwnerKeyIds = () => {
       if (!ownerKeyIdsLoaded) {
         ownerKeyIdsLoaded = true
-        ownerKeyIds = loadOwnerKeyIds(this.db, ownerId)
+        ownerKeyIds = loadOwnerKeyIds(this.db, ownerId, { cache })
       }
       return ownerKeyIds
     }
@@ -1805,18 +2002,21 @@ export class UsageLogsView {
           return Math.max(0, Number(await liveLogs.getInflightCount({ now })) || 0)
         }
         if (typeof liveLogs.listLiveAndRecent === 'function') {
-          const entries = await liveLogs.listLiveAndRecent({
-            limit: 500,
-            ownerUserId: null,
-            includeRecent: false,
-            now,
-          })
-          let ownerKeyIdsLoaded = false
-          let ownerKeyIds = null
+          const [entries, preloadedOwnerKeys] = await Promise.all([
+            liveLogs.listLiveAndRecent({
+              limit: 500,
+              ownerUserId: null,
+              includeRecent: false,
+              now,
+            }),
+            ownerId ? loadOwnerKeyIdsAsync(this.db, ownerId, { cache }) : Promise.resolve(null),
+          ])
+          let ownerKeyIdsLoaded = preloadedOwnerKeys != null
+          let ownerKeyIds = preloadedOwnerKeys
           const getOwnerKeyIds = () => {
             if (!ownerKeyIdsLoaded) {
               ownerKeyIdsLoaded = true
-              ownerKeyIds = loadOwnerKeyIds(this.db, ownerId)
+              ownerKeyIds = loadOwnerKeyIds(this.db, ownerId, { cache })
             }
             return ownerKeyIds
           }
