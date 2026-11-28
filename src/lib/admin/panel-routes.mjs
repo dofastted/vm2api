@@ -147,7 +147,13 @@ import { publicUserView } from './panel-users.mjs'
 import { authorizePanelRoute, mePayload, panelIdentity } from './panel-acl.mjs'
 import { INTEGRATION_DELEGATED, handleIntegrationAdminRoute } from './integration-routes.mjs'
 import { IntegrationTokenStore } from './integration-tokens.mjs'
-import { callGeminiHost, createGeminiPanelHandler, geminiProxyFor, isGeminiPanelPath } from '../gemini/routes.mjs'
+import {
+  callGeminiHost,
+  createGeminiPanelHandler,
+  geminiProxyEgressOptionsFor,
+  geminiProxyFor,
+  isGeminiPanelPath,
+} from '../gemini/routes.mjs'
 import {
   denyIfUserCannotDeleteVm,
   denyIfUserMissesKey,
@@ -893,6 +899,7 @@ export function createPanelHandler(ctx) {
   }
   const handleSchedulerPools = createSchedulerPoolsHandler({
     getDb: () => apiKeyStore?.db || ctx.getDb?.() || getDb(),
+    getRouting: () => ctx.routingConfig || {},
     cfg,
     apiKeyStore: ctx.apiKeyStore,
     apiEndpointStore: ctx.apiEndpointStore,
@@ -7664,6 +7671,10 @@ export function createPanelHandler(ctx) {
           resolveGeminiProxy: (proxyId, envId) => {
             const ownerUserId = ctx.geminiOwnersRepo?.getOwner?.(envId) ?? null
             return geminiProxyFor(ctx.proxyPool, proxyId, { ownerUserId })
+          },
+          resolveGeminiProxyEgressOptions: (proxyId, envId) => {
+            const ownerUserId = ctx.geminiOwnersRepo?.getOwner?.(envId) ?? null
+            return geminiProxyEgressOptionsFor(ctx.proxyPool, proxyId, { ownerUserId })
           },
           apiEndpointStore: ctx.apiEndpointStore,
           cfg,

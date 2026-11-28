@@ -1914,20 +1914,24 @@ export class FailoverRunner {
             return { ...clientCancelledResult({ committed }), via: 'rust-scheduler', ...attribution() }
           }
 
+          const isCragEmptyReplaceUnsupported = error?.code === 'crag_prompt_replace_empty_unsupported'
           result = {
             ok: false,
-            status: 0,
+            status: isCragEmptyReplaceUnsupported ? error.status || 503 : 0,
             transportError: true,
             committed,
-            terminalState: committed ? 'incomplete' : 'transport_error',
-            body: {
-              type: 'error',
-              error: {
-                type: 'worker_error',
-                code: error.code || 'attempt_failed',
-                message: String(error.message || error).slice(0, 300),
-              },
-            },
+            terminalState: committed ? 'incomplete' : isCragEmptyReplaceUnsupported ? 'rejected' : 'transport_error',
+            body:
+              isCragEmptyReplaceUnsupported && error.body
+                ? error.body
+                : {
+                    type: 'error',
+                    error: {
+                      type: 'worker_error',
+                      code: error.code || 'attempt_failed',
+                      message: String(error.message || error).slice(0, 300),
+                    },
+                  },
           }
           policy = classifyAttempt(
             result,

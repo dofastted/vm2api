@@ -32,6 +32,8 @@ import {
   raiseDockerSlotPids,
   readSlotCgroupStats,
 } from './docker-slot-memory.mjs'
+import { activeCragManifestForSlot, resolveKernelDataplane } from './slot-engine.mjs'
+import { vmCliHomePath } from './execution-context.mjs'
 import {
   configureSlotCapacity,
   MAX_PIDS_LIMIT,
@@ -123,7 +125,17 @@ export function createSlotCapacityReconciler({
     counters.set(vm.id, stats)
     const oomGrew = !!prev && stats.oomKills > prev.oomKills
     const pidsGrew = !!prev && stats.pidsMaxHits > prev.pidsMaxHits
-    const target = slotCapacityTarget(vm, routing)
+    let capacityOptions = null
+    if (
+      projectRoot &&
+      (resolveKernelDataplane(vm, routing) === 'crag' ||
+        vm.kernel_installation?.kernel === 'crag' ||
+        vm.runtime?.runtime_variant === 'crag-v2')
+    ) {
+      const manifest = activeCragManifestForSlot(projectRoot, vm, vmCliHomePath(projectRoot, vm.id))
+      if (manifest?.capabilities) capacityOptions = { capabilities: manifest.capabilities }
+    }
+    const target = slotCapacityTarget(vm, routing, capacityOptions)
     const out = { vm_id: vm.id, plan: target.plan, slots: target.slots }
 
     const currentMem = slotMemory(vm, routing)

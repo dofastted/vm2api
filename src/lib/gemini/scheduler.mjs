@@ -1180,10 +1180,26 @@ export function createGeminiScheduler({
         const isManagedPool = Boolean(poolAccess && poolAccess.legacy === false)
         const effectiveAllowedEnvIds = isManagedPool ? null : allowedEnvIds
         const defaultEffort = isGeminiSeriesId(model) ? resolveGeminiDefaultEffort(model) : null
-        const catalog =
+        const rawCatalog =
           catalogSnapshot && Array.isArray(catalogSnapshot.accounts) && !isManagedPool
             ? catalogSnapshot
             : await this.catalog({ ownerScope, allowedEnvIds: effectiveAllowedEnvIds })
+        const accountAllowedByScope = (account) => {
+          if (!account?.id) return false
+          if (!geminiEnvMatchesOwnerScope(envOwnerOf(account.id), ownerScope)) return false
+          if (Array.isArray(effectiveAllowedEnvIds) && !effectiveAllowedEnvIds.includes(account.id)) return false
+          return true
+        }
+        const catalog =
+          catalogSnapshot && Array.isArray(catalogSnapshot.accounts) && !isManagedPool
+            ? {
+                ...rawCatalog,
+                accounts: rawCatalog.accounts.filter(accountAllowedByScope),
+                unlicensedAccounts: Array.isArray(rawCatalog.unlicensedAccounts)
+                  ? rawCatalog.unlicensedAccounts.filter(accountAllowedByScope)
+                  : [],
+              }
+            : rawCatalog
         const matchedAccounts = []
         for (const account of catalog.accounts) {
           const resolved = resolveUpstreamModel(model, account.models, {
