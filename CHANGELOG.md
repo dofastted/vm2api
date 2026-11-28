@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.4.257 — 2026-11-28 · Gemini 多租户代理出口隔离、上游错误语义保留与 V4 headless 容量对齐
+
+- **Gemini 多租户代理出口隔离与目录过滤（#2079）**：
+  - `src/lib/gemini/routes.mjs`：`proxyEgressOptionsFor` 在取认证信息前先做租户归属校验——租户环境只能用平台共享代理或自己的代理，平台环境只能用无归属代理，别的租户的代理一律返回 `null`；`warmGeminiEnvironments` 与 `createGeminiTerminal` 按环境归属解析代理与 `egress_options`，租户环境的预热与终端不再丢失出口选项
+  - `src/lib/admin/catalog-monitor.mjs`、`src/lib/admin/panel-routes.mjs`、`src/server.mjs`：`syncGeminiCatalog` / `createCatalogMonitor` 经 `resolveGeminiProxyEgressOptions` 把 `egress_options` 带到模型目录拉取
+  - `src/lib/gemini/scheduler.mjs`：对外部传入的 `catalogSnapshot` 增加 `ownerScope` 与 `allowedEnvIds` 过滤，托管号池路径行为不变
+- **上游错误语义保留（#2079）**：`mapUpstreamError` 新增 `crag_prompt_too_large`（400）、`pool_forbidden`（403 `permission_error`）、`crag_prompt_replace_empty_unsupported`（503 `overloaded_error`，不可重试）并补入 `STRICT_LOCAL_GATEWAY_CODES`；旧槽位抛出 `crag_prompt_replace_empty_unsupported` 时保留 503 语义，混合池内直接切换到支持的节点，耗尽时向客户端保留 503（`src/lib/core/errors.mjs`、`src/lib/pool/{upstream-error-policy,failover-runner}.mjs`）
+- **V4 headless bridge 容量对齐（#2079）**：槽位持久化并透出 `capabilities` / `kernel_generation` / `transport`（`kernel-install.mjs`、`vm-registry.mjs`、`kernel-catalog.mjs`），`isHeadlessBridgeSlot` 识别 `kernel_installation.transport === 'headless_bridge'` 与 `kernel_generation >= 4`；容量对账器、看门狗、`seatCapOf` / `seatCapForVm` 与 `/api/panel/pools` 统一按同一份能力计算有效槽位数，避免面板座位数与内核实际容量不一致
+- 部署说明：本次改动零数据库迁移、零 Rust 变更；升级后重启控制面即可生效，V4 内核槽位的座位上限会按其声明的能力重新计算。
+
 ## 1.4.256 — 2026-11-28 · Gemini 单次上游 502 不再把健康账号永久摘出调度
 
 - **瞬时 `upstream_502` / `proxy_502` 的 unschedulable 标记 10 分钟后自动过期（#2077，Fixes #2049）**：此前一次上游 502 会把 `settings.gemini_slot_prefs[envId].unschedulable` 持久化，而全仓没有任何自动清除路径（周期检查的自动恢复只覆盖 `reauth_required` / `verification_required` / `location_unsupported` / `ineligible`），健康账号因此被永久摘出调度，所有 Gemini 请求返回 `429 gemini_pool_overloaded`，只能手动 `recover`。
