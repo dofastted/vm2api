@@ -475,6 +475,137 @@ class AgyAndLoginExitClassificationTests(unittest.TestCase):
             self.assertNotIn("PTY_SECRET_URL_STATE_999", stderr_out)
             self.assertNotIn("SUPER_SECRET_PASS", stderr_out)
 
+    def test_sandbox_ca_cert_mounts_cover_multi_distro_public_trust_only(self):
+        mounts = self.mod._sandbox_ca_cert_mounts()
+        self.assertEqual(len(mounts) % 3, 0)
+        triples = [tuple(mounts[i : i + 3]) for i in range(0, len(mounts), 3)]
+        bound_paths = []
+        for flag, src, dst in triples:
+            self.assertEqual(flag, "--ro-bind-try")
+            self.assertEqual(src, dst)
+            bound_paths.append(src)
+        for required in (
+            "/etc/ssl/certs",
+            "/etc/ssl/cert.pem",
+            "/etc/ssl/ca-bundle.pem",
+            "/etc/ca-certificates",
+            "/etc/pki/ca-trust",
+            "/etc/pki/tls/certs",
+            "/etc/pki/tls/cert.pem",
+            "/var/lib/ca-certificates",
+        ):
+            self.assertIn(required, bound_paths)
+        for forbidden in (
+            "/etc/ssl",
+            "/etc/ssl/private",
+            "/etc/pki",
+            "/etc/pki/tls",
+            "/etc/pki/tls/private",
+        ):
+            self.assertNotIn(forbidden, bound_paths)
+
+    def test_agy_and_shard_worker_bwrap_include_ca_cert_mounts(self):
+        expected_ca = self.mod._sandbox_ca_cert_mounts()
+        with tempfile.TemporaryDirectory(prefix="gemini-ca-mounts-") as tmpdir:
+            root = Path(tmpdir)
+            payload = root / "payload"
+            payload.mkdir()
+            for name in ("agy", "craggemini", "libagy_bridge.so"):
+                (payload / name).write_bytes(b"stub")
+            native_dir = root / "native"
+            native_dir.mkdir()
+
+            host = self.mod.Host.__new__(self.mod.Host)
+            host.directory = root
+            host.payload = payload
+            host.payload_mode = "legacy"
+            host.crag_host_dir = None
+            host.uid_base = 29000
+            host.egress_uid = 29008
+            host.egress = root / "kin-egress"
+            host.runtime_policy = self.mod.normalize_runtime_policy({})
+            host.env_uid = lambda _env: 29000
+            host.ensure_env_machine_id = lambda _env: root / "machine-id"
+            (root / "machine-id").write_text("0" * 32 + "\n", encoding="utf-8")
+            host.installed_agy_sha256 = lambda: "a" * 64
+            host.spawn = lambda fn: fn()
+            host.acquire_slot_network = lambda *_args, **_kwargs: {
+                "lock": None,
+                "egress": None,
+                "relay": None,
+            }
+            host._allocate_native_dir = lambda *_args, **_kwargs: (native_dir, False)
+
+            env_id = "gemini-" + "a" * 24
+            profile_dir = root / env_id / "p1"
+            (profile_dir / "home").mkdir(parents=True)
+            env = {
+                "id": env_id,
+                "name": "acc",
+                "proxy_id": "px-1",
+                "slot": 0,
+                "auth_method": "oauth",
+                "auth_state": "authorized",
+                "profile": "p1",
+                "call_models": ["gemini-3-flash"],
+            }
+
+            captured_agy = {}
+
+            def fake_launch_cli(_self, argv, _size):
+                captured_agy["argv"] = list(argv)
+
+            with (
+                patch.object(self.mod.os, "chown"),
+                patch.object(self.mod, "private_json"),
+                patch.object(self.mod.Agy, "launch_cli", fake_launch_cli),
+                patch.object(self.mod.Agy, "launch_args", return_value=["setpriv"]),
+            ):
+                self.mod.Agy(
+                    host,
+                    env,
+                    "socks5h://u1:pass@192.0.2.15:1080",
+                    profile=profile_dir,
+                    size=(24, 80),
+                )
+
+            agy_argv = captured_agy["argv"]
+            ca_start = agy_argv.index("/etc/ssl/certs") - 1
+            self.assertEqual(agy_argv[ca_start : ca_start + len(expected_ca)], expected_ca)
+
+            captured_shard = {}
+
+            class FakeProc:
+                def poll(self):
+                    return None
+
+            def fake_popen(argv, **_kwargs):
+                captured_shard["argv"] = list(argv)
+                return FakeProc()
+
+            with (
+                patch.object(self.mod.os, "chown"),
+                patch.object(self.mod, "private_json"),
+                patch.object(
+                    self.mod.CragDaemonShard,
+                    "_stage_account_files",
+                    return_value=(f"/accounts/{env_id}/home", f"/accounts/{env_id}/work"),
+                ),
+                patch.object(self.mod.subprocess, "Popen", side_effect=fake_popen),
+            ):
+                self.mod.CragDaemonShard(
+                    host,
+                    "shard-0",
+                    [(env, "socks5h://u1:pass@192.0.2.15:1080", ((), b""), "gemini-3-flash")],
+                )
+
+            shard_argv = captured_shard["argv"]
+            shard_ca_start = shard_argv.index("/etc/ssl/certs") - 1
+            self.assertEqual(
+                shard_argv[shard_ca_start : shard_ca_start + len(expected_ca)],
+                expected_ca,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
