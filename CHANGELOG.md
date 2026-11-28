@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.4.256 — 2026-11-28 · Gemini 单次上游 502 不再把健康账号永久摘出调度
+
+- **瞬时 `upstream_502` / `proxy_502` 的 unschedulable 标记 10 分钟后自动过期（#2077，Fixes #2049）**：此前一次上游 502 会把 `settings.gemini_slot_prefs[envId].unschedulable` 持久化，而全仓没有任何自动清除路径（周期检查的自动恢复只覆盖 `reauth_required` / `verification_required` / `location_unsupported` / `ineligible`），健康账号因此被永久摘出调度，所有 Gemini 请求返回 `429 gemini_pool_overloaded`，只能手动 `recover`。
+  - `src/lib/gemini/slot-prefs.mjs`：`get()` / `resolved()` / `all()` 读取时判定，瞬时原因的标记距其 `at` 满 10 分钟即过期，并从存储中删除；新的 502 会重新计时；升级前已落盘的旧 502 标记按其既有 `at` 过期，无需迁移
+  - 确定性状态（`reauth_required`、`verification_required`、`location_unsupported`、`ineligible`）与运营手动 `schedulable:false` 不受影响；`gemini.failover.unschedulable_on_502=false` 仍可整体关闭该标记行为
+  - 10 分钟为固定默认值，未做成配置项；issue 中「面板取消进行中的授权」一项未处理（独立接口，另行跟进）
+- 部署说明：本次改动零数据库迁移、零 Rust 变更、零前端改动；升级后重启控制面即可生效，已被 502 标记的账号会在各自 `at` 满 10 分钟后自动恢复。
+
 ## 1.4.255 — 2026-11-28 · 虚拟机面板透出 Rust 调度器 `node_cooldown`，测试链接给出准确原因
 
 - **面板显示与调度器一致：`node_cooldown` 不再被当成「可用」（#2069，Fixes #2057）**：Rust `kin-scheduler` 在连续上游拒答（如 `content_filter_refusal`）等情形下会让槽位进入节点级冷却并将其排除出派发，状态落在 `scheduler_node_penalties`，但面板此前只读 JS 侧的运行时冷却，于是该槽仍显示「可用 / 正在接单」、`diagnose` 全绿。
