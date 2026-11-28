@@ -183,7 +183,7 @@ function makeMockFailoverRuntime({ scheduler, config = {} } = {}) {
       return leases.get(leaseId)?.candidate || null
     },
     async acquireNode(params, { signal } = {}) {
-      const lockKey = params.isEphemeralProbe ? '' : String(params.sessionId || '')
+      const lockKey = params.isEphemeralProbe || params.skipSessionGate ? '' : String(params.sessionId || '')
       const releaseLock = await acquireSessionLock(lockKey, config.session_queue_timeout_ms, signal)
       try {
         const selected = await selectCandidate(params)
@@ -2066,14 +2066,13 @@ test('the fifth candidate is reached after four VMs fail', async () => {
   assert.deepEqual(seen, ['vm-01', 'vm-02', 'vm-03', 'vm-04', 'vm-05'])
 })
 
-test('session queue timeout defaults to 15 minutes and reloads over the default', () => {
+test('failover config has no session_queue_timeout_ms default; the scheduler pool column owns it', () => {
   const scheduler = new Scheduler([candidate(1)])
   const runner = new FailoverRunner({ scheduler })
-  assert.equal(runner.config.session_queue_timeout_ms, 900_000)
-  runner.reloadConfig({ total_retry_deadline_ms: 50 })
-  assert.equal(runner.config.session_queue_timeout_ms, 900_000)
-  runner.reloadConfig({ session_queue_timeout_ms: 0 })
-  assert.equal(runner.config.session_queue_timeout_ms, 0)
+  assert.equal(Object.hasOwn(runner.config, 'session_queue_timeout_ms'), false)
+  // A stored routing.json that still carries the key reloads without error.
+  runner.reloadConfig({ session_queue_timeout_ms: 900_000, total_retry_deadline_ms: 50 })
+  assert.equal(runner.config.total_retry_deadline_ms, 50)
 })
 
 test('batch member requests sharing a sticky key run concurrently, not serialized', async () => {

@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.4.253 — 2026-11-28 · 清理 M3 切换后无人读取的号池/故障转移配置键与面板滑块
+
+- **删除 M3 切换（v1.4.243）后没有任何读取方的 routing 键（#2063）**：
+  - 移除 `pool.sticky_wait_timeout_ms`、`pool.seat_grace_ms`、`pool.seat_budget_reserve_pct`、`pool.kernel_lease_queue_grace_ms`、`pool.heartbeat_stale_ms` 与 `failover.session_queue_timeout_ms` 的默认值、归一化与 `src/config/routing.json` 条目（`src/lib/pool/{pool-scheduler,failover-runner}.mjs`）；已存有这些键的 `routing.json` 照常加载，未知键原样透传、不读也不报错，生产配置无需修改
+  - 设置页「号池」移除不再生效的「每席位预算预留」滑块与余量阶梯图、「粘性等待」滑块，排队时间线只画全局排队一条线，与 Rust 调度器立即溢出一致（`web/src/features/settings/{pool-pane.tsx,routing-draft.ts}`）；`docs/INFERENCE.md`、`docs/API.md` 同步改写，`session_queue_timeout_ms` 改指向号池级配置（`scheduler_pools.session_queue_timeout_ms`，该列未改动）
+  - 保留仍在生效的 `pool.circuit_failure_threshold` / `pool.circuit_open_ms`（`unitCircuit` 全局单例仍由 Claude 与 Gemini 调度共用）
+- 测试修复（#2066）：`test/unit/failover-runner.test.mjs` 的 mock 调度器现在与生产契约一致，识别 `skipSessionGate`；此前 #2056 合入后「batch 成员并发不串行」用例会永远等待 mock 会话锁，整文件撞到 300s 上限（dev 的推送 CI 只跑被改动的测试文件，因此未被发现）。纯测试改动，无用户可见变化
+- 部署说明：本次改动零数据库迁移、零 Rust 变更；仅删除无读取方的配置与面板控件，升级无需额外操作。
+
 ## 1.4.252 — 2026-11-28 · 补回 M3 切换丢失的 238 调度规则（Fable 闸、节点闸、借号不搬 pin、续聊不跨号等）
 
 - **恢复 Rust `kin-scheduler` 切换（v1.4.243，#1994）时丢失的 v1.4.238 JS 调度规则（#2056）**：规则加在 Rust 调度器或调用它的 JS 边界上，未回退到 JS 调度；逐条对照表见 `docs/scheduler-m3-parity.md`。

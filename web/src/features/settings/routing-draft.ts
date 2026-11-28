@@ -27,8 +27,6 @@ export const READONLY_ROUTING_KEYS = new Set([
 /** 与后端 DEFAULT_POOL_ROUTING 及 src/config/routing.json 预置默认值一致。 */
 export const POOL_DEFAULTS = {
   queue_max: 50,
-  seat_budget_reserve_pct: 0.02,
-  sticky_wait_timeout_ms: 45000,
   fallback_wait_timeout_ms: 30000,
   circuit_failure_threshold: 3,
   circuit_open_ms: 30000,
@@ -665,29 +663,17 @@ export function computePendingCards(
           di.prewarm_enabled === true,
           dp.max_primary_sessions ?? null,
           dp.max_subagents_per_session ?? null,
-          numberOf(
-            dp.seat_budget_reserve_pct,
-            POOL_DEFAULTS.seat_budget_reserve_pct
-          ),
         ],
         [
           numberOf(si.session_slots, 20),
           si.prewarm_enabled === true,
           sp.max_primary_sessions ?? null,
           sp.max_subagents_per_session ?? null,
-          numberOf(
-            sp.seat_budget_reserve_pct,
-            POOL_DEFAULTS.seat_budget_reserve_pct
-          ),
         ]
       ),
       queue: !sameJson(
         [
           numberOf(dp.queue_max, POOL_DEFAULTS.queue_max),
-          numberOf(
-            dp.sticky_wait_timeout_ms,
-            POOL_DEFAULTS.sticky_wait_timeout_ms
-          ),
           numberOf(
             dp.fallback_wait_timeout_ms,
             POOL_DEFAULTS.fallback_wait_timeout_ms
@@ -695,10 +681,6 @@ export function computePendingCards(
         ],
         [
           numberOf(sp.queue_max, POOL_DEFAULTS.queue_max),
-          numberOf(
-            sp.sticky_wait_timeout_ms,
-            POOL_DEFAULTS.sticky_wait_timeout_ms
-          ),
           numberOf(
             sp.fallback_wait_timeout_ms,
             POOL_DEFAULTS.fallback_wait_timeout_ms
