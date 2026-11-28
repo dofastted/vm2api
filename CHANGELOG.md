@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.4.271 — 2026-11-29 · CRAG 本地能力拒绝不再冷却健康节点（外部贡献）
+
+- **本地创建的能力拒绝按 `request_protocol` 上报，不再让健康节点进入冷却（#2106，外部贡献 `DNAlec`）**：零注入要求在旧版 CRAG 槽位上做空提示替换时，`prepareCragPrintBody` 会在推理前本地拒绝；此前 `FailoverRunner` 把它当作 `transport` 报给 Rust，尽管 Node 策略明确要求不冷却，健康节点仍被冷却。
+  - `src/lib/pool/failover-runner.mjs`、`src/lib/protocol/crag-print-prompt.mjs`：用私有 `WeakSet` 标记本地创建的能力错误，并以 `request_protocol` 上报；保持 HTTP 503、错误码与直接切换到兼容槽位的行为。上游响应或抛出的同名错误码拿不到这个豁免。
+  - `scheduler/crates/scheduler-proto/src/types.rs`、`scheduler-core/src/health.rs`：新增对应的 Rust 请求故障类别，本地校验既不能制造、放大，也不能清除节点健康惩罚；已有的真实冷却保持不变。
+  - **行为变化，升级前请知悉**：Node 与调度器需要一起升级；控制面镜像从源码构建调度器，所以随镜像升级即可，不要单独替换其中一个。
+  - 测试：`test/unit/crag-local-capability-runtime.test.mjs`（新增）、`crag-opt2a-scheduler-m1b-joint.test.mjs`、`scheduler-core/tests/tier_rank_health_tests.rs`。覆盖本地拒绝后仍能同时持有两个并发租约、同名上游错误/传输失败/超时仍会冷却节点。
+- 部署说明：零数据库迁移、零 `deploy/payload.json` 变更；含 Rust 调度器变更，需随控制面镜像整体升级后重启。
+
 ## 1.4.270 — 2026-11-29 · Gemini 基础别名与显式推理档位不再被 M3 准入误判为池耗尽（外部贡献）
 
 - **M3 准入与模型解析使用同一套默认/请求推理档位（#2108，外部贡献 `DNAlec`）**：此前 Gemini 请求解析与 M3 兼容性闸门各自取默认/请求档位，基础别名（如 `gemini-4-hydrogen`）即使默认变体存在也可能被当作池耗尽拒绝；显式指定的非默认档位同样会被误拒。
