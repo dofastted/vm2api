@@ -411,6 +411,32 @@ impl SchedulerEngine {
         }
     }
 
+    fn cached_acquire_reply(
+        &self,
+        request_id: &RequestId,
+        attempt_no: u32,
+    ) -> Result<Option<AcquireResponse>, ScheduleError> {
+        let now = now_ms();
+        let Some(hit) = self.idempotency.get(&(request_id.clone(), attempt_no)) else {
+            return Ok(None);
+        };
+        if now > hit.expires_at_ms {
+            return Ok(None);
+        }
+        // A control-plane admission check can reject and release a granted lease.
+        // Keep the attempt idempotent, but never replay a success without capacity.
+        if self
+            .leases
+            .get(&hit.response.lease_id)
+            .is_none_or(|lease| now >= lease.expires_at_ms)
+        {
+            return Err(ScheduleError::LeaseNotFound(
+                "Cached attempt lease is no longer active; use a new request or attempt".to_owned(),
+            ));
+        }
+        Ok(Some(hit.response.clone()))
+    }
+
     async fn acquire_inner(
         &self,
         req: AcquireRequest,
@@ -419,12 +445,8 @@ impl SchedulerEngine {
         let t_total = Instant::now();
 
         if !dry_run {
-            let now = now_ms();
-            let idem_key = (req.request_id.clone(), req.attempt_no);
-            if let Some(hit) = self.idempotency.get(&idem_key) {
-                if now <= hit.expires_at_ms {
-                    return Ok(hit.response.clone());
-                }
+            if let Some(reply) = self.cached_acquire_reply(&req.request_id, req.attempt_no)? {
+                return Ok(reply);
             }
         }
 
@@ -492,14 +514,10 @@ impl SchedulerEngine {
     pub async fn switch(&self, mut req: SwitchRequest) -> Result<AcquireResponse, ScheduleError> {
         let t_total = Instant::now();
         let now = now_ms();
-        let idem_key = (
-            req.next_attempt.request_id.clone(),
-            req.next_attempt.attempt_no,
-        );
-        if let Some(hit) = self.idempotency.get(&idem_key) {
-            if now <= hit.expires_at_ms {
-                return Ok(hit.response.clone());
-            }
+        if let Some(reply) =
+            self.cached_acquire_reply(&req.next_attempt.request_id, req.next_attempt.attempt_no)?
+        {
+            return Ok(reply);
         }
 
         // 1. Pop old lease, free ONLY its node slot, and re-arm its immutable GateHoldGuard.
