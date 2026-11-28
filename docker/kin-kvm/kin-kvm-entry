@@ -770,7 +770,13 @@ if [ "$KIN_KVM_MODE" = custom-erofs ]; then
   sync_state_ext4_boot_files
 
   # Clean /proc/cmdline: zero kin.* parameters (all slot boot parameters live in slot-state.ext4:/boot.env).
-  CMDLINE="console=ttyS0 root=/dev/vda rootfstype=erofs ro init=/usr/local/sbin/kin-guest-init net.ifnames=0 biosdevname=0 quiet"
+  # On the custom kernel track, initrd.img-custom sets init=/usr/local/sbin/kin-guest-init via
+  # /conf/conf.d/99-kin-init so /proc/cmdline contains zero "kin" substrings; official track keeps init=.
+  if [ "$KIN_KVM_KERNEL_TRACK" = custom ]; then
+    CMDLINE="console=ttyS0 root=/dev/vda rootfstype=erofs ro net.ifnames=0 biosdevname=0 quiet"
+  else
+    CMDLINE="console=ttyS0 root=/dev/vda rootfstype=erofs ro init=/usr/local/sbin/kin-guest-init net.ifnames=0 biosdevname=0 quiet"
+  fi
 
   MACHINE_ARG="q35,mem-merge=off,vmport=off"
   if [ -n "${KIN_KVM_ACPI_OEM_ID:-}" ] && ! printf '%s' "$KIN_KVM_ACPI_OEM_ID" | grep -Eq '[,="\\]'; then
