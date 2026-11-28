@@ -1396,7 +1396,7 @@ export function createGeminiPanelHandler({
       }
       if (req.method === 'POST' && pathname === `${PANEL_PATH}/crag-subscription/claim-by-order`) {
         if (!cragSubscription) return fail(503, 'license_unconfigured', GEMINI_LICENSE_MESSAGES.license_unconfigured)
-        if (publicBaseUrl && req.apiKeyKind !== 'master' && !sameOriginPost(req, publicBaseUrl)) {
+        if (req.apiKeyKind !== 'master' && !sameOriginPost(req, publicBaseUrl)) {
           return fail(403, 'crag_subscription_origin_denied', '请从本面板发起请求')
         }
         const body = await readBody(req, 2048)
@@ -1409,7 +1409,7 @@ export function createGeminiPanelHandler({
       }
       if (req.method === 'POST' && pathname === `${PANEL_PATH}/crag-subscription/migrate`) {
         if (!cragSubscription) return fail(503, 'license_unconfigured', GEMINI_LICENSE_MESSAGES.license_unconfigured)
-        if (publicBaseUrl && req.apiKeyKind !== 'master' && !sameOriginPost(req, publicBaseUrl)) {
+        if (req.apiKeyKind !== 'master' && !sameOriginPost(req, publicBaseUrl)) {
           return fail(403, 'crag_subscription_origin_denied', '请从本面板发起请求')
         }
         const body = await readBody(req, 4096)
@@ -1426,7 +1426,7 @@ export function createGeminiPanelHandler({
       }
       if (req.method === 'POST' && pathname === `${PANEL_PATH}/crag-subscription/rebuild-identity`) {
         if (!cragSubscription) return fail(503, 'license_unconfigured', GEMINI_LICENSE_MESSAGES.license_unconfigured)
-        if (publicBaseUrl && req.apiKeyKind !== 'master' && !sameOriginPost(req, publicBaseUrl)) {
+        if (req.apiKeyKind !== 'master' && !sameOriginPost(req, publicBaseUrl)) {
           return fail(403, 'crag_subscription_origin_denied', '请从本面板发起请求')
         }
         const out = await cragSubscription.rebuildIdentity()

@@ -2044,4 +2044,21 @@ test('createGeminiCragSubscription supports orders, claimByOrder collision auto-
   assert.equal(rotated.status, 200)
   assert.equal(rotated.payload.data.active, false)
   assert.notEqual(rotated.payload.data.host_id, rebuiltHostId)
+
+  // 10. Same-origin CSRF check is enforced even when publicBaseUrl is unset (null)
+  const panelNoBase = createGeminiPanelHandler({
+    json,
+    readBody: async (req) => req.body,
+    proxyPool: () => null,
+    cragSubscription: sub,
+    callHost: async () => ({}),
+  })
+  await panelNoBase(
+    makeReq('POST', {}, { origin: 'https://sibling.example.test', 'sec-fetch-site': 'same-site' }),
+    res,
+    '/api/panel/gemini/crag-subscription/rebuild-identity',
+  )
+  const csrfBlocked = responses.pop()
+  assert.equal(csrfBlocked.status, 403)
+  assert.equal(csrfBlocked.payload.error.code, 'crag_subscription_origin_denied')
 })
