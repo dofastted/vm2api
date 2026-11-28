@@ -565,10 +565,12 @@ function recordBan(decision, { devices, policy, requestId, now = Date.now() }) {
 const OVER_REFUSAL_SAFE_FLOOR = 0.85
 
 /**
- * Single non-NSFW JEV hits at or above this floor refuse only the current
- * request without permanently banning the session or adding a device strike.
- * NSFW hits, multi-question hits, and scores strictly below this floor still
- * escalate to session + 3-strike device bans.
+ * Non-NSFW JEV hits whose lowest score is at or above this floor refuse only
+ * the current request without permanently banning the session or adding a
+ * device strike. Usage-policy and abuse are strongly correlated, so a borderline
+ * document often trips several questions at once; that alone is not evidence.
+ * NSFW hits and scores strictly below this floor still escalate to session +
+ * 3-strike device bans.
  */
 export const JEV_BAN_CONFIDENCE_FLOOR = 0.25
 
@@ -613,7 +615,7 @@ export function shouldEscalateJevBan(verdict, jev = null) {
       : verdict.category
         ? [verdict.category]
         : []
-  if (categories.includes('nsfw') || categories.length >= 2) return true
+  if (categories.includes('nsfw')) return true
   const score = lowestHitScore(verdict)
   if (score === null) return true
   return score < JEV_BAN_CONFIDENCE_FLOOR
