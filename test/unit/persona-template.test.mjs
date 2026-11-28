@@ -210,7 +210,9 @@ test('agent standing preset flags default off and isolate per preset', () => {
     assert.equal(presetFlagEnabled({}, 'agent_standing_presets', preset), false)
     assert.equal(agentStandingVar({}, preset), '')
   }
-  assert.equal(presetFlagEnabled({}, 'persona_env_presets', 'official'), true)
+  assert.equal(presetFlagEnabled({}, 'persona_env_presets', 'official'), false)
+  assert.equal(presetFlagEnabled({}, 'persona_env_presets', 'official_full'), true)
+  assert.equal(presetFlagEnabled({}, 'persona_env_presets', 'zero'), false)
   assert.equal(presetFlagEnabled({}, 'agent_standing_hide_presets', 'official'), true)
   assert.equal(presetFlagEnabled({}, 'usage_passthrough_presets', 'zero'), false)
   assert.equal(
@@ -439,7 +441,7 @@ test('official preset with overlay official parks the mandatory reminder without
     assert.ok(!out.system.some((b) => String(b?.text || '').includes(DEFAULT_AGENT_STANDING)))
     assert.match(out.system[0].text, /^x-anthropic-billing-header: /)
     assert.equal(out.system[1].text, CRS_OFFICIAL_CLI_SYSTEM)
-    assert.equal(out.system[2].text, OFFICIAL_303_HARNESS)
+    assert.equal(out.system.length, 2)
     assert.equal(
       out.system.some((block) => String(block.text).startsWith('Write code that reads like the surrounding code')),
       false,
@@ -500,15 +502,20 @@ test('cli-hop renders official and official_full from the configured template, t
       const texts = hop.system.map((block) => String(block.text || ''))
       assert.equal(texts.filter((text) => text.startsWith('x-anthropic-billing-header')).length, 1, preset)
       assert.equal(texts.filter((text) => text === CRS_OFFICIAL_CLI_SYSTEM).length, 1, preset)
-      assert.equal(texts.filter((text) => text === OFFICIAL_303_HARNESS).length, 1, preset)
+      assert.equal(
+        texts.filter((text) => text === OFFICIAL_303_HARNESS).length,
+        preset === 'official_full' ? 1 : 0,
+        preset,
+      )
       // sonnet-4-6 has no mid-conversation system: the Environment is lifted out of messages.
       assert.equal(
         hop.messages.some((message) => message.role === 'system'),
         false,
         preset,
       )
-      assert.ok(
+      assert.equal(
         texts.some((text) => /# Environment/.test(text)),
+        preset === 'official_full',
         preset,
       )
       assert.ok(firstUserText(hop).startsWith('<system-reminder>\nCALLER_APPEND\n</system-reminder>\n'), preset)
@@ -737,7 +744,12 @@ test('edited built-in templates saved with the old global-scope default stop sen
     )
   for (const preset of ['official', 'official_full']) {
     withRoutingFile(
-      { persona_preset: preset, overlay_preset: 'off', persona_templates: { [preset]: legacy(preset) } },
+      {
+        persona_preset: preset,
+        overlay_preset: 'off',
+        ...(preset === 'official' ? { persona_block_presets: { official: { harness: true } } } : {}),
+        persona_templates: { [preset]: legacy(preset) },
+      },
       (file) => {
         const out = applyCrsUnofficialPersona({ messages: [{ role: 'user', content: 'hi' }] }, { routingFile: file })
         const scoped = out.system.filter((block) => block?.cache_control?.scope)
@@ -829,7 +841,12 @@ test('agent standing: default off, explicit per-preset on, and custom text repla
     assert.ok(!out.system.some((block) => String(block.text).includes(DEFAULT_AGENT_STANDING)))
   })
   withRoutingFile(
-    { persona_preset: 'official', overlay_preset: 'off', agent_standing_presets: { official: true } },
+    {
+      persona_preset: 'official',
+      overlay_preset: 'off',
+      persona_block_presets: { official: { harness: true } },
+      agent_standing_presets: { official: true },
+    },
     (file) => {
       const out = applyCrsUnofficialPersona({ messages: [{ role: 'user', content: 'hi' }] }, { routingFile: file })
       assert.ok(out.system[2].text.startsWith(`${DEFAULT_AGENT_STANDING}\n${OFFICIAL_303_HARNESS}`))
@@ -838,7 +855,8 @@ test('agent standing: default off, explicit per-preset on, and custom text repla
   )
   withRoutingFile({ persona_preset: 'official', overlay_preset: 'off' }, (file) => {
     const out = applyCrsUnofficialPersona({ messages: [{ role: 'user', content: 'hi' }] }, { routingFile: file })
-    assert.equal(out.system[2].text, OFFICIAL_303_HARNESS)
+    assert.equal(out.system.length, 2)
+    assert.equal(out.system[1].text, CRS_OFFICIAL_CLI_SYSTEM)
     assert.equal(
       out.system.some((block) => String(block.text).startsWith('Write code that reads like the surrounding code')),
       false,
@@ -913,14 +931,26 @@ test('official env block goes to a role=system message and is switchable per pre
   const everything = (out) => [...out.system.map((block) => String(block.text)), ...envMessages(out)].join('\n')
   withRoutingFile({ persona_preset: 'official', overlay_preset: 'off' }, (file) => {
     const out = applyCrsUnofficialPersona(body(), { routingFile: file, identity })
-    assert.match(envMessages(out)[0], /^# Environment/)
-    assert.equal(
-      out.system.some((block) => String(block.text).includes('# Environment')),
-      false,
-    )
+    assert.deepEqual(envMessages(out), [])
   })
   withRoutingFile(
-    { persona_preset: 'official', overlay_preset: 'off', persona_timezone_presets: { official: true } },
+    { persona_preset: 'official', overlay_preset: 'off', persona_env_presets: { official: true } },
+    (file) => {
+      const out = applyCrsUnofficialPersona(body(), { routingFile: file, identity })
+      assert.match(envMessages(out)[0], /^# Environment/)
+      assert.equal(
+        out.system.some((block) => String(block.text).includes('# Environment')),
+        false,
+      )
+    },
+  )
+  withRoutingFile(
+    {
+      persona_preset: 'official',
+      overlay_preset: 'off',
+      persona_env_presets: { official: true },
+      persona_timezone_presets: { official: true },
+    },
     (file) => {
       const out = applyCrsUnofficialPersona(body(), { routingFile: file, identity })
       assert.match(envMessages(out)[0], / - Timezone: Asia\/Tokyo/)

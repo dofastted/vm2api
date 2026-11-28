@@ -93,8 +93,8 @@ test('kernel.json cli_version follows the slot profile', () => {
       '2.1.321',
     )
     const slot = read({ id: 'vm-05', persona_preset: 'official_303' }, {})
-    assert.equal(slot.persona_preset, 'official_303')
-    assert.equal(slot.system_layout, 'identity')
+    assert.equal(slot.persona_preset, 'official_full')
+    assert.equal(slot.system_layout, 'official_full')
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }

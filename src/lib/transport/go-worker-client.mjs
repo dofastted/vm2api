@@ -14,6 +14,7 @@ import { modelDirectiveForCrag } from '../protocol/model-policy.mjs'
 import { capOutboundBody } from '../protocol/outbound-snapshot.mjs'
 import { cacheTtlFromRouting } from '../protocol/cache-ttl.mjs'
 import { ccEntrypointFromRouting, stripSubagentBilling } from '../identity/crs-persona.mjs'
+import { isPromptSpecV1Caps, sanitizePromptSpec } from '../identity/system-prompt-spec.mjs'
 import { sealClaudeCodeCch } from '../identity/cch.mjs'
 import { canRefreshCredential, credentialModeFromOauth, isApiKeyMode } from '../oauth/credential-mode.mjs'
 import { isCrsMock, writeCrsTrace, mockCrsPayload, emitMockSse } from './crs-mock.mjs'
@@ -713,6 +714,7 @@ function gateCragBody(body, print, health, isolated = false, dropSampling = fals
   if (print && !strictPassthrough) alignSamplingWithThinking(body, { drop: dropSampling })
   const caps = print && Array.isArray(health?.capabilities) ? health.capabilities : []
   const headlessBridge = print && isHeadlessBridgeCaps(caps)
+  const promptSpecV1 = print && isPromptSpecV1Caps(caps, health)
   const prompt = body.crag_prompt
   const model =
     print && !isolated && body.thread == null && cragConsumesModelDirective(health)
@@ -724,12 +726,19 @@ function gateCragBody(body, print, health, isolated = false, dropSampling = fals
     (Object.hasOwn(body, 'crag_persona_preset') ||
       Object.hasOwn(body, 'crag_prompt_version') ||
       Object.hasOwn(body, 'crag_env'))
+  const stripPromptSpec = !promptSpecV1 && Object.hasOwn(body, 'crag_prompt_spec')
+  const stripNonLegacyPreset =
+    headlessBridge &&
+    !promptSpecV1 &&
+    (body.crag_persona_preset === 'official' || body.crag_persona_preset === 'custom')
   if (
     !model &&
     !Object.hasOwn(body, 'crag_prompt') &&
     !Object.hasOwn(body, 'crag_model') &&
     !hasAlias &&
-    !stripHeadlessFields
+    !stripHeadlessFields &&
+    !stripPromptSpec &&
+    !stripNonLegacyPreset
   ) {
     return body
   }
@@ -741,6 +750,12 @@ function gateCragBody(body, print, health, isolated = false, dropSampling = fals
     delete out.crag_persona_preset
     delete out.crag_prompt_version
     delete out.crag_env
+  }
+  if (stripPromptSpec) {
+    delete out.crag_prompt_spec
+  }
+  if (stripNonLegacyPreset) {
+    delete out.crag_persona_preset
   }
   if (model) out.crag_model = model
   else delete out.crag_model
@@ -824,7 +839,8 @@ export function prepareWorkerPayload({
       (officialPassthrough === false ||
         body?.crag_persona_preset != null ||
         body?.crag_prompt != null ||
-        body?.crag_env != null)
+        body?.crag_env != null ||
+        (body?.crag_prompt_spec != null && body.crag_prompt_spec?.passthrough !== true))
     const headerReq = nonPassthroughHeadless ? stripClientNonCcHeaders(reqHeaders) : reqHeaders
     headers = prepareOutboundHeaders(headerReq, exec?.homeDir, identity, canonicalBody?.model || '', {
       credentialMode: credentialModeFromOauth(exec?.vm?.claude || {}),
@@ -902,6 +918,7 @@ export async function workerEnvelope({
   preserveCacheBreakpoints = null,
   cliHop = false,
   cragPrint = null,
+  promptSpec = null,
   callerCwd = null,
   repaired = false,
   dropSampling = false,
@@ -932,8 +949,10 @@ export async function workerEnvelope({
   const gated = redaction ? masked.body : prepared.gated
   const outgoingCwd = redaction ? validateCallerCwd(masked.caller_cwd) : cwd
   const finalized = sealPreparedPayload(prepared, gated)
-  const nativeV3 =
-    nativeCragRequest(exec, cragPrint) && exec?.workerStatus?.capabilities?.includes('generation_controls_v3')
+  const print = nativeCragRequest(exec, cragPrint)
+  const nativeV3 = print && exec?.workerStatus?.capabilities?.includes('generation_controls_v3')
+  // Top-level `prompt_spec` rides on the worker envelope for cli-node (never inside `envelope.body`).
+  const cleanPromptSpec = !print && promptSpec ? sanitizePromptSpec(promptSpec) : null
   // Resolve execution defaults even when cacheTtl is null for mixed-TTL accounting.
   const defaultCacheTtl = prepared.strictPassthrough
     ? (cacheTtl ?? null)
@@ -944,6 +963,7 @@ export async function workerEnvelope({
   const envelope = {
     ...(requestContext ? { request_context: requestContext } : {}),
     ...(typeof outgoingCwd === 'string' ? { caller_cwd: outgoingCwd } : {}),
+    ...(cleanPromptSpec ? { prompt_spec: cleanPromptSpec } : {}),
     body: finalized.body,
     ...(finalized.headers ? { headers: finalized.headers } : {}),
     stream: !!stream,
@@ -988,8 +1008,8 @@ async function preparePrebuiltEnvelope(envelope, redaction, messages, exec, crag
       )
     }
   }
-  if (out.body && Object.hasOwn(out.body, 'caller_cwd')) {
-    const { caller_cwd: _bodyCwd, ...body } = out.body
+  if (out.body && (Object.hasOwn(out.body, 'caller_cwd') || Object.hasOwn(out.body, 'prompt_spec'))) {
+    const { caller_cwd: _bodyCwd, prompt_spec: _bodyPromptSpec, ...body } = out.body
     out.body = body
   }
   if (redaction && out.body) out.body = await maskJson(out.body, redaction)
@@ -1125,6 +1145,7 @@ async function callGoWorkerRaw({
   envelope = null,
   cliHop = false,
   cragPrint = null,
+  promptSpec = null,
   callerCwd = null,
   repaired = false,
   strictPassthrough = false,
@@ -1152,7 +1173,12 @@ async function callGoWorkerRaw({
       strictPassthrough,
       safeguardsSanitized,
     })
-    reportEnvelope(onEnvelope, { body: outboundBody, headers })
+    const cleanPromptSpec = !nativeCragRequest(exec, cragPrint) && promptSpec ? sanitizePromptSpec(promptSpec) : null
+    reportEnvelope(onEnvelope, {
+      ...(cleanPromptSpec ? { prompt_spec: cleanPromptSpec } : {}),
+      body: outboundBody,
+      headers,
+    })
     const rejection = await beforeInferencePost?.()
     if (rejection) return rejection
     writeCrsTrace({ body: outboundBody, headers, stream: false })
@@ -1202,6 +1228,7 @@ async function callGoWorkerRaw({
           preserveCacheBreakpoints,
           cliHop,
           cragPrint,
+          promptSpec,
           callerCwd,
           requestContext,
           repaired,
@@ -1360,6 +1387,7 @@ async function streamGoWorkerRaw({
   envelope = null,
   cliHop = false,
   cragPrint = null,
+  promptSpec = null,
   callerCwd = null,
   repaired = false,
   dropSampling = false,
@@ -1390,7 +1418,12 @@ async function streamGoWorkerRaw({
       strictPassthrough,
       safeguardsSanitized,
     })
-    reportEnvelope(onEnvelope, { body: outboundBody, headers })
+    const cleanPromptSpec = !nativeCragRequest(exec, cragPrint) && promptSpec ? sanitizePromptSpec(promptSpec) : null
+    reportEnvelope(onEnvelope, {
+      ...(cleanPromptSpec ? { prompt_spec: cleanPromptSpec } : {}),
+      body: outboundBody,
+      headers,
+    })
     const rejection = await beforeInferencePost?.()
     if (rejection) return rejection
     writeCrsTrace({ body: outboundBody, headers, stream: true })
@@ -1502,6 +1535,7 @@ async function streamGoWorkerRaw({
           preserveCacheBreakpoints,
           cliHop,
           cragPrint,
+          promptSpec,
           callerCwd,
           requestContext,
           repaired,

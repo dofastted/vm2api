@@ -284,7 +284,7 @@ export function ProtocolPane({
           />
         </SettingRow>
         <SettingRow
-          label='CRAG print 丢弃外来 thinking'
+          label='CRAG 丢弃外来 thinking'
           desc={
             cragDropForeignThinkingFromCompat(compat) === 'all'
               ? '全部：不是本账号签发的块都丢（含签名无记录的）。签名记录不完整时（清库、记录开始前的老会话）会误丢本账号 thinking 并让提示缓存失效。'
@@ -294,7 +294,7 @@ export function ProtocolPane({
           }
         >
           <ChipGroup
-            label='CRAG print 丢弃外来 thinking'
+            label='CRAG 丢弃外来 thinking'
             value={cragDropForeignThinkingFromCompat(compat)}
             options={[
               ['off', '关'],

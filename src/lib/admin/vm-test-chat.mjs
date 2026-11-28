@@ -1059,9 +1059,9 @@ export async function runVmTestChat(opts = {}) {
           dataplane === 'crag'
             ? ` · ${kernelRoute}`
             : cliHop
-              ? cliLayout === 'identity'
-                ? ' · cli-hop · CLI 官方提示词'
-                : ' · cli-hop · 0注入'
+              ? cliLayout === 'zero'
+                ? ' · cli-hop · 0注入'
+                : ' · cli-hop · CLI 官方提示词'
               : unofficial
                 ? ' · 非官方 inference 入站'
                 : ' · 官方 Claude Code 入站'

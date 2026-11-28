@@ -176,7 +176,6 @@
 
   "compatibility": {
     "persona_preset": "official_full",
-    "crag_persona_preset": "official_full",
     "craggemini_persona_preset": "official_full",
     "overlay_preset": "off",
     "persona_park": false,

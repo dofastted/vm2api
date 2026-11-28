@@ -385,13 +385,14 @@ test('caller tail drops billing lines and non-text blocks', () => {
   )
 })
 
-test('CRAG print persona does not follow the cli-node preset', () => {
+test('CRAG print persona follows unified SSOT (slot > persona_preset > legacy crag_persona_preset)', () => {
   const routing = { compatibility: { persona_preset: 'official', crag_persona_preset: 'zero' } }
-  assert.equal(resolveCragPrintPersona({}, routing), 'zero')
-  assert.equal(resolveCragPrintPersona({ persona_preset: 'official' }, routing), 'official_full')
+  assert.equal(resolveCragPrintPersona({}, routing), 'official')
+  assert.equal(resolveCragPrintPersona({ persona_preset: 'official' }, routing), 'official')
   assert.equal(resolveCragPrintPersona({ persona_preset: 'official_303' }, routing), 'official_full')
   assert.equal(resolveCragPrintPersona({ persona_preset: 'zero' }, routing), 'zero')
-  assert.equal(resolveCragPrintPersona({}, { compatibility: { persona_preset: 'zero' } }), 'official_full')
+  assert.equal(resolveCragPrintPersona({}, { compatibility: { persona_preset: 'zero' } }), 'zero')
+  assert.equal(resolveCragPrintPersona({}, { compatibility: { crag_persona_preset: 'zero' } }), 'zero')
 })
 
 test('print follows the kernel enabled on the VM, not the global dataplane', () => {
@@ -433,13 +434,15 @@ test('print follows the kernel enabled on the VM, not the global dataplane', () 
   fs.rmSync(root, { recursive: true, force: true })
 })
 
-test('routing save accepts only the two CRAG print presets', () => {
+test('routing save accepts all four unified presets on legacy crag_persona_preset and rejects unknown values', () => {
+  assert.deepEqual(validatePersonaRoutingPatch({ compatibility: { crag_persona_preset: 'official' } }), [])
   assert.deepEqual(validatePersonaRoutingPatch({ compatibility: { crag_persona_preset: 'official_full' } }), [])
   assert.deepEqual(validatePersonaRoutingPatch({ compatibility: { crag_persona_preset: 'zero' } }), [])
+  assert.deepEqual(validatePersonaRoutingPatch({ compatibility: { crag_persona_preset: 'custom' } }), [])
   assert.deepEqual(validatePersonaRoutingPatch({ compatibility: { crag_persona_preset: '' } }), [])
   assert.match(
-    validatePersonaRoutingPatch({ compatibility: { crag_persona_preset: 'official' } })[0],
-    /official_full \/ zero/,
+    validatePersonaRoutingPatch({ compatibility: { crag_persona_preset: 'invalid_mode' } })[0],
+    /official \/ official_full \/ zero \/ custom/,
   )
 })
 
