@@ -8,8 +8,11 @@
  */
 
 import { ignoredErrorSqlList } from '../../admin/error-class.mjs'
+import { getCacheRuntime } from '../../cache/index.mjs'
 
 const AGG_LOCK_KEY = 'vm2api_dashboard_aggregator_v1'
+const LEADER_LOCK_NAME = 'dashboard-agg'
+const LEADER_LOCK_TTL_MS = 300_000
 const DEFAULT_INTERVAL_MS = 60_000
 const OUTBOX_RETENTION_HOURS = 24
 const IGNORED_CODES_SQL = ignoredErrorSqlList()
@@ -24,43 +27,54 @@ let running = false
  * Re-aggregates any hour/day buckets touched since the watermark (with a 2-hour
  * overlap guard for late writes/repricing) so numbers are always exact and idempotent.
  */
-export async function runDashboardAggregation(pool, { fullBackfill = false } = {}) {
+export async function runDashboardAggregation(pool, { fullBackfill = false, cacheRuntime = null } = {}) {
   if (!pool) return { skipped: true, reason: 'no_pool' }
-  const client = await pool.connect()
-  let locked = false
+  const dashboardCache = (cacheRuntime || getCacheRuntime())?.dashboard || null
+  let leaderLock = null
+  if (typeof dashboardCache?.acquireLeaderLock === 'function') {
+    leaderLock = await dashboardCache.acquireLeaderLock(LEADER_LOCK_NAME, LEADER_LOCK_TTL_MS)
+    if (!leaderLock?.acquired) {
+      return { skipped: true, reason: 'leader_lock_busy' }
+    }
+  }
   try {
-    const lockRes = await client.query('SELECT pg_try_advisory_lock(hashtext($1)) AS locked', [AGG_LOCK_KEY])
-    locked = Boolean(lockRes.rows?.[0]?.locked)
-    if (!locked) return { skipped: true, reason: 'lock_busy' }
-
-    const wmRes = await client.query(
-      'SELECT last_aggregated_at, last_aggregated_id FROM usage_dashboard_aggregation_watermark WHERE id = 1',
-    )
-    const prevAt = fullBackfill ? '' : String(wmRes.rows?.[0]?.last_aggregated_at || '')
-
-    // Look back 2 hours from watermark for idempotent bucket refresh on late/repriced rows.
-    let sinceIso = ''
-    if (prevAt) {
-      const parsed = Date.parse(prevAt)
-      if (Number.isFinite(parsed)) {
-        sinceIso = new Date(parsed - 2 * 3_600_000).toISOString()
-      }
-    }
-
-    const maxRes = await client.query('SELECT created_at, id FROM usage_logs ORDER BY created_at DESC, id DESC LIMIT 1')
-    const latestRow = maxRes.rows?.[0] || null
-    if (!latestRow) {
-      return { skipped: false, hourlyBuckets: 0, dailyBuckets: 0, latestAt: '' }
-    }
-
-    const whereClause = sinceIso ? 'WHERE created_at >= $1' : ''
-    const params = sinceIso ? [sinceIso] : []
-
-    await client.query('BEGIN')
+    const client = await pool.connect()
+    let locked = false
     try {
-      // 1. Hourly user set
-      await client.query(
-        `
+      const lockRes = await client.query('SELECT pg_try_advisory_lock(hashtext($1)) AS locked', [AGG_LOCK_KEY])
+      locked = Boolean(lockRes.rows?.[0]?.locked)
+      if (!locked) return { skipped: true, reason: 'lock_busy' }
+
+      const wmRes = await client.query(
+        'SELECT last_aggregated_at, last_aggregated_id FROM usage_dashboard_aggregation_watermark WHERE id = 1',
+      )
+      const prevAt = fullBackfill ? '' : String(wmRes.rows?.[0]?.last_aggregated_at || '')
+
+      // Look back 2 hours from watermark for idempotent bucket refresh on late/repriced rows.
+      let sinceIso = ''
+      if (prevAt) {
+        const parsed = Date.parse(prevAt)
+        if (Number.isFinite(parsed)) {
+          sinceIso = new Date(parsed - 2 * 3_600_000).toISOString()
+        }
+      }
+
+      const maxRes = await client.query(
+        'SELECT created_at, id FROM usage_logs ORDER BY created_at DESC, id DESC LIMIT 1',
+      )
+      const latestRow = maxRes.rows?.[0] || null
+      if (!latestRow) {
+        return { skipped: false, hourlyBuckets: 0, dailyBuckets: 0, latestAt: '' }
+      }
+
+      const whereClause = sinceIso ? 'WHERE created_at >= $1' : ''
+      const params = sinceIso ? [sinceIso] : []
+
+      await client.query('BEGIN')
+      try {
+        // 1. Hourly user set
+        await client.query(
+          `
         INSERT INTO usage_dashboard_hourly_users (bucket_start, user_id)
         SELECT DISTINCT
           date_trunc('hour', created_at::timestamptz) AS bucket_start,
@@ -69,12 +83,12 @@ export async function runDashboardAggregation(pool, { fullBackfill = false } = {
         ${whereClause ? `${whereClause} AND user_id IS NOT NULL AND user_id <> ''` : "WHERE user_id IS NOT NULL AND user_id <> ''"}
         ON CONFLICT (bucket_start, user_id) DO NOTHING
         `,
-        params,
-      )
+          params,
+        )
 
-      // 2. Daily user set (UTC)
-      await client.query(
-        `
+        // 2. Daily user set (UTC)
+        await client.query(
+          `
         INSERT INTO usage_dashboard_daily_users (bucket_date, user_id)
         SELECT DISTINCT
           (created_at::timestamptz AT TIME ZONE 'UTC')::date AS bucket_date,
@@ -83,12 +97,12 @@ export async function runDashboardAggregation(pool, { fullBackfill = false } = {
         ${whereClause ? `${whereClause} AND user_id IS NOT NULL AND user_id <> ''` : "WHERE user_id IS NOT NULL AND user_id <> ''"}
         ON CONFLICT (bucket_date, user_id) DO NOTHING
         `,
-        params,
-      )
+          params,
+        )
 
-      // 3. Hourly aggregate
-      const hourlyRes = await client.query(
-        `
+        // 3. Hourly aggregate
+        const hourlyRes = await client.query(
+          `
         WITH affected AS (
           SELECT DISTINCT date_trunc('hour', created_at::timestamptz) AS bucket_start
           FROM usage_logs
@@ -136,12 +150,12 @@ export async function runDashboardAggregation(pool, { fullBackfill = false } = {
           active_users = EXCLUDED.active_users,
           updated_at = NOW()
         `,
-        params,
-      )
+          params,
+        )
 
-      // 4. Daily aggregate (UTC)
-      const dailyRes = await client.query(
-        `
+        // 4. Daily aggregate (UTC)
+        const dailyRes = await client.query(
+          `
         WITH affected AS (
           SELECT DISTINCT (created_at::timestamptz AT TIME ZONE 'UTC')::date AS bucket_date
           FROM usage_logs
@@ -189,12 +203,12 @@ export async function runDashboardAggregation(pool, { fullBackfill = false } = {
           active_users = EXCLUDED.active_users,
           updated_at = NOW()
         `,
-        params,
-      )
+          params,
+        )
 
-      // 5. Hourly model breakdown
-      await client.query(
-        `
+        // 5. Hourly model breakdown
+        await client.query(
+          `
         WITH affected AS (
           SELECT DISTINCT date_trunc('hour', created_at::timestamptz) AS bucket_start
           FROM usage_logs
@@ -234,66 +248,75 @@ export async function runDashboardAggregation(pool, { fullBackfill = false } = {
           total_cost = EXCLUDED.total_cost,
           actual_cost = EXCLUDED.actual_cost
         `,
-        params,
-      )
+          params,
+        )
 
-      // 6. Advance watermark
-      await client.query(
-        `
+        // 6. Advance watermark
+        await client.query(
+          `
         UPDATE usage_dashboard_aggregation_watermark
         SET last_aggregated_at = $1, last_aggregated_id = $2, updated_at = NOW()
         WHERE id = 1
         `,
-        [String(latestRow.created_at), String(latestRow.id)],
-      )
+          [String(latestRow.created_at), String(latestRow.id)],
+        )
 
-      await client.query('COMMIT')
+        await client.query('COMMIT')
 
-      // Prune stale outbox rows under the same advisory lock so outbox tables stay bounded.
-      let outboxPruned = 0
-      try {
-        const [schedPrune, authPrune] = await Promise.all([
-          client.query(
-            `DELETE FROM scheduler_outbox WHERE created_at < NOW() - INTERVAL '${OUTBOX_RETENTION_HOURS} hours'`,
-          ),
-          client.query(
-            `DELETE FROM auth_cache_invalidation_outbox WHERE created_at < NOW() - INTERVAL '${OUTBOX_RETENTION_HOURS} hours'`,
-          ),
-        ])
-        outboxPruned = (Number(schedPrune.rowCount) || 0) + (Number(authPrune.rowCount) || 0)
-      } catch {}
+        if (typeof dashboardCache?.invalidateNamespaces === 'function') {
+          await dashboardCache.invalidateNamespaces(['stats', 'stats-filtered', 'overview']).catch(() => {})
+        }
 
-      return {
-        skipped: false,
-        hourlyBuckets: hourlyRes.rowCount || 0,
-        dailyBuckets: dailyRes.rowCount || 0,
-        outboxPruned,
-        latestAt: String(latestRow.created_at),
+        // Prune stale outbox rows under the same advisory lock so outbox tables stay bounded.
+        let outboxPruned = 0
+        try {
+          const [schedPrune, authPrune] = await Promise.all([
+            client.query(
+              `DELETE FROM scheduler_outbox WHERE created_at < NOW() - INTERVAL '${OUTBOX_RETENTION_HOURS} hours'`,
+            ),
+            client.query(
+              `DELETE FROM auth_cache_invalidation_outbox WHERE created_at < NOW() - INTERVAL '${OUTBOX_RETENTION_HOURS} hours'`,
+            ),
+          ])
+          outboxPruned = (Number(schedPrune.rowCount) || 0) + (Number(authPrune.rowCount) || 0)
+        } catch {}
+
+        return {
+          skipped: false,
+          hourlyBuckets: hourlyRes.rowCount || 0,
+          dailyBuckets: dailyRes.rowCount || 0,
+          outboxPruned,
+          latestAt: String(latestRow.created_at),
+        }
+      } catch (err) {
+        try {
+          await client.query('ROLLBACK')
+        } catch {}
+        throw err
       }
-    } catch (err) {
-      try {
-        await client.query('ROLLBACK')
-      } catch {}
-      throw err
+    } finally {
+      if (locked) {
+        try {
+          await client.query('SELECT pg_advisory_unlock(hashtext($1))', [AGG_LOCK_KEY])
+        } catch {}
+      }
+      client.release()
     }
   } finally {
-    if (locked) {
-      try {
-        await client.query('SELECT pg_advisory_unlock(hashtext($1))', [AGG_LOCK_KEY])
-      } catch {}
+    if (leaderLock?.acquired && typeof dashboardCache?.releaseLeaderLock === 'function') {
+      await dashboardCache.releaseLeaderLock(LEADER_LOCK_NAME, leaderLock).catch(() => {})
     }
-    client.release()
   }
 }
 
-export function startDashboardAggregator(pool, { intervalMs = DEFAULT_INTERVAL_MS } = {}) {
+export function startDashboardAggregator(pool, { intervalMs = DEFAULT_INTERVAL_MS, cacheRuntime = null } = {}) {
   stopDashboardAggregator()
   if (!pool) return
   const tick = async () => {
     if (running) return
     running = true
     try {
-      await runDashboardAggregation(pool)
+      await runDashboardAggregation(pool, { cacheRuntime })
     } catch (err) {
       console.warn('[dashboard-aggregator]', err?.message || err)
     } finally {

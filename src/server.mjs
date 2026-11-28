@@ -154,8 +154,9 @@ import { GATEWAY_CAPABILITIES } from './lib/vm/execution-context.mjs'
 import { isTelemetryPath, telemetryInterceptResponse } from './lib/identity/telemetry-rewrite.mjs'
 import { openDatabaseAsync, closeDatabaseAsync, getDb, getDbEngine, getPgPool } from './lib/db/database.mjs'
 import { startDashboardAggregator, stopDashboardAggregator } from './lib/db/pg/dashboard-aggregator.mjs'
-import { snapshotCacheMetrics } from './lib/cache/index.mjs'
-import { armWriteBehind } from './lib/db/write-behind.mjs'
+import { startPgLogWriter, stopPgLogWriter } from './lib/db/pg/pg-log-writer.mjs'
+import { closeCacheRuntime, snapshotCacheMetrics } from './lib/cache/index.mjs'
+import { armWriteBehind, flushWrites } from './lib/db/write-behind.mjs'
 import { JevUsageRepo } from './lib/db/repos/jev-usage-repo.mjs'
 import { installJevUsageRecorder } from './lib/protocol/jev-usage.mjs'
 import { jevHealthSnapshot, readJevConfig } from './lib/protocol/jev-intercept.mjs'
@@ -388,6 +389,9 @@ const allowRate = createRateLimiter({
 const dataDir = cfg.paths.data || path.join(cfg.paths.root, 'data')
 await openDatabaseAsync({ dataDir, pooled: true, enableAggregator: false })
 armWriteBehind(getDb())
+if (getDbEngine() === 'postgres' && getPgPool()) {
+  startPgLogWriter(getPgPool())
+}
 const jevUsageRepo = new JevUsageRepo()
 installJevUsageRecorder((event) => jevUsageRepo.record(event))
 try {
@@ -588,6 +592,7 @@ accountQuota = new AccountQuota({
 accountQuota.loadVmQuotaOverrides(listVms(cfg.paths.project))
 
 const apiKeyStore = new ApiKeyStore({ dataDir: cfg.paths.data })
+apiKeyStore.startUsageFlusher()
 groupsRepo = new GroupsRepo()
 let geminiOwnersRepo = new GeminiOwnersRepo()
 const geminiOwnersProxy = {
@@ -1171,12 +1176,16 @@ function requireAuth(req, res, { keyGate = true, buyer = false, optionalBuyer = 
         }),
       )
     }
-    req.panelUser = session.user
-    req.panelRole = session.role || panelUsers.getByUsername(session.user)?.role || 'user'
     const rec = panelUsers.getByUsername(session.user)
+    req.panelUser = session.user
+    req.panelRole = session.role || rec?.role || 'user'
     req.panelUserId = rec?.id || null
     req.panelVmCreateQuota = rec?.vm_create_quota ?? 0
     if (buyer) req.panelBuyerOwner = sessionBuyerOwner(session, rec, getPanelAdmin())
+    if (!buyer) {
+      req._authVerified = true
+      req._authVerifiedWithGate = Boolean(req._authVerifiedWithGate || keyGate)
+    }
     return true
   }
   if (buyer) {
@@ -1204,6 +1213,8 @@ function requireAuth(req, res, { keyGate = true, buyer = false, optionalBuyer = 
     req.apiKeyKind = 'master'
     req.panelRole = 'admin'
     req.panelUser = 'master'
+    req._authVerified = true
+    req._authVerifiedWithGate = Boolean(req._authVerifiedWithGate || keyGate)
     return true
   }
 
@@ -1242,6 +1253,130 @@ function requireAuth(req, res, { keyGate = true, buyer = false, optionalBuyer = 
   }
   req.apiKeyKind = 'managed'
   req.apiKeyRecord = managed.record
+  req._authVerified = true
+  req._authVerifiedWithGate = Boolean(req._authVerifiedWithGate || keyGate)
+  return true
+}
+
+/**
+ * Async hot-path authentication for `/v1/*` proxy ingress:
+ * uses `apiKeyStore.authenticateAsync` (L1 + Redis L2 + 30s bounded L1 negative cache)
+ * and `apiKeyStore.canAcceptAsync` (Redis ConcurrencyCache + RPM), and short-circuits
+ * when an earlier route guard (e.g. `isGeminiSharedPath`) already authenticated this request.
+ */
+async function requireAuthAsync(req, res, { keyGate = true, buyer = false, optionalBuyer = false } = {}) {
+  if (!buyer && req._authVerified && (!keyGate || req._authVerifiedWithGate)) {
+    return true
+  }
+  req.presentedApiKey = extractApiKey(req)
+  const token = extractPanelToken(req) || req.presentedApiKey
+  if (!token) {
+    if (buyer && optionalBuyer) return false
+    return rejectAuth(
+      req,
+      res,
+      makeError({
+        type: ErrorType.AUTH,
+        code: ErrorCode.MISSING_API_KEY,
+        message: 'Missing credentials. Login at /api/panel/login or provide Authorization Bearer token.',
+        status: 401,
+      }),
+    )
+  }
+  const session = verifyPanelSession(token)
+  if (session) {
+    if (!allowRate('panel:' + session.user)) {
+      return rejectAuth(
+        req,
+        res,
+        makeError({
+          type: ErrorType.RATE_LIMIT,
+          code: ErrorCode.GATEWAY_RATE_LIMIT,
+          message: 'Gateway rate limit exceeded. Retry later.',
+          status: 429,
+        }),
+      )
+    }
+    const rec =
+      typeof panelUsers.getByUsernameAsync === 'function'
+        ? await panelUsers.getByUsernameAsync(session.user)
+        : panelUsers.getByUsername(session.user)
+    req.panelUser = session.user
+    req.panelRole = session.role || rec?.role || 'user'
+    req.panelUserId = rec?.id || null
+    req.panelVmCreateQuota = rec?.vm_create_quota ?? 0
+    if (buyer) req.panelBuyerOwner = sessionBuyerOwner(session, rec, getPanelAdmin())
+    if (!buyer) {
+      req._authVerified = true
+      req._authVerifiedWithGate = Boolean(req._authVerifiedWithGate || keyGate)
+    }
+    return true
+  }
+  if (buyer) {
+    if (optionalBuyer) return false
+    json(res, 403, {
+      ok: false,
+      error: { code: 'shop_login_required', message: 'Sign in to the panel to access CRAG shop' },
+    })
+    return false
+  }
+  if (timingSafeEqualStr(token, cfg.api_key)) {
+    if (cfg.limits.rate_capacity_explicit && !allowRate(token)) {
+      return rejectAuth(
+        req,
+        res,
+        makeError({
+          type: ErrorType.RATE_LIMIT,
+          code: ErrorCode.GATEWAY_RATE_LIMIT,
+          message: 'Gateway rate limit exceeded. Retry later.',
+          status: 429,
+        }),
+      )
+    }
+    req.apiKeyKind = 'master'
+    req.panelRole = 'admin'
+    req.panelUser = 'master'
+    req._authVerified = true
+    req._authVerifiedWithGate = Boolean(req._authVerifiedWithGate || keyGate)
+    return true
+  }
+
+  const managed = await apiKeyStore.authenticateAsync(token)
+  if (!managed.ok) {
+    return rejectAuth(
+      req,
+      res,
+      makeError({
+        type: ErrorType.AUTH,
+        code: ErrorCode.INVALID_API_KEY,
+        message: 'Invalid credentials',
+        status: 401,
+      }),
+    )
+  }
+  if (
+    managed.record.group_type === 'gemini' &&
+    !geminiKeyAllowsPath(parseRequestUrl(req)?.pathname || '', req.method)
+  ) {
+    return rejectAuth(
+      req,
+      res,
+      makeError({
+        type: ErrorType.PERMISSION,
+        code: 'key_group_mismatch',
+        message: 'This key can only call Gemini endpoints.',
+        status: 403,
+      }),
+    )
+  }
+  const gate = keyGate ? await apiKeyStore.canAcceptAsync(managed.record) : { ok: true }
+  if (!gate.ok) {
+    return rejectAuth(req, res, makeApiKeyGateError(gate))
+  }
+  req.apiKeyKind = 'managed'
+  req.apiKeyRecord = managed.record
+  req._authVerified = true
+  req._authVerifiedWithGate = Boolean(req._authVerifiedWithGate || keyGate)
   return true
 }
 
@@ -1297,6 +1432,7 @@ const { handleProtocol, handleSearch, handleImages } = createHandleProtocol({
   writeSSEHeaders,
   readBody,
   requireAuth,
+  requireAuthAsync,
   cfg,
   requestLog,
   stickyRouter,
@@ -1905,6 +2041,26 @@ const gracefulShutdown = createGracefulShutdown({
       console.warn('[shutdown] scheduler-runtime shutdown failed', e?.message || e)
     }
     try {
+      await apiKeyStore.close()
+    } catch (e) {
+      console.warn('[shutdown] api-key usage flush failed', e?.message || e)
+    }
+    try {
+      await stopPgLogWriter()
+    } catch (e) {
+      console.warn('[shutdown] pg-log-writer stop failed', e?.message || e)
+    }
+    try {
+      flushWrites()
+    } catch (e) {
+      console.warn('[shutdown] write-behind flush failed', e?.message || e)
+    }
+    try {
+      await closeCacheRuntime()
+    } catch (e) {
+      console.warn('[shutdown] cache runtime close failed', e?.message || e)
+    }
+    try {
       await closeDatabaseAsync()
     } catch {}
   },
@@ -2063,7 +2219,7 @@ const server = http.createServer(async (req, res) => {
       req.method === 'GET' &&
       (p === '/v1/models' || p === '/models' || p === '/v1beta/models' || Boolean(singleModelGet))
     ) {
-      if (!requireAuth(req, res)) return
+      if (!(await requireAuthAsync(req, res))) return
       const modelOwnerScope = ownerScopeFromRequest(req, apiKeyStore?.users)
       const modelVms = listVms(cfg.paths.project)
       const modelApiEndpoints = apiEndpointStore.listRaw()
@@ -2243,7 +2399,7 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, filtered)
     }
     if (req.method === 'POST' && p === '/admin/models/refresh') {
-      if (!requireAuth(req, res)) return
+      if (!(await requireAuthAsync(req, res))) return
       const result = await fetchWorkerModels()
       return json(res, 200, result)
     }
@@ -2280,7 +2436,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (isGeminiPublicPath(p)) {
-      if (!requireAuth(req, res)) return
+      if (!(await requireAuthAsync(req, res))) return
       const gemGen = req.method === 'POST' ? parseGeminiGeneratePath(p) : null
       const backend = resolveInferenceBackend(req)
       if (gemGen && backend === 'api') {
@@ -2326,7 +2482,7 @@ const server = http.createServer(async (req, res) => {
     // every other caller would get gemini_key_required. requireAuth has to run
     // first: it is what populates the key record this reads.
     if (isGeminiSharedPath(p)) {
-      if (!requireAuth(req, res)) return
+      if (!(await requireAuthAsync(req, res))) return
       if (keyScopeFromRequest(req).group_type === 'gemini') return handleGeminiPublic(req, res)
     }
 

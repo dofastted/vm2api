@@ -359,6 +359,29 @@ function makeAbortError(message = 'Selection cancelled') {
   return Object.assign(new Error(message), { code: 'selection_cancelled' })
 }
 
+const DEFAULT_HEARTBEAT_QUIET_WINDOW_MS = 15_000
+
+function heartbeatFingerprint(update) {
+  const ws = update?.worker_status || {}
+  const cred = ws?.credential || {}
+  return JSON.stringify([
+    update?.vm_id || null,
+    update?.status || null,
+    Number(update?.credential_generation) || 0,
+    update?.refresh_status || null,
+    ws?.ok ?? null,
+    ws?.engine || null,
+    ws?.worker_version || null,
+    ws?.runtime_variant || null,
+    ws?.dataplane || null,
+    ws?.last_error || ws?.error || null,
+    cred?.has_access ?? null,
+    cred?.has_refresh ?? null,
+    cred?.expires_at || null,
+    cred?.credential_state || null,
+  ])
+}
+
 function allowedClaudeNodeKeysFromScope(keyScope) {
   if (!keyScope || typeof keyScope !== 'object') return undefined
   if (Array.isArray(keyScope.allowed_vms) && keyScope.allowed_vms.length > 0) {
@@ -410,6 +433,11 @@ export class PoolScheduler extends EventEmitter {
     this.workerUnreachable = new Map()
     this.healthFlights = new Map()
     this.healthWrites = new Map()
+    this._lastWrittenHeartbeats = new Map() // accountId -> { fingerprint, at }
+    this.heartbeatQuietWindowMs =
+      config?.heartbeat_quiet_window_ms !== undefined
+        ? Math.max(0, Number(config.heartbeat_quiet_window_ms) || 0)
+        : DEFAULT_HEARTBEAT_QUIET_WINDOW_MS
     this.maintenanceTimer = null
     this.maintenanceFlight = null
     this.maintenanceStopped = false
@@ -846,8 +874,17 @@ export class PoolScheduler extends EventEmitter {
 
   async flushHealthWrites() {
     if (this.maintenanceStopped || !this.runtimeRepo) return
+    const quietMs = Math.max(0, Number(this.heartbeatQuietWindowMs) || 0)
     for (const [accountId, update] of this.healthWrites) {
+      const fp = heartbeatFingerprint(update)
+      const now = Number(update?.worker_heartbeat_at) || Date.now()
+      const prev = this._lastWrittenHeartbeats.get(accountId)
+      if (quietMs > 0 && prev && prev.fingerprint === fp && now - prev.at < quietMs) {
+        if (this.healthWrites.get(accountId) === update) this.healthWrites.delete(accountId)
+        continue
+      }
       await this.runtimeRepo.writeHeartbeat(update)
+      this._lastWrittenHeartbeats.set(accountId, { fingerprint: fp, at: now })
       if (this.healthWrites.get(accountId) === update) this.healthWrites.delete(accountId)
     }
   }
@@ -882,6 +919,7 @@ export class PoolScheduler extends EventEmitter {
     const ids = [...new Set([accountId, vmId].filter(Boolean))]
     let cleared = false
     for (const id of ids) {
+      this._lastWrittenHeartbeats.delete(id)
       try {
         if (this.runtimeRepo?.clearAuthCooldown?.(id, { vmId })) cleared = true
       } catch {}
@@ -897,6 +935,7 @@ export class PoolScheduler extends EventEmitter {
     const ids = [...new Set([accountId, vmId].filter(Boolean))]
     let cleared = false
     for (const id of ids) {
+      this._lastWrittenHeartbeats.delete(id)
       try {
         if (this.runtimeRepo?.clearGrantRevokeCooldown?.(id, { vmId })) cleared = true
       } catch {}
@@ -1030,6 +1069,7 @@ export class PoolScheduler extends EventEmitter {
   }
 
   markCooldown(candidate, { until, reason, model = null, status = 'cooldown' } = {}) {
+    if (candidate?.accountId) this._lastWrittenHeartbeats.delete(candidate.accountId)
     this.runtimeRepo?.markCooldown?.(candidate.accountId, {
       vmId: candidate.vmId,
       until,

@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.4.264 — 2026-11-28 · PostgreSQL + Redis 热路径与实时日志 I/O 优化（含 PG 迁移 `011`）
+
+- **缓存底座、面板读、请求热路径、日志批写四块性能优化（#2102）**：针对 PostgreSQL + Redis 部署，减少面板查询与请求热路径上的同步 PG 往返、修复缓存失效缺陷、把日志落库改为异步批写。
+  - **缓存底座**：`MultiTierCacheClient` 的 L2 前缀失效真正清除远端 Redis 键、L1 回填对齐 Redis 剩余 TTL；新增 SWR、进程内 `SnapshotCache`（含 ETag）、`DashboardCache` 分布式 Leader 锁、`EntityCache`（面板用户、分组费率、配置、池授权、VM 归属）与 `LiveLogCache`；常规 `api_keys` 用量更新不再触发全局 `apiKeys.invalidateAll()`；`auth/scheduler` outbox 默认不再写入
+  - **面板读**：5 张 `usage_dashboard_*` 预聚合表接入统计查询（非整点时区、SQLite、细粒度筛选自动回退）；VM 列表消除逐账户 N+1；`/dashboard`、`/vms`、`/usage`、`/pools`、`/api-keys`、`/statistics`、`/billing` 等高频接口接入 SWR / SnapshotCache / ETag(304)，面板与调度池写操作后精准失效
+  - **请求热路径**：`/v1/*` 鉴权走 L1+L2 缓存与有界负缓存；用户并发、RPM、Sticky、`AccountQuota.snapshot()`、拒答封禁、Thinking 签名查写由 Redis/内存优先；**`api_keys` 用量稳态改为 1.5 秒合批写回**，命中 USD / 请求数 / 消费窗口边界时同步直写以防透支；`server.mjs` 补齐优雅停机排干顺序
+  - **日志**：PG 引擎下新增 `PgLogWriter`（多行批写、故障隔离、自动分片避开 65535 参数上限、满队直写不丢日志、停机排干），日志页新增在飞（in-flight）实时展示与稳定行键；`usage_logs` 保留策略清理改为 `ctid` 分批
+  - **PG 迁移 `011_drop_duplicate_usage_logs_indexes.sql`**：幂等 `DROP INDEX IF EXISTS`，删除与 `idx_reqlog_ts`、唯一 `idx_reqlog_reqid` 重复的 `idx_reqlog_cost_ts`、`idx_usage_logs_request_id`；SQLite 不受影响
+- **升级前请知悉（已知未验证项）**：
+  - 作者在合并说明中确认**未在真实外置 PostgreSQL + Redis 上跑端到端与压测**，合并后另有 1 个依赖真实 PG 的用例被跳过；该版本已按项目负责人的决定合并，建议先在灰度/预发环境验证后再全量升级
+  - **多实例注意**：`api_keys` 用量稳态为本进程合批、1.5 秒刷盘，额度判断基于本进程快照。蓝绿切换窗口或多副本并行时，额度临界点附近可能出现少量超发；超发量级大致取决于「实例数 × 1.5 秒内的请求量」，这是评审时的推断，**没有测试覆盖也没有实测**；对按额度计费的租户请留意
+  - 回退方式：Redis 可用 `REDIS_URL=1` 禁用，自动降级为 L1 + PG `LISTEN/NOTIFY`；SQLite 部署不启用异步 PG 日志写入
+- 部署说明：包含 **PostgreSQL 迁移 `011`**（升级时自动应用，仅删除重复索引，可幂等重跑）；零 Rust 变更、零 `deploy/payload.json` 变更；升级后重启控制面生效。
+
 ## 1.4.263 — 2026-11-28 · 修复无参工具调用被误判为 `502 native_handoff_invalid`
 
 - **无参工具调用的空 `input_json_delta` 不再残留 `_inputJson`（#2101）**：Anthropic 在流式返回无参工具（如 `CronList`、`ListAgents`）时，会在 `content_block_start`（`input: {}`）与 `content_block_stop` 之间发一条空的 `input_json_delta`（`partial_json: ""`）。`src/lib/protocol/convert.mjs` 的 `applyClaudeSSELineToMessage` 在收尾时用 `if (block._inputJson)` 判断，空串为假值导致整段被跳过、`_inputJson` 没有删除；下游 `native-handoff.mjs` 看到 `Object.hasOwn(block, '_inputJson')` 就把这个合法的无参调用判成 `502 native_handoff_invalid: Native tool batch has invalid identity or arguments`，并让 `issued-tool-replay` 跳过记录。

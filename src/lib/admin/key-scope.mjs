@@ -4,7 +4,8 @@
  * vm_pool_id schedules the pool's current members instead of a copied allowlist.
  * group_id (coding/other) is a rate multiplier and is not this field.
  */
-import { isDbOpen, getDb } from '../db/database.mjs'
+import { DB_INSTANCE_ID, isDbOpen, getDb } from '../db/database.mjs'
+import { getCacheRuntime } from '../cache/index.mjs'
 import { SchedulerPoolsRepo } from '../db/repos/scheduler-pools-repo.mjs'
 import { VmPoolsRepo } from '../db/repos/vm-pools-repo.mjs'
 import { resolveUpstreamModel, stripAntigravityPrefix } from '../gemini/model-catalog.mjs'
@@ -118,25 +119,67 @@ export function keyScopeFromRecord(rec) {
   }
 }
 
+const cachedSchedPoolsRepos = new WeakMap()
+const cachedVmPoolsRepos = new WeakMap()
+
+function getSchedPoolsRepo(db) {
+  let repo = cachedSchedPoolsRepos.get(db)
+  if (!repo) {
+    repo = new SchedulerPoolsRepo(db)
+    cachedSchedPoolsRepos.set(db, repo)
+  }
+  return repo
+}
+
+function getVmPoolsRepo(db) {
+  let repo = cachedVmPoolsRepos.get(db)
+  if (!repo) {
+    repo = new VmPoolsRepo(db)
+    cachedVmPoolsRepos.set(db, repo)
+  }
+  return repo
+}
+
+function poolEntityScopePrefix(db) {
+  if (isDbOpen() && db === getDb()) return ''
+  return `${db?.[DB_INSTANCE_ID] || 'isolated'}:`
+}
+
+function shouldUsePoolAccessCache(poolsRepo, useCache) {
+  if (typeof useCache === 'boolean') return useCache
+  const cache = getCacheRuntime()
+  if (!cache?.client?.enabled) return false
+  if (!poolsRepo) return isDbOpen()
+  if (!poolsRepo.db) return false
+  return poolsRepo.db.engine === 'postgres' || cache.client.hasRedis
+}
+
 function defaultPoolLookup(id) {
   if (!isDbOpen()) return null
   const db = getDb()
-  try {
-    const schedPool = new SchedulerPoolsRepo(db).get(id)
-    if (schedPool) {
-      return {
-        id: schedPool.id,
-        name: schedPool.name,
-        enabled: schedPool.enabled,
-        vm_ids: (schedPool.members || [])
-          .filter((m) => m.enabled !== false && (m.node_type === 'claude_vm' || m.node_type === 'codex_vm'))
-          .map((m) => m.node_id),
+  const load = () => {
+    try {
+      const schedPool = getSchedPoolsRepo(db).get(id)
+      if (schedPool) {
+        return {
+          id: schedPool.id,
+          name: schedPool.name,
+          enabled: schedPool.enabled,
+          vm_ids: (schedPool.members || [])
+            .filter((m) => m.enabled !== false && (m.node_type === 'claude_vm' || m.node_type === 'codex_vm'))
+            .map((m) => m.node_id),
+        }
       }
+    } catch {
+      // Databases before migration 071 fall back to vm_pools.
     }
-  } catch {
-    // Databases before migration 071 fall back to vm_pools.
+    return getVmPoolsRepo(db).get(id)
   }
-  return new VmPoolsRepo(db).get(id)
+  const cache = getCacheRuntime()
+  if (cache?.client?.enabled && (db.engine === 'postgres' || cache.client.hasRedis)) {
+    return cache.entity.getPoolAccessSync(`vmpool:${id}`, load)
+  }
+  return load()
 }
 
 /** Live membership. A missing, disabled, or empty pool never widens to the global set. */
@@ -734,8 +777,17 @@ export function resolvePoolAccessForKey({
   geminiOwnerMap = null,
   apiEndpoints = null,
   ownerScope = null,
+  useCache = null,
 } = {}) {
-  const repo = poolsRepo || (isDbOpen() ? new SchedulerPoolsRepo(getDb()) : null)
+  const repo = poolsRepo || (isDbOpen() ? getSchedPoolsRepo(getDb()) : null)
+  const cacheEnabled = Boolean(repo && shouldUsePoolAccessCache(poolsRepo, useCache))
+  const scopePrefix = cacheEnabled ? poolEntityScopePrefix(repo.db) : ''
+  const entityCache = cacheEnabled ? getCacheRuntime().entity : null
+  const loadPoolById = (poolId) => {
+    if (!poolId || !repo?.get) return null
+    if (!entityCache) return repo.get(poolId) || null
+    return entityCache.getPoolAccessSync(`${scopePrefix}pool:${poolId}`, () => repo.get(poolId) || null)
+  }
   const isMaster = apiKeyKind === 'master' || !key
   const reqPool = requestedPoolId == null ? null : String(requestedPoolId).trim() || null
   const downgradeId =
@@ -750,7 +802,9 @@ export function resolvePoolAccessForKey({
   let boundRows = []
   if (!isMaster && key?.id && repo) {
     try {
-      boundRows = repo.listBindingsByKey(key.id)
+      boundRows = entityCache
+        ? entityCache.getPoolAccessSync(`${scopePrefix}bindings:${key.id}`, () => repo.listBindingsByKey(key.id)) || []
+        : repo.listBindingsByKey(key.id)
     } catch {
       boundRows = []
     }
@@ -820,7 +874,7 @@ export function resolvePoolAccessForKey({
 
   let originPool = null
   if (originPoolId) {
-    originPool = repo?.get?.(originPoolId) || null
+    originPool = loadPoolById(originPoolId)
     if (!originPool) {
       return {
         ok: false,
@@ -848,7 +902,7 @@ export function resolvePoolAccessForKey({
   let effectivePool = originPool
   let isDowngraded = false
   if (downgradeId) {
-    const dp = repo?.get?.(downgradeId) || null
+    const dp = loadPoolById(downgradeId)
     const isTrustedTarget = Boolean(dp && dp.enabled && (dp.pool_role === 'downgrade' || trustedSet.has(dp.id)))
     if (!isTrustedTarget) {
       return {

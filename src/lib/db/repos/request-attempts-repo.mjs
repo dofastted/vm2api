@@ -1,5 +1,6 @@
 import { getDb } from '../database.mjs'
 import { enqueueWrite, writeBehindArmed } from '../write-behind.mjs'
+import { getPgLogWriter } from '../pg/pg-log-writer.mjs'
 import { sanitizeErrorDetailsForLog, sanitizeErrorToken } from '../../core/errors.mjs'
 import { correlationIdForLog } from '../../protocol/log-fields.mjs'
 
@@ -80,8 +81,10 @@ function rowToAttempt(row) {
 }
 
 export class RequestAttemptsRepo {
-  constructor(db = getDb()) {
+  constructor(db = getDb(), { pgLogWriter = null, forceSyncWrite = false } = {}) {
     this.db = db
+    this._pgLogWriter = pgLogWriter
+    this._forceSyncWrite = !!forceSyncWrite
     this._insert = db.prepare(`
       INSERT INTO request_attempts (
         request_id, attempt_no, vm_id, account_id, model, selection_reason,
@@ -113,6 +116,16 @@ export class RequestAttemptsRepo {
     `)
   }
 
+  _activePgLogWriter() {
+    if (this._forceSyncWrite) return null
+    if (this._pgLogWriter) {
+      return this._pgLogWriter.stats?.().closed ? null : this._pgLogWriter
+    }
+    if (this.db?.engine !== 'postgres') return null
+    const writer = getPgLogWriter()
+    return writer && !writer.stats?.().closed ? writer : null
+  }
+
   begin({
     requestId,
     attemptNo,
@@ -126,6 +139,41 @@ export class RequestAttemptsRepo {
     hopRequestId = null,
   }) {
     const startedAt = new Date().toISOString()
+    const safeHopRequestId = correlationIdForLog(hopRequestId)
+    const pgWriter = this._activePgLogWriter()
+    if (pgWriter) {
+      pgWriter.enqueueAttempt({
+        request_id: requestId,
+        attempt_no: attemptNo,
+        vm_id: vmId ?? null,
+        account_id: accountId ?? null,
+        model: model ?? null,
+        selection_reason: selectionReason ?? null,
+        started_at: startedAt,
+        completed_at: null,
+        upstream_status: null,
+        error_scope: null,
+        action: null,
+        cooldown_until: null,
+        downstream_committed: 0,
+        terminal_state: 'started',
+        usage_json: null,
+        wait_ms: waitMs ?? 0,
+        ttft_ms: null,
+        latency_ms: null,
+        queue_wait_ms: queueWaitMs,
+        scheduling_ms: schedulingMs,
+        error_code: null,
+        upstream_type: null,
+        error_details_json: null,
+        hop_request_id: safeHopRequestId,
+        provider_run_id: null,
+        provider_turn_id: null,
+        provider_attempt_id: null,
+        provider_request_id: null,
+      })
+      return null
+    }
     const write = () => {
       this._insert.run(
         requestId,
@@ -151,7 +199,7 @@ export class RequestAttemptsRepo {
         null,
         null,
         null,
-        correlationIdForLog(hopRequestId),
+        safeHopRequestId,
         null,
         null,
         null,
@@ -185,21 +233,50 @@ export class RequestAttemptsRepo {
     )
     const providerAttemptId = normalizeProviderAttemptId(result.providerAttemptId)
     const providerRequestId = correlationIdForLog(result.providerRequestId)
+    const cooldownUntil = normalizeCooldownUntilMs(result.cooldownUntil)
+    const usageJson = result.usage != null ? JSON.stringify(result.usage) : null
+    const errorDetailsJson = errorDetails ? JSON.stringify(errorDetails) : null
+    const pgWriter = this._activePgLogWriter()
+    if (pgWriter) {
+      pgWriter.enqueueAttempt({
+        request_id: requestId,
+        attempt_no: attemptNo,
+        completed_at: completedAt,
+        upstream_status: result.upstreamStatus ?? null,
+        error_scope: result.errorScope ?? null,
+        action: result.action ?? null,
+        cooldown_until: cooldownUntil,
+        downstream_committed: result.downstreamCommitted ? 1 : 0,
+        terminal_state: result.terminalState ?? null,
+        usage_json: usageJson,
+        ttft_ms: result.ttftMs ?? null,
+        latency_ms: result.latencyMs ?? null,
+        error_code: errorCode,
+        upstream_type: upstreamType,
+        error_details_json: errorDetailsJson,
+        hop_request_id: hopRequestId,
+        provider_run_id: providerRunId,
+        provider_turn_id: providerTurnId,
+        provider_attempt_id: providerAttemptId,
+        provider_request_id: providerRequestId,
+      })
+      return null
+    }
     const write = () => {
       this._complete.run(
         completedAt,
         result.upstreamStatus ?? null,
         result.errorScope ?? null,
         result.action ?? null,
-        normalizeCooldownUntilMs(result.cooldownUntil),
+        cooldownUntil,
         result.downstreamCommitted ? 1 : 0,
         result.terminalState ?? null,
-        result.usage != null ? JSON.stringify(result.usage) : null,
+        usageJson,
         result.ttftMs ?? null,
         result.latencyMs ?? null,
         errorCode,
         upstreamType,
-        errorDetails ? JSON.stringify(errorDetails) : null,
+        errorDetailsJson,
         hopRequestId,
         providerRunId,
         providerTurnId,
@@ -215,6 +292,120 @@ export class RequestAttemptsRepo {
     }
     write()
     return this.list(requestId).find((item) => item.attempt_no === attemptNo) || null
+  }
+
+  /** Single-shot attempt upsert (accepts snake_case or camelCase fields). */
+  record(attempt = {}) {
+    if (!attempt || typeof attempt !== 'object') return null
+    const requestId = attempt.request_id ?? attempt.requestId
+    const attemptNo = attempt.attempt_no ?? attempt.attemptNo
+    if (!requestId || attemptNo == null) return null
+
+    const startedAt = attempt.started_at ?? attempt.startedAt ?? new Date().toISOString()
+    const completedAt = attempt.completed_at ?? attempt.completedAt ?? null
+    const errorCode = sanitizeErrorToken(attempt.error_code ?? attempt.errorCode, 128)
+    const rawErrDetails = attempt.error_details ?? attempt.errorDetails
+    const upstreamType = sanitizeErrorToken(
+      attempt.upstream_type ?? attempt.upstreamType ?? rawErrDetails?.upstream_type,
+      128,
+    )
+    const errorDetails = sanitizeErrorDetailsForLog(rawErrDetails, {
+      status: attempt.upstream_status ?? attempt.upstreamStatus ?? null,
+      upstreamType,
+    })
+    const hopRequestId = correlationIdForLog(attempt.hop_request_id ?? attempt.hopRequestId)
+    const providerRunId = correlationIdForLog(attempt.provider_run_id ?? attempt.providerRunId)
+    const rawTurnId = attempt.provider_turn_id ?? attempt.providerTurnId
+    const providerTurnId = correlationIdForLog(
+      typeof rawTurnId === 'number' && Number.isSafeInteger(rawTurnId) && rawTurnId >= 0
+        ? String(rawTurnId)
+        : rawTurnId,
+    )
+    const providerAttemptId = normalizeProviderAttemptId(attempt.provider_attempt_id ?? attempt.providerAttemptId)
+    const providerRequestId = correlationIdForLog(attempt.provider_request_id ?? attempt.providerRequestId)
+    const cooldownUntil = normalizeCooldownUntilMs(attempt.cooldown_until ?? attempt.cooldownUntil)
+    const rawUsage = attempt.usage_json !== undefined ? attempt.usage_json : attempt.usage
+    const usageJson = rawUsage == null ? null : typeof rawUsage === 'string' ? rawUsage : JSON.stringify(rawUsage)
+    const errorDetailsJson =
+      attempt.error_details_json !== undefined
+        ? attempt.error_details_json
+        : errorDetails
+          ? JSON.stringify(errorDetails)
+          : null
+
+    const pgWriter = this._activePgLogWriter()
+    if (pgWriter) {
+      pgWriter.enqueueAttempt({
+        request_id: requestId,
+        attempt_no: attemptNo,
+        vm_id: attempt.vm_id ?? attempt.vmId ?? null,
+        account_id: attempt.account_id ?? attempt.accountId ?? null,
+        model: attempt.model ?? null,
+        selection_reason: attempt.selection_reason ?? attempt.selectionReason ?? null,
+        started_at: startedAt,
+        completed_at: completedAt,
+        upstream_status: attempt.upstream_status ?? attempt.upstreamStatus ?? null,
+        error_scope: attempt.error_scope ?? attempt.errorScope ?? null,
+        action: attempt.action ?? null,
+        cooldown_until: cooldownUntil,
+        downstream_committed: (attempt.downstream_committed ?? attempt.downstreamCommitted) ? 1 : 0,
+        terminal_state: attempt.terminal_state ?? attempt.terminalState ?? 'started',
+        usage_json: usageJson,
+        wait_ms: attempt.wait_ms ?? attempt.waitMs ?? 0,
+        ttft_ms: attempt.ttft_ms ?? attempt.ttftMs ?? null,
+        latency_ms: attempt.latency_ms ?? attempt.latencyMs ?? null,
+        queue_wait_ms: attempt.queue_wait_ms ?? attempt.queueWaitMs ?? null,
+        scheduling_ms: attempt.scheduling_ms ?? attempt.schedulingMs ?? null,
+        error_code: errorCode,
+        upstream_type: upstreamType,
+        error_details_json: errorDetailsJson,
+        hop_request_id: hopRequestId,
+        provider_run_id: providerRunId,
+        provider_turn_id: providerTurnId,
+        provider_attempt_id: providerAttemptId,
+        provider_request_id: providerRequestId,
+      })
+      return null
+    }
+
+    const write = () => {
+      this._insert.run(
+        requestId,
+        attemptNo,
+        attempt.vm_id ?? attempt.vmId ?? null,
+        attempt.account_id ?? attempt.accountId ?? null,
+        attempt.model ?? null,
+        attempt.selection_reason ?? attempt.selectionReason ?? null,
+        startedAt,
+        completedAt,
+        attempt.upstream_status ?? attempt.upstreamStatus ?? null,
+        attempt.error_scope ?? attempt.errorScope ?? null,
+        attempt.action ?? null,
+        cooldownUntil,
+        (attempt.downstream_committed ?? attempt.downstreamCommitted) ? 1 : 0,
+        attempt.terminal_state ?? attempt.terminalState ?? 'started',
+        usageJson,
+        attempt.wait_ms ?? attempt.waitMs ?? 0,
+        attempt.ttft_ms ?? attempt.ttftMs ?? null,
+        attempt.latency_ms ?? attempt.latencyMs ?? null,
+        attempt.queue_wait_ms ?? attempt.queueWaitMs ?? null,
+        attempt.scheduling_ms ?? attempt.schedulingMs ?? null,
+        errorCode,
+        upstreamType,
+        errorDetailsJson,
+        hopRequestId,
+        providerRunId,
+        providerTurnId,
+        providerAttemptId,
+        providerRequestId,
+      )
+    }
+    if (writeBehindArmed()) {
+      enqueueWrite(write)
+      return null
+    }
+    write()
+    return this.list(requestId).find((item) => item.attempt_no === Number(attemptNo)) || null
   }
 
   list(requestId) {
