@@ -20,6 +20,7 @@ import {
   isClaudeCodeFamilyRequest,
 } from '../identity/claude-code-only.mjs'
 import { toStandardAnthropicBody } from './anthropic-policy.mjs'
+import { rectifyCrag321Request } from './crag-321-rectifier.mjs'
 import { relocateThirdPartySystem } from './third-party-system.mjs'
 import { foldThirdPartyRoleSystemMessages } from './outbound-attempt.mjs'
 import { canCountTokens, canOfficialUsage, credentialModeOfVm, isApiKeyMode } from '../oauth/credential-mode.mjs'
@@ -495,7 +496,10 @@ export async function handleUserCountTokens(req, res, deps) {
       if (typeof beta === 'string' && beta.trim()) kernelHeaders['anthropic-beta'] = beta.trim()
     }
     const hop = await (deps.countTokensViaKernel || countTokensViaKernel)(peeked.exec, {
-      body: outboundBody,
+      body: rectifyCrag321Request(outboundBody, {
+        strictPassthrough: officialTraffic === true,
+        countTokens: true,
+      }),
       headers: kernelHeaders,
       timeoutMs: 45000,
     })

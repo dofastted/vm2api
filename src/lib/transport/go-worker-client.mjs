@@ -7,6 +7,7 @@ import { resolveStreamIdleTimeoutMs } from '../core/config.mjs'
 import { prepareOutboundHeaders } from '../protocol/outbound-attempt.mjs'
 import { alignSamplingWithThinking, sanitizeAnthropicBodyForBetaTokens } from '../protocol/anthropic-policy.mjs'
 import { prepareCliNodeRequest, prepareCragRequest } from '../protocol/kernel-request.mjs'
+import { rectifyCrag321Request } from '../protocol/crag-321-rectifier.mjs'
 import { withRequestProtocolBetas } from '../protocol/claude-code-betas.mjs'
 import { pinThreadBetas, rememberThreadTurn } from '../protocol/thread-betas.mjs'
 import { applyThinkingDisplay, ensureOfficialPrintThinking, thinkingDisplayMode } from '../protocol/thinking.mjs'
@@ -2809,11 +2810,12 @@ export async function countTokensViaKernel(exec, { body, headers = {}, timeoutMs
       },
     },
   }
+  const outboundBody = rectifyCrag321Request(body, { strictPassthrough: true, countTokens: true })
   try {
     const response = await workerRequest(kernelExec, {
       method: 'POST',
       requestPath: '/internal/v1/messages/count_tokens',
-      body,
+      body: outboundBody,
       headers,
       timeoutMs,
       signal,
