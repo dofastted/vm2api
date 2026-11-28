@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.4.244 — 2026-11-28 · Codex 软限与临时停车状态接入 Rust 调度准入、存量 KVM 9p 挂载自动升级 `cache=none` 与跨类定时测试同步提示修正
+
+- **Codex 软限与临时停车状态接入 Rust `kin-scheduler` 准入（#2009，Refs #1874）**：
+  - `scheduler/crates/scheduler-proto/src/{config,ipc,lib,serde_patch}.rs` 新增 `CodexQuotaPolicy`、`ConfigSnapshot.codex_quota`、`BackendNodeConfig.temp_unschedulable_{until_ms,reason}` 与 `serde_patch::double_option`（并为 `NodeTelemetryUpdate` 的 3 个 `double_option` 字段补齐 `skip_serializing_if = "Option::is_none"`，防止局部遥测序列化为 JSON `null` 误清空停车状态）。
+  - `scheduler/crates/scheduler-core/src/{admission,node_state}.rs` 与 `src/lib/scheduler/scheduler-runtime.mjs` 将 `routing.codex.quota` 软限接入 Rust `codex_vm` 准入（Claude 槽维持既有 95% 门禁）；`temp_unschedulable_*` 经配置快照（冷启动 fail-closed）与实时遥测同步，清除态显式发送 `temp_unschedulable_until_ms: 0` / `reason: null` 并置 `temp_park_live_authoritative` 避免回落旧快照；补齐 `scheduler/crates/scheduler-core/tests/admission_codex_quota_tests.rs`、`test/unit/scheduler-codex-quota-snapshot.test.mjs` 及 `scheduler-proto`/`scheduler-core`/`scheduler-daemon` 回归测试。
+- **存量 legacy KVM 槽位 `kin-guest-setup` 9p 挂载自动升级 `cache=none`（#2018，Refs #1877）**：
+  - `docker/kin-kvm/guest/kin-crag-apparmor` 新增 `upgrade_guest_9p_cache`，在每次内核启动前幂等改写 `#1924` 前存量 KVM 盘内 `/usr/local/sbin/kin-guest-setup` 的 `kinhome`（`/home/kincli`）与 `kinclaude`（`/home/kincli/.claude`）两行 9p 挂载参数，由 `mmap` 原子升级为 `none`（保留 `0755` 权限，下次槽位 stop/start 或 recover 生效，缓解 v9fs getattr writeback 僵尸进程）；缺失文件返回 `no-guest-setup`，符号链接或手工编辑/重复行返回 `operator-managed` 且零写盘，不影响 `crag-debian13` custom-erofs 槽位；`test/unit/kvm-crag-apparmor.test.mjs` 补充覆盖单测。
+- **定时测试「同步到全部槽」确认框异类槽文案修正（#2008，Refs #1874）**：
+  - `web/src/features/vm/vm-test-schedule.tsx` 更新「同步到全部槽？」`AlertDialog` 说明文案，如实告知另一类槽（Claude/Codex 不同）保留自己的模型与 Prompt，但仍同步开关、时间及本表单显式提供的运行模式与自动续热，与 `src/lib/admin/vm-test-schedule.mjs` 及 `docs/PANEL_API.md` 一致。
+- 部署说明：本次改动零新增数据库迁移，零 `deploy/payload.json`、Gemini 宿主脚本或 `bin/` / `share/wrap-cli` 载荷变更；预期 **`SLOT_SYNC=skip`**，无需重启 `vm2api-gemini`。Rust `kin-scheduler` 由 `Dockerfile`（amd64）与 `deploy/Dockerfile.arm64-control`（arm64）从源码现编并经容器入口自动同步（不随 `deploy/payload.json` 或 GitHub Release 附件分发），**裸机 Node / `systemd` 宿主机重启前须先执行 `npm run build:scheduler`（需 Rust / Cargo 1.86+）** 编译安装新版 `bin/kin-scheduler`。控制面更新并重启后，`src/lib/vm/kvm-crag-apparmor.mjs` 会在下次 legacy KVM 槽启动内核前自动下发新版 `docker/kin-kvm/guest/kin-crag-apparmor` 改写旧盘脚本，存量 legacy KVM 槽待下次 stop/start 或 recover 即生效；因涉及 `docker/kin-kvm/**`，合入 `main` 后将自动触发 `guest-images` 工作流同步刷新 `kin-kvm-*` 镜像。
+
 ## 1.4.243 — 2026-11-28 · 修复 CRAG 商城直充刷新与 CRAGGemini 购买、订单台账/认领、身份迁移/重建、续费自愈及双产品订阅工作台
 
 - **CRAG 商城代理双产品参数化与直充立即生效修复（#2022）**：
