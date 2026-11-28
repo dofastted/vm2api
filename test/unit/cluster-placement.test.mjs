@@ -27,7 +27,6 @@ import {
 } from '../../src/lib/cluster/remote-slot.mjs'
 import {
   ensureRemoteOfficialCredentialLink,
-  pullSlotCredentials,
   pushCragSlot,
   pushSlotBinaries,
   pushSlotCredentials,
@@ -390,27 +389,23 @@ test('cluster CRAG KVM refresh reaches the managed lifecycle for running and sto
   )
 })
 
-test('login prepare reconcile keeps a live remote credential when local is stale', async () => {
+test('reconcile enforces Panel SSOT by one-way pushing authoritative panel credentials read-only and linking .credentials.json', async () => {
   const node = fakeNode()
-  node.files.set(node.remoteCred, Buffer.from('{"rt":"rotated-live"}'))
-  const slotDir = localSlot('{"rt":"stale-local"}')
+  node.files.set(node.remoteCred, Buffer.from('{"rt":"stale-remote"}'))
+  const slotDir = localSlot('{"rt":"panel-authoritative"}')
   const official = `${node.session.host.root}/vms/vm-07/claude/.credentials.json`
   node.files.set(official, Buffer.from('{"claudeAiOauth":{"accessToken":"","refreshToken":""}}'))
   const r = await reconcileSlotCredentials(vm, slotDir, node.session)
-  assert.equal(r.pulled, true)
-  assert.equal(node.files.get(node.remoteCred).toString(), '{"rt":"rotated-live"}')
+  assert.equal(r.pushed, true)
+  assert.equal(node.files.get(node.remoteCred).toString(), '{"rt":"panel-authoritative"}')
+  assert.equal(node.modes.get(node.remoteCred), 0o400)
   const local = path.join(slotDir, 'cli-home', '.claude', 'credentials.json')
-  assert.equal(fs.readFileSync(local, 'utf8'), '{"rt":"rotated-live"}')
+  assert.equal(fs.readFileSync(local, 'utf8'), '{"rt":"panel-authoritative"}')
   assert.equal(node.links.get(official), 'credentials.json')
   assert.equal(node.files.has(official), false)
-  node.files.set(node.remoteCred, Buffer.from('{"rt":"next-rotation"}'))
-  assert.equal(
-    node.files.get(path.posix.join(path.posix.dirname(official), node.links.get(official))).toString(),
-    '{"rt":"next-rotation"}',
-  )
   assert.equal((await ensureRemoteOfficialCredentialLink(vm, slotDir, node.session)).linked, true)
   assert.equal(node.symlinksCreated.length, 1)
-  assert.deepEqual(node.published, [official])
+  assert.deepEqual(node.published, [node.remoteCred, official])
 })
 
 test('periodic link repair only inspects metadata and refuses a missing or symlinked authority', async () => {
@@ -448,28 +443,30 @@ test('failed atomic link publication leaves the old name intact and can retry', 
   assert.equal(node.links.get(official), 'credentials.json')
 })
 
-test('start reconcile never overwrites a remote credential the slot already rotated', async () => {
+test('start reconcile always overwrites remote drift with the panel credential at 0400 and preserves local seal', async () => {
   const node = fakeNode()
-  node.files.set(node.remoteCred, Buffer.from('{"rt":"rotated"}'))
-  const slotDir = localSlot('{"rt":"stale"}')
+  node.files.set(node.remoteCred, Buffer.from('{"rt":"remote-drift"}'))
+  const slotDir = localSlot('{"rt":"panel-ssot"}')
   const r = await reconcileSlotCredentials(vm, slotDir, node.session)
-  assert.equal(r.pulled, true)
-  assert.equal(node.files.get(node.remoteCred).toString(), '{"rt":"rotated"}', 'remote copy must stay authoritative')
+  assert.equal(r.pushed, true)
+  assert.equal(node.files.get(node.remoteCred).toString(), '{"rt":"panel-ssot"}', 'panel copy must stay authoritative')
+  assert.equal(node.modes.get(node.remoteCred), 0o400)
   const local = path.join(slotDir, 'cli-home', '.claude', 'credentials.json')
-  assert.equal(fs.readFileSync(local, 'utf8'), '{"rt":"rotated"}')
-  assert.equal(fs.statSync(local).mode & 0o777, 0o444, 'local seal survives the pull')
+  assert.equal(fs.readFileSync(local, 'utf8'), '{"rt":"panel-ssot"}')
+  assert.equal(fs.statSync(local).mode & 0o777, 0o444, 'local seal stays intact')
 })
 
-test('start reconcile seeds an empty node dir from the local credential', async () => {
+test('start reconcile seeds an empty node dir from the panel credential at 0400', async () => {
   const node = fakeNode()
   const slotDir = localSlot('{"rt":"first"}')
   const r = await reconcileSlotCredentials(vm, slotDir, node.session)
   assert.equal(r.pushed, true)
   assert.equal(node.files.get(node.remoteCred).toString(), '{"rt":"first"}')
+  assert.equal(node.modes.get(node.remoteCred), 0o400)
   assert.equal(node.links.get(`${node.session.host.root}/vms/vm-07/claude/.credentials.json`), 'credentials.json')
 })
 
-test('explicit import strips email and replaces the node credential at 0600; identical pull is a no-op', async () => {
+test('explicit push strips email and writes the node credential read-only at 0400', async () => {
   const node = fakeNode()
   node.files.set(node.remoteCred, Buffer.from('{"rt":"old-account"}'))
   const slotDir = localSlot(
@@ -482,91 +479,96 @@ test('explicit import strips email and replaces the node credential at 0600; ide
     }),
   )
   fs.chmodSync(path.join(slotDir, 'cli-home', '.claude', 'credentials.json'), 0o777)
-  await pushSlotCredentials(vm, slotDir, node.session)
+  const pushed = await pushSlotCredentials(vm, slotDir, node.session)
+  assert.deepEqual(pushed, { pushed: true })
   const remoteText = node.files.get(node.remoteCred).toString()
   assert.doesNotMatch(remoteText, /panel-only@example\.test|"email"/)
   assert.equal(JSON.parse(remoteText).claudeAiOauth.refreshToken, 'imported-rt')
   assert.equal(fs.readFileSync(path.join(slotDir, 'cli-home', '.claude', 'credentials.json'), 'utf8'), remoteText)
-  assert.equal(node.modes.get(node.remoteCred), 0o600, 'a 0777 local checkout must not leak its mode to the node')
-  assert.deepEqual(await pullSlotCredentials(vm, slotDir, node.session), { pulled: false, reason: 'same' })
+  assert.equal(node.modes.get(node.remoteCred), 0o400, 'a 0777 local checkout must not leak its mode to the node')
 })
 
-for (const identical of [false, true]) {
-  test(`node credential reconciliation strips email and restores platform-scoped scheduling with identical=${identical}`, async (t) => {
-    const root = tmpDir('kin-node-credential-metadata-')
-    t.after(() => fs.rmSync(root, { recursive: true, force: true }))
-    const slotDir = path.join(root, 'vms', vm.id)
-    const credentialFile = path.join(slotDir, 'cli-home', '.claude', 'credentials.json')
-    const credential = JSON.stringify({
-      claudeAiOauth: {
-        accessToken: 'node-access',
-        refreshToken: 'node-refresh',
-        expiresAt: Date.now() + 3600_000,
-        accountUuid: 'node-account',
-        email: 'node@example.test',
-        kinGeneration: 7,
-      },
-    })
-    fs.mkdirSync(path.dirname(credentialFile), { recursive: true })
-    if (identical) fs.writeFileSync(credentialFile, credential, { mode: 0o600 })
-    atomicWriteJson(path.join(root, 'vms', `${vm.id}.json`), {
-      ...vm,
-      status: 'paused',
-      schedulable: false,
-      schedule_disabled_reason: 'no_credential',
-      proxy_cli_enabled: true,
-      proxy: { id: 'px-local', kind: 'local' },
-      claude: { email: 'panel-kept@example.test' },
-    })
-    const node = fakeNode()
-    node.files.set(node.remoteCred, Buffer.from(credential))
-    const target = { ...vm }
-    await reconcileSlotCredentials(target, slotDir, node.session)
-    assert.equal(target.claude.has_access, true)
-
-    const stored = getVm(root, vm.id)
-    assert.equal(stored.claude.has_access, true)
-    assert.equal(stored.claude.has_refresh, true)
-    assert.equal(stored.claude.account_uuid, 'node-account')
-    assert.equal(stored.claude.email, 'panel-kept@example.test')
-    assert.equal(stored.schedulable, true)
-    assert.equal(stored.schedule_disabled_reason, null)
-    assert.equal(JSON.stringify(stored).includes('node-access'), false)
-    assert.equal(JSON.stringify(stored).includes('node-refresh'), false)
-    assert.equal(listVms(root)[0].has_token, true)
-    const remoteStored = node.files.get(node.remoteCred).toString()
-    assert.doesNotMatch(remoteStored, /node@example\.test|"email"/)
-    assert.equal(JSON.parse(remoteStored).claudeAiOauth.refreshToken, 'node-refresh')
-    assert.equal(fs.readFileSync(credentialFile, 'utf8'), remoteStored)
-
-    const pool = new PoolScheduler({
-      projectRoot: root,
-      schedulerRuntime: createMockSchedulerRuntime({ projectRoot: root }),
-    })
-    const selected = await pool.selectAndReserve({
-      model: 'claude-sonnet-4-6',
-      keyScope: { group_type: 'anthropic', allowed_vms: [vm.id] },
-      allowWait: false,
-    })
-    assert.equal(selected.ok, true)
-    assert.equal(selected.vmId, vm.id)
-    assert.equal(selected.accountId, 'node-account')
-    selected.release()
-    const denied = await pool.selectAndReserve({
-      model: 'claude-sonnet-4-6',
-      keyScope: { group_type: 'anthropic', allowed_vms: ['vm-other'] },
-      allowWait: false,
-    })
-    assert.equal(denied.ok, false)
+test('node credential reconciliation strips email, projects read-only, and restores platform-scoped scheduling', async (t) => {
+  const root = tmpDir('kin-node-credential-metadata-')
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const slotDir = path.join(root, 'vms', vm.id)
+  const credentialFile = path.join(slotDir, 'cli-home', '.claude', 'credentials.json')
+  const credential = JSON.stringify({
+    claudeAiOauth: {
+      accessToken: 'panel-access',
+      refreshToken: 'panel-refresh',
+      expiresAt: Date.now() + 3600_000,
+      accountUuid: 'panel-account',
+      email: 'legacy@example.test',
+      kinGeneration: 7,
+    },
   })
-}
+  fs.mkdirSync(path.dirname(credentialFile), { recursive: true })
+  fs.writeFileSync(credentialFile, credential, { mode: 0o600 })
+  atomicWriteJson(path.join(root, 'vms', `${vm.id}.json`), {
+    ...vm,
+    status: 'paused',
+    schedulable: false,
+    schedule_disabled_reason: 'no_credential',
+    proxy_cli_enabled: true,
+    proxy: { id: 'px-local', kind: 'local' },
+    claude: { email: 'panel-kept@example.test' },
+  })
+  const node = fakeNode()
+  const target = { ...vm }
+  await reconcileSlotCredentials(target, slotDir, node.session)
+  assert.equal(target.claude.has_access, true)
+
+  const stored = getVm(root, vm.id)
+  assert.equal(stored.claude.has_access, true)
+  assert.equal(stored.claude.has_refresh, true)
+  assert.equal(stored.claude.account_uuid, 'panel-account')
+  assert.equal(stored.claude.email, 'panel-kept@example.test')
+  assert.equal(stored.schedulable, true)
+  assert.equal(stored.schedule_disabled_reason, null)
+  assert.equal(JSON.stringify(stored).includes('panel-access'), false)
+  assert.equal(JSON.stringify(stored).includes('panel-refresh'), false)
+  assert.equal(listVms(root)[0].has_token, true)
+  const remoteStored = node.files.get(node.remoteCred).toString()
+  assert.doesNotMatch(remoteStored, /legacy@example\.test|"email"/)
+  assert.equal(JSON.parse(remoteStored).claudeAiOauth.refreshToken, 'panel-refresh')
+  assert.equal(node.modes.get(node.remoteCred), 0o400)
+  assert.equal(fs.readFileSync(credentialFile, 'utf8'), remoteStored)
+
+  const pool = new PoolScheduler({
+    projectRoot: root,
+    schedulerRuntime: createMockSchedulerRuntime({ projectRoot: root }),
+  })
+  const selected = await pool.selectAndReserve({
+    model: 'claude-sonnet-4-6',
+    keyScope: { group_type: 'anthropic', allowed_vms: [vm.id] },
+    allowWait: false,
+  })
+  assert.equal(selected.ok, true)
+  assert.equal(selected.vmId, vm.id)
+  assert.equal(selected.accountId, 'panel-account')
+  selected.release()
+  const denied = await pool.selectAndReserve({
+    model: 'claude-sonnet-4-6',
+    keyScope: { group_type: 'anthropic', allowed_vms: ['vm-other'] },
+    allowWait: false,
+  })
+  assert.equal(denied.ok, false)
+})
 
 for (const reason of ['disabled', 'oauth_revoked']) {
-  test(`pulling node credentials preserves ${reason} scheduling restrictions`, async (t) => {
+  test(`pushing node credentials preserves ${reason} scheduling restrictions`, async (t) => {
     const root = tmpDir('kin-node-credential-restriction-')
     t.after(() => fs.rmSync(root, { recursive: true, force: true }))
     const slotDir = path.join(root, 'vms', vm.id)
-    fs.mkdirSync(slotDir, { recursive: true })
+    const credentialFile = path.join(slotDir, 'cli-home', '.claude', 'credentials.json')
+    fs.mkdirSync(path.dirname(credentialFile), { recursive: true })
+    fs.writeFileSync(
+      credentialFile,
+      JSON.stringify({
+        claudeAiOauth: { accessToken: 'existing-access', refreshToken: 'existing-refresh' },
+      }),
+    )
     atomicWriteJson(path.join(root, 'vms', `${vm.id}.json`), {
       ...vm,
       schedulable: false,
@@ -575,15 +577,7 @@ for (const reason of ['disabled', 'oauth_revoked']) {
       claude: { refresh_error: reason === 'oauth_revoked' ? reason : null },
     })
     const node = fakeNode()
-    node.files.set(
-      node.remoteCred,
-      Buffer.from(
-        JSON.stringify({
-          claudeAiOauth: { accessToken: 'existing-access', refreshToken: 'existing-refresh' },
-        }),
-      ),
-    )
-    await pullSlotCredentials({ ...vm }, slotDir, node.session)
+    await pushSlotCredentials({ ...vm }, slotDir, node.session)
     const stored = getVm(root, vm.id)
     assert.equal(stored.claude.has_access, true)
     assert.equal(stored.schedulable, false)
@@ -591,7 +585,7 @@ for (const reason of ['disabled', 'oauth_revoked']) {
   })
 }
 
-test('identical node credentials do not clear an existing authentication cooldown', async (t) => {
+test('pushing unchanged node credentials does not clear an existing authentication cooldown', async (t) => {
   const root = tmpDir('kin-node-credential-cooldown-')
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   const slotDir = path.join(root, 'vms', vm.id)
@@ -611,25 +605,24 @@ test('identical node credentials do not clear an existing authentication cooldow
   atomicWriteJson(path.join(root, 'vms', `${vm.id}.json`), record)
   const node = fakeNode()
   node.files.set(node.remoteCred, Buffer.from(credential))
-  await pullSlotCredentials({ ...vm }, slotDir, node.session)
+  await pushSlotCredentials({ ...vm }, slotDir, node.session)
   assert.deepEqual(getVm(root, vm.id), record)
 })
 
-test('a guest-planted symlink at the credential path is refused, not followed', async () => {
+test('a guest-planted symlink at the remote credential path is atomically replaced without following it', async () => {
   const node = fakeNode()
   const sibling = `${node.session.host.root}/vms/vm-08/claude/credentials.json`
   node.files.set(sibling, Buffer.from('{"rt":"sibling-secret"}'))
   node.links.set(node.remoteCred, sibling)
   const slotDir = localSlot('{"rt":"mine"}')
-  await assert.rejects(pullSlotCredentials(vm, slotDir, node.session), { code: 'remote_read_refused' })
+  const r = await reconcileSlotCredentials(vm, slotDir, node.session)
+  assert.equal(r.pushed, true)
   const local = path.join(slotDir, 'cli-home', '.claude', 'credentials.json')
-  assert.equal(fs.readFileSync(local, 'utf8'), '{"rt":"mine"}', 'sibling credential must not reach the control plane')
-
-  // An import replaces the link itself; the sibling file keeps its bytes.
-  await pushSlotCredentials(vm, slotDir, node.session)
+  assert.equal(fs.readFileSync(local, 'utf8'), '{"rt":"mine"}', 'sibling credential must never reach the control plane')
   assert.equal(node.files.get(sibling).toString(), '{"rt":"sibling-secret"}')
   assert.equal(node.links.has(node.remoteCred), false)
   assert.equal(node.files.get(node.remoteCred).toString(), '{"rt":"mine"}')
+  assert.equal(node.modes.get(node.remoteCred), 0o400)
 })
 
 test('node paths keep ~/.claude in the host-owned mount, everything else in place', () => {

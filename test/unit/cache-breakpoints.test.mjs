@@ -458,7 +458,7 @@ test('over the four-breakpoint budget, message anchors are kept over system extr
     breakpoint used to vanish and every turn re-created the cache. The caller system now
     rides in the first user turn; the template harness carries the system breakpoint. */
 test('a caller system with a breakpoint still leaves a cacheable system prefix through the official persona preset', () => {
-  const compat = { persona_preset: 'official', overlay_preset: 'off' }
+  const compat = { persona_preset: 'official_full', overlay_preset: 'off' }
   withRoutingFile(compat, (routingFile) => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-bp-home-'))
     const inbound = {

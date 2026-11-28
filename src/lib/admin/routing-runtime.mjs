@@ -419,6 +419,7 @@ export function createRoutingRuntime(ctx) {
     return (
       Object.prototype.hasOwnProperty.call(compatibility, 'cache_ttl') ||
       Object.prototype.hasOwnProperty.call(compatibility, 'persona_preset') ||
+      Object.prototype.hasOwnProperty.call(compatibility, 'crag_persona_preset') ||
       Object.prototype.hasOwnProperty.call(compatibility, 'cch_enabled') ||
       Object.prototype.hasOwnProperty.call(compatibility, 'cc_entrypoint')
     )
@@ -565,6 +566,20 @@ export function createRoutingRuntime(ctx) {
       routingConfig.compatibility = { ...(routingConfig.compatibility || {}), ...body.compatibility }
       delete routingConfig.compatibility.persona_rules
       delete routingConfig.compatibility.persona_leak_append
+      // Unified SSOT: saving persona_preset retires stale crag_persona_preset drift.
+      if (
+        Object.prototype.hasOwnProperty.call(body.compatibility, 'persona_preset') &&
+        !Object.prototype.hasOwnProperty.call(body.compatibility, 'crag_persona_preset')
+      ) {
+        delete routingConfig.compatibility.crag_persona_preset
+      } else if (
+        !Object.prototype.hasOwnProperty.call(body.compatibility, 'persona_preset') &&
+        Object.prototype.hasOwnProperty.call(body.compatibility, 'crag_persona_preset') &&
+        String(body.compatibility.crag_persona_preset || '').trim() !== ''
+      ) {
+        routingConfig.compatibility.persona_preset = body.compatibility.crag_persona_preset
+        delete routingConfig.compatibility.crag_persona_preset
+      }
       if (
         Object.prototype.hasOwnProperty.call(body.compatibility, 'cch_enabled') ||
         routingConfig.compatibility.cch_enabled == null

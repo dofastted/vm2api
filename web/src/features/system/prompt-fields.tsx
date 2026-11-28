@@ -2,8 +2,10 @@ import { useState } from 'react'
 import type { PersonaPreset } from '@/types/panel-routing'
 import { ArrowRight, FileText, Globe2 } from 'lucide-react'
 import {
+  isPresetEnvEnabled,
+  isPresetGuidanceEnabled,
+  isPresetHarnessEnabled,
   presetFlagEnabled,
-  selectedPreviewBlocks,
   setPresetFlag,
   setTemplateBlock,
   templateBlockEnabled,
@@ -32,9 +34,14 @@ type Compat = Record<string, unknown>
 
 const ENV_FLAGS: Record<string, PresetFlagField> = {
   env_extra: 'model_env_extra_presets',
+  env_instructions: 'persona_env_instructions_presets',
+  env_timezone: 'persona_timezone_presets',
+  env_locale: 'persona_locale_presets',
 }
 
-/** Environment blocks render at the end of the top-level system, under the env switch. */
+const TOP_LEVEL_TOGGLEABLE = new Set(['harness', 'guidance'])
+
+/** Environment blocks render under the unified 环境注入 master switch. */
 const isEnvironmentBlock = (id: string) => /^env(_|$)/.test(id)
 
 function PromptDetail({
@@ -127,28 +134,34 @@ export function PromptFields({
   onBlocksChange: (blocks: RawBlock[]) => void
   onCompatChange: (next: Compat) => void
 }) {
-  const routed = selectedPreviewBlocks(blocks, undefined, preset)
-  const envOn = presetFlagEnabled(compat, 'persona_env_presets', preset)
+  const envOn = isPresetEnvEnabled(compat, preset)
   const fields = (environment: boolean) =>
-    routed.flatMap((block, index) => {
+    blocks.flatMap((block, index) => {
       const id = String(block.id ?? '')
       if (isEnvironmentBlock(id) !== environment) return []
       if (id === 'dynamic_boundary' || (id === 'billing' && preset !== 'zero'))
         return []
-      const flag = environment ? ENV_FLAGS[id] : undefined
+      const flag = environment
+        ? ENV_FLAGS[id]
+        : id === 'guidance'
+          ? ('persona_guidance_presets' as const)
+          : undefined
       const selected = templateBlockEnabled(compat, preset, id)
       const [label, description] = promptBlockLabel(id)
       const literal = String(block.text ?? '')
         .replace(/\{\{[^}]+\}\}/g, '')
         .replace(/\u200b/g, '')
         .trim()
-      // A disabled macro flag does not suppress saved literal text. Reflect the
-      // existing content, and use block selection when switching the whole part off.
+      const controlled = environment || TOP_LEVEL_TOGGLEABLE.has(id)
+      // A disabled env macro flag does not suppress saved literal text.
       const on =
-        selected &&
-        (!flag || presetFlagEnabled(compat, flag, preset) || !!literal)
+        id === 'harness'
+          ? isPresetHarnessEnabled(compat, preset)
+          : id === 'guidance'
+            ? isPresetGuidanceEnabled(compat, preset)
+            : selected &&
+              (!flag || presetFlagEnabled(compat, flag, preset) || !!literal)
       const enabled = on && (!environment || envOn)
-      const controlled = environment && (flag || id !== 'env')
       const effectId = `prompt-effect-${preset}-${index}`
       return [
         <li key={`${id}-${index}`} className='flex items-start gap-2 py-3'>
@@ -180,12 +193,18 @@ export function PromptFields({
               aria-label={`加载${label}`}
               aria-describedby={effectId}
               checked={on}
-              disabled={!envOn}
-              onCheckedChange={(enabled) => {
-                const next = setTemplateBlock(compat, preset, id, enabled)
+              disabled={environment && !envOn}
+              onCheckedChange={(checked) => {
+                const next = setTemplateBlock(
+                  compat,
+                  preset,
+                  id,
+                  checked,
+                  server
+                )
                 onCompatChange(
                   flag
-                    ? setPresetFlag(next, flag, preset, enabled, server)
+                    ? setPresetFlag(next, flag, preset, checked, server)
                     : next
                 )
               }}
@@ -196,7 +215,9 @@ export function PromptFields({
               size='sm'
               variant='ghost'
               onClick={() =>
-                onCompatChange(setTemplateBlock(compat, preset, id, true))
+                onCompatChange(
+                  setTemplateBlock(compat, preset, id, true, server)
+                )
               }
             >
               启用
@@ -243,13 +264,13 @@ export function PromptFields({
               aria-label='加载环境'
               aria-describedby={`prompt-environment-effect-${preset}`}
               checked={envOn}
-              onCheckedChange={(enabled) =>
+              onCheckedChange={(checked) =>
                 onCompatChange(
                   setPresetFlag(
                     compat,
                     'persona_env_presets',
                     preset,
-                    enabled,
+                    checked,
                     server
                   )
                 )

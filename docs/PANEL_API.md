@@ -390,9 +390,7 @@ Analytics 按官方 [`codex_thread_initialized`](https://github.com/openai/codex
 
 `failover.max_accounts_per_request`（正整数，默认 `0` 不限制）：单请求实际执行过的不同账号数达到上限后，不再向新账号发起推理；没执行的准入失败不计入。无配额、模型或重试时间证据的上游 429 不直接冷却账号或 Fable；同一请求在两个账号收到此类 429 时保留上游错误并停止调度。
 
-`compatibility.persona_preset`（`official` / `official_full` / `zero` / `custom`）和 `compatibility.cache_ttl`（`5m` / `1h`）保存后投影到每个 Claude 槽的 `vms/<id>/run/kernel.json`：`persona_preset`、`system_layout`（`zero`→`zero`，其余→`identity`）、`default_cache_ttl`。响应 `kernel_persona.updated` 是本次字节有变化的槽数。`PATCH /vms/:id` 的 `timezone` / `timezone_follow_proxy` 另把 `timezone` 热写进该槽 `kernel.json`，`timezone_sync.kernel_hot` 表示文件有变化。容器 `TZ` 不在这次写入里。Codex 槽不写。
-
-`compatibility.crag_persona_preset`（`official_full` / `zero`，缺省 `official_full`）只给 CRAG v2 print 清洗，不投影进 `kernel.json`。v2 worker 不读 `persona_preset` 或 `CLAUDE_CODE_SYSTEM_LAYOUT`。`official_full` 只 append 调用方尾巴；`zero` 送 `crag_prompt.mode=replace`。其它值保存时 400。槽位显式 `zero` 覆盖该档；其它槽位人设在 print 上收成 append。这不是 TUI：不关内置工具，也不加 `--no-chrome`。
+`compatibility.persona_preset`（`official` / `official_full` / `zero` / `custom`，缺省 `official_full`）是 Claude 系统提示词的唯一权威配置（SSOT），统一作用于 `cli-node`、CRAG V4 及直连路径，并按 `prompt_spec` v1 IR 编译投递给各内核。旧键 `compatibility.crag_persona_preset` 已废弃（仅保留读写兼容，保存 `persona_preset` 时自动清理旧键漂移）。`official`（官方提示词）默认仅注入计费头与官方身份句（核心提示词 `harness`、行为指引 `guidance`、环境注入 `env` 均默认关闭并可独立开关）；`official_full`（完整官方提示词）保持完整官方逻辑；`zero`（0注入）将官方身份句写入计费头 `prompt_version`、剔除 `system[]` 中的官方身份句并原样保留调用方业务 `system`。保存 `persona_preset` 和 `cache_ttl`（`5m` / `1h`）后投影到每个 Claude 槽的 `vms/<id>/run/kernel.json`：`persona_preset`、`system_layout`（`zero`→`zero`，其余→`identity`）、`default_cache_ttl`。响应 `kernel_persona.updated` 是本次字节有变化的槽数。`PATCH /vms/:id` 的 `timezone` / `timezone_follow_proxy` 另把 `timezone` 热写进该槽 `kernel.json`，`timezone_sync.kernel_hot` 表示文件有变化。容器 `TZ` 不在这次写入里。Codex 槽不写。
 
 `compatibility.crag_fold_history_system`（缺省开，写 `false` 关闭）：CRAG print 前把历史里的 `role: "system"` 消息改成 `<system-reminder>` 文本，并入前一条 user 消息（前一条是 assistant 时并入下一条 user，放在 tool_result 之后）；带图片等非文本内容的、找不到 user 可并的保持原样。Claude Code 几乎每轮都追加一条这类消息，不折叠时 CRAG `--resume` 重放出的请求每轮只命中 tools + system，整段对话按 1h 重写。
 

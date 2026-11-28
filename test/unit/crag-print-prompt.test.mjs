@@ -1,3 +1,4 @@
+import { firstHistoryDiff } from '../../src/lib/protocol/cache-prefix.mjs'
 import { sanitizeCragBodyWhitelist } from '../../src/lib/protocol/crag-whitelist.mjs'
 import { relocateThirdPartySystem } from '../../src/lib/protocol/third-party-system.mjs'
 import fs from 'node:fs'
@@ -387,13 +388,14 @@ test('caller tail drops billing lines and non-text blocks', () => {
   )
 })
 
-test('CRAG print persona does not follow the cli-node preset', () => {
+test('CRAG print persona follows unified SSOT (slot > persona_preset > legacy crag_persona_preset)', () => {
   const routing = { compatibility: { persona_preset: 'official', crag_persona_preset: 'zero' } }
-  assert.equal(resolveCragPrintPersona({}, routing), 'zero')
-  assert.equal(resolveCragPrintPersona({ persona_preset: 'official' }, routing), 'official_full')
+  assert.equal(resolveCragPrintPersona({}, routing), 'official')
+  assert.equal(resolveCragPrintPersona({ persona_preset: 'official' }, routing), 'official')
   assert.equal(resolveCragPrintPersona({ persona_preset: 'official_303' }, routing), 'official_full')
   assert.equal(resolveCragPrintPersona({ persona_preset: 'zero' }, routing), 'zero')
-  assert.equal(resolveCragPrintPersona({}, { compatibility: { persona_preset: 'zero' } }), 'official_full')
+  assert.equal(resolveCragPrintPersona({}, { compatibility: { persona_preset: 'zero' } }), 'zero')
+  assert.equal(resolveCragPrintPersona({}, { compatibility: { crag_persona_preset: 'zero' } }), 'zero')
 })
 
 test('print follows the kernel enabled on the VM, not the global dataplane', () => {
@@ -435,13 +437,15 @@ test('print follows the kernel enabled on the VM, not the global dataplane', () 
   fs.rmSync(root, { recursive: true, force: true })
 })
 
-test('routing save accepts only the two CRAG print presets', () => {
+test('routing save accepts all four unified presets on legacy crag_persona_preset and rejects unknown values', () => {
+  assert.deepEqual(validatePersonaRoutingPatch({ compatibility: { crag_persona_preset: 'official' } }), [])
   assert.deepEqual(validatePersonaRoutingPatch({ compatibility: { crag_persona_preset: 'official_full' } }), [])
   assert.deepEqual(validatePersonaRoutingPatch({ compatibility: { crag_persona_preset: 'zero' } }), [])
+  assert.deepEqual(validatePersonaRoutingPatch({ compatibility: { crag_persona_preset: 'custom' } }), [])
   assert.deepEqual(validatePersonaRoutingPatch({ compatibility: { crag_persona_preset: '' } }), [])
   assert.match(
-    validatePersonaRoutingPatch({ compatibility: { crag_persona_preset: 'official' } })[0],
-    /official_full \/ zero/,
+    validatePersonaRoutingPatch({ compatibility: { crag_persona_preset: 'invalid_mode' } })[0],
+    /official \/ official_full \/ zero \/ custom/,
   )
 })
 
@@ -746,7 +750,64 @@ test('automatic caching still converts at the four-breakpoint budget', () => {
   assert.deepEqual(out.messages[0].content[0].cache_control, mark)
 })
 
-test('CRAG V4 official_full reserves 2 template cache_control breakpoints so caller 4 breakpoints do not become 6 (#2016)', () => {
+test('trailing cached system turn after assistant stays role-stable when next user turn appends (#2007)', () => {
+  const block = (text, cache = false) => ({
+    type: 'text',
+    text,
+    ...(cache ? { cache_control: { type: 'ephemeral', ttl: '1h' } } : {}),
+  })
+  const turnA = {
+    model: 'claude-fable-5-2',
+    max_tokens: 64,
+    system: [block('Stable synthetic instructions.')],
+    messages: [
+      { role: 'user', content: [block('Read the synthetic input.')] },
+      { role: 'assistant', content: [block('Read complete.')] },
+      { role: 'system', content: [block('Synthetic background task notice.', true)] },
+    ],
+  }
+  const turnB = {
+    ...turnA,
+    messages: [...turnA.messages, { role: 'user', content: [block('Continue.', true)] }],
+  }
+  const turnC = {
+    ...turnB,
+    messages: [
+      ...turnB.messages,
+      { role: 'assistant', content: [block('Continued.')] },
+      { role: 'user', content: [block('Follow up.')] },
+      { role: 'system', content: [block('Regular post-user reminder.')] },
+    ],
+  }
+  const options = {
+    preset: 'official_full',
+    capabilities: [
+      'generation_controls_v3',
+      'prompt_append',
+      'system_text_cache_v3',
+      'linux_tui_native_queue',
+      'native_history_v3',
+    ],
+  }
+  const outA = prepareCragPrintBody(turnA, options)
+  const outB = prepareCragPrintBody(turnB, options)
+  const outC = prepareCragPrintBody(turnC, options)
+
+  assert.equal(firstHistoryDiff(turnA, turnB).section, null)
+  assert.equal(firstHistoryDiff(outA, outB).section, null)
+  assert.equal(firstHistoryDiff(outB, outC).section, null)
+  assert.deepEqual(
+    outB.messages.map((m) => m.role),
+    ['user', 'assistant', 'system', 'user'],
+  )
+  // Later regular post-user system notices still fold into their preceding user turn.
+  assert.deepEqual(
+    outC.messages.map((m) => m.role),
+    ['user', 'assistant', 'system', 'user', 'assistant', 'user'],
+  )
+})
+
+test('legacy CRAG V4 (without prompt_spec_v1) official_full reserves 2 template breakpoints while CRAG 3.1.27+ (prompt_spec_v1) preserves all 4 caller breakpoints (#2016)', () => {
   const countCacheControls = (obj) => {
     let n = 0
     const walk = (v) => {
@@ -760,7 +821,9 @@ test('CRAG V4 official_full reserves 2 template cache_control breakpoints so cal
     return n
   }
 
-  const caps = ['headless_claude_bridge_v1', 'generation_controls_v3', 'prompt_append', 'system_text_cache_v3']
+  const legacyV4Caps = ['headless_claude_bridge_v1', 'generation_controls_v3', 'prompt_append', 'system_text_cache_v3']
+  const promptSpecV1Caps = [...legacyV4Caps, 'prompt_spec_v1']
+  const promptSpecHealthFlag = { capabilities: legacyV4Caps, prompt_spec_v1: true }
   const inbound = {
     model: 'claude-opus-5-5',
     max_tokens: 64,
@@ -792,21 +855,23 @@ test('CRAG V4 official_full reserves 2 template cache_control breakpoints so cal
     ],
   }
   const relocated = relocateThirdPartySystem(inbound, { onlyForeign: false })
-  const prepared = prepareCragPrintBody(relocated.body, {
+
+  // 1. Legacy CRAG V4 (<= 3.1.26, no prompt_spec_v1): reserves 2 template breakpoints so 4 caller -> 2 (2 + 2 <= 4).
+  const legacyPrepared = prepareCragPrintBody(relocated.body, {
     preset: 'official_full',
     officialPassthrough: false,
-    capabilities: caps,
+    capabilities: legacyV4Caps,
     cacheTtl: '1h',
   })
-  assert.equal(prepared.crag_persona_preset, 'official_full')
-  assert.equal(prepared.system, undefined)
-  assert.equal(countCacheControls(prepared), 2)
-  assert.equal(prepared.messages[0].content[0].cache_control, undefined)
-  assert.equal(prepared.messages[0].content[1].cache_control, undefined)
-  assert.deepEqual(prepared.messages[0].content[2].cache_control, { type: 'ephemeral', ttl: '1h' })
-  assert.deepEqual(prepared.messages[0].content[3].cache_control, { type: 'ephemeral', ttl: '1h' })
+  assert.equal(legacyPrepared.crag_persona_preset, 'official_full')
+  assert.equal(legacyPrepared.system, undefined)
+  assert.equal(countCacheControls(legacyPrepared), 2)
+  assert.equal(legacyPrepared.messages[0].content[0].cache_control, undefined)
+  assert.equal(legacyPrepared.messages[0].content[1].cache_control, undefined)
+  assert.deepEqual(legacyPrepared.messages[0].content[2].cache_control, { type: 'ephemeral', ttl: '1h' })
+  assert.deepEqual(legacyPrepared.messages[0].content[3].cache_control, { type: 'ephemeral', ttl: '1h' })
 
-  const direct = sanitizeCragBodyWhitelist(
+  const legacyWhitelist = sanitizeCragBodyWhitelist(
     {
       model: 'claude-opus-5-5',
       max_tokens: 64,
@@ -823,28 +888,53 @@ test('CRAG V4 official_full reserves 2 template cache_control breakpoints so cal
         },
       ],
     },
-    { capabilities: caps },
+    { capabilities: legacyV4Caps },
   ).body
-  assert.equal(countCacheControls(direct), 2)
-  assert.deepEqual(direct.messages[0].content[2].cache_control, { type: 'ephemeral', ttl: '1h' })
-  assert.deepEqual(direct.messages[0].content[3].cache_control, { type: 'ephemeral', ttl: '1h' })
+  assert.equal(countCacheControls(legacyWhitelist), 2)
+  assert.deepEqual(legacyWhitelist.messages[0].content[2].cache_control, { type: 'ephemeral', ttl: '1h' })
+  assert.deepEqual(legacyWhitelist.messages[0].content[3].cache_control, { type: 'ephemeral', ttl: '1h' })
 
-  // Controls: zero preset and officialPassthrough keep all 4 caller breakpoints.
+  // 2. Modern CRAG V4 3.1.27+ (prompt_spec_v1 in capabilities OR health.prompt_spec_v1):
+  //    preserves all 4 caller breakpoints intact; wire.rs::enforce_post_injection_cache_controls
+  //    drops injected template markers first instead of sacrificing caller anchors.
+  for (const opts of [
+    { capabilities: promptSpecV1Caps, health: null },
+    { capabilities: legacyV4Caps, health: promptSpecHealthFlag },
+  ]) {
+    const modernPrepared = prepareCragPrintBody(relocated.body, {
+      preset: 'official_full',
+      officialPassthrough: false,
+      capabilities: opts.capabilities,
+      health: opts.health,
+      cacheTtl: '1h',
+    })
+    assert.equal(modernPrepared.crag_persona_preset, 'official_full')
+    assert.equal(modernPrepared.crag_prompt_spec?.mode, 'official_full')
+    assert.equal(modernPrepared.system, undefined)
+    assert.equal(countCacheControls(modernPrepared), 4)
+    const modernWhitelisted = sanitizeCragBodyWhitelist(modernPrepared, opts).body
+    assert.equal(countCacheControls(modernWhitelisted), 4)
+  }
+
+  // 3. Controls: zero preset and officialPassthrough keep all 4 caller breakpoints even on legacy V4.
   const zeroPrepared = prepareCragPrintBody(inbound, {
     preset: 'zero',
-    capabilities: caps,
+    capabilities: legacyV4Caps,
     cacheTtl: '1h',
   })
   assert.equal(zeroPrepared.crag_persona_preset, 'zero')
   assert.equal(countCacheControls(zeroPrepared), 4)
-  assert.equal(countCacheControls(sanitizeCragBodyWhitelist(zeroPrepared, { capabilities: caps }).body), 4)
+  assert.equal(countCacheControls(sanitizeCragBodyWhitelist(zeroPrepared, { capabilities: legacyV4Caps }).body), 4)
 
   const passthroughPrepared = prepareCragPrintBody(inbound, {
     preset: 'official_full',
     officialPassthrough: true,
-    capabilities: caps,
+    capabilities: legacyV4Caps,
     cacheTtl: '1h',
   })
   assert.equal(countCacheControls(passthroughPrepared), 4)
-  assert.equal(countCacheControls(sanitizeCragBodyWhitelist(passthroughPrepared, { capabilities: caps }).body), 4)
+  assert.equal(
+    countCacheControls(sanitizeCragBodyWhitelist(passthroughPrepared, { capabilities: legacyV4Caps }).body),
+    4,
+  )
 })

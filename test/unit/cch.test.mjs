@@ -222,20 +222,32 @@ test('persona assembly seals a CCH matching the serialized request projection', 
   assert.equal(computeClaudeCodeCch(Buffer.from(projected, 'utf8')), cch)
 })
 
-test('no inbound system still emits billing, identity, 303 harness, and role=system env', () => {
+test('no inbound system emits billing+identity in Mode 1 (official) and full 303 harness+env in Mode 2 (official_full)', () => {
   const sessionId = '11111111-2222-4333-8444-555555555555'
-  const out = applyCrsUnofficialPersona(
+  const minimal = applyCrsUnofficialPersona(
     {
       model: 'claude-sonnet-5-5',
       messages: [{ role: 'user', content: '你好呀。' }],
     },
     { mode: 'official_prompt', sessionId },
   )
-  assert.match(out.system[0].text, /^x-anthropic-billing-header: /)
-  assert.equal(out.system[1].text, "You are Claude Code, Anthropic's official CLI for Claude.")
-  assert.equal(out.system[2].text, OFFICIAL_303_HARNESS)
-  assert.deepEqual(out.system[2].cache_control, { type: 'ephemeral', scope: 'global' })
-  assert.equal(out.system[3].text, '__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__')
-  assert.equal(out.messages[1].role, 'system')
-  assert.match(out.messages[1].content, /^# Environment\n/)
+  assert.equal(minimal.system.length, 2)
+  assert.match(minimal.system[0].text, /^x-anthropic-billing-header: /)
+  assert.equal(minimal.system[1].text, "You are Claude Code, Anthropic's official CLI for Claude.")
+  assert.equal(minimal.messages.length, 1)
+
+  const full = applyCrsUnofficialPersona(
+    {
+      model: 'claude-sonnet-5-5',
+      messages: [{ role: 'user', content: '你好呀。' }],
+    },
+    { mode: 'official_full', sessionId },
+  )
+  assert.match(full.system[0].text, /^x-anthropic-billing-header: /)
+  assert.equal(full.system[1].text, "You are Claude Code, Anthropic's official CLI for Claude.")
+  assert.equal(full.system[2].text, OFFICIAL_303_HARNESS)
+  assert.deepEqual(full.system[2].cache_control, { type: 'ephemeral', scope: 'global' })
+  assert.equal(full.system[3].text, '__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__')
+  assert.equal(full.messages[1].role, 'system')
+  assert.match(full.messages[1].content, /^# Environment\n/)
 })

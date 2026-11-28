@@ -35,19 +35,24 @@ function firstUserText(body) {
   return (Array.isArray(content) ? content : []).map((part) => String(part?.text || '')).join('')
 }
 
-function assertOfficial(body, { caller = '' } = {}) {
+function assertOfficial(body, { caller = '', full = false } = {}) {
   const blocks = texts(body)
   assert.match(blocks[0], /^x-anthropic-billing-header: /)
   assert.equal(blocks[1], CRS_OFFICIAL_CLI_SYSTEM)
-  assert.equal(blocks[2], OFFICIAL_303_HARNESS)
-  assert.equal(blocks[3], '__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__')
-  assert.equal(blocks.length, 4)
+  if (full) {
+    assert.equal(blocks[2], OFFICIAL_303_HARNESS)
+    assert.equal(blocks[3], '__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__')
+    assert.equal(blocks.length, 4)
+  } else {
+    assert.equal(blocks.length, 2)
+  }
   assert.equal(body.messages[0].role, 'user')
   const first = firstUserText(body)
   if (caller) assert.equal(first, `<system-reminder>\n${caller}\n</system-reminder>\n${HI}`)
   else assert.equal(first, HI)
   const env = body.messages.find((message) => message.role === 'system')
-  assert.match(String(env?.content || ''), /^# Environment\n/)
+  if (full) assert.match(String(env?.content || ''), /^# Environment\n/)
+  else assert.equal(env, undefined)
 }
 
 function assertZero(body, { caller = '' } = {}) {

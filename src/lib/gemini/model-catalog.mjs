@@ -250,7 +250,10 @@ export function resolveUpstreamModel(
     if (isGemini || wantedLower.startsWith(ANTIGRAVITY_PREFIX)) {
       const baseHit = publicByLower.get(baseLower)
       if (baseHit) {
-        const clamped = desiredTier === 'xhigh' && !baseLower.includes('hydrogen') ? 'high' : desiredTier
+        const clamped =
+          desiredTier === 'xhigh' && !baseLower.includes('hydrogen') && !baseLower.includes('neon')
+            ? 'high'
+            : desiredTier
         const canonicalPublic = spec.impliedEffort && !spec.hadDecorations ? wanted : `${baseHit.public_id}-${clamped}`
         return formatHit(baseHit, canonicalPublic)
       }

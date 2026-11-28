@@ -4851,6 +4851,18 @@ export function createPanelHandler(ctx) {
           if (hasAuthScheme) {
             const vm = persistSlotAuthScheme(cfg.paths.project, id, body.auth_scheme || body.authScheme)
             if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+            try {
+              const host = slotHost(vm)
+              await (host.syncCredentials || host.onImport)?.(vm, path.join(cfg.paths.project, 'vms', id))
+            } catch (error) {
+              return json(res, 502, {
+                ok: false,
+                error: {
+                  code: 'credential_sync_failed',
+                  message: String(error?.message || 'failed to sync auth_scheme to slot'),
+                },
+              })
+            }
           }
           let slotPolicyResult = null
           if (hasSlotPolicy) {

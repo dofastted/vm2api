@@ -402,7 +402,7 @@ function normalizeGlobalOfficialPreset(rawValue) {
     .trim()
     .toLowerCase()
   if (!raw) return null
-  if (raw === OFFICIAL_303_PRESET || raw === 'official-303' || raw === '303') return OFFICIAL_303_PRESET
+  if (raw === OFFICIAL_303_PRESET || raw === 'official-303' || raw === '303') return 'official_full'
   const normalized = normalizePersonaPreset(raw)
   if (normalized === 'official') return 'official'
   return 'official_full'
@@ -420,10 +420,7 @@ export function resolveGlobalPromptPolicy(routingConfig = {}) {
     .trim()
     .toLowerCase()
 
-  if (
-    resolveGlobalZeroInject(routingConfig) ||
-    (!rawPersonaPreset && rawCragPreset !== '' && normalizeCragPersonaPreset(rawCragPreset) === 'zero')
-  ) {
+  if (resolveGlobalZeroInject(routingConfig)) {
     return {
       mode: 'zero_inject',
       preset: 'official_full',

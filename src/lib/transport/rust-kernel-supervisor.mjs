@@ -1230,7 +1230,7 @@ async function startRustKernel(
   if (!licensed.ok) return { ...licensed, reason: licensed.code }
   if (exec?.homeDir) {
     const ids = slotUidGidFromHomeDir(exec.homeDir)
-    ensureOfficialCredentialLink(exec.homeDir, ids || {})
+    ensureOfficialCredentialLink(exec.homeDir, { ...(ids || {}), adoptOfficial: false })
     try {
       ensureSlotSubscriptionType(exec.homeDir, exec.vm?.claude?.account_tier || exec.vm?.account_tier, {
         source: exec.vm?.claude?.account_tier ? exec.vm.claude.account_tier_source : exec.vm?.account_tier_source,
