@@ -393,6 +393,66 @@ test('monitor tick accumulates time and exits when operator clears pin', async (
   assert.equal(store.get('vm-1').policy.warmup, undefined)
 })
 
+test('monitor tick records hold_fatal through the loop and dedupes within the fatal window', async () => {
+  const db = fakeDb()
+  insert(db, { at: '2026-11-27T05:30:00.000Z', status: 401, code: 'upstream_auth_failed' })
+
+  const store = new Map()
+  const vm = { id: 'vm-1', status: 'running', schedulable: true, policy: {} }
+  startWarmup(vm, { targetRpm: 30, now: '2026-11-26T00:00:00.000Z' })
+  store.set('vm-1', vm)
+
+  const monitor = createWarmupMonitor({
+    config: { interval_sec: 600, min_hours: 24, min_requests: 100, fatal_window_hours: 6 },
+    getDb: () => db,
+    poolMemberVmIds: () => new Set(['vm-1']),
+    listVms: () => [{ id: 'vm-1' }],
+    getVm: (id) => store.get(id),
+    loadVm: async (id) => store.get(id),
+    saveVm: async (v) => store.set(v.id, v),
+    now: () => NOW_MS,
+    log: () => {},
+  })
+
+  // First tick: the hold_fatal decision flows through applyWarmupAction (not
+  // just logged) and persists last_fatal_at + one audit event.
+  await monitor.tickNow()
+  const w1 = store.get('vm-1').policy.warmup
+  assert.equal(w1.last_fatal_at, NOW_ISO)
+  assert.equal(w1.events.at(-1).kind, 'hold_fatal')
+  assert.equal(w1.accumulated_minutes, 0)
+
+  // Second tick, same fatal still inside the window: deduped — no rewrite,
+  // no extra event, bounded history preserved.
+  await monitor.tickNow()
+  const w2 = store.get('vm-1').policy.warmup
+  assert.equal(w2.events.filter((e) => e.kind === 'hold_fatal').length, 1)
+  assert.equal(w2.last_fatal_at, NOW_ISO)
+
+  // After the window slides out the phase returns to warming and the next
+  // fatal cluster records a fresh timestamp.
+  const later = Date.parse('2026-11-27T14:00:00.000Z')
+  const monitor2 = createWarmupMonitor({
+    config: { interval_sec: 600, min_hours: 24, min_requests: 100, fatal_window_hours: 6 },
+    getDb: () => db,
+    poolMemberVmIds: () => new Set(['vm-1']),
+    listVms: () => [{ id: 'vm-1' }],
+    getVm: (id) => store.get(id),
+    loadVm: async (id) => store.get(id),
+    saveVm: async (v) => store.set(v.id, v),
+    now: () => later,
+    log: () => {},
+  })
+  await monitor2.tickNow()
+  assert.equal(store.get('vm-1').policy.warmup.accumulated_minutes, 10) // resumed accruing
+
+  insert(db, { at: '2026-11-27T13:30:00.000Z', status: 403, code: 'refusal_guard' })
+  await monitor2.tickNow()
+  const w3 = store.get('vm-1').policy.warmup
+  assert.equal(w3.last_fatal_at, '2026-11-27T14:00:00.000Z')
+  assert.equal(w3.events.filter((e) => e.kind === 'hold_fatal').length, 2)
+})
+
 test('monitor setConfig recreates interval timer when interval_sec changes', (t) => {
   const origSetInterval = globalThis.setInterval
   const origClearInterval = globalThis.clearInterval

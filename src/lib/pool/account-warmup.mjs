@@ -248,10 +248,19 @@ export async function applyWarmupAction(
         return { applied: 'pause' }
 
       case 'hold_fatal': {
-        w.last_fatal_at = stamp
-        pushEvent(w, { kind: 'hold_fatal', count: decision.recentFatal }, stamp, config?.max_events)
-        await save(vm)
-        return { applied: 'hold_fatal', last_fatal_at: stamp }
+        // Dedupe: record the first sighting of a fatal cluster only. Re-running
+        // every monitor tick would keep refreshing last_fatal_at (so the window
+        // never slides out) and flood the bounded event history.
+        const cfg = config || DEFAULT_WARMUP
+        const stampMs = Date.parse(stamp)
+        const prevMs = Date.parse(w.last_fatal_at || '')
+        const deduped = Number.isFinite(prevMs) && stampMs - prevMs < cfg.fatal_window_hours * 3600_000
+        if (!deduped) {
+          w.last_fatal_at = stamp
+          pushEvent(w, { kind: 'hold_fatal', count: decision.recentFatal }, stamp, cfg.max_events)
+          await save(vm)
+        }
+        return { applied: 'hold_fatal', last_fatal_at: w.last_fatal_at, deduped }
       }
 
       default:
