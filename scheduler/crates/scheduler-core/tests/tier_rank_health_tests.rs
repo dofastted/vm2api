@@ -1021,6 +1021,105 @@ async fn admin_unrest_clears_cooldown_sink_permanent_and_wakes_waiters() {
 }
 
 #[tokio::test]
+async fn idempotency_cache_rejects_released_acquire_lease() {
+    let pool = PoolConfig {
+        id: CompactString::const_new("p1"),
+        members: vec![member("claude_vm:n1", "n1", MemberRole::Active, 1)],
+        ..Default::default()
+    };
+    let eng = boot_pool(
+        EngineOptions::default(),
+        pool,
+        vec![node_cfg("claude_vm:n1", "n1", 8, 10, 1, 1)],
+        vec![],
+    );
+    let request = req("released", "p1", "m", "s1");
+    let lease = eng.acquire(request.clone()).await.unwrap();
+    release_ok(&eng, &lease.lease_id);
+    assert_eq!(
+        eng.acquire(request).await.unwrap_err().code(),
+        ErrorCode::LeaseNotFound
+    );
+    assert_eq!(eng.node_inflight("claude_vm:n1"), 0);
+    let fresh = eng.acquire(req("fresh", "p1", "m", "s1")).await.unwrap();
+    assert_ne!(fresh.lease_id, lease.lease_id);
+    release_ok(&eng, &fresh.lease_id);
+}
+
+#[tokio::test]
+async fn idempotency_cache_rejects_released_switch_lease() {
+    let pool = PoolConfig {
+        id: CompactString::const_new("p1"),
+        members: vec![
+            member("claude_vm:n1", "n1", MemberRole::Active, 1),
+            member("claude_vm:n2", "n2", MemberRole::Active, 2),
+        ],
+        ..Default::default()
+    };
+    let eng = boot_pool(
+        EngineOptions::default(),
+        pool,
+        vec![
+            node_cfg("claude_vm:n1", "n1", 8, 10, 1, 1),
+            node_cfg("claude_vm:n2", "n2", 8, 10, 1, 1),
+        ],
+        vec![],
+    );
+    let first = eng.acquire(req("switch", "p1", "m", "s1")).await.unwrap();
+    let mut next = req("switch", "p1", "m", "s1");
+    next.attempt_no = 2;
+    let request = SwitchRequest {
+        release_lease_id: first.lease_id,
+        failure: FailureReport {
+            http_status: 400,
+            error_class: ErrorClass::Client4xx,
+            ..Default::default()
+        },
+        next_attempt: next,
+    };
+    let switched = eng.switch(request.clone()).await.unwrap();
+    assert_eq!(
+        eng.switch(request.clone()).await.unwrap().lease_id,
+        switched.lease_id
+    );
+    release_ok(&eng, &switched.lease_id);
+    assert_eq!(
+        eng.switch(request).await.unwrap_err().code(),
+        ErrorCode::LeaseNotFound
+    );
+    assert_eq!(
+        eng.node_inflight("claude_vm:n1") + eng.node_inflight("claude_vm:n2"),
+        0
+    );
+}
+
+#[tokio::test]
+async fn idempotency_cache_rejects_expired_lease_before_reaping() {
+    let pool = PoolConfig {
+        id: CompactString::const_new("p1"),
+        members: vec![member("claude_vm:n1", "n1", MemberRole::Active, 1)],
+        ..Default::default()
+    };
+    let eng = boot_pool(
+        EngineOptions {
+            lease_ttl_ms: 1,
+            ..Default::default()
+        },
+        pool,
+        vec![node_cfg("claude_vm:n1", "n1", 8, 10, 1, 1)],
+        vec![],
+    );
+    let request = req("expired", "p1", "m", "s1");
+    let lease = eng.acquire(request.clone()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert_eq!(
+        eng.acquire(request).await.unwrap_err().code(),
+        ErrorCode::LeaseNotFound
+    );
+    release_ok(&eng, &lease.lease_id);
+}
+
+#[tokio::test]
 async fn idempotency_cache_returns_same_lease_for_same_request_and_attempt() {
     let pool = PoolConfig {
         id: CompactString::const_new("p1"),
@@ -1715,103 +1814,4 @@ async fn aborted_timeout_and_request_fault_releases_keep_session_stick() {
         );
         assert_eq!(sticks.bindings[0].node_key, "claude_vm:n1");
     }
-}
-
-#[tokio::test]
-async fn idempotency_cache_rejects_released_acquire_lease() {
-    let pool = PoolConfig {
-        id: CompactString::const_new("p1"),
-        members: vec![member("claude_vm:n1", "n1", MemberRole::Active, 1)],
-        ..Default::default()
-    };
-    let eng = boot_pool(
-        EngineOptions::default(),
-        pool,
-        vec![node_cfg("claude_vm:n1", "n1", 8, 10, 1, 1)],
-        vec![],
-    );
-    let request = req("released", "p1", "m", "s1");
-    let lease = eng.acquire(request.clone()).await.unwrap();
-    release_ok(&eng, &lease.lease_id);
-    assert_eq!(
-        eng.acquire(request).await.unwrap_err().code(),
-        ErrorCode::LeaseNotFound
-    );
-    assert_eq!(eng.node_inflight("claude_vm:n1"), 0);
-    let fresh = eng.acquire(req("fresh", "p1", "m", "s1")).await.unwrap();
-    assert_ne!(fresh.lease_id, lease.lease_id);
-    release_ok(&eng, &fresh.lease_id);
-}
-
-#[tokio::test]
-async fn idempotency_cache_rejects_released_switch_lease() {
-    let pool = PoolConfig {
-        id: CompactString::const_new("p1"),
-        members: vec![
-            member("claude_vm:n1", "n1", MemberRole::Active, 1),
-            member("claude_vm:n2", "n2", MemberRole::Active, 2),
-        ],
-        ..Default::default()
-    };
-    let eng = boot_pool(
-        EngineOptions::default(),
-        pool,
-        vec![
-            node_cfg("claude_vm:n1", "n1", 8, 10, 1, 1),
-            node_cfg("claude_vm:n2", "n2", 8, 10, 1, 1),
-        ],
-        vec![],
-    );
-    let first = eng.acquire(req("switch", "p1", "m", "s1")).await.unwrap();
-    let mut next = req("switch", "p1", "m", "s1");
-    next.attempt_no = 2;
-    let request = SwitchRequest {
-        release_lease_id: first.lease_id,
-        failure: FailureReport {
-            http_status: 400,
-            error_class: ErrorClass::Client4xx,
-            ..Default::default()
-        },
-        next_attempt: next,
-    };
-    let switched = eng.switch(request.clone()).await.unwrap();
-    assert_eq!(
-        eng.switch(request.clone()).await.unwrap().lease_id,
-        switched.lease_id
-    );
-    release_ok(&eng, &switched.lease_id);
-    assert_eq!(
-        eng.switch(request).await.unwrap_err().code(),
-        ErrorCode::LeaseNotFound
-    );
-    assert_eq!(
-        eng.node_inflight("claude_vm:n1") + eng.node_inflight("claude_vm:n2"),
-        0
-    );
-}
-
-#[tokio::test]
-async fn idempotency_cache_rejects_expired_lease_before_reaping() {
-    let pool = PoolConfig {
-        id: CompactString::const_new("p1"),
-        members: vec![member("claude_vm:n1", "n1", MemberRole::Active, 1)],
-        ..Default::default()
-    };
-    let eng = boot_pool(
-        EngineOptions {
-            lease_ttl_ms: 1,
-            ..Default::default()
-        },
-        pool,
-        vec![node_cfg("claude_vm:n1", "n1", 8, 10, 1, 1)],
-        vec![],
-    );
-    let request = req("expired", "p1", "m", "s1");
-    let lease = eng.acquire(request.clone()).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(10)).await;
-    assert_eq!(
-        eng.acquire(request).await.unwrap_err().code(),
-        ErrorCode::LeaseNotFound
-    );
-    release_ok(&eng, &lease.lease_id);
 }
