@@ -23,8 +23,20 @@ function splitSmbios(body) {
   return parts
 }
 
+function coalesceBrokenCommaParts(parts) {
+  const merged = []
+  for (const part of parts) {
+    if (!part.includes('=') && merged.length > 0) {
+      merged[merged.length - 1] += `,${part}`
+    } else {
+      merged.push(part)
+    }
+  }
+  return merged
+}
+
 function joinSmbios(parts) {
-  return parts.join(',')
+  return parts.map((part) => String(part).replaceAll(',', ',,')).join(',')
 }
 
 function uuidFromQemuSmbiosArgs(text) {
@@ -48,7 +60,7 @@ function uuidFromQemuSmbiosArgs(text) {
 
 function setType1Uuid(type1Line, uuid) {
   const body = type1Line.startsWith('type=1,') ? type1Line.slice('type=1,'.length) : type1Line
-  const parts = splitSmbios(body)
+  const parts = body ? coalesceBrokenCommaParts(splitSmbios(body)) : []
   let found = false
   const next = parts.map((part) => {
     const eq = part.indexOf('=')
