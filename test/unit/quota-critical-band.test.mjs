@@ -273,7 +273,7 @@ test('scheduler switches using requestRisk on the quotaRequest body estimate', a
           .map((entry) => `claude_vm:${entry.id}`),
     }),
     workerHealth: async () => ({ ok: true, credential: { generation: 1, has_access: true } }),
-    config: { fallback_wait_timeout_ms: 5, sticky_wait_timeout_ms: 5 },
+    config: { fallback_wait_timeout_ms: 5 },
   })
   const selected = await pool.selectAndReserve({
     model: 'claude-sonnet-4-5',
@@ -313,7 +313,7 @@ test('all in-band accounts yield quota_guard_request_too_large', async (t) => {
         }),
     }),
     workerHealth: async () => ({ ok: true, credential: { generation: 1, has_access: true } }),
-    config: { fallback_wait_timeout_ms: 5, sticky_wait_timeout_ms: 5 },
+    config: { fallback_wait_timeout_ms: 5 },
   })
   const selected = await pool.selectAndReserve({
     model: 'claude-sonnet-4-5',

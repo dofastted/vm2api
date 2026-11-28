@@ -170,7 +170,7 @@ describe('P1-02: StickyPane copy distinguishes routing affinity from seat occupa
   })
 })
 
-describe('P1-03, P2-04 & P2-05: PoolPane defaults, seatCap, no seat_grace_ms, router Links', () => {
+describe('P1-03, P2-04 & P2-05: PoolPane defaults, seatCap, no dead pool keys, router Links', () => {
   it('matches routing.json failover defaults and PoolScheduler familyLimitsOf seatCap', () => {
     expect(FAILOVER_DEFAULTS.max_account_switches).toBe(3)
     expect(FAILOVER_DEFAULTS.max_same_account_retries).toBe(3)
@@ -194,12 +194,21 @@ describe('P1-03, P2-04 & P2-05: PoolPane defaults, seatCap, no seat_grace_ms, ro
     ).toBe(12)
   })
 
-  it('removes seat_grace_ms slider and hardcoded /console/#/ anchors from PoolPane', () => {
+  it('removes dead pool key sliders and hardcoded /console/#/ anchors from PoolPane', () => {
     const source = readFileSync(
       new URL('./pool-pane.tsx', import.meta.url),
       'utf8'
     )
-    expect(source).not.toContain('seat_grace_ms')
+    // Keys nobody reads since the M3 Rust-scheduler cutover.
+    for (const dead of [
+      'seat_grace_ms',
+      'seat_budget_reserve_pct',
+      'sticky_wait_timeout_ms',
+      'kernel_lease_queue_grace_ms',
+      'heartbeat_stale_ms',
+    ]) {
+      expect(source).not.toContain(dead)
+    }
     expect(source).not.toContain('旧席位宽限')
     expect(source).not.toContain("href='/console/#/vm'")
     expect(source).not.toContain("href='/console/#/settings/sticky'")
@@ -427,9 +436,7 @@ describe('P3-02: per-card pending badges reflect only the edited card slice', ()
         strategy: 'balanced',
         reset_priority: true,
         queue_max: 50,
-        sticky_wait_timeout_ms: 45000,
         fallback_wait_timeout_ms: 30000,
-        seat_budget_reserve_pct: 0.02,
       },
       inference: { session_slots: 20, prewarm_enabled: false },
       tiers: {

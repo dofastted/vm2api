@@ -68,12 +68,8 @@
     "max_subagents_per_session": null,
     "max_primary_sessions": null,
     "queue_max": 50,
-    "seat_grace_ms": 30000,
-    "seat_budget_reserve_pct": 0.02,
     "fallback_wait_timeout_ms": 30000,
-    "sticky_wait_timeout_ms": 45000,
     "worker_health_ttl_ms": 5000,
-    "heartbeat_stale_ms": 15000,
     "circuit_failure_threshold": 3,
     "circuit_open_ms": 30000
   },
@@ -85,7 +81,6 @@
     "total_retry_deadline_ms": 120000,
     "stream_idle_timeout_ms": 180000,
     "queue_keepalive_delay_ms": 60000,
-    "session_queue_timeout_ms": 900000,
     "eager_tool_streaming": true
   },
   "websocket": {

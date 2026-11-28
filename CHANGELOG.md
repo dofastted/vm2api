@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.4.253 — 2026-11-28 · 热修：`role: "system"` `tool_addition`/`tool_removal` 400、内联工具改写与 CRAG `3.1.30` beta 兼容性修复
+## 1.4.254 — 2026-11-28 · 热修：`role: "system"` `tool_addition`/`tool_removal` 400、内联工具改写与 CRAG `3.1.30` beta 兼容性修复
 
 - **修复中转/第三方流量触发 `400 messages.*.content: 'tool_addition'/'tool_removal' blocks are only permitted within role: "system" messages` 及重构兼容性回归**：
   - **收口第三方 `role: "system"|"developer"` 折叠路径（`src/lib/protocol/{third-party-system,outbound-attempt}.mjs`）**：`foldThirdPartyRoleSystemMessages` 统一复用 `extractThirdPartySystemMessages`（SSOT），仅搬迁纯文本块到 `messages[firstUser]`，完整保留 `tool_addition` / `tool_removal` / `tool_reference` 非文本块与 `output_config` / `clear_at` / `cache_control` 回合控制原位留在 `role: "system"`。
@@ -10,7 +10,16 @@
 - **钉选 CRAG V4 `3.1.30` 延续载荷（`dofastted/crag#43`、`payload-2026.11.28-crag-3.1.30`，零密钥轮换）**：
   - 修复 `wire.rs::scan_body_features` 遗漏顶层 `body.cache_control`（`1h` / `evict_on_complete` / `scope`）、`synthesize_betas` 误将 `claude-haiku-5-5` 判为旧 Haiku 及 `/v1/messages/count_tokens` 缺少按需 beta，并修复 `runtime.rs::collect_body_feature_betas` 对 `fast-mode-2026-02-01` 与 `compact_20260904` 的门控。
   - `deploy/payload.json` 与 `src/lib/admin/kernel-catalog.mjs` 升级至 `payload-2026.11.28-crag-3.1.30`（沿用生产公钥 `9dbb4bc2…` / 载荷密钥 `835451e2…`，保留 `3.1.29` 可一键回退）。
-- 部署说明：本次热修零数据库迁移、零前端与 `bin/` 变更；更新控制面至 `v1.4.253` 并刷新宿主 `share/crag/kernels/v2/amd64/` 与共享仓 `store/crag/current -> versions/3.1.30` 后滚动重载 CRAG 槽即可生效。
+- 部署说明：本次热修零数据库迁移、零前端与 `bin/` 变更；更新控制面至 `v1.4.254` 并刷新宿主 `share/crag/kernels/v2/amd64/` 与共享仓 `store/crag/current -> versions/3.1.30` 后滚动重载 CRAG 槽即可生效。
+
+## 1.4.253 — 2026-11-28 · 清理 M3 切换后无人读取的号池/故障转移配置键与面板滑块
+
+- **删除 M3 切换（v1.4.243）后没有任何读取方的 routing 键（#2063）**：
+  - 移除 `pool.sticky_wait_timeout_ms`、`pool.seat_grace_ms`、`pool.seat_budget_reserve_pct`、`pool.kernel_lease_queue_grace_ms`、`pool.heartbeat_stale_ms` 与 `failover.session_queue_timeout_ms` 的默认值、归一化与 `src/config/routing.json` 条目（`src/lib/pool/{pool-scheduler,failover-runner}.mjs`）；已存有这些键的 `routing.json` 照常加载，未知键原样透传、不读也不报错，生产配置无需修改
+  - 设置页「号池」移除不再生效的「每席位预算预留」滑块与余量阶梯图、「粘性等待」滑块，排队时间线只画全局排队一条线，与 Rust 调度器立即溢出一致（`web/src/features/settings/{pool-pane.tsx,routing-draft.ts}`）；`docs/INFERENCE.md`、`docs/API.md` 同步改写，`session_queue_timeout_ms` 改指向号池级配置（`scheduler_pools.session_queue_timeout_ms`，该列未改动）
+  - 保留仍在生效的 `pool.circuit_failure_threshold` / `pool.circuit_open_ms`（`unitCircuit` 全局单例仍由 Claude 与 Gemini 调度共用）
+- 测试修复（#2066）：`test/unit/failover-runner.test.mjs` 的 mock 调度器现在与生产契约一致，识别 `skipSessionGate`；此前 #2056 合入后「batch 成员并发不串行」用例会永远等待 mock 会话锁，整文件撞到 300s 上限（dev 的推送 CI 只跑被改动的测试文件，因此未被发现）。纯测试改动，无用户可见变化
+- 部署说明：本次改动零数据库迁移、零 Rust 变更；仅删除无读取方的配置与面板控件，升级无需额外操作。
 
 ## 1.4.252 — 2026-11-28 · 补回 M3 切换丢失的 238 调度规则（Fable 闸、节点闸、借号不搬 pin、续聊不跨号等）
 

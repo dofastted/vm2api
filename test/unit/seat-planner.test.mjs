@@ -45,9 +45,11 @@ test('pool routing normalization: queue_max clamps, legacy strategy, dropped per
     seat_budget_reserve_pct: 0.9,
   })
   assert.equal(Object.hasOwn(next, 'max_waiters_per_account'), false)
-  assert.equal(next.seat_grace_ms, 120000)
-  assert.equal(next.seat_budget_reserve_pct, 0.5)
-  assert.equal(normalizePoolRouting({}).seat_budget_reserve_pct, 0.02)
+  // SeatPlanner keys are dead since M3: stored values load untouched, defaults no longer add them.
+  assert.equal(next.seat_grace_ms, 999999)
+  assert.equal(next.seat_budget_reserve_pct, 0.9)
+  assert.equal(Object.hasOwn(normalizePoolRouting({}), 'seat_grace_ms'), false)
+  assert.equal(Object.hasOwn(normalizePoolRouting({}), 'seat_budget_reserve_pct'), false)
 })
 
 test('M3 cutover (D4): PoolScheduler does not instantiate legacy Node SeatPlanner', () => {
