@@ -1786,3 +1786,58 @@ unixTest(
     assert.equal(row409.providerChain[0].providerRequestId, 'req_anthropic_409')
   },
 )
+
+test('native handoff accepts zero-argument tool_use with empty input_json_delta before content_block_stop', async () => {
+  const result = summary({
+    schema_version: 2,
+    message_id: 'msg_zero_arg_tool',
+    stop_reason: 'tool_use',
+    provider_complete: true,
+    handoff_complete: true,
+  })
+  const sse =
+    start(result) +
+    frame({
+      type: 'content_block_start',
+      index: 0,
+      content_block: { type: 'tool_use', id: 'toolu_cronlist', name: 'CronList', input: {} },
+    }) +
+    frame({ type: 'ping' }) +
+    frame({
+      type: 'content_block_delta',
+      index: 0,
+      delta: { type: 'input_json_delta', partial_json: '' },
+    }) +
+    frame({ type: 'content_block_stop', index: 0 }) +
+    resultFrame(result) +
+    frame({
+      type: 'message_delta',
+      delta: { stop_reason: 'tool_use', stop_sequence: null },
+      usage: { output_tokens: 16 },
+    }) +
+    frame({ type: 'message_stop' })
+  const response = Readable.from([sse])
+  response.headers = { 'content-type': 'text/event-stream' }
+  const state = createNativeHandoffState({ enabled: true, providerResultEnabled: true })
+  const lines = []
+  const consumed = await consumeNativeHandoffStream(response, {
+    state,
+    deliveryMode: 'realtime',
+    onEvent: (line) => lines.push(line),
+  })
+  const events = eventsFrom(lines)
+  assert.equal(consumed.body.type, 'message')
+  assert.equal(consumed.body.stop_reason, 'tool_use')
+  assert.equal(consumed.body.content.length, 1)
+  assert.equal(consumed.body.content[0].name, 'CronList')
+  assert.deepEqual(consumed.body.content[0].input, {})
+  assert.equal(Object.hasOwn(consumed.body.content[0], '_inputJson'), false)
+  assert.equal(
+    events.some((evt) => evt.type === 'error'),
+    false,
+  )
+  assert.equal(
+    events.some((evt) => evt.type === 'message_stop'),
+    true,
+  )
+})
