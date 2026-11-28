@@ -3816,6 +3816,15 @@ function stopToAnthropicReason(stop) {
   return 'end_turn'
 }
 
+function geminiErrorInfoReason(error) {
+  const details = Array.isArray(error?.details) ? error.details : []
+  const info = details.find(
+    (item) =>
+      item?.['@type'] === 'type.googleapis.com/google.rpc.ErrorInfo' && typeof item.reason === 'string' && item.reason,
+  )
+  return info ? { reason: info.reason } : {}
+}
+
 /** Parse one raw SSE frame (`data: ...\n\n`) from Gemini API or Code Assist. */
 export function parseGeminiSseFrame(frame) {
   const normalized = String(frame || '').replace(/\r\n/g, '\n')
@@ -3849,6 +3858,7 @@ export function parseGeminiSseFrame(frame) {
           (typeof parsed?.code === 'string' && parsed.code) ||
           'gemini_inference_failed',
         message: parsed?.error?.message || parsed?.message || 'Gemini stream error',
+        ...geminiErrorInfoReason(parsed?.error || parsed),
       }
     } catch {
       return { kind: 'error', status: 502, code: 'gemini_inference_failed', message: raw || 'Gemini stream error' }
@@ -3870,6 +3880,7 @@ export function parseGeminiSseFrame(frame) {
       status: Number.isInteger(payload.error.code) ? payload.error.code : 502,
       code: payload.error.status || 'gemini_inference_failed',
       message: payload.error.message || 'Gemini returned an error frame',
+      ...geminiErrorInfoReason(payload.error),
     }
   }
   const response = payload.response !== undefined ? payload.response : payload
@@ -3880,6 +3891,7 @@ export function parseGeminiSseFrame(frame) {
       status: Number.isInteger(response.error.code) ? response.error.code : 502,
       code: response.error.status || 'gemini_inference_failed',
       message: response.error.message || 'Gemini returned an error frame',
+      ...geminiErrorInfoReason(response.error),
     }
   }
   const meta = isPlainObject(payload.craggeminiMeta)
@@ -4033,7 +4045,7 @@ export function createGeminiEventDecoder({ fallbackModel = '' } = {}) {
       const parsed = parseGeminiSseFrame(frame)
       if (parsed.kind === 'chunk') decodeChunk(parsed.chunk, emit, parsed.meta)
       else if (parsed.kind === 'error') {
-        emit({ kind: 'error', status: parsed.status, code: parsed.code, message: parsed.message })
+        emit(parsed)
       } else if (parsed.kind === 'invalid') {
         emit({ kind: 'error', status: 502, code: 'gemini_inference_invalid_output', message: parsed.message })
       }
