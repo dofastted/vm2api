@@ -26,6 +26,7 @@ import {
   clientDeclaredAgyBridgeParam,
   forwardAgyBridgeToolArgs,
   restoreAgyBridgeToolArgs,
+  isRe2CompatibleRegex,
   sanitizeGeminiSchema,
   sanitizeNativeTuiText,
   signedToolCallId,
@@ -2216,4 +2217,81 @@ test('gemini-4-neon preserves xhigh thinkingLevel alongside gemini-4-neon-xhigh 
     includeThinkingConfig: true,
   })
   assert.equal(carbonReq.generationConfig.thinkingConfig.thinkingLevel, 'high')
+})
+
+test('sanitizeGeminiSchema strips non-RE2 pattern lookarounds/backrefs while keeping valid RE2 patterns (#1985)', () => {
+  // Unit checks on isRe2CompatibleRegex
+  assert.equal(isRe2CompatibleRegex('^[a-z]+$'), true)
+  assert.equal(isRe2CompatibleRegex('^[a-zA-Z0-9_-]{1,64}$'), true)
+  assert.equal(isRe2CompatibleRegex('^(?:foo|bar)+?$'), true)
+  assert.equal(isRe2CompatibleRegex('^\\(\\?!literal\\)$'), true)
+  assert.equal(isRe2CompatibleRegex('^[a-z(?!)]+$'), true)
+  assert.equal(isRe2CompatibleRegex('^(?!x)[a-z]+$'), false)
+  assert.equal(isRe2CompatibleRegex('^(?=.*[A-Z])[a-zA-Z0-9]+$'), false)
+  assert.equal(isRe2CompatibleRegex('(?<=foo)bar'), false)
+  assert.equal(isRe2CompatibleRegex('(?<!foo)bar'), false)
+  assert.equal(isRe2CompatibleRegex('^([a-z]+)-\\1$'), false)
+  assert.equal(isRe2CompatibleRegex('^(?<id>[a-z]+)-\\k<id>$'), false)
+  assert.equal(isRe2CompatibleRegex('^[a-z]++$'), false)
+  assert.equal(isRe2CompatibleRegex('^(?>foo|bar)$'), false)
+
+  const originalSchema = {
+    type: 'object',
+    properties: {
+      collection: { type: 'string', description: 'Collection name', minLength: 1, pattern: '^(?!x)[a-z]+$' },
+      safe: { type: 'string', pattern: '^[a-z]+$' },
+      writes: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: {
+            doc_id: { type: 'string', pattern: '^(?!_)[a-zA-Z0-9_-]+$' },
+            tag: { type: 'string', pattern: '^[a-z0-9-]+$' },
+          },
+          required: ['doc_id'],
+        },
+      },
+    },
+    required: ['collection'],
+  }
+
+  for (const plain of [true, false]) {
+    const cleaned = sanitizeGeminiSchema(originalSchema, { plain })
+    assert.equal(cleaned.properties.collection.pattern, undefined)
+    assert.equal(cleaned.properties.collection.type, 'string')
+    assert.equal(cleaned.properties.collection.description, 'Collection name')
+    assert.equal(cleaned.properties.collection.minLength, 1)
+    assert.equal(cleaned.properties.safe.pattern, '^[a-z]+$')
+    assert.equal(cleaned.properties.writes.items.properties.doc_id.pattern, undefined)
+    assert.equal(cleaned.properties.writes.items.properties.tag.pattern, '^[a-z0-9-]+$')
+    assert.deepEqual(cleaned.properties.writes.items.required, ['doc_id'])
+  }
+  // Caller's original schema object is never mutated.
+  assert.equal(originalSchema.properties.collection.pattern, '^(?!x)[a-z]+$')
+  assert.equal(originalSchema.properties.writes.items.properties.doc_id.pattern, '^(?!_)[a-zA-Z0-9_-]+$')
+
+  // End-to-end Google native inbound -> Antigravity outbound strips incompatible lookahead pattern.
+  const ir = parseInboundToGemini(
+    'gemini',
+    {
+      contents: [{ role: 'user', parts: [{ text: 'Reply with OK.' }] }],
+      tools: [
+        {
+          functionDeclarations: [
+            {
+              name: 'ArtifactData',
+              description: 'Read/write artifacts',
+              parameters: originalSchema,
+            },
+          ],
+        },
+      ],
+    },
+    { routeModel: 'gemini-4-carbon-high', routeStream: true },
+  )
+  const req = buildGeminiRequest(ir, { target: 'antigravity' })
+  const outParams = req.tools[0].functionDeclarations[0].parameters
+  assert.equal(outParams.properties.collection.pattern, undefined)
+  assert.equal(outParams.properties.safe.pattern, '^[a-z]+$')
+  assert.equal(outParams.properties.writes.items.properties.doc_id.pattern, undefined)
 })

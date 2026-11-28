@@ -369,6 +369,8 @@ export function mapCragWorkerError(httpStatus, payload) {
     err.status = status
     err.code = errCode
     err.upstreamStatus = upstream ?? (Number.isInteger(httpStatus) ? httpStatus : status)
+    if (code) err.workerCode = code
+    if (code === 'bridge_disconnected' && upstream == null) err.bridgeDisconnected = true
     return err
   }
   if (code && LICENSE_ERROR_CODES.has(code)) {
