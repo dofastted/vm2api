@@ -9,7 +9,9 @@
  * Transient state (inflight counters, RPM buckets) stays in memory.
  */
 
-import { resolveStoreDb } from '../db/database.mjs'
+import { getDb, isDbOpen, resolveStoreDb } from '../db/database.mjs'
+import { enqueueWrite, writeBehindArmed } from '../db/write-behind.mjs'
+import { getCacheRuntime } from '../cache/index.mjs'
 import { AccountsRepo } from '../db/repos/accounts-repo.mjs'
 import { computeWeeklySplit, weeklySplitConfig } from './weekly-split.mjs'
 import {
@@ -74,6 +76,8 @@ const RESET_WINDOW_MAP = {
   '7d_oi': '7d_oi',
 }
 const MAX_APPLIED_RESET_OPS = 32
+const RESET_GEN_CACHE_TTL_MS = 8_000
+const SESSION_WINDOW_WRITE_DEDUPE_MS = 60_000
 
 function fableModelKey(model) {
   return resolvePolicyModelId(model) || String(model || '').trim()
@@ -122,17 +126,46 @@ export class AccountQuota {
     this.sessions = config?.sessions instanceof SessionLimitRegistry ? config.sessions : new SessionLimitRegistry()
     // vm_id → normalized `vm.policy.quota`; vm.json is the source of truth, this is the hot-path copy.
     this.vmQuota = new Map()
+    this._resetGenCache = new Map() // accountId -> { gens, at }
+    this._lastWrittenWindow = new Map() // accountId -> { vmId, end, start, status, at }
+    this._batchLastUsedStmt = null
+    this._batchAllocsStmt = null
+    this._prepareBatchStatements()
     // seed accounts
     for (const a of accounts || []) this.ensure(a)
   }
 
-  /** Kept for API compat + post-restore hook (no in-memory cache to refresh). */
-  reload() {}
+  _prepareBatchStatements() {
+    try {
+      this._batchAllocsStmt = this.db.prepare(`
+        SELECT account_id, at, source, util_5h, util_7d, status_5h, status_7d, claim, tokens_in, tokens_out
+        FROM (
+          SELECT account_id, at, source, util_5h, util_7d, status_5h, status_7d, claim, tokens_in, tokens_out,
+                 ROW_NUMBER() OVER (PARTITION BY account_id ORDER BY id DESC) AS rn
+          FROM account_allocations
+        ) ranked
+        WHERE rn <= 5
+        ORDER BY account_id, rn ASC
+      `)
+    } catch {
+      this._batchAllocsStmt = null
+    }
+    this._batchLastUsedStmt = null
+  }
+
+  /** Kept for API compat + post-restore hook. */
+  reload() {
+    this._resetGenCache.clear()
+    this._lastWrittenWindow.clear()
+  }
 
   /** Re-bind to a fresh DB connection (after backup restore). */
   rebind(db) {
     this.db = db
     this.repo = new AccountsRepo(db)
+    this._resetGenCache.clear()
+    this._lastWrittenWindow.clear()
+    this._prepareBatchStatements()
   }
 
   /**
@@ -141,6 +174,21 @@ export class AccountQuota {
    */
   attachRuntimeRepo(runtimeRepo) {
     this.runtimeRepo = runtimeRepo || null
+    this._lastWrittenWindow.clear()
+    this._batchLastUsedStmt = null
+  }
+
+  _cacheResetGenerationsFromAccount(accountId, acc, now = Date.now()) {
+    if (!accountId) return
+    const boundaries = acc?.unified?.reset_boundaries || {}
+    this._resetGenCache.set(accountId, {
+      gens: {
+        '5h': Number(boundaries['5h']?.generation) || 0,
+        '7d': Number(boundaries['7d']?.generation) || 0,
+        '7d_oi': Number(boundaries['7d_oi']?.generation) || 0,
+      },
+      at: now,
+    })
   }
 
   _writeSessionWindow(acc) {
@@ -149,16 +197,43 @@ export class AccountQuota {
     const w5 = extra.utilization != null || extra.status || extra.reset ? extra : officialWindow(acc.unified, '5h')
     const endIso = w5.reset || null
     const endMs = endIso ? Date.parse(endIso) : NaN
+    const sessionWindowEnd = Number.isFinite(endMs)
+      ? endMs
+      : Number.isFinite(parseResetMs(endIso))
+        ? parseResetMs(endIso)
+        : null
+    const sessionWindowStart = Number.isFinite(endMs) ? endMs - 5 * 3600_000 : null
+    const sessionWindowStatus = w5.status || null
+    const vmId = acc.vm_id || null
+    // Deduplicate identical session-window writes for real DB-backed runtimeRepo
+    // (mock runtimeRepos without `.db` always pass through so unit tests observe every call).
+    const now = Date.now()
+    if (this.runtimeRepo.db) {
+      const prev = this._lastWrittenWindow.get(acc.account_id)
+      if (
+        prev &&
+        prev.vmId === vmId &&
+        prev.end === sessionWindowEnd &&
+        prev.start === sessionWindowStart &&
+        prev.status === sessionWindowStatus &&
+        now - prev.at < SESSION_WINDOW_WRITE_DEDUPE_MS
+      ) {
+        return
+      }
+      this._lastWrittenWindow.set(acc.account_id, {
+        vmId,
+        end: sessionWindowEnd,
+        start: sessionWindowStart,
+        status: sessionWindowStatus,
+        at: now,
+      })
+    }
     try {
       this.runtimeRepo.updateWindow(acc.account_id, {
-        vmId: acc.vm_id || null,
-        sessionWindowEnd: Number.isFinite(endMs)
-          ? endMs
-          : Number.isFinite(parseResetMs(endIso))
-            ? parseResetMs(endIso)
-            : null,
-        sessionWindowStart: Number.isFinite(endMs) ? endMs - 5 * 3600_000 : null,
-        sessionWindowStatus: w5.status || null,
+        vmId,
+        sessionWindowEnd,
+        sessionWindowStart,
+        sessionWindowStatus,
       })
     } catch {}
   }
@@ -230,18 +305,27 @@ export class AccountQuota {
 
   resetGenerations(accountId) {
     if (!accountId) return { '5h': 0, '7d': 0, '7d_oi': 0 }
+    const now = Date.now()
+    const cached = this._resetGenCache.get(accountId)
+    if (cached && now - cached.at < RESET_GEN_CACHE_TTL_MS) {
+      return { ...cached.gens }
+    }
     const acc = this.repo.get(accountId)
     const boundaries = acc?.unified?.reset_boundaries || {}
-    return {
+    const gens = {
       '5h': Number(boundaries['5h']?.generation) || 0,
       '7d': Number(boundaries['7d']?.generation) || 0,
       '7d_oi': Number(boundaries['7d_oi']?.generation) || 0,
     }
+    this._resetGenCache.set(accountId, { gens, at: now })
+    return { ...gens }
   }
 
   isPreResetResponse(accountId, windowKey, { requestStartedAt = null, resetGenerations = null } = {}) {
     const key = RESET_WINDOW_MAP[windowKey] || windowKey
     if (!accountId || !key) return false
+    const gens = this.resetGenerations(accountId)
+    if ((Number(gens[key]) || 0) === 0) return false
     const acc = this.repo.get(accountId)
     if (!acc?.unified?.reset_boundaries?.[key]) return false
     const check = checkResetWindowWrite(acc, key, {
@@ -313,6 +397,8 @@ export class AccountQuota {
     acc.unified.reset_boundaries = boundaries
     acc.unified.updated_at = new Date(nowMs).toISOString()
     const saved = this.repo.save(acc)
+    this._cacheResetGenerationsFromAccount(accountId, saved)
+    this._lastWrittenWindow.delete(accountId)
     return { applied: true, replayed: !!replayed, windows: updatedWindows, account: saved }
   }
 
@@ -481,7 +567,7 @@ export class AccountQuota {
     if (countRequest) {
       const view = headerWindowOrEmpty(acc.unified, '5h', { now: nowMs })
       const view7 = headerWindowOrEmpty(acc.unified, '7d', { now: nowMs })
-      this.repo.addAllocation(accountId, {
+      const allocRow = {
         at: sampledAt,
         source: 'headers',
         util_5h: view.utilization ?? officialWindow(acc.unified, '5h').utilization,
@@ -491,12 +577,18 @@ export class AccountQuota {
         claim: acc.unified.representative_claim,
         tokens_in: usageBody?.input_tokens ?? null,
         tokens_out: usageBody?.output_tokens ?? null,
-      })
+      }
+      if (writeBehindArmed() && isDbOpen() && this.db === getDb()) {
+        enqueueWrite(() => this.repo.addAllocation(accountId, allocRow))
+      } else {
+        this.repo.addAllocation(accountId, allocRow)
+      }
     }
 
     settleElapsedHeaderWindows(acc, sampledAt, nowMs)
     this._rollWindowHistory(acc, nowMs)
-    const saved = this.repo.save(acc)
+    const saved = !countRequest && !sampled && !exhausted && !reconciledAny ? acc : this.repo.save(acc)
+    if (reconciledAny) this._cacheResetGenerationsFromAccount(accountId, saved)
     this._writeSessionWindow(saved)
     if (reconciledAny && this.headerUnderSafety(saved, nowMs)) {
       this.clearQuotaExhaustedCooldown(accountId, {
@@ -1409,6 +1501,7 @@ export class AccountQuota {
         rate_limit_reset_at: null,
         ...(canLiftRateLimit && state.session_window_status === 'rejected' ? { session_window_status: 'allowed' } : {}),
       })
+      this._lastWrittenWindow.delete(accountId)
     } catch {
       return false
     }
@@ -1447,14 +1540,84 @@ export class AccountQuota {
     }
   }
 
+  _batchLastUsedMap(accountIds) {
+    const out = new Map()
+    if (!this.runtimeRepo) return out
+    if (this.runtimeRepo.db) {
+      try {
+        if (!this._batchLastUsedStmt) {
+          this._batchLastUsedStmt = this.runtimeRepo.db.prepare(
+            'SELECT id AS account_id, last_used_at FROM accounts WHERE last_used_at IS NOT NULL',
+          )
+        }
+        for (const row of this._batchLastUsedStmt.all()) {
+          const ms = typeof row.last_used_at === 'number' ? row.last_used_at : Date.parse(row.last_used_at)
+          if (Number.isFinite(ms) && ms > 0) out.set(row.account_id, ms)
+        }
+        return out
+      } catch {}
+    }
+    for (const id of accountIds) {
+      try {
+        const ms = Number(this.runtimeRepo.get?.(id)?.last_used_at)
+        if (Number.isFinite(ms) && ms > 0) out.set(id, ms)
+      } catch {}
+    }
+    return out
+  }
+
+  _batchRecentAllocationsMap(accountIds) {
+    const out = new Map()
+    if (this._batchAllocsStmt) {
+      try {
+        for (const row of this._batchAllocsStmt.all()) {
+          let list = out.get(row.account_id)
+          if (!list) {
+            list = []
+            out.set(row.account_id, list)
+          }
+          list.push({
+            at: row.at,
+            source: row.source,
+            util_5h: row.util_5h,
+            util_7d: row.util_7d,
+            status_5h: row.status_5h,
+            status_7d: row.status_7d,
+            claim: row.claim,
+            tokens_in: row.tokens_in,
+            tokens_out: row.tokens_out,
+          })
+        }
+        return out
+      } catch {}
+    }
+    for (const id of accountIds) {
+      try {
+        out.set(id, this.repo.recentAllocations(id, 5))
+      } catch {
+        out.set(id, [])
+      }
+    }
+    return out
+  }
+
   snapshot({ now = Date.now() } = {}) {
     const def = this.tiers?.default || {}
+    const rows = this.repo.list()
+    const ids = rows.map((a) => a.account_id)
+    const runtimeLastUsed = this._batchLastUsedMap(ids)
+    const allocsByAccount = this._batchRecentAllocationsMap(ids)
     return {
       safety_ratio: def.limit_5h ?? def.safety_ratio ?? this.config.safety_ratio,
       weekly_safety_ratio: def.limit_7d ?? def.weekly_safety_ratio ?? this.config.weekly_safety_ratio,
       tiers: this.tiers,
-      accounts: this.repo.list().map((a) => {
-        const lastUsedAt = this._lastUsedAt(a.account_id)
+      accounts: rows.map((a) => {
+        const recentAllocs = allocsByAccount.get(a.account_id) || []
+        let lastUsedAt = runtimeLastUsed.get(a.account_id) ?? null
+        if (lastUsedAt == null && recentAllocs[0]?.at) {
+          const parsed = Date.parse(recentAllocs[0].at)
+          lastUsedAt = Number.isFinite(parsed) ? parsed : null
+        }
         const rpm = this._rpmCount(a.account_id, now)
         const official = applyEffectiveWindows(a.unified, { now, lastUsedAt, source: a.unified?.source })
         const listed = listQuotaFromHeaders(a.unified, { now })
@@ -1480,7 +1643,7 @@ export class AccountQuota {
           },
           last_blocked: a.last_blocked,
           window_history: a.window_history || null,
-          recent_allocations: this.repo.recentAllocations(a.account_id, 5),
+          recent_allocations: recentAllocs,
         }
       }),
     }

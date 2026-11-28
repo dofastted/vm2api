@@ -5,8 +5,14 @@
 
 import crypto from 'node:crypto'
 import { ENVELOPE_NEEDLES, extractPrompt } from '../core/distill-detect.mjs'
-import { resolveStoreDb } from '../db/database.mjs'
+import { DB_INSTANCE_ID, getDb, isDbOpen, resolveStoreDb } from '../db/database.mjs'
+import { enqueueWrite, writeBehindArmed } from '../db/write-behind.mjs'
+import { getCacheRuntime } from '../cache/index.mjs'
 import { StickyRepo } from '../db/repos/sticky-repo.mjs'
+
+const STICKY_REDIS_TTL_MS = 3_600_000
+const STICKY_L1_MAX = 16_384
+const STICKY_RENEW_MIN_GAP_MS = 60_000
 import {
   claudeCodeAgentRootSession,
   extractCallerSession,
@@ -203,20 +209,111 @@ export function childDeclaredWithoutParent(body = {}, headers = {}) {
 }
 
 export class StickyRouter {
-  constructor({ dataDir, db, config }) {
+  constructor({ dataDir, db, config, writeBehind = null }) {
     this.db = resolveStoreDb({ db, dataDir })
     this.repo = new StickyRepo(this.db)
     this.config = mergeStickyConfig(config)
+    this._explicitWriteBehind = typeof writeBehind === 'boolean' ? writeBehind : null
+    this._l1 = new Map() // key -> { ent, renewedAt }
+    this._latestByDevice = new Map() // `${prefix}\0${device}` -> { key, bound_at, expires_at }
+    this._stmtLatestByDevice = null
+    this._prepareAuxStatements()
     this.repo.dropAliasKeys()
   }
 
+  _prepareAuxStatements() {
+    try {
+      this._stmtLatestByDevice = this.db.prepare(
+        `SELECT key, device_id, bound_at, expires_at
+         FROM sticky_sessions
+         WHERE device_id = ? AND expires_at > ? AND bound_at >= ?
+         ORDER BY bound_at DESC
+         LIMIT 50`,
+      )
+    } catch {
+      this._stmtLatestByDevice = null
+    }
+  }
+
+  _isPrimaryDb() {
+    return isDbOpen() && this.db === getDb()
+  }
+
+  _redisStickyKey(key) {
+    if (!key) return ''
+    if (this._isPrimaryDb()) return String(key)
+    return `iso:${this.db?.[DB_INSTANCE_ID] || 'isolated'}:${key}`
+  }
+
+  _shouldWriteBehind() {
+    if (this._explicitWriteBehind !== null) return this._explicitWriteBehind
+    return writeBehindArmed() && this._isPrimaryDb()
+  }
+
+  _putL1(key, ent, now = Date.now()) {
+    if (!key || !ent) return
+    if (this._l1.has(key)) this._l1.delete(key)
+    while (this._l1.size >= STICKY_L1_MAX) {
+      const oldest = this._l1.keys().next().value
+      if (oldest === undefined) break
+      this._l1.delete(oldest)
+    }
+    this._l1.set(key, { ent: { ...ent }, renewedAt: now })
+    this._indexLatestParent(key, ent)
+  }
+
+  _indexLatestParent(key, ent) {
+    const device = String(ent?.device_id || '').trim()
+    if (!device || !key) return
+    const m = String(key).match(/^((?:p:[a-z]+:)?k[^:]+:)(.+)$/)
+    if (!m) return
+    const [, prefix, rest] = m
+    if (!rest || /^(fam:|ch:|dev:|envelope$|login$)/.test(rest)) return
+    const mapKey = `${prefix}\0${device}`
+    const prev = this._latestByDevice.get(mapKey)
+    const boundAt = Number(ent.bound_at) || 0
+    if (!prev || boundAt >= prev.bound_at) {
+      if (this._latestByDevice.size > 4096) this._latestByDevice.clear()
+      this._latestByDevice.set(mapKey, {
+        key,
+        bound_at: boundAt,
+        expires_at: Number(ent.expires_at) || 0,
+      })
+    }
+  }
+
+  _getEntrySync(key) {
+    const cached = this._l1.get(key)
+    if (cached) return cached.ent
+    const fromDb = this.repo.get(key)
+    if (fromDb) this._putL1(key, fromDb)
+    return fromDb || null
+  }
+
+  _formatBinding(key, ent) {
+    return {
+      accountId: ent.account_id,
+      vmId: ent.vm_id,
+      sessionId: ent.session_id || null,
+      generation: Number(ent.generation) || 0,
+      slotIndex: ent.slot_index == null ? null : Number(ent.slot_index),
+      key,
+    }
+  }
+
   /** Kept for API compat + post-restore hook (state lives in DB). */
-  reload() {}
+  reload() {
+    this._l1.clear()
+    this._latestByDevice.clear()
+  }
 
   /** Re-bind to a fresh DB connection (after backup restore). */
   rebind(db) {
     this.db = db
     this.repo = new StickyRepo(db)
+    this._l1.clear()
+    this._latestByDevice.clear()
+    this._prepareAuxStatements()
   }
 
   isolateKey(raw, req = null) {
@@ -323,6 +420,34 @@ export class StickyRouter {
     if (id == null || id === '') return null
     const prefix = scopeStickyKey(this.isolateKey('', req), platform)
     if (!prefix) return null
+    const mapKey = `${prefix}\0${device}`
+    const memo = this._latestByDevice.get(mapKey)
+    if (memo) {
+      if (memo.expires_at > now && now - memo.bound_at <= withinMs) {
+        return memo.key
+      }
+      if (memo.expires_at <= now) this._latestByDevice.delete(mapKey)
+    }
+
+    if (this._stmtLatestByDevice) {
+      try {
+        const rows = this._stmtLatestByDevice.all(device, now, now - withinMs)
+        for (const row of rows) {
+          const key = String(row.key || '')
+          if (!key.startsWith(prefix)) continue
+          const rest = key.slice(prefix.length)
+          if (!rest || /^(fam:|ch:|dev:|envelope$|login$)/.test(rest)) continue
+          this._latestByDevice.set(mapKey, {
+            key,
+            bound_at: Number(row.bound_at) || 0,
+            expires_at: Number(row.expires_at) || 0,
+          })
+          return key
+        }
+        return null
+      } catch {}
+    }
+
     let best = null
     let bestAt = 0
     for (const [key, ent] of Object.entries(this.repo.all())) {
@@ -426,18 +551,96 @@ export class StickyRouter {
   /** @returns {{ accountId: string, vmId: string } | null } */
   resolve(key) {
     if (!key || !this.config.enabled) return null
+    const now = Date.now()
+    const cache = getCacheRuntime()
+    const hasRedis = Boolean(cache?.client?.hasRedis)
+    const cached = this._l1.get(key)
+    if (cached) {
+      const ent = cached.ent
+      if (now > ent.expires_at) {
+        this._l1.delete(key)
+        return null
+      }
+      if (hasRedis && now - cached.renewedAt >= STICKY_RENEW_MIN_GAP_MS) {
+        cached.renewedAt = now
+        const renewTtl = Math.min(STICKY_REDIS_TTL_MS, Math.max(1_000, ent.expires_at - now))
+        cache.concurrency.getSticky(this._redisStickyKey(key), { renewTtlMs: renewTtl }).catch(() => {})
+      }
+      return this._formatBinding(key, ent)
+    }
+
     const ent = this.repo.get(key)
     if (!ent) return null
-    if (Date.now() > ent.expires_at) {
+    if (now > ent.expires_at) {
       return null
     }
-    return {
-      accountId: ent.account_id,
-      vmId: ent.vm_id,
-      sessionId: ent.session_id || null,
-      generation: Number(ent.generation) || 0,
-      slotIndex: ent.slot_index == null ? null : Number(ent.slot_index),
-      key,
+    this._putL1(key, ent, now)
+    if (hasRedis) {
+      const ttlMs = Math.min(STICKY_REDIS_TTL_MS, Math.max(1_000, ent.expires_at - now))
+      cache.concurrency.setSticky(this._redisStickyKey(key), ent, { ttlMs }).catch(() => {})
+    }
+    return this._formatBinding(key, ent)
+  }
+
+  /**
+   * Async Redis-first sticky lookup: L1 -> Redis `getSticky` (auto-renews 1h TTL) -> DB backfill.
+   */
+  async resolveAsync(key) {
+    if (!key || !this.config.enabled) return null
+    const now = Date.now()
+    const cache = getCacheRuntime()
+    const hasRedis = Boolean(cache?.client?.hasRedis)
+    const cached = this._l1.get(key)
+    if (cached) {
+      if (now > cached.ent.expires_at) {
+        this._l1.delete(key)
+      } else {
+        if (hasRedis && now - cached.renewedAt >= STICKY_RENEW_MIN_GAP_MS) {
+          cached.renewedAt = now
+          const renewTtl = Math.min(STICKY_REDIS_TTL_MS, Math.max(1_000, cached.ent.expires_at - now))
+          cache.concurrency.getSticky(this._redisStickyKey(key), { renewTtlMs: renewTtl }).catch(() => {})
+        }
+        return this._formatBinding(key, cached.ent)
+      }
+    }
+
+    if (hasRedis) {
+      const fromRedis = await cache.concurrency.getSticky(this._redisStickyKey(key), {
+        renewTtlMs: STICKY_REDIS_TTL_MS,
+      })
+      if (fromRedis && typeof fromRedis === 'object' && fromRedis.account_id && fromRedis.vm_id) {
+        if (!fromRedis.expires_at || now <= Number(fromRedis.expires_at)) {
+          this._putL1(key, fromRedis, now)
+          return this._formatBinding(key, fromRedis)
+        }
+      }
+    }
+
+    return this.resolve(key)
+  }
+
+  /** Prewarm candidate sticky keys from Redis into L1 in parallel (no-op without Redis). */
+  async prewarmKeys(keys) {
+    if (!this.config.enabled || !Array.isArray(keys) || !keys.length) return
+    const cache = getCacheRuntime()
+    if (!cache?.client?.hasRedis) return
+    const unique = [...new Set(keys.filter((k) => k && !this._l1.has(k)))]
+    if (!unique.length) return
+    await Promise.all(unique.map((k) => this.resolveAsync(k).catch(() => null)))
+  }
+
+  _persistUpsert(key, entry) {
+    const cache = getCacheRuntime()
+    if (cache?.client?.hasRedis) {
+      const ttlMs = Math.min(STICKY_REDIS_TTL_MS, Math.max(1_000, (Number(entry.expires_at) || 0) - Date.now()))
+      cache.concurrency.setSticky(this._redisStickyKey(key), entry, { ttlMs }).catch(() => {})
+    }
+    this._putL1(key, entry)
+    if (this._shouldWriteBehind()) {
+      const snapshot = { ...entry }
+      enqueueWrite(() => this.repo.upsert(key, snapshot))
+    } else {
+      this.repo.upsert(key, entry)
     }
   }
 
@@ -455,7 +658,7 @@ export class StickyRouter {
   ) {
     if (!key || !this.config.enabled) return false
     const ttl = (this.config.ttl_seconds || 86400) * 1000
-    const prev = this.repo.get(key) || {}
+    const prev = this._getEntrySync(key) || {}
     const prevGeneration = Number(prev.generation) || 0
     if (ifGeneration != null && prevGeneration !== Number(ifGeneration)) return false
     const vmChanged = !!(prev.vm_id && vmId && prev.vm_id !== vmId)
@@ -485,17 +688,19 @@ export class StickyRouter {
           ? prev.session_id || sessionId || null
           : sessionId || prev.session_id || null
     const device = deviceId == null ? prev.device_id || null : String(deviceId).trim() || null
-    this.repo.upsert(key, {
+    const now = Date.now()
+    const nextEntry = {
       account_id: nextAccount,
       vm_id: nextVm,
       session_id: nextSessionId,
       device_id: device || null,
-      bound_at: keepExpiry && Number(prev.bound_at) ? Number(prev.bound_at) : Date.now(),
-      expires_at: keepExpiry && Number(prev.expires_at) > Date.now() ? Number(prev.expires_at) : Date.now() + ttl,
+      bound_at: keepExpiry && Number(prev.bound_at) ? Number(prev.bound_at) : now,
+      expires_at: keepExpiry && Number(prev.expires_at) > now ? Number(prev.expires_at) : now + ttl,
       hits: (prev.hits || 0) + (countHit ? 1 : 0),
       generation,
       slot_index: nextSlot,
-    })
+    }
+    this._persistUpsert(key, nextEntry)
     return true
   }
 
@@ -503,15 +708,16 @@ export class StickyRouter {
   rebindFamily(key, { accountId, vmId } = {}) {
     if (!key || !this.config.enabled || !accountId || !vmId) return null
     const ttl = (this.config.ttl_seconds || 86400) * 1000
-    const prev = this.repo.get(key) || {}
+    const prev = this._getEntrySync(key) || {}
     const generation = (Number(prev.generation) || 0) + 1
-    this.repo.upsert(key, {
+    const now = Date.now()
+    this._persistUpsert(key, {
       account_id: accountId,
       vm_id: vmId,
       session_id: null,
       device_id: prev.device_id || null,
-      bound_at: Date.now(),
-      expires_at: Date.now() + ttl,
+      bound_at: now,
+      expires_at: now + ttl,
       hits: prev.hits || 0,
       generation,
       slot_index: null,
@@ -523,17 +729,18 @@ export class StickyRouter {
   bindDeviceAffinity(key, { accountId, vmId } = {}, { countHit = false } = {}) {
     if (!key || !this.config.enabled || !accountId || !vmId) return null
     const ttl = (this.config.ttl_seconds || 86400) * 1000
-    const prev = this.repo.get(key) || {}
+    const prev = this._getEntrySync(key) || {}
     const changed = !!(prev.vm_id && (prev.account_id !== accountId || prev.vm_id !== vmId))
     const prevGeneration = Number(prev.generation) || 0
     const generation = prev.vm_id ? (changed ? prevGeneration + 1 : prevGeneration || 1) : 1
-    this.repo.upsert(key, {
+    const now = Date.now()
+    this._persistUpsert(key, {
       account_id: accountId,
       vm_id: vmId,
       session_id: null,
       device_id: prev.device_id || null,
-      bound_at: Date.now(),
-      expires_at: Date.now() + ttl,
+      bound_at: now,
+      expires_at: now + ttl,
       hits: (prev.hits || 0) + (countHit ? 1 : 0),
       generation,
       slot_index: null,
@@ -590,10 +797,45 @@ export class StickyRouter {
 
   unbind(key) {
     if (!key) return
-    this.repo.remove(key)
+    this._l1.delete(key)
+    for (const [mk, rec] of this._latestByDevice) {
+      if (rec.key === key) this._latestByDevice.delete(mk)
+    }
+    const cache = getCacheRuntime()
+    if (cache?.client?.hasRedis) {
+      cache.concurrency.delSticky(this._redisStickyKey(key)).catch(() => {})
+    }
+    if (this._shouldWriteBehind()) {
+      enqueueWrite(() => this.repo.remove(key))
+    } else {
+      this.repo.remove(key)
+    }
   }
 
   unbindByAccount({ accountId = null, vmId = null } = {}) {
+    const keysToDelete = new Set()
+    for (const [k, { ent }] of this._l1) {
+      if ((accountId && ent?.account_id === accountId) || (vmId && ent?.vm_id === vmId)) {
+        keysToDelete.add(k)
+        this._l1.delete(k)
+      }
+    }
+    for (const [mk, rec] of this._latestByDevice) {
+      if (keysToDelete.has(rec.key)) this._latestByDevice.delete(mk)
+    }
+    const cache = getCacheRuntime()
+    if (cache?.client?.hasRedis) {
+      try {
+        for (const [k, ent] of Object.entries(this.repo.all() || {})) {
+          if ((accountId && ent?.account_id === accountId) || (vmId && ent?.vm_id === vmId)) {
+            keysToDelete.add(k)
+          }
+        }
+      } catch {}
+      for (const k of keysToDelete) {
+        cache.concurrency.delSticky(this._redisStickyKey(k)).catch(() => {})
+      }
+    }
     return this.repo.removeByAccount({ accountId, vmId })
   }
 

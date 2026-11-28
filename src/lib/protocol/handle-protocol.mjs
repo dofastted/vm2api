@@ -22,14 +22,15 @@ import {
   refusalSessionId,
   riskPrincipal,
 } from '../core/refusal-guard.mjs'
-import { isDbOpen } from '../db/database.mjs'
+import { DB_INSTANCE_ID, getDb, isDbOpen } from '../db/database.mjs'
+import { getCacheRuntime } from '../cache/index.mjs'
 import { RefusalGuardsRepo } from '../db/repos/refusal-guards-repo.mjs'
 import { RefusalDeviceBlocksRepo } from '../db/repos/refusal-device-blocks-repo.mjs'
 import { RefusalSessionBlocksRepo } from '../db/repos/refusal-session-blocks-repo.mjs'
 import { SettingsRepo } from '../db/repos/settings-repo.mjs'
 import { makeApiKeyGateError } from '../admin/api-keys.mjs'
 import { readJevConfig } from './jev-intercept.mjs'
-import { observeUpstreamRisk, upstreamRiskClientError } from './intercept-gate.mjs'
+import { invalidateRiskBanCache, observeUpstreamRisk, upstreamRiskClientError } from './intercept-gate.mjs'
 import {
   clientBlockErrorOf,
   isTrustedGateDecision,
@@ -261,6 +262,7 @@ import {
   filterThinkingForAccount,
   inspectForeignThinking,
   recordThinkingOwners,
+  thinkingSignatureKey,
   thinkingOwners as defaultThinkingOwners,
 } from '../pool/thinking-owner.mjs'
 import { getVm, listVms } from '../vm/vm-registry.mjs'
@@ -389,6 +391,59 @@ export function createHandleProtocol(deps) {
   const writeSSEHeaders = (...args) => deps.writeSSEHeaders(...args)
   const readBody = (...args) => deps.readBody(...args)
   const requireAuth = (...args) => deps.requireAuth(...args)
+  const authenticateRequest = async (req, res) =>
+    typeof deps.requireAuthAsync === 'function' ? await deps.requireAuthAsync(req, res) : requireAuth(req, res)
+  const acquireManagedKey = async (managedKey) =>
+    typeof apiKeyStore?.acquireAsync === 'function'
+      ? await apiKeyStore.acquireAsync(managedKey)
+      : apiKeyStore.acquire(managedKey)
+  const resolveGroupRate = (req) => {
+    const groupId = req?.apiKeyRecord?.group_id ?? 1
+    if (req && req._resolvedGroupRateGroupId === groupId && Number.isFinite(req._resolvedGroupRate)) {
+      return req._resolvedGroupRate
+    }
+    const proj = req?.apiKeyRecord?._authProjection
+    let rate
+    if (proj && proj.groupId === groupId && Number.isFinite(proj.groupRateMultiplier)) {
+      rate = proj.groupRateMultiplier
+    } else {
+      rate = deps.groupsRepo.rateMultiplier(groupId)
+    }
+    if (req && typeof req === 'object') {
+      req._resolvedGroupRateGroupId = groupId
+      req._resolvedGroupRate = rate
+    }
+    return rate
+  }
+  const emitRequestPhase = (requestId, patch) => {
+    try {
+      requestLog?.updatePhase?.(requestId, patch)
+    } catch {}
+  }
+  const cachedSettingsRepos = new WeakMap()
+  const cachedRefusalGuardsRepos = new WeakMap()
+  const cachedRefusalDeviceRepos = new WeakMap()
+  const cachedRefusalSessionRepos = new WeakMap()
+  const SETTING_MISSING = Symbol('setting_missing')
+  const readCachedSetting = (key, fallback = null) => {
+    if (deps.settings) return deps.settings.get(key, fallback)
+    if (!isDbOpen()) return fallback
+    const db = getDb()
+    let repo = cachedSettingsRepos.get(db)
+    if (!repo) {
+      repo = new SettingsRepo(db)
+      cachedSettingsRepos.set(db, repo)
+    }
+    const cache = getCacheRuntime()
+    if (!cache?.client?.enabled) return repo.get(key, fallback)
+    const cacheKey = db.engine === 'postgres' ? String(key) : `${db?.[DB_INSTANCE_ID] || 'sqlite'}:${key}`
+    const wrapped = cache.entity.getSettingSync(cacheKey, () => {
+      const val = repo.get(key, SETTING_MISSING)
+      return val === SETTING_MISSING ? { __missing: true } : { value: val }
+    })
+    if (!wrapped || wrapped.__missing) return fallback
+    return wrapped.value
+  }
   const cfg = deps.cfg
   const requestLog = deps.requestLog
   const stickyRouter = deps.stickyRouter
@@ -516,7 +571,7 @@ export function createHandleProtocol(deps) {
   // Codex handlers write usage onto logBag themselves. The key is charged the
   // official cost usage_logs prices for the same row (image generation
   // included) times the group rate; logBag is left as is so the row is too.
-  function billCodexKey(managedKey, logBag) {
+  function billCodexKey(managedKey, logBag, req = null) {
     if (
       logBag.final_state !== 'verified' &&
       !(logBag.final_state === 'incomplete' && logBag.usage && !logBag.error_code)
@@ -530,7 +585,7 @@ export function createHandleProtocol(deps) {
       const priced = costColumnsFromUsage(logBag.usage || {}, model, image)
       apiKeyStore.recordUsage(managedKey, logBag.usage || {}, {
         model,
-        rateMultiplier: deps.groupsRepo.rateMultiplier(managedKey.group_id ?? 1),
+        rateMultiplier: req ? resolveGroupRate(req) : deps.groupsRepo.rateMultiplier(managedKey.group_id ?? 1),
         officialCost: priced.total_cost,
       })
     } catch {}
@@ -540,7 +595,7 @@ export function createHandleProtocol(deps) {
   async function runWithCodexKey(req, res, logBag, run) {
     const managedKey = req.apiKeyRecord || null
     if (!managedKey) return run()
-    const gate = apiKeyStore.acquire(managedKey)
+    const gate = await acquireManagedKey(managedKey)
     if (!gate.ok) {
       stats.errors++
       logBag.error_code = gate.code
@@ -553,7 +608,7 @@ export function createHandleProtocol(deps) {
       try {
         apiKeyStore.release(managedKey)
       } catch {}
-      billCodexKey(managedKey, logBag)
+      billCodexKey(managedKey, logBag, req)
     }
   }
 
@@ -720,8 +775,7 @@ export function createHandleProtocol(deps) {
 
   function readRuntimeJev() {
     try {
-      const settings = deps.settings || new SettingsRepo()
-      return readJevConfig((key, fallback) => settings.get(key, fallback))
+      return readJevConfig((key, fallback) => readCachedSetting(key, fallback))
     } catch {
       return readJevConfig()
     }
@@ -1017,7 +1071,14 @@ export function createHandleProtocol(deps) {
   function refusalRepo() {
     if (deps.refusalGuards) return deps.refusalGuards
     try {
-      return new RefusalGuardsRepo()
+      if (!isDbOpen()) return null
+      const db = getDb()
+      let repo = cachedRefusalGuardsRepos.get(db)
+      if (!repo) {
+        repo = new RefusalGuardsRepo(db)
+        cachedRefusalGuardsRepos.set(db, repo)
+      }
+      return repo
     } catch {
       return null
     }
@@ -1026,7 +1087,14 @@ export function createHandleProtocol(deps) {
   function deviceRepo() {
     if (deps.refusalDevices) return deps.refusalDevices
     try {
-      return new RefusalDeviceBlocksRepo()
+      if (!isDbOpen()) return null
+      const db = getDb()
+      let repo = cachedRefusalDeviceRepos.get(db)
+      if (!repo) {
+        repo = new RefusalDeviceBlocksRepo(db)
+        cachedRefusalDeviceRepos.set(db, repo)
+      }
+      return repo
     } catch {
       return null
     }
@@ -1035,7 +1103,14 @@ export function createHandleProtocol(deps) {
   function sessionRepo() {
     if (deps.refusalSessions) return deps.refusalSessions
     try {
-      return new RefusalSessionBlocksRepo()
+      if (!isDbOpen()) return null
+      const db = getDb()
+      let repo = cachedRefusalSessionRepos.get(db)
+      if (!repo) {
+        repo = new RefusalSessionBlocksRepo(db)
+        cachedRefusalSessionRepos.set(db, repo)
+      }
+      return repo
     } catch {
       return null
     }
@@ -1055,6 +1130,7 @@ export function createHandleProtocol(deps) {
         preview: refusalPreview(body, inbound),
         reason: 'upstream_refusal',
       })
+      invalidateRiskBanCache({ kind: 'session', db: sessions?.db || null })
     } catch {
       /* the refusal itself still goes back to the caller */
     }
@@ -1062,8 +1138,7 @@ export function createHandleProtocol(deps) {
 
   function refusalPolicy() {
     try {
-      const settings = deps.settings || new SettingsRepo()
-      return refusalGuardPolicy((key, fallback) => settings.get(key, fallback))
+      return refusalGuardPolicy((key, fallback) => readCachedSetting(key, fallback))
     } catch {
       return refusalGuardPolicy()
     }
@@ -1219,12 +1294,12 @@ export function createHandleProtocol(deps) {
           api_key_id: req.apiKeyRecord?.id || null,
           user_id: req.apiKeyRecord?.user_id ?? null,
           group_id: groupId,
-          rate_multiplier: deps.groupsRepo.rateMultiplier(groupId),
+          rate_multiplier: resolveGroupRate(req),
           ...logBag,
         })
       } catch {}
     })
-    if (!requireAuth(req, res)) {
+    if (!(await authenticateRequest(req, res))) {
       logBag.error_code = req.authError?.code || ErrorCode.INVALID_API_KEY
       logBag.error_message = req.authError?.message || 'Invalid credentials'
       logBag.api_key_presented = presentedApiKeyForLog(req.presentedApiKey)
@@ -1276,6 +1351,15 @@ export function createHandleProtocol(deps) {
     )
     logBag.inbound_device_id = sessionIdForLog(auditIdentity.deviceId)
     logBag.reasoning_effort = reasoningEffortOf(inbound)
+    emitRequestPhase(logCtx.request_id, {
+      phase: 'routing',
+      model: logBag.model,
+      stream: logBag.stream,
+      session_id: logBag.session_id,
+      api_key_kind: req.apiKeyKind || null,
+      api_key_id: req.apiKeyRecord?.id || null,
+      user_id: req.apiKeyRecord?.user_id ?? null,
+    })
     const fp = fingerprintRequest(req, inbound)
     const rawBodyBytes = Buffer.isBuffer(req?.rawBodyBytes)
       ? req.rawBodyBytes
@@ -2541,6 +2625,32 @@ export function createHandleProtocol(deps) {
       : summarySession
         ? `seat:sess:${summarySession}`
         : resolveSeatIdentity({ inbound, body: ctx.body, headers: req.headers, clientIp: clientIp(req) }).key
+    // Prewarm Redis sticky keys in parallel before sync resolution when Redis is connected.
+    if (stickyRouter?.prewarmKeys && getCacheRuntime()?.client?.hasRedis) {
+      const prewarmList = []
+      if (!summarySession) {
+        const canonicalSess = stickyRouter.canonicalSessionKey?.(inboundIdentity.sessionId)
+        if (canonicalSess) prewarmList.push(canonicalSess)
+        for (const k of stickyRouter.collectPoolKeys?.(req, inbound, { platform: 'anthropic' }) || []) {
+          prewarmList.push(k)
+        }
+        for (const k of stickyRouter.collectPoolKeys?.(req, inbound) || []) {
+          prewarmList.push(k)
+        }
+      }
+      if (stickyDeviceId) {
+        const dk = stickyRouter.canonicalDeviceKey?.(stickyDeviceId)
+        if (dk) prewarmList.push(dk)
+      }
+      const pSess = explicitParentSessionId(inbound, req.headers) || callerSession
+      if (pSess) {
+        const fk = stickyRouter.canonicalFamilyKey?.(pSess)
+        if (fk) prewarmList.push(fk)
+        const lfk = stickyRouter.familyKey?.(req, pSess, 'anthropic')
+        if (lfk) prewarmList.push(lfk)
+      }
+      if (prewarmList.length) await stickyRouter.prewarmKeys(prewarmList)
+    }
     // Summary forks retain parent affinity, but must not migrate/bind its
     // aliases or join its serialization queue while the parent is streaming.
     const sessionKeys = summarySession
@@ -2793,7 +2903,7 @@ export function createHandleProtocol(deps) {
     if (inferenceBackend === 'api') {
       const managedKey = req.apiKeyRecord || null
       if (managedKey) {
-        const gate = apiKeyStore.acquire(managedKey)
+        const gate = await acquireManagedKey(managedKey)
         if (!gate.ok) {
           stats.errors++
           return respondKeyGateError(res, gate)
@@ -2910,6 +3020,12 @@ export function createHandleProtocol(deps) {
 
         for (;;) {
           apiAttempts += 1
+          emitRequestPhase(logCtx.request_id, {
+            phase: apiAttempts > 1 ? 'retrying' : 'routing',
+            attempt_count: apiAttempts,
+            account_id: activeApiSelection.accountId || activeApiSelection.endpoint?.id || null,
+            active_provider: platform.platform || 'api',
+          })
           const attemptPrompt = resolveAttemptPoolPromptPolicy(
             activeApiSelection.promptPolicy,
             effectivePool,
@@ -2930,6 +3046,7 @@ export function createHandleProtocol(deps) {
           apiFinalConvertedBody = rendered.attemptBody
           personaHideTokens = rendered.hideTokens
 
+          let apiStreamingNoted = false
           result = await runApiInference({
             req,
             res,
@@ -2946,7 +3063,19 @@ export function createHandleProtocol(deps) {
             timeoutMs: cfg.limits.upstream_timeout_ms,
             personaHideTokens,
             cacheTtl,
-            onPublicLine: publicStream ? (line) => publicStream.observe(line) : null,
+            onPublicLine: (line) => {
+              if (!apiStreamingNoted) {
+                apiStreamingNoted = true
+                emitRequestPhase(logCtx.request_id, {
+                  phase: 'streaming',
+                  attempt_count: apiAttempts,
+                  account_id: activeApiSelection.accountId || activeApiSelection.endpoint?.id || null,
+                  ttft_ms: Math.max(0, Date.now() - logCtx.t0),
+                  active_provider: platform.platform || 'api',
+                })
+              }
+              publicStream?.observe(line)
+            },
             requestContext,
             passthrough: officialPassthrough,
             officialTraffic,
@@ -3116,7 +3245,7 @@ export function createHandleProtocol(deps) {
       if (result?.upstreamStatus != null) afterHop(result)
       attachPricing(logBag, {
         managedKey,
-        rateMultiplier: deps.groupsRepo.rateMultiplier(managedKey?.group_id ?? 1),
+        rateMultiplier: resolveGroupRate(req),
         bill: !!(result?.ok && managedKey),
       })
       if (clientStream) {
@@ -3176,7 +3305,7 @@ export function createHandleProtocol(deps) {
     const managedKey = req.apiKeyRecord || null
     const tenantId = tenantPrincipal ? hashKey(`crag-tenant:${tenantPrincipal}`) : ''
     if (managedKey) {
-      const gate = apiKeyStore.acquire(managedKey)
+      const gate = await acquireManagedKey(managedKey)
       if (!gate.ok) {
         stats.errors++
         return respondKeyGateError(res, gate)
@@ -3280,10 +3409,29 @@ export function createHandleProtocol(deps) {
         logBag.outbound_body_truncated = extra.body_truncated === true
       }
     }
+    // Prewarm thinking signature owners from Redis L2 in one MGET when Redis is ready.
+    if (
+      thinkingOwnerStore?.ownersOfAsync &&
+      getCacheRuntime()?.client?.hasRedis &&
+      Array.isArray(canonicalBody?.messages)
+    ) {
+      const sigKeys = []
+      for (const message of canonicalBody.messages) {
+        if (message?.role !== 'assistant' || !Array.isArray(message.content)) continue
+        for (const block of message.content) {
+          const k = thinkingSignatureKey(block)
+          if (k) sigKeys.push(k)
+        }
+      }
+      if (sigKeys.length) {
+        await thinkingOwnerStore.ownersOfAsync(sigKeys).catch(() => {})
+      }
+    }
     let result
     try {
       result = await getFailoverRunner().run({
         requestId: logCtx.request_id,
+        requestLog,
         canonicalBody,
         model: canonicalBody.model,
         stickyKey: isProbe ? null : stickyKey,
@@ -4308,7 +4456,7 @@ export function createHandleProtocol(deps) {
       } catch {}
       attachPricing(logBag, {
         managedKey,
-        rateMultiplier: deps.groupsRepo.rateMultiplier(managedKey?.group_id ?? 1),
+        rateMultiplier: resolveGroupRate(req),
         bill: !!managedKey,
       })
     }
@@ -4478,12 +4626,12 @@ export function createHandleProtocol(deps) {
           api_key_id: req.apiKeyRecord?.id || null,
           user_id: req.apiKeyRecord?.user_id ?? null,
           group_id: groupId,
-          rate_multiplier: deps.groupsRepo.rateMultiplier(groupId),
+          rate_multiplier: resolveGroupRate(req),
           ...logBag,
         })
       } catch {}
     })
-    if (!requireAuth(req, res)) {
+    if (!(await authenticateRequest(req, res))) {
       logBag.error_code = req.authError?.code || ErrorCode.INVALID_API_KEY
       logBag.error_message = req.authError?.message || 'Invalid credentials'
       logBag.api_key_presented = presentedApiKeyForLog(req.presentedApiKey)
@@ -4732,12 +4880,12 @@ export function createHandleProtocol(deps) {
           api_key_id: req.apiKeyRecord?.id || null,
           user_id: req.apiKeyRecord?.user_id ?? null,
           group_id: groupId,
-          rate_multiplier: deps.groupsRepo.rateMultiplier(groupId),
+          rate_multiplier: resolveGroupRate(req),
           ...logBag,
         })
       } catch {}
     })
-    if (!requireAuth(req, res)) {
+    if (!(await authenticateRequest(req, res))) {
       logBag.error_code = req.authError?.code || ErrorCode.INVALID_API_KEY
       logBag.error_message = req.authError?.message || 'Invalid credentials'
       logBag.api_key_presented = presentedApiKeyForLog(req.presentedApiKey)
