@@ -1393,3 +1393,99 @@ test('claude_code_only gate passes rawBodyBytes and rejects forged static cch=12
   assert.equal(res.status, 403, JSON.stringify(res.body))
   assert.equal(captured.length, 0)
 })
+
+test('P0 regression: relayed/third-party role=system tool_addition/tool_removal and turn controls stay in role=system (never moved to role=user)', async (t) => {
+  const routing = {
+    sticky: { outbound_session: 'passthrough' },
+    compatibility: {
+      persona_preset: 'official_full',
+      crag_persona_preset: 'official_full',
+      official_cc_passthrough: false,
+      claude_code_only: false,
+    },
+  }
+  const inlineToolBody = {
+    model: 'claude-opus-5-5',
+    max_tokens: 1024,
+    stream: false,
+    messages: [
+      {
+        role: 'system',
+        content: [
+          { type: 'text', text: 'You are a relayed third-party system note.' },
+          {
+            type: 'tool_addition',
+            tool: {
+              type: 'tool_definition',
+              definition: {
+                name: 'lookup_doc',
+                description: 'Look up OpenCode docs',
+                input_schema: { type: 'object', properties: { q: { type: 'string' } } },
+              },
+            },
+          },
+        ],
+      },
+      { role: 'user', content: 'Find the config key' },
+      {
+        role: 'assistant',
+        content: [{ type: 'tool_use', id: 'toolu_1', name: 'lookup_doc', input: { q: 'foo' } }],
+      },
+      {
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: 'bar' }],
+      },
+      {
+        role: 'system',
+        clear_at: 2,
+        output_config: { effort: 'high' },
+        content: [
+          { type: 'text', text: 'Mid-turn third-party prose.' },
+          { type: 'tool_removal', tool: { type: 'tool_reference', name: 'lookup_doc' } },
+        ],
+      },
+      { role: 'user', content: 'Summarize' },
+    ],
+  }
+  const headers = { authorization: 'Bearer sk-relayed', 'user-agent': 'Go-http-client/2.0' }
+  const invokeCrag = createProtocolHarness(t, {
+    routing,
+    vm: { id: 'vm-p0-crag', node_id: 'node-1', dataplane: 'wrap', official_cc_inference: 'cli-hop' },
+    health: makeCragHealth(HEADLESS_V4_CAPS),
+  })
+  const res = await invokeCrag({ body: inlineToolBody, headers })
+  assert.equal(res.res.status, 200, JSON.stringify(res.res.body))
+  const out = res.captured[0].hopBody
+
+  // No tool_addition/tool_removal may EVER land in a non-system message
+  for (const msg of out.messages) {
+    if (msg.role !== 'system' && Array.isArray(msg.content)) {
+      assert.equal(
+        msg.content.some((b) => b?.type === 'tool_addition' || b?.type === 'tool_removal'),
+        false,
+        `non-system message (${msg.role}) must never carry tool_addition/tool_removal: ${JSON.stringify(msg)}`,
+      )
+    }
+  }
+
+  // Leading system turn kept tool_addition in role:system with rewritten definition name
+  assert.equal(out.messages[0].role, 'system')
+  assert.equal(out.messages[0].content.length, 1)
+  assert.equal(out.messages[0].content[0].type, 'tool_addition')
+  assert.equal(out.messages[0].content[0].tool.definition.name, 'mcp__lookup_doc')
+
+  // Relocated third-party text landed in the first user turn (never left inside role:system)
+  const firstUser = out.messages.find((m) => m.role === 'user')
+  assert.ok(JSON.stringify(firstUser).includes('relayed third-party system note'))
+  assert.ok(JSON.stringify(firstUser).includes('Mid-turn third-party prose'))
+
+  // Mid-conversation system turn kept tool_removal, clear_at, and output_config in place
+  const midSystem = out.messages.find(
+    (m) => m.role === 'system' && Array.isArray(m.content) && m.content.some((b) => b?.type === 'tool_removal'),
+  )
+  assert.ok(midSystem, `expected mid-conversation role=system tool_removal: ${JSON.stringify(out.messages)}`)
+  assert.equal(midSystem.clear_at, 2)
+  assert.deepEqual(midSystem.output_config, { effort: 'high' })
+  assert.equal(midSystem.content[0].tool.name, 'mcp__lookup_doc')
+  assert.equal(res.captured[0].attemptMeta.toolNames.mcp__lookup_doc, 'lookup_doc')
+})
