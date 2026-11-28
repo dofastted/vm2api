@@ -47,9 +47,9 @@ const CRAG_PINNED_RELEASES = [
   {
     tag: 'payload-2026.11.28-crag-3.1.27',
     label: '3.1.27 统一 PromptSpec v1、拆解 Self-Probe 与缓存/Zero 模式安全修复',
-    size: 168917264,
-    manifestSha256: 'a32b8c5e8f007cbda7ad0f5df2987368044142bdbb2a52b1c786fb8d338b197f',
-    sha256: '5edca02283a71e23e6bf06de12f6724e810da87476fde2dea969915c5639069a',
+    size: 168930962,
+    manifestSha256: '6b8ad1e85df367c37f22cfc7661a67e51d8ccba72a21408d64efef8e02162c2e',
+    sha256: '31d94d341061789bdda7f34f115cf35037b913c43b55c8df65ae1f7061388ecb',
   },
   {
     tag: 'payload-2026.11.28-crag-3.1.26',

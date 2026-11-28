@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.4.246 — 2026-11-28 · KVM 共享 Store CRAG 原子同步与回滚自愈、账号预热爬坡引擎（opt-in / M3 / PG 18）与 CRAG `3.1.27` 载荷哈希同步
+
+- **KVM `crag-debian13` 共享 Store CRAG 版本同步与回滚自愈（#2040）**：
+  - `src/lib/vm/wrap-cli-runtime.mjs` 新增 `syncSharedStoreCrag()`、`resolveSharedStoreCragCurrentDir()` 与 `sharedStoreCragWouldChange()`：先经 `verifyCragV2Tree()` 严格验签，再写入不可变版本目录 `store/crag/versions/<version>`（同版本重构建使用 `<version>-<sha8>`，不覆写运行中 KVM 正在 `mmap` 的旧二进制）并原子切换 `current`/`previous` 相对软链，接入 `materializeCragV2()` 与 `inspectKernelChanges()`。
+  - `src/lib/vm/vm-runtime.mjs` 在 `buildKvmRunArgs()`、`cragCustomOsDockerMountArgs()` 及 `startVmRuntimeAdmitted()` `preserveCrag` 路径自动同步/补齐共享 store CRAG；`src/lib/vm/{kernel-install,crag-license}.mjs` 与 `src/lib/admin/kernel-catalog.mjs` 在 `restoreCragRollback()` 原子回切 `store/crag/current` 并为 `crag-debian13` 槽位透传 `allowUnbundledStore` / `sharedClaudeStoreRoot`；`src/lib/oauth/claude-auth-login.mjs` 解析真实版本目录避免传软链触发 `crag_v2_symlink`；新增 `test/unit/shared-store-crag-sync.test.mjs`。
+- **账号预热爬坡引擎落地与 M3 / PG 18 全链路对齐（#1970）**：
+  - 新增 `src/lib/pool/{account-warmup,warmup-monitor}.mjs` 与 `test/unit/{account-warmup,warmup-monitor}.test.mjs`，接入 `src/lib/admin/{panel-api,panel-routes,routing-runtime}.mjs`、`src/lib/oauth/import-commit.mjs`、`src/lib/pool/account-quota.mjs` 与 `src/server.mjs`：默认 `enabled: false`（opt-in），支持新导入/换绑账号自动启动预热并在稳定达标后自动毕业，保留人工覆写优先（operator-wins）生命周期。
+  - 端到端对齐 M3 Rust `kin-scheduler` 与 PostgreSQL 18：启动与毕业均触发 `schedulerRuntime.syncConfigNow()` 同步 `max_rpm`，毕业经 `inheritVmScheduling(id, { rpm: true })` 恢复分档/默认限流并清除 `rpm_override=0`；日志查询改用 ISO-8601 字符串比较（兼容 PG 18）并记录结构化告警；基于 `scheduler_pools`/`scheduler_pool_members` 并在无自定义 Claude 池时覆盖默认虚拟池；统一 `withVmLock(vmPath)` 完整路径锁并接入 `stopLeaderJobs()` 与备份恢复/配置热更新生命周期。
+- **同步 `payload-2026.11.28-crag-3.1.27` 载荷哈希并补齐多架构镜像**：
+  - 同步 `deploy/payload.json` 与 `src/lib/admin/kernel-catalog.mjs` 中 `payload-2026.11.28-crag-3.1.27` 更新后的 4 项资产大小与 SHA256（`crag-v2` `aa9c9c6d…`、`crag-v2.payload.enc` `c9ffa0d1…`、`manifest.json` `6b8ad1e8…`、`crag-v2-licensed-amd64.tar.gz` `31d94d34…`；零密钥轮换，沿用生产公钥 `9dbb4bc2…` 与载荷密钥 `835451e2…`），修复 `v1.4.245` 因远端 prerelease 原地更新中断的 `amd64` 镜像与多架构 `latest` 发布。
+- 部署说明：本次改动零新增数据库迁移，零 `docker/`、`scripts/gemini-host.py`、`protofront` 或 Rust `kin-scheduler` 变更；`v1.4.246` 完整发布 `amd64` + `arm64` 多架构控制面镜像并更新 `latest` tag，升级后自动同步新版 CRAG `3.1.27` 载荷并经 `#2040` 原子更新 `crag-debian13` KVM 共享 store `store/crag/current`；账号预热默认关闭（`routing.warmup.enabled = false`），按需开启。
+
 ## 1.4.245 — 2026-11-28 · 统一 System Prompt `PromptSpec v1` 与 CRAG `3.1.27` 载荷钉选、严格官方 CC 校验、面板凭据 SSOT、多模型健康探测及 Gemini/KVM 多项加固
 
 - **统一 System Prompt `PromptSpec v1`、载荷钉选与 CRAG 缓存/前缀修复（#2026、#2031、#2032）**：
