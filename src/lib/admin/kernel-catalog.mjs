@@ -46,17 +46,17 @@ const archFor = (projectRoot, kernel, runtimeOptions) =>
 const CRAG_PINNED_RELEASES = [
   {
     tag: 'payload-2026.11.28-crag-3.1.27',
-    label: '3.1.27 统一 PromptSpec v1、拆解 Self-Probe 与缓存/Zero 模式安全修复',
-    size: 168917264,
-    manifestSha256: 'a32b8c5e8f007cbda7ad0f5df2987368044142bdbb2a52b1c786fb8d338b197f',
-    sha256: '5edca02283a71e23e6bf06de12f6724e810da87476fde2dea969915c5639069a',
+    label: '3.1.27 统一 PromptSpec v1、拆解 Self-Probe、缓存/Zero 安全与 tool_use handoff_complete 修复',
+    size: 168930962,
+    manifestSha256: '6b8ad1e85df367c37f22cfc7661a67e51d8ccba72a21408d64efef8e02162c2e',
+    sha256: '31d94d341061789bdda7f34f115cf35037b913c43b55c8df65ae1f7061388ecb',
   },
   {
     tag: 'payload-2026.11.28-crag-3.1.26',
-    label: '3.1.26 原生 V4 Headless Bridge + 自定义系统底座与 vsock 传输',
-    size: 168860276,
-    manifestSha256: 'a727f3fb4f102a6006925f25ad6acc17673da5fa8ff5cbd590bc06f8d590c3bf',
-    sha256: '1e3b867cd16e228ff50f71b611145e5dc19bbdcb153ea8bff97dc48baa1adfb1',
+    label: '3.1.26 原生 V4 Headless Bridge、自定义系统底座/vsock 与 tool_use handoff_complete 修复',
+    size: 168863735,
+    manifestSha256: 'e8a6cd7e0481622c48c03fb50ab039f9d3ccd87a5c5534770570a4f5181959b9',
+    sha256: 'cad5fe5ebb7c35d7c8eec54265d346c7faad7a09358c859cd3d4d8fe4bed14e5',
   },
   {
     tag: 'payload-2026.11.27-crag-3.1.25',
