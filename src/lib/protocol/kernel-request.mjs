@@ -8,7 +8,14 @@ import {
 import { isSmallTextTurn, messageHasTurnControls, reusableContentBlock, sanitizeAnthropicBody } from './sanitize.mjs'
 import { normalizeToolInputSchemas } from './tool-input-schema.mjs'
 
-const INTERNAL_FIELDS = ['gateway_policy', 'request_context', 'kin_outbound_shape', 'request_id', 'delivery_mode']
+const INTERNAL_FIELDS = [
+  'gateway_policy',
+  'request_context',
+  'kin_outbound_shape',
+  'request_id',
+  'delivery_mode',
+  'prompt_spec',
+]
 const STRICT_PRIVATE_FIELDS = new Set([...INTERNAL_FIELDS, 'caller_cwd'])
 const CRAG_ALIASES = new Set(['model', 'max_tokens', 'effort', 'cache_ttl', 'session_slots'])
 
@@ -228,6 +235,7 @@ export function prepareCragRequest(
   }
   const { body: out } = sanitizeCragBodyWhitelist(normalized, {
     capabilities: health?.capabilities,
+    health,
     preserveCanonicalHistory: reuseHistory,
     toolsNormalized: true,
     safeguardsSanitized,

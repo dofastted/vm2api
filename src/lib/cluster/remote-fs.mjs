@@ -99,7 +99,9 @@ async function writeRemoteFileBody(sftp, file, data, { mode = 0o600, owner = nul
   const tmp = `${dir}/.kin-${crypto.randomBytes(8).toString('hex')}.tmp`
   let handle = null
   try {
-    handle = await call((cb) => sftp.open(tmp, 'wx', { mode }, cb))
+    // Always open the temp file writable (0600) so read-only target modes like 0400
+    // succeed across every SFTP server, then fchmod to the final mode after writing.
+    handle = await call((cb) => sftp.open(tmp, 'wx', { mode: 0o600 }, cb))
     // Bound memory and requests while keeping distant nodes' SFTP windows full.
     // Settle the whole batch before closing/unlinking a handle after any failure.
     for (let start = 0; start < data.length; start += WRITE_CHUNK * WRITE_WINDOW) {

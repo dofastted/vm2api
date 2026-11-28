@@ -294,8 +294,7 @@ test('RC-3 + RC-2 live 74d26aa4 reproduction: Cherry Studio / magpie/dev 19 tool
   const routing = {
     sticky: { outbound_session: 'passthrough' },
     compatibility: {
-      persona_preset: 'official',
-      crag_persona_preset: 'official_full',
+      persona_preset: 'official_full',
       official_cc_passthrough: false,
       claude_code_only: false,
       crag_strict_passthrough: false,
@@ -462,8 +461,7 @@ test('RC-3: Official CC tools stay untouched on CRAG V4 (only stray mcp_* normal
   const routing = {
     sticky: { outbound_session: 'passthrough' },
     compatibility: {
-      persona_preset: 'official',
-      crag_persona_preset: 'official_full',
+      persona_preset: 'official_full',
       official_cc_passthrough: false,
       crag_strict_passthrough: false,
     },

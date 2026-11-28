@@ -1,13 +1,39 @@
+/**
+ * Panel-owned OAuth execution via the control plane's own `bin/kin-worker`.
+ *
+ * Credentials are a Panel SSOT: the control plane is the sole reader/writer of
+ * `vms/<id>/cli-home/.claude/credentials.json` and its `.refresh-attempt` journal.
+ * Outbound OAuth requests still leave strictly through the target VM's bound exit
+ * (`hostProxyUrlForVm`: slot SOCKS5/HTTP proxy, local `px-local` default route, or
+ * a cluster/macOS node's loopback SSH SOCKS5 forwarder) with Go `kin-worker`'s
+ * Chrome TLS impersonation. Slots never execute `kin-worker oauth` or rotate RTs;
+ * after a panel refresh, the panel one-way projects the read-only credential down
+ * to the slot via `slotHost(vm).syncCredentials`.
+ */
 import { spawn } from 'node:child_process'
 import { randomUUID as cryptoRandomUUID } from 'node:crypto'
+import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import { createInterface } from 'node:readline'
+import { fileURLToPath } from 'node:url'
 import { postRustKernelTelemetryEvent } from './rust-kernel-client.mjs'
-import { slotHost } from '../vm/slot-host.mjs'
-import { slotExecArgv } from '../vm/slot-exec.mjs'
+import { hostProxyUrlForVm, slotHost } from '../vm/slot-host.mjs'
+import { isLocalEgressProxy } from '../vm/egress.mjs'
+import { proxyBlockedReason } from '../vm/proxy-policy.mjs'
+import { canRefreshCredential } from '../oauth/credential-mode.mjs'
+import {
+  assertSafeSlotCredentialPaths,
+  hasRefreshPresence,
+  mirrorWorkerCredentialsToVm,
+  needsRefresh,
+  readWorkerCredentialFile,
+  sealWorkerCredentialFile,
+  slotWorkerCredentialPath,
+  withCredentialRefreshLock,
+} from '../oauth/oauth-credentials.mjs'
 
-const WORKER_CONFIG = '/run/kin/worker.json'
-const WORKER_BIN = '/usr/local/bin/kin-worker'
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..')
 const OPS = new Set([
   'refresh',
   'usage',
@@ -27,14 +53,29 @@ function failure(code, message = undefined) {
     status: 0,
     body: { error },
     headers: {},
-    via: 'slot-worker',
+    via: 'panel-worker',
     transportError: true,
   }
 }
 
-export function runSlotProcess(argv, { stdin = '', timeoutMs = 45000, env, onStdoutLine } = {}) {
+export function resolvePanelWorkerBin(projectRoot = '') {
+  const envBin = String(process.env.KIN_PANEL_WORKER_BIN || process.env.KIN_WORKER_BIN || '').trim()
+  if (envBin) return envBin
+  const candidates = [
+    projectRoot ? path.join(projectRoot, 'bin', 'kin-worker') : '',
+    path.join(REPO_ROOT, 'bin', 'kin-worker'),
+    '/opt/vm2api/bin/kin-worker',
+    '/opt/kin-gateway/bin/kin-worker',
+  ].filter(Boolean)
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) return candidate
+  }
+  return candidates[0] || '/usr/local/bin/kin-worker'
+}
+
+function spawnCapturedProcess(bin, argv, { stdin = '', timeoutMs = 45000, env, onStdoutLine } = {}) {
   return new Promise((resolve) => {
-    const child = spawn(process.env.KIN_DOCKER_BIN || 'docker', argv, {
+    const child = spawn(bin, argv, {
       stdio: ['pipe', 'pipe', 'pipe'],
       ...(env ? { env } : {}),
     })
@@ -106,6 +147,15 @@ export function runSlotProcess(argv, { stdin = '', timeoutMs = 45000, env, onStd
   })
 }
 
+/** Retained for container status probes (`slot-process-status.mjs`). */
+export function runSlotProcess(argv, opts = {}) {
+  return spawnCapturedProcess(process.env.KIN_DOCKER_BIN || 'docker', argv, opts)
+}
+
+export function runPanelWorkerProcess(argv, { bin = resolvePanelWorkerBin(), ...opts } = {}) {
+  return spawnCapturedProcess(bin, argv, opts)
+}
+
 function lastJsonLine(stdout) {
   const lines = String(stdout || '')
     .split(/\r?\n/)
@@ -119,10 +169,125 @@ function lastJsonLine(stdout) {
   }
 }
 
+const allowTestEndpoints = () => process.env.KIN_WORKER_TEST_ENDPOINTS === '1'
+
+function readExistingWorkerConfig(slotDir) {
+  if (!slotDir) return null
+  let fd = null
+  try {
+    const runDir = path.join(slotDir, 'run')
+    const dirStat = fs.lstatSync(runDir)
+    if (dirStat.isSymbolicLink() || !dirStat.isDirectory()) return null
+    const configPath = path.join(runDir, 'worker.json')
+    const fileStat = fs.lstatSync(configPath)
+    if (fileStat.isSymbolicLink() || !fileStat.isFile()) return null
+    const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0)
+    fd = fs.openSync(configPath, flags)
+    if (!fs.fstatSync(fd).isFile()) return null
+    const raw = fs.readFileSync(fd, 'utf8')
+    const parsed = JSON.parse(raw)
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null
+  } catch {
+    return null
+  } finally {
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd)
+      } catch {}
+    }
+  }
+}
+
 /**
- * Does the worker on this node keep the refresh attempt journal? Asked with an operation that reads no
- * config, no credential and does not touch the network. A worker built before the journal does not know
- * it and answers invalid_arguments, so only an explicit yes counts.
+ * Resolve the outbound exit for panel-side OAuth (`bin/kin-worker`).
+ * Strictly fail-closed: an unbound or blocked proxy never falls back to the
+ * control plane's direct route unless the slot is explicitly bound to local egress.
+ */
+export function resolvePanelOauthEgress(vm, { proxyUrl, existingConfig } = {}) {
+  if (proxyUrl !== undefined) {
+    const explicit = String(proxyUrl || '').trim()
+    if (explicit) return { ok: true, egress_mode: 'socks', proxy_url: explicit, proxy_required: true }
+    return { ok: true, egress_mode: 'transparent', proxy_url: '', proxy_required: false }
+  }
+  const blocked = proxyBlockedReason(vm?.proxy)
+  if (blocked) {
+    return { ok: false, code: 'proxy_required', message: `slot proxy is blocked (${blocked})` }
+  }
+  if (isLocalEgressProxy(vm?.proxy)) {
+    let resolved = ''
+    try {
+      resolved = hostProxyUrlForVm(vm)
+    } catch (error) {
+      return {
+        ok: false,
+        code: 'proxy_required',
+        message: String(error?.message || 'node local egress is unavailable'),
+      }
+    }
+    if (resolved) {
+      return { ok: true, egress_mode: 'socks', proxy_url: resolved, proxy_required: true }
+    }
+    return { ok: true, egress_mode: 'transparent', proxy_url: '', proxy_required: false }
+  }
+  const bound = hostProxyUrlForVm(vm)
+  if (bound) {
+    return { ok: true, egress_mode: 'socks', proxy_url: bound, proxy_required: true }
+  }
+  if (allowTestEndpoints() && existingConfig?.test_endpoints === true) {
+    return {
+      ok: true,
+      egress_mode: existingConfig.egress_mode || (existingConfig.proxy_url ? 'socks' : 'transparent'),
+      proxy_url: existingConfig.proxy_url || '',
+      proxy_required: existingConfig.proxy_required !== false,
+    }
+  }
+  return { ok: false, code: 'proxy_required', message: 'slot SOCKS5 is required' }
+}
+
+export function buildPanelOauthConfig(exec, { proxyUrl } = {}) {
+  const vmId = String(exec?.vmId || exec?.vm?.id || '').trim()
+  const vm = { ...(exec?.vm || {}), id: vmId }
+  if (exec?.homeDir) {
+    try {
+      assertSafeSlotCredentialPaths(exec.homeDir)
+    } catch (error) {
+      return {
+        ok: false,
+        code: error?.code || 'unsafe_credential_path',
+        message: String(error?.message || 'slot credential path is unsafe'),
+      }
+    }
+  }
+  const slotDir = exec?.homeDir ? path.dirname(exec.homeDir) : ''
+  const existing = readExistingWorkerConfig(slotDir)
+  const egress = resolvePanelOauthEgress(vm, { proxyUrl, existingConfig: existing })
+  if (!egress.ok) return egress
+
+  const credPath = slotWorkerCredentialPath(exec?.homeDir) || '/tmp/kin-panel-missing-credentials.json'
+  const socketPath = slotDir ? path.resolve(slotDir, 'run', 'worker.sock') : '/tmp/kin-panel-worker.sock'
+  const testEndpointsAllowed = allowTestEndpoints() && existing?.test_endpoints === true
+  const config = {
+    vm_id: vmId || existing?.vm_id || 'panel',
+    socket_path: socketPath,
+    credential_path: path.resolve(credPath),
+    egress_mode: egress.egress_mode,
+    proxy_url: egress.proxy_url,
+    proxy_required: egress.proxy_required,
+    refresh_skew_seconds: Number(existing?.refresh_skew_seconds) > 0 ? Number(existing.refresh_skew_seconds) : 300,
+    ...(existing?.oauth_user_agent ? { oauth_user_agent: existing.oauth_user_agent } : {}),
+    ...(existing?.cli_version ? { cli_version: existing.cli_version } : {}),
+    ...(testEndpointsAllowed && existing?.anthropic_base_url
+      ? { anthropic_base_url: existing.anthropic_base_url }
+      : {}),
+    ...(testEndpointsAllowed && existing?.oauth_token_url ? { oauth_token_url: existing.oauth_token_url } : {}),
+    ...(testEndpointsAllowed ? { test_endpoints: true } : {}),
+  }
+  return { ok: true, config }
+}
+
+/**
+ * Does the control plane's `bin/kin-worker` keep the refresh attempt journal?
+ * Asked with an operation that reads no config, no credential, and touches no network.
  */
 export async function probeAttemptGuard(exec, opts = {}) {
   try {
@@ -135,22 +300,72 @@ export async function probeAttemptGuard(exec, opts = {}) {
 
 const isInvalidArguments = (result) => lastJsonLine(result?.stdout)?.body?.error?.code === 'invalid_arguments'
 
+async function projectRefreshedCredential(host, vm, slotDir) {
+  const push = host?.syncCredentials || host?.onImport
+  if (typeof push !== 'function') return { pushed: false, skipped: true }
+  let lastError = null
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      return await push(vm, slotDir)
+    } catch (error) {
+      lastError = error
+      if (attempt === 0) await new Promise((resolve) => setTimeout(resolve, 200))
+    }
+  }
+  throw lastError
+}
+
 export async function runSlotOauth(exec, op, opts = {}) {
   if (process.env.KIN_CRS_MOCK === '1') return null
   if (!OPS.has(op)) return failure('worker_op_invalid', `unsupported oauth operation: ${op}`)
-  if (op !== 'refresh') return (await runSlotOauthProcess(exec, op, opts)).response
-  // The worker's attempt journal is what makes a refresh safe to retry after a lost answer:
-  // it refuses to send a refresh token whose last send never resolved. A worker built before
-  // the journal rejects the flag as invalid_arguments before touching any token, so asking it
-  // again without the flag is still its first real attempt.
-  const guarded = await runSlotOauthProcess(exec, op, { ...opts, attemptGuard: true })
+
+  if (op !== 'guard-probe' && exec?.homeDir) {
+    try {
+      assertSafeSlotCredentialPaths(exec.homeDir)
+    } catch (error) {
+      return failure(
+        error?.code || 'unsafe_credential_path',
+        String(error?.message || 'slot credential path is unsafe'),
+      )
+    }
+  }
+
+  // Non-refresh Go oauthcmd calls are strictly read-only; if the panel's credential is due
+  // for refresh, rotate through the single panel SSOT refresh + one-way projection path first.
+  if (op !== 'refresh' && op !== 'guard-probe' && opts.autoRefresh !== false && exec?.homeDir) {
+    const cred = readWorkerCredentialFile(exec.homeDir)
+    const mode = cred?.type || cred?.mode
+    if (cred && canRefreshCredential(mode) && hasRefreshPresence(cred) && needsRefresh(cred.expires_at)) {
+      const lockKey = String(exec.homeDir || exec.vm?.id || 'credential')
+      const refreshed = await withCredentialRefreshLock(lockKey, async () => {
+        const live = readWorkerCredentialFile(exec.homeDir)
+        if (!live || !needsRefresh(live.expires_at)) return { ok: true }
+        return runSlotOauth(exec, 'refresh', {
+          timeoutMs: opts.timeoutMs,
+          runWorker: opts.runWorker,
+          runDocker: opts.runDocker,
+          workerBin: opts.workerBin,
+          postTelemetry: opts.postTelemetry,
+          projectRoot: opts.projectRoot,
+          proxyUrl: opts.proxyUrl,
+          host: opts.host,
+        })
+      })
+      if (refreshed && !refreshed.ok) return refreshed
+    }
+  }
+
+  if (op !== 'refresh') return (await runPanelOauthProcess(exec, op, opts)).response
+  // The worker's attempt journal makes refresh retry-safe after a lost answer:
+  // it refuses to send a refresh token whose last send never resolved.
+  const guarded = await runPanelOauthProcess(exec, op, { ...opts, attemptGuard: true })
   if (!isInvalidArguments(guarded.raw)) return { ...guarded.response, attempt_guard: true }
-  const legacy = await runSlotOauthProcess(exec, op, opts)
+  const legacy = await runPanelOauthProcess(exec, op, opts)
   return { ...legacy.response, attempt_guard: false }
 }
 
-/** One worker run: `raw` is the process result, `response` the mapped answer. */
-async function runSlotOauthProcess(
+/** One panel-local `bin/kin-worker` run: `raw` is the process result, `response` the mapped answer. */
+async function runPanelOauthProcess(
   exec,
   op,
   {
@@ -159,14 +374,43 @@ async function runSlotOauthProcess(
     force = false,
     attemptGuard = false,
     timeoutMs = 45000,
-    runDocker = runSlotProcess,
+    runWorker,
+    runDocker,
+    workerBin,
+    projectRoot,
+    proxyUrl,
+    host: hostOverride,
     postTelemetry = postRustKernelTelemetryEvent,
   } = {},
 ) {
-  const host = slotHost(exec?.vm)
-  const vm = { ...(exec?.vm || {}), id: exec?.vmId || exec?.vm?.id }
-  const user = host.execUser(vm)
-  const argv = slotExecArgv(vm, [WORKER_BIN, 'oauth', op, '--config', WORKER_CONFIG], { interactive: true, user })
+  const vmId = String(exec?.vmId || exec?.vm?.id || '').trim()
+  const vm = { ...(exec?.vm || {}), id: vmId }
+  const host = hostOverride || slotHost(vm)
+  const slotDir = exec?.homeDir ? path.dirname(exec.homeDir) : ''
+  const resolvedRoot = projectRoot || exec?.projectRoot || (slotDir ? path.dirname(path.dirname(slotDir)) : '')
+  const runner = runWorker || runDocker || runPanelWorkerProcess
+  const bin = workerBin || resolvePanelWorkerBin(resolvedRoot)
+
+  let tmpConfigPath = null
+  let configArg = '/dev/null'
+  let panelConfig = null
+  if (op !== 'guard-probe') {
+    const built = buildPanelOauthConfig(exec, { proxyUrl })
+    if (!built.ok) {
+      return { raw: null, response: failure(built.code || 'proxy_required', built.message) }
+    }
+    panelConfig = built.config
+    tmpConfigPath = path.join(os.tmpdir(), `kin-panel-oauth-${vmId || 'slot'}-${cryptoRandomUUID()}.json`)
+    fs.writeFileSync(tmpConfigPath, `${JSON.stringify(panelConfig)}\n`, { mode: 0o600 })
+    if (process.platform !== 'win32') {
+      try {
+        fs.chmodSync(tmpConfigPath, 0o600)
+      } catch {}
+    }
+    configArg = tmpConfigPath
+  }
+
+  const argv = ['oauth', op, '--config', configArg]
   if (force) argv.push('--force')
   if (attemptGuard) argv.push('--attempt-guard')
 
@@ -176,8 +420,8 @@ async function runSlotOauthProcess(
       : op === 'reset-redeem'
         ? JSON.stringify(body || {})
         : ''
-  // Only the unique guest RT writer can prove an attempt happened: cache hits,
-  // waiters and polls emit no notification. Preserve order without blocking stdout.
+
+  // Only the unique panel refresher emits oauth_attempt events when an upstream POST runs.
   let telemetry = Promise.resolve()
   let telemetryError = null
   const attempts = new Map()
@@ -220,12 +464,20 @@ async function runSlotOauthProcess(
       }
     })
   }
+
   let result
   try {
-    result = await runDocker(argv, { stdin, timeoutMs, env: host.dockerEnv(), onStdoutLine })
+    result = await runner(argv, { bin, stdin, timeoutMs, onStdoutLine, panelConfig })
   } catch (error) {
     result = { execError: String(error?.message || error).slice(0, 300) }
+  } finally {
+    if (tmpConfigPath) {
+      try {
+        fs.rmSync(tmpConfigPath, { force: true })
+      } catch {}
+    }
   }
+
   for (const [attempt_id, phase] of attempts) {
     if (phase === 'start')
       onStdoutLine(
@@ -247,16 +499,7 @@ async function runSlotOauthProcess(
   if (result?.execError) return done(failed('worker_exec_failed', result.execError))
   if (result?.timed_out) return done(failed('worker_timeout'))
   if (result?.output_limit) return done(failed('worker_output_limit'))
-  // An older worker rejecting --attempt-guard did nothing; there is nothing to pull back.
   if (attemptGuard && isInvalidArguments(result)) return done(failed('invalid_arguments'))
-  // A refresh rotates the RT where the slot keeps its credential; the local mirror must follow before anyone reads it.
-  if (op === 'refresh' && exec.homeDir) {
-    try {
-      await host.afterRefresh(exec.vm, path.dirname(exec.homeDir))
-    } catch (error) {
-      return done(failed('credential_pull_failed', String(error?.message || error).slice(0, 300)))
-    }
-  }
 
   const payload = lastJsonLine(result?.stdout)
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
@@ -269,8 +512,29 @@ async function runSlotOauthProcess(
     status,
     body: payload.body && typeof payload.body === 'object' ? payload.body : {},
     headers: payload.headers && typeof payload.headers === 'object' ? payload.headers : {},
-    via: 'slot-worker',
+    via: 'panel-worker',
   }
+
+  // Panel is the sole writer: after a successful refresh, re-seal the panel file (0444 +
+  // relative symlink), mirror metadata to vm.json, and one-way project down to the slot.
+  if (op === 'refresh' && response.ok && exec?.homeDir) {
+    try {
+      sealWorkerCredentialFile(exec.homeDir)
+      if (vmId && slotDir) {
+        const vmPath = path.join(path.dirname(slotDir), `${vmId}.json`)
+        if (fs.existsSync(vmPath)) {
+          const mirrored = mirrorWorkerCredentialsToVm(vmPath, exec.homeDir)
+          if (mirrored && exec.vm && typeof exec.vm === 'object') exec.vm.claude = mirrored.claude
+        }
+      }
+      if (slotDir) {
+        await projectRefreshedCredential(host, vm, slotDir)
+      }
+    } catch (error) {
+      return done(failed('credential_sync_failed', String(error?.message || error).slice(0, 300)))
+    }
+  }
+
   if (telemetryError) response.telemetry_error = telemetryError
   if (status === 0) response.transportError = true
   return done(response)

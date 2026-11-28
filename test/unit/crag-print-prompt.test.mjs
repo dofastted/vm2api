@@ -1,3 +1,4 @@
+import { firstHistoryDiff } from '../../src/lib/protocol/cache-prefix.mjs'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -385,13 +386,14 @@ test('caller tail drops billing lines and non-text blocks', () => {
   )
 })
 
-test('CRAG print persona does not follow the cli-node preset', () => {
+test('CRAG print persona follows unified SSOT (slot > persona_preset > legacy crag_persona_preset)', () => {
   const routing = { compatibility: { persona_preset: 'official', crag_persona_preset: 'zero' } }
-  assert.equal(resolveCragPrintPersona({}, routing), 'zero')
-  assert.equal(resolveCragPrintPersona({ persona_preset: 'official' }, routing), 'official_full')
+  assert.equal(resolveCragPrintPersona({}, routing), 'official')
+  assert.equal(resolveCragPrintPersona({ persona_preset: 'official' }, routing), 'official')
   assert.equal(resolveCragPrintPersona({ persona_preset: 'official_303' }, routing), 'official_full')
   assert.equal(resolveCragPrintPersona({ persona_preset: 'zero' }, routing), 'zero')
-  assert.equal(resolveCragPrintPersona({}, { compatibility: { persona_preset: 'zero' } }), 'official_full')
+  assert.equal(resolveCragPrintPersona({}, { compatibility: { persona_preset: 'zero' } }), 'zero')
+  assert.equal(resolveCragPrintPersona({}, { compatibility: { crag_persona_preset: 'zero' } }), 'zero')
 })
 
 test('print follows the kernel enabled on the VM, not the global dataplane', () => {
@@ -433,13 +435,15 @@ test('print follows the kernel enabled on the VM, not the global dataplane', () 
   fs.rmSync(root, { recursive: true, force: true })
 })
 
-test('routing save accepts only the two CRAG print presets', () => {
+test('routing save accepts all four unified presets on legacy crag_persona_preset and rejects unknown values', () => {
+  assert.deepEqual(validatePersonaRoutingPatch({ compatibility: { crag_persona_preset: 'official' } }), [])
   assert.deepEqual(validatePersonaRoutingPatch({ compatibility: { crag_persona_preset: 'official_full' } }), [])
   assert.deepEqual(validatePersonaRoutingPatch({ compatibility: { crag_persona_preset: 'zero' } }), [])
+  assert.deepEqual(validatePersonaRoutingPatch({ compatibility: { crag_persona_preset: 'custom' } }), [])
   assert.deepEqual(validatePersonaRoutingPatch({ compatibility: { crag_persona_preset: '' } }), [])
   assert.match(
-    validatePersonaRoutingPatch({ compatibility: { crag_persona_preset: 'official' } })[0],
-    /official_full \/ zero/,
+    validatePersonaRoutingPatch({ compatibility: { crag_persona_preset: 'invalid_mode' } })[0],
+    /official \/ official_full \/ zero \/ custom/,
   )
 })
 
@@ -742,4 +746,61 @@ test('automatic caching still converts at the four-breakpoint budget', () => {
   )
   assert.equal('cache_control' in out, false)
   assert.deepEqual(out.messages[0].content[0].cache_control, mark)
+})
+
+test('trailing cached system turn after assistant stays role-stable when next user turn appends (#2007)', () => {
+  const block = (text, cache = false) => ({
+    type: 'text',
+    text,
+    ...(cache ? { cache_control: { type: 'ephemeral', ttl: '1h' } } : {}),
+  })
+  const turnA = {
+    model: 'claude-fable-5-2',
+    max_tokens: 64,
+    system: [block('Stable synthetic instructions.')],
+    messages: [
+      { role: 'user', content: [block('Read the synthetic input.')] },
+      { role: 'assistant', content: [block('Read complete.')] },
+      { role: 'system', content: [block('Synthetic background task notice.', true)] },
+    ],
+  }
+  const turnB = {
+    ...turnA,
+    messages: [...turnA.messages, { role: 'user', content: [block('Continue.', true)] }],
+  }
+  const turnC = {
+    ...turnB,
+    messages: [
+      ...turnB.messages,
+      { role: 'assistant', content: [block('Continued.')] },
+      { role: 'user', content: [block('Follow up.')] },
+      { role: 'system', content: [block('Regular post-user reminder.')] },
+    ],
+  }
+  const options = {
+    preset: 'official_full',
+    capabilities: [
+      'generation_controls_v3',
+      'prompt_append',
+      'system_text_cache_v3',
+      'linux_tui_native_queue',
+      'native_history_v3',
+    ],
+  }
+  const outA = prepareCragPrintBody(turnA, options)
+  const outB = prepareCragPrintBody(turnB, options)
+  const outC = prepareCragPrintBody(turnC, options)
+
+  assert.equal(firstHistoryDiff(turnA, turnB).section, null)
+  assert.equal(firstHistoryDiff(outA, outB).section, null)
+  assert.equal(firstHistoryDiff(outB, outC).section, null)
+  assert.deepEqual(
+    outB.messages.map((m) => m.role),
+    ['user', 'assistant', 'system', 'user'],
+  )
+  // Later regular post-user system notices still fold into their preceding user turn.
+  assert.deepEqual(
+    outC.messages.map((m) => m.role),
+    ['user', 'assistant', 'system', 'user', 'assistant', 'user'],
+  )
 })

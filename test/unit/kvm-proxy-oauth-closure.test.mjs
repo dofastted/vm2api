@@ -284,7 +284,7 @@ linuxTest(
     assert.equal(fs.readFileSync(path.join(guest.runDir, 'worker.json'), 'utf8'), workerBody)
     assert.equal(fs.statSync(path.join(guest.runDir, 'worker.json')).mode & 0o777, 0o600)
     assert.equal(fs.readFileSync(path.join(guest.claudeDir, 'credentials.json'), 'utf8'), credBody)
-    assert.equal(fs.statSync(path.join(guest.claudeDir, 'credentials.json')).mode & 0o777, 0o600)
+    assert.equal(fs.statSync(path.join(guest.claudeDir, 'credentials.json')).mode & 0o777, 0o440)
     assert.equal(fs.readlinkSync(path.join(guest.claudeDir, '.credentials.json')), 'credentials.json')
     assert.equal(fs.readFileSync(path.join(guest.managedDir, '10-workstation.json'), 'utf8'), safePresetBody)
 

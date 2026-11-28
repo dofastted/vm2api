@@ -1450,7 +1450,7 @@ test('resolveGlobalPromptPolicy maps persona_preset, crag_persona_preset, and pe
   )
   assert.deepEqual(resolveGlobalPromptPolicy({ compatibility: { persona_preset: 'official_303' } }), {
     mode: 'official',
-    preset: 'official_303',
+    preset: 'official_full',
     text: '',
     client_system_policy: 'prepend_pool',
   })

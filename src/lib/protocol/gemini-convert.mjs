@@ -3265,11 +3265,15 @@ function modelSupportsGeminiDefaultThinking(model) {
   return false
 }
 
+function supportsGeminiXhighThinkingLevel(model) {
+  return /(?:hydrogen|neon)/i.test(String(model || ''))
+}
+
 function mapGemini3ThinkingLevel(effort, model) {
   if (effort === 'minimal') return /flash/i.test(model) ? 'minimal' : 'low'
   if (effort === 'low') return 'low'
   if (effort === 'medium') return 'medium'
-  if ((effort === 'xhigh' || effort === 'max') && /hydrogen/i.test(model)) return 'xhigh'
+  if ((effort === 'xhigh' || effort === 'max') && supportsGeminiXhighThinkingLevel(model)) return 'xhigh'
   return 'high'
 }
 

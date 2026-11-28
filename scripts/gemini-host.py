@@ -835,6 +835,30 @@ def _bwrap_tool_available():
     return entry.is_file() and os.access(entry, os.X_OK)
 
 
+# Public TLS trust-store paths needed across Linux distributions (Debian/Ubuntu,
+# Arch Linux, RHEL/Fedora/CentOS, openSUSE, Alpine). On Arch Linux, entries under
+# /etc/ssl/certs are relative symlinks into /etc/ca-certificates/extracted/*;
+# binding only /etc/ssl/certs leaves every CA bundle dangling inside bwrap.
+# Never bind /etc/ssl or /etc/pki/tls wholesale so private-key directories stay excluded.
+SANDBOX_CA_CERT_PATHS = (
+    "/etc/ssl/certs",
+    "/etc/ssl/cert.pem",
+    "/etc/ssl/ca-bundle.pem",
+    "/etc/ca-certificates",
+    "/etc/pki/ca-trust",
+    "/etc/pki/tls/certs",
+    "/etc/pki/tls/cert.pem",
+    "/var/lib/ca-certificates",
+)
+
+
+def _sandbox_ca_cert_mounts():
+    mounts = []
+    for path in SANDBOX_CA_CERT_PATHS:
+        mounts.extend(("--ro-bind-try", path, path))
+    return mounts
+
+
 def _sandbox_probe_command(uid, *, true_bin=None):
     if true_bin is None:
         true_bin = "/usr/bin/true" if os.path.exists("/usr/bin/true") else "/bin/true"
@@ -2008,9 +2032,7 @@ class Agy:
             "--ro-bind-try",
             "/bin",
             "/bin",
-            "--ro-bind-try",
-            "/etc/ssl/certs",
-            "/etc/ssl/certs",
+            *_sandbox_ca_cert_mounts(),
             *identity,
             "--ro-bind",
             str(self.host.payload / "agy"),
@@ -3332,9 +3354,7 @@ class CragDaemonShard:
             "--ro-bind-try",
             "/bin",
             "/bin",
-            "--ro-bind-try",
-            "/etc/ssl/certs",
-            "/etc/ssl/certs",
+            *_sandbox_ca_cert_mounts(),
             *identity,
             *crag_mounts,
             "--ro-bind",

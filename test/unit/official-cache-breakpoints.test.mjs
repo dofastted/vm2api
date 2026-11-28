@@ -50,10 +50,13 @@ for (const preset of ['official', 'official_full']) {
             assert.equal(hop.stream, stream)
             const anchors = messageMarkers(body)
             assert.ok(listCacheMarkers(body).every((marker) => marker.ttl === '1h'))
-            assert.equal(anchors.length, turn === 0 ? 1 : 2)
+            // Mode 1 (`official`, env=false) has 3 messages on turn 1 (below the 4-message threshold for a second anchor);
+            // Mode 2 (`official_full`, env=true) has 4 messages on turn 1 because of the mid-conversation Environment block.
+            const expectedAnchors = preset === 'official' ? (turn < 2 ? 1 : 2) : turn === 0 ? 1 : 2
+            assert.equal(anchors.length, expectedAnchors)
             const lastUser = body.messages.findLastIndex((m) => m.role === 'user')
             assert.equal(anchors.at(-1).index, lastUser)
-            if (previousUser) assert.deepEqual(body.messages[anchors[0].index], previousUser)
+            if (expectedAnchors === 2 && previousUser) assert.deepEqual(body.messages[anchors[0].index], previousUser)
             previousUser = body.messages[lastUser]
             validateCacheBreakpoints(body)
             assert.deepEqual(prepareCliHopBody(hop, { cacheTtl: '1h', stream, repaired: true }), hop)

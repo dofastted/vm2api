@@ -52,7 +52,14 @@ for (const preset of ['official', 'official_full']) {
     test(`${preset} fills template and message TTL from ${ttl} setting`, (t) => {
       const { rendered, out } = render(t, { preset, ttl })
       const markers = listCacheMarkers(out)
-      assert.ok(markers.some((m) => m.section === 'system'))
+      // Mode 1 (`official`) default emits only [billing, CLI_IDENTITY] (no harness marker);
+      // Mode 2 (`official_full`) includes the cached harness block in system[].
+      if (preset === 'official_full') assert.ok(markers.some((m) => m.section === 'system'))
+      else
+        assert.equal(
+          markers.some((m) => m.section === 'system'),
+          false,
+        )
       assert.equal(markers.filter((m) => m.section === 'messages').length, 2)
       assert.ok(markers.every((m) => m.ttl === ttl))
       assert.deepEqual(out.system, rendered.system)
@@ -67,24 +74,25 @@ test('request TTL header overrides the default for both template and message anc
 })
 
 for (const ttl of [undefined, '5m', '1h']) {
-  test(`caller message marker with ${ttl} TTL stays intact`, (t) => {
+  test(`caller message marker with ${ttl} TTL keeps explicit TTL and fills omitted TTL from config`, (t) => {
     const input = fixture()
     input.messages[0].content = [
       { type: 'text', text: 'anchor', cache_control: { type: 'ephemeral', ...(ttl ? { ttl } : {}) } },
     ]
     const before = structuredClone(input)
     const { out } = render(t, { input, ttl: '1h' })
+    const expectedTtl = ttl || '1h'
     assert.deepEqual(out.messages[0], {
       ...input.messages[0],
       content: [
         { type: 'text', text: `<system-reminder>\n${input.system}\n</system-reminder>\n` },
-        ...input.messages[0].content,
+        { type: 'text', text: 'anchor', cache_control: { type: 'ephemeral', ttl: expectedTtl } },
       ],
     })
     assert.deepEqual(input, before)
     const messages = listCacheMarkers(out).filter((m) => m.section === 'messages')
     assert.equal(messages.length, 1)
-    assert.equal(messages[0].ttl, ttl || null)
+    assert.equal(messages[0].ttl, expectedTtl)
     validateCacheBreakpoints(out)
   })
 }

@@ -24,6 +24,44 @@ export const OFFICIAL_303_PRESET = 'official_303'
 export const OVERLAY_PRESETS = Object.freeze(['off', 'official', 'minimal', 'custom'])
 export const DEFAULT_OVERLAY_PRESET = 'off'
 
+/** Canonical Claude Code CLI identity string used across official / official_full / zero. */
+export const CLI_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude."
+
+/** Exact-trimmed official identity sentences stripped/deduplicated in Mode 3 (zero) and Mode 1/2. */
+export const OFFICIAL_IDENTITY_SET = Object.freeze(
+  new Set([
+    CLI_IDENTITY,
+    "You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK.",
+    "You are a Claude agent, built on Anthropic's Claude Agent SDK.",
+  ]),
+)
+
+export function isOfficialIdentityText(text) {
+  return OFFICIAL_IDENTITY_SET.has(String(text ?? '').trim())
+}
+
+/**
+ * Filter exact-trimmed official identity blocks out of a system array/string while
+ * preserving all other caller business blocks (text, whitespace, cache_control, order) verbatim.
+ */
+export function stripOfficialIdentityBlocks(system) {
+  if (system == null) return []
+  const list = Array.isArray(system) ? system : [system]
+  const out = []
+  for (const item of list) {
+    if (typeof item === 'string') {
+      if (!isOfficialIdentityText(item)) out.push({ type: 'text', text: item })
+      continue
+    }
+    if (item && typeof item === 'object' && typeof item.text === 'string') {
+      if (!isOfficialIdentityText(item.text)) out.push(item)
+      continue
+    }
+    if (item != null) out.push(item)
+  }
+  return out
+}
+
 export const PERSONA_TEMPLATE_META_KEYS = Object.freeze(['id', 'note', 'drop_if_empty', 'hide', 'role'])
 export const PERSONA_TEMPLATE_BLOCK_MAX = 40_000
 export const PERSONA_TEMPLATE_TOTAL_MAX = 200_000
@@ -129,6 +167,22 @@ export const DEFAULT_PERSONA_TEMPLATES = Object.freeze({
       drop_if_empty: true,
       type: 'text',
       text: '{{env_303}}',
+    }),
+    Object.freeze({
+      id: 'env_extra',
+      note: 'Environment 之后的附加段。默认不加载，仅开启模型句开关时注入',
+      drop_if_empty: true,
+      role: 'system',
+      type: 'text',
+      text: '{{model_sentence}}',
+    }),
+    Object.freeze({
+      id: 'env_instructions',
+      note: '2.1.303 抓包长环境说明。仅显式开启时加载',
+      role: 'system',
+      drop_if_empty: true,
+      type: 'text',
+      text: '{{env_instructions_303}}',
     }),
     Object.freeze({
       id: 'env_timezone',
@@ -354,23 +408,27 @@ export function agentStandingText(compat = {}) {
 
 /**
  * Per-preset switch maps (agent_standing_presets / agent_standing_hide_presets /
- * persona_env_presets). Standing injection is opt-in per preset; other maps
- * remain opt-out for backwards-compatible masking/env behavior.
+ * persona_env_presets). Standing injection and optional sub-sections are opt-in.
+ * For `persona_env_presets`, Mode 1 (`official`) and Mode 3 (`zero`) default OFF
+ * (opt-in), while Mode 2 (`official_full`) defaults ON (opt-out).
  */
 export function presetFlagEnabled(compat, field, preset) {
-  const optIn = [
-    'agent_standing_presets',
-    'model_env_extra_presets',
-    'persona_env_instructions_presets',
-    'persona_timezone_presets',
-    'persona_locale_presets',
-    'persona_guidance_presets',
-    'usage_passthrough_presets',
-  ].includes(field)
+  const key = normalizePersonaPreset(preset)
+  const optIn =
+    [
+      'agent_standing_presets',
+      'model_env_extra_presets',
+      'persona_env_instructions_presets',
+      'persona_timezone_presets',
+      'persona_locale_presets',
+      'persona_guidance_presets',
+      'usage_passthrough_presets',
+    ].includes(field) ||
+    (field === 'persona_env_presets' && (key === 'official' || key === 'zero'))
   const defaultValue = !optIn
   const map = compat?.[field]
   if (!map || typeof map !== 'object' || Array.isArray(map)) return defaultValue
-  const value = map[normalizePersonaPreset(preset)]
+  const value = map[key]
   if (optIn) return value === true
   return value !== false
 }
@@ -392,17 +450,76 @@ export const PRESET_FLAG_FIELDS = Object.freeze([
   'usage_passthrough_presets',
 ])
 
-/** zero、官方、官方完整都可按块 id 关掉。guidance 默认关，显式 true 才注入。 */
+/** Unified SSOT check for core prompt (`harness`): off by default on `official`, on by default on `official_full`, always off on `zero`. */
+export function isPresetHarnessEnabled(compat = {}, preset) {
+  const key = normalizePersonaPreset(preset)
+  if (key === 'zero') return false
+  const selected = compat?.persona_block_presets?.[key]
+  const hasBlockMap = Boolean(selected && typeof selected === 'object' && !Array.isArray(selected))
+  if (key === 'official') return hasBlockMap && selected.harness === true
+  if (hasBlockMap && selected.harness === false) return false
+  return true
+}
+
+/**
+ * Unified SSOT check for behavior guidance (`guidance`): eliminates the old
+ * double-gate between `persona_block_presets[p].guidance` and `persona_guidance_presets[p]`.
+ * Defaults OFF on both `official` and `official_full`; always OFF on `zero`.
+ */
+export function isPresetGuidanceEnabled(compat = {}, preset) {
+  const key = normalizePersonaPreset(preset)
+  if (key === 'zero') return false
+  const selected = compat?.persona_block_presets?.[key]
+  if (selected && typeof selected === 'object' && !Array.isArray(selected) && typeof selected.guidance === 'boolean') {
+    return selected.guidance
+  }
+  return presetFlagEnabled(compat, 'persona_guidance_presets', key)
+}
+
+/**
+ * Unified SSOT check for master environment injection (`persona_env_presets`):
+ * off by default on `official`/`zero`, on by default on `official_full`.
+ * Individual block opt-out (`persona_block_presets[p].env = false`) only drops
+ * the `env` block while letting sub-blocks (e.g. `env_timezone`) remain controllable.
+ */
+export function isPresetEnvEnabled(compat = {}, preset) {
+  const key = normalizePersonaPreset(preset)
+  return presetFlagEnabled(compat, 'persona_env_presets', key)
+}
+
+/**
+ * zero、官方、官方完整都可按块 id 开关：
+ * - `harness` (核心提示词)：`official` 默认关，`official_full` 默认开
+ * - `guidance` (行为指引)：统一走 `isPresetGuidanceEnabled`，默认关
+ * - `dynamic_boundary`：当 `harness` 与 `guidance` 均关闭且未显式开启 `dynamic_boundary: true` 时自动省略
+ */
 export function selectedTemplateBlocks(blocks, compat = {}, preset) {
   const key = normalizePersonaPreset(preset)
   if (!['zero', 'official', 'official_full'].includes(key)) return blocks
   const selected = compat?.persona_block_presets?.[key]
-  return blocks.filter((block) => {
+  const hasSelected = selected && typeof selected === 'object' && !Array.isArray(selected)
+  const filtered = blocks.filter((block) => {
     const id = String(block?.id || '')
-    if (id === 'guidance') return selected?.[id] === true || presetFlagEnabled(compat, 'persona_guidance_presets', key)
-    if (!selected || typeof selected !== 'object' || Array.isArray(selected)) return true
+    if (id === 'harness') return isPresetHarnessEnabled(compat, key)
+    if (id === 'guidance') return isPresetGuidanceEnabled(compat, key)
+    if (!hasSelected) return true
     return selected[id] !== false
   })
+  if (key === 'official' || key === 'official_full') {
+    const definesCoreOrGuidance = blocks.some((block) => {
+      const id = String(block?.id || '')
+      return id === 'harness' || id === 'guidance'
+    })
+    const hasCoreOrGuidance = filtered.some((block) => {
+      const id = String(block?.id || '')
+      return id === 'harness' || id === 'guidance'
+    })
+    const explicitBoundary = hasSelected && selected.dynamic_boundary === true
+    if (definesCoreOrGuidance && !hasCoreOrGuidance && !explicitBoundary) {
+      return filtered.filter((block) => String(block?.id || '') !== 'dynamic_boundary')
+    }
+  }
+  return filtered
 }
 
 /** {{agent_standing}} 的值：非空时以换行结尾，紧跟下一段不粘连。 */
@@ -615,14 +732,20 @@ function templateFrom(templates, key, defaults) {
 export function migrateLegacyOfficialTemplate(preset, blocks) {
   if (preset !== 'official') return blocks
   const defaults = DEFAULT_PERSONA_TEMPLATES.official
-  const legacy = defaults.filter((block) => block.id !== 'caller_system')
+  const legacyNoCaller = defaults.filter((block) => block.id !== 'caller_system')
+  const legacyPreExtra = defaults.filter(
+    (block) => block.id !== 'caller_system' && block.id !== 'env_extra' && block.id !== 'env_instructions',
+  )
   const shape = (value) => {
     if (!value || typeof value !== 'object') return value
     const { note: _note, ...block } = value
     return block
   }
-  if (!isDeepStrictEqual(blocks.map(shape), legacy.map(shape))) return blocks
-  return [...blocks, defaults.find((block) => block.id === 'caller_system')]
+  const shaped = blocks.map(shape)
+  if (isDeepStrictEqual(shaped, legacyNoCaller.map(shape)) || isDeepStrictEqual(shaped, legacyPreExtra.map(shape))) {
+    return [...blocks, defaults.find((block) => block.id === 'caller_system')]
+  }
+  return blocks
 }
 
 /** Empty array means "use the built-in preset"; empty custom falls back to official. */
