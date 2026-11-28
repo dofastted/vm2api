@@ -7,7 +7,7 @@
   - **WebSocket `ws_replay` 增量续接（`src/lib/protocol/{responses-ws,handle-codex}.mjs`）**：向内核传递 `options.ws_replay`（`{}` / `{ previous_response_id }`），请求侧保留完整展开的 `body.input`；`incomplete_details.reason === "interrupted"` 且有最终输出的回合与已完成回合一样进入连接重放缓存
   - **实时 `response.interrupt` 转发**：`x-tap-interrupt === "websocket"` 时转发到 `POST /internal/v1/interrupt`，`204` 保持上游生成不中断，`409` 返回 `response.interrupt.failed` 且不中止连接
   - **遥测与重试安全（`src/lib/pool/codex-slot-pool.mjs` 等）**：从客户端响应中剔除内部 `x-tap-*` / `x-kin-*` 头；`x-tap-turn-timing`（头与 trailer）记入 `logBag.hop_meta.codex_vm_timing.attempts[]`；`x-kin-upstream-sent: unknown` 时停止同账号、传输层与故障转移重试，避免重复提交
-- 部署说明：本次改动零数据库迁移；`deploy/payload.json` 未变，`kin-codex-kernel` 仍为既有钉选版本，新协议在内核声明能力前保持关闭，升级后无需额外操作。
+- 部署说明：本次改动零数据库迁移；`deploy/payload.json` 未变，`kin-codex-kernel` 仍为既有钉选版本；UDS packed 仅在 worker 声明 `uds_packed_v1` 时启用，实时中断仅在内核返回 `x-tap-interrupt: websocket` 时转发，升级后无需额外操作。
 
 ## 1.4.250 — 2026-11-28 · 热修：钉选 CRAG `3.1.29` 修复 V4 工具续接 `409` 死锁与 `inline-tools-2026-09-15` 缺失 `400`
 
