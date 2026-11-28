@@ -707,17 +707,19 @@ function attachSlotRuntime(vm) {
       if (rt) {
         return {
           ...vm,
+          _account: acc || null,
           cooldown_until: rt.cooldown_until || 0,
           cooldown_reason: rt.cooldown_reason || null,
         }
       }
     } catch {}
   }
-  return vm
+  return acc ? { ...vm, _account: acc } : vm
 }
 
 healthMonitor = createHealthProbeMonitor({
   config: routingConfig.health_probe,
+  getFableRequiresMax: () => routingConfig?.pool?.fable_requires_max === true,
   listTargets: () => listVms(cfg.paths.project).map(attachSlotRuntime),
   runChat: (vm, real) =>
     runVmTestChat({
