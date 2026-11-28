@@ -2,15 +2,20 @@
  * Redis Live Request & Active Session Bridge (`LiveLogCache`).
  *
  * Bridges real-time in-flight request visibility with zero hot-path PostgreSQL INSERTs
- * (inspired by claude-code-hub's live-chain observability + short post-completion bridge):
+ * and micro-batched Redis Pipelining (50ms window or 64-op immediate flush):
  *
  * Key layout (under cacheClient keyPrefix, default `vm2api:`):
  * - `live:req:{id}`             String JSON (TTL 300s) — in-flight request snapshot + `_live`
  * - `live:inflight`             ZSET (score = started_at ms, member = requestId)
  * - `live:sess:conc:{session}`  String counter (INCR / atomic DECR->DEL when <=0, TTL 600s)
  * - `live:sess:active`          ZSET (score = last_seen ms, member = sessionKey, TTL 3600s)
- * - `live:recent`               ZSET (score = completed_at ms, member = requestId, capped at 500)
+ * - `live:recent`               ZSET (score = completed_at ms, member = requestId, periodically trimmed to 2000)
  * - `live:recent:req:{id}`      String JSON (TTL 15s) — bridges 200ms async write-behind flush window
+ *
+ * High-concurrency protection (`highConcurrencyMode`):
+ * - Enabled via `VM2API_HIGH_CONCURRENCY=1` or automatically when local in-flight requests >= 1000.
+ * - Skips per-phase `updatePhase()` `live:req:*` Redis writes and samples homepage live/recent payloads
+ *   while preserving exact session concurrency counters (`live:sess:conc:*`).
  *
  * Degrades cleanly to bounded in-process Maps when Redis is unconfigured or unavailable (Fail-Open).
  */
@@ -24,14 +29,20 @@ const RECENT_REQ_PREFIX = 'live:recent:req:'
 
 const DEFAULT_REQ_TTL_MS = 300_000
 const DEFAULT_RECENT_TTL_MS = 15_000
-const DEFAULT_RECENT_MAX_ENTRIES = 500
-const DEFAULT_MAX_LOCAL_INFLIGHT = 2_000
+const DEFAULT_RECENT_MAX_ENTRIES = 2_000
+const DEFAULT_MAX_LOCAL_INFLIGHT = 15_000
 const DEFAULT_SESS_CONC_TTL_SEC = 600
 const DEFAULT_SESS_ACTIVE_TTL_SEC = 3_600
-const MAX_FINISHED_GUARD = 4_096
+const DEFAULT_FLUSH_INTERVAL_MS = 50
+const DEFAULT_BATCH_SIZE = 64
+const DEFAULT_RECENT_TRIM_INTERVAL_MS = 5_000
+const DEFAULT_HIGH_CONCURRENCY_THRESHOLD = 1_000
+const DEFAULT_HIGH_CONCURRENCY_SAMPLE_RATE = 10
+const MAX_FINISHED_GUARD = 32_768
 
 // Atomically remove request from inflight, decrement session concurrency (DEL if <=0, idempotent via ZREM),
-// and record completed summary in bounded recent ZSET (TTL 15s, max 500 entries).
+// and record completed summary in `live:recent`. Periodic rank/score trimming runs outside this hot script
+// (every 5s / batch threshold) instead of executing ZREMRANGEBYRANK on every single request finish.
 const FINISH_REQUEST_LUA = `
 local inflightKey = KEYS[1]
 local reqKey = KEYS[2]
@@ -43,8 +54,7 @@ local reqId = ARGV[1]
 local completedAt = tonumber(ARGV[2]) or 0
 local recentJson = ARGV[3] or ''
 local recentTtlMs = tonumber(ARGV[4]) or 15000
-local recentMax = tonumber(ARGV[5]) or 500
-local hasSess = ARGV[6] == '1'
+local hasSess = ARGV[5] == '1'
 
 local removed = redis.call('ZREM', inflightKey, reqId)
 redis.call('DEL', reqKey)
@@ -59,16 +69,29 @@ end
 if recentJson ~= '' then
   redis.call('SET', recentReqKey, recentJson, 'PX', recentTtlMs)
   redis.call('ZADD', recentZsetKey, completedAt, reqId)
-  redis.call('ZREMRANGEBYSCORE', recentZsetKey, '-inf', completedAt - recentTtlMs)
-  local card = redis.call('ZCARD', recentZsetKey)
-  if card > recentMax then
-    redis.call('ZREMRANGEBYRANK', recentZsetKey, 0, card - recentMax - 1)
-  end
-  redis.call('PEXPIRE', recentZsetKey, recentTtlMs * 2)
 end
 
 return removed
 `
+
+// Lightweight session concurrency decrement for unsampled requests in highConcurrencyMode
+// (which were never inserted into live:inflight / live:req:*).
+const DECR_SESSION_CONC_LUA = `
+local sessConcKey = KEYS[1]
+local next = redis.call('DECR', sessConcKey)
+if next <= 0 then
+  redis.call('DEL', sessConcKey)
+  return 0
+end
+return next
+`
+
+function envFlagTruthy(val) {
+  const s = String(val ?? '')
+    .trim()
+    .toLowerCase()
+  return s === '1' || s === 'true' || s === 'on' || s === 'yes'
+}
 
 function resolveSessionKey(entry) {
   if (!entry || typeof entry !== 'object') return null
@@ -118,6 +141,7 @@ function formatInflightEntry(raw, now) {
     _live: live,
   }
   delete out._sessionKey
+  delete out._redisSampled
   return out
 }
 
@@ -130,6 +154,7 @@ function formatRecentEntry(raw) {
   }
   delete out._live
   delete out._sessionKey
+  delete out._redisSampled
   return out
 }
 
@@ -143,6 +168,12 @@ export class LiveLogCache {
       maxLocalInflight = DEFAULT_MAX_LOCAL_INFLIGHT,
       sessionConcTtlSec = DEFAULT_SESS_CONC_TTL_SEC,
       sessionActiveTtlSec = DEFAULT_SESS_ACTIVE_TTL_SEC,
+      flushIntervalMs = DEFAULT_FLUSH_INTERVAL_MS,
+      batchSize = DEFAULT_BATCH_SIZE,
+      recentTrimIntervalMs = DEFAULT_RECENT_TRIM_INTERVAL_MS,
+      highConcurrencyMode = null,
+      highConcurrencyThreshold = DEFAULT_HIGH_CONCURRENCY_THRESHOLD,
+      highConcurrencySampleRate = DEFAULT_HIGH_CONCURRENCY_SAMPLE_RATE,
     } = {},
   ) {
     this.cache = cacheClient
@@ -152,6 +183,18 @@ export class LiveLogCache {
     this.maxLocalInflight = Math.max(64, Number(maxLocalInflight) || DEFAULT_MAX_LOCAL_INFLIGHT)
     this.sessionConcTtlSec = Math.max(30, Number(sessionConcTtlSec) || DEFAULT_SESS_CONC_TTL_SEC)
     this.sessionActiveTtlSec = Math.max(60, Number(sessionActiveTtlSec) || DEFAULT_SESS_ACTIVE_TTL_SEC)
+    this.flushIntervalMs = Math.max(5, Math.min(5_000, Number(flushIntervalMs) || DEFAULT_FLUSH_INTERVAL_MS))
+    this.batchSize = Math.max(1, Math.min(4_096, Math.trunc(Number(batchSize) || DEFAULT_BATCH_SIZE)))
+    this.recentTrimIntervalMs = Math.max(100, Number(recentTrimIntervalMs) || DEFAULT_RECENT_TRIM_INTERVAL_MS)
+    this._forcedHighConcurrency = typeof highConcurrencyMode === 'boolean' ? highConcurrencyMode : null
+    this.highConcurrencyThreshold = Math.max(
+      1,
+      Math.trunc(Number(highConcurrencyThreshold) || DEFAULT_HIGH_CONCURRENCY_THRESHOLD),
+    )
+    this.highConcurrencySampleRate = Math.max(
+      1,
+      Math.trunc(Number(highConcurrencySampleRate) || DEFAULT_HIGH_CONCURRENCY_SAMPLE_RATE),
+    )
 
     /** In-flight requests started by this process (also serves as bounded local fallback). */
     this._localInflight = new Map() // requestId -> normalized entry
@@ -161,10 +204,52 @@ export class LiveLogCache {
     this._localSessionConc = new Map() // sessionKey -> count
     this._localActiveSessions = new Map() // sessionKey -> lastSeenMs
 
-    /** Microtask coalescing state for updatePhase(). */
-    this._scheduledFlushes = new Set() // requestIds with pending microtask
-    this._activeFlushPromises = new Set() // in-flight Redis SET promises from microtasks
-    this._finishedGuard = new Set() // recently finished requestIds to block stale microtask writes
+    /** Micro-batch Redis pipeline state (coalesced per requestId within 50ms / 64-op window). */
+    this._pendingOps = new Map() // requestId -> op descriptor
+    this._flushTimer = null
+    this._activeFlushPromises = new Set()
+    this._finishedGuard = new Set() // recently finished requestIds to block stale writes
+
+    /** Periodic `live:recent` trimming state (avoids ZREMRANGEBYRANK on every finishRequest). */
+    this._lastRecentTrimAt = 0
+    this._recentWritesSinceTrim = 0
+    this._sampleCounter = 0
+
+    this._stats = {
+      batchesFlushed: 0,
+      pipelinedOps: 0,
+      skippedPhaseWrites: 0,
+      sampledOutStarts: 0,
+      periodicTrims: 0,
+    }
+  }
+
+  /**
+   * True when `VM2API_HIGH_CONCURRENCY=1` is set, explicitly enabled in options,
+   * or in-flight local requests exceed `highConcurrencyThreshold` (default 1000).
+   */
+  get highConcurrencyMode() {
+    return this.isHighConcurrencyMode()
+  }
+
+  isHighConcurrencyMode() {
+    if (this._forcedHighConcurrency !== null) return this._forcedHighConcurrency
+    if (envFlagTruthy(process.env.VM2API_HIGH_CONCURRENCY)) return true
+    return this._localInflight.size >= this.highConcurrencyThreshold
+  }
+
+  stats() {
+    return {
+      pendingOps: this._pendingOps.size,
+      localInflight: this._localInflight.size,
+      localRecent: this._localRecent.size,
+      highConcurrencyMode: this.isHighConcurrencyMode(),
+      batchesFlushed: this._stats.batchesFlushed,
+      pipelinedOps: this._stats.pipelinedOps,
+      skippedPhaseWrites: this._stats.skippedPhaseWrites,
+      sampledOutStarts: this._stats.sampledOutStarts,
+      periodicTrims: this._stats.periodicTrims,
+    }
   }
 
   _rememberFinished(requestId) {
@@ -218,9 +303,207 @@ export class LiveLogCache {
     this._pruneLocalRecent(completedAt)
   }
 
+  _clearFlushTimer() {
+    if (this._flushTimer) {
+      clearTimeout(this._flushTimer)
+      this._flushTimer = null
+    }
+  }
+
+  _scheduleMicroBatchFlush() {
+    if (!this.cache?.hasRedis || this._pendingOps.size === 0) return
+    if (this._pendingOps.size >= this.batchSize) {
+      this._clearFlushTimer()
+      this._dispatchPendingBatch()
+      return
+    }
+    if (!this._flushTimer) {
+      this._flushTimer = setTimeout(() => {
+        this._flushTimer = null
+        this._dispatchPendingBatch()
+      }, this.flushIntervalMs)
+      this._flushTimer.unref?.()
+    }
+  }
+
+  _dispatchPendingBatch() {
+    if (this._pendingOps.size === 0) return null
+    const ops = [...this._pendingOps.values()]
+    this._pendingOps.clear()
+    this._clearFlushTimer()
+
+    if (!this.cache?.hasRedis) return null
+
+    const flushPromise = this._executePipelineBatch(ops).finally(() => {
+      this._activeFlushPromises.delete(flushPromise)
+    })
+    this._activeFlushPromises.add(flushPromise)
+    return flushPromise
+  }
+
+  async _executePipelineBatch(ops) {
+    if (!ops.length || !this.cache?.hasRedis) return
+    const now = Date.now()
+    const redis = this.cache.redis
+    const inflightKey = this.cache.redisKey(INFLIGHT_ZSET)
+    const activeKey = this.cache.redisKey(SESS_ACTIVE_ZSET)
+    const recentZsetKey = this.cache.redisKey(RECENT_ZSET)
+
+    let hasInflightWrite = false
+    let hasSessionActiveWrite = false
+    let recentWritesInBatch = 0
+    const deferredLuaFinishes = []
+    const deferredSessDecrs = []
+
+    try {
+      const pipe = redis.pipeline()
+      const pipeSupportsEval = typeof pipe.eval === 'function'
+      let queuedCommands = 0
+
+      for (const op of ops) {
+        if (op.kind === 'start') {
+          const current = this._localInflight.get(op.id)
+          if (!current || this._finishedGuard.has(op.id)) continue
+
+          if (op.sampled) {
+            const reqKey = this.cache.redisKey(`${REQ_PREFIX}${op.id}`)
+            const serialized = JSON.stringify(formatInflightEntry(current, op.startedAt))
+            pipe.set(reqKey, serialized, 'PX', this.reqTtlMs)
+            pipe.zadd(inflightKey, op.startedAt, op.id)
+            hasInflightWrite = true
+            queuedCommands += 2
+          }
+
+          if (op.sessionKey) {
+            const concKey = this.cache.redisKey(`${SESS_CONC_PREFIX}${op.sessionKey}`)
+            pipe.incr(concKey)
+            pipe.expire(concKey, this.sessionConcTtlSec)
+            pipe.zadd(activeKey, op.now, op.sessionKey)
+            hasSessionActiveWrite = true
+            queuedCommands += 3
+          }
+        } else if (op.kind === 'phase') {
+          if (this._finishedGuard.has(op.id)) continue
+          const current = this._localInflight.get(op.id)
+          if (!current || current._redisSampled === false) continue
+
+          const reqKey = this.cache.redisKey(`${REQ_PREFIX}${op.id}`)
+          const payload = JSON.stringify(formatInflightEntry(current, now))
+          pipe.set(reqKey, payload, 'PX', this.reqTtlMs)
+          queuedCommands += 1
+        } else if (op.kind === 'finish_unflushed') {
+          // Request started and finished within the same 50ms micro-batch: skip
+          // inflight ZADD/ZREM & sess INCR/DECR churn; only persist recent bridge + session activity.
+          if (op.sampled && op.recentEntry) {
+            const recentReqKey = this.cache.redisKey(`${RECENT_REQ_PREFIX}${op.id}`)
+            pipe.set(recentReqKey, JSON.stringify(op.recentEntry), 'PX', this.recentTtlMs)
+            pipe.zadd(recentZsetKey, op.completedAt, op.id)
+            recentWritesInBatch += 1
+            queuedCommands += 2
+          }
+          if (op.sessionKey) {
+            pipe.zadd(activeKey, op.completedAt, op.sessionKey)
+            hasSessionActiveWrite = true
+            queuedCommands += 1
+          }
+        } else if (op.kind === 'finish') {
+          if (op.sampled === false) {
+            // Unsampled in highConcurrencyMode: never inserted into live:inflight / live:req:*,
+            // only atomically decrement session concurrency counter when present.
+            if (op.sessionKey) {
+              const concKey = this.cache.redisKey(`${SESS_CONC_PREFIX}${op.sessionKey}`)
+              if (pipeSupportsEval) {
+                pipe.eval(DECR_SESSION_CONC_LUA, 1, concKey)
+                queuedCommands += 1
+              } else {
+                deferredSessDecrs.push(`${SESS_CONC_PREFIX}${op.sessionKey}`)
+              }
+            }
+          } else {
+            const recentJson = op.recentEntry ? JSON.stringify(op.recentEntry) : ''
+            const sessConcLogical = op.sessionKey
+              ? `${SESS_CONC_PREFIX}${op.sessionKey}`
+              : `${SESS_CONC_PREFIX}__none__`
+            const keys = [
+              inflightKey,
+              this.cache.redisKey(`${REQ_PREFIX}${op.id}`),
+              this.cache.redisKey(sessConcLogical),
+              recentZsetKey,
+              this.cache.redisKey(`${RECENT_REQ_PREFIX}${op.id}`),
+            ]
+            const args = [
+              op.id,
+              String(op.completedAt),
+              recentJson,
+              String(this.recentTtlMs),
+              op.sessionKey ? '1' : '0',
+            ]
+            if (recentJson) recentWritesInBatch += 1
+            if (pipeSupportsEval) {
+              pipe.eval(FINISH_REQUEST_LUA, 5, ...keys, ...args)
+              queuedCommands += 1
+            } else {
+              deferredLuaFinishes.push({
+                logicalKeys: [
+                  INFLIGHT_ZSET,
+                  `${REQ_PREFIX}${op.id}`,
+                  sessConcLogical,
+                  RECENT_ZSET,
+                  `${RECENT_REQ_PREFIX}${op.id}`,
+                ],
+                args,
+              })
+            }
+          }
+        }
+      }
+
+      if (hasInflightWrite) {
+        pipe.pexpire(inflightKey, this.reqTtlMs * 2)
+        queuedCommands += 1
+      }
+      if (hasSessionActiveWrite) {
+        pipe.expire(activeKey, this.sessionActiveTtlSec)
+        queuedCommands += 1
+      }
+
+      if (recentWritesInBatch > 0) {
+        this._recentWritesSinceTrim += recentWritesInBatch
+        const trimDue =
+          this._lastRecentTrimAt === 0 ||
+          now - this._lastRecentTrimAt >= this.recentTrimIntervalMs ||
+          this._recentWritesSinceTrim >= this.recentMaxEntries
+        if (trimDue) {
+          this._lastRecentTrimAt = now
+          this._recentWritesSinceTrim = 0
+          pipe.zremrangebyscore(recentZsetKey, '-inf', now - this.recentTtlMs)
+          pipe.zremrangebyrank(recentZsetKey, 0, -(this.recentMaxEntries + 1))
+          pipe.pexpire(recentZsetKey, this.recentTtlMs * 2)
+          this._stats.periodicTrims += 1
+          queuedCommands += 3
+        }
+      }
+
+      if (queuedCommands > 0) {
+        await pipe.exec()
+        this._stats.batchesFlushed += 1
+        this._stats.pipelinedOps += ops.length
+      }
+
+      for (const item of deferredLuaFinishes) {
+        await this.cache.evalLua(FINISH_REQUEST_LUA, item.logicalKeys, item.args)
+      }
+      for (const sessKey of deferredSessDecrs) {
+        await this.cache.evalLua(DECR_SESSION_CONC_LUA, [sessKey], [])
+      }
+    } catch {
+      this.cache.l2Errors += 1
+    }
+  }
+
   /**
    * Register a newly started in-flight request.
-   * Writes `live:req:{id}` (TTL 300s), `ZADD live:inflight`, and optional session concurrency/activity.
+   * Updates local state synchronously and enqueues into the 50ms / 64-op Redis micro-batch pipeline.
    */
   async startRequest(requestId, entry = {}) {
     if (!requestId) return false
@@ -237,6 +520,14 @@ export class LiveLogCache {
       phase: entry.phase || 'routing',
       attempt_count: entry.attempt_count ?? 0,
     })
+
+    const highConc = this.isHighConcurrencyMode()
+    let sampled = true
+    if (highConc) {
+      this._sampleCounter += 1
+      sampled = this.highConcurrencySampleRate <= 1 || this._sampleCounter % this.highConcurrencySampleRate === 1
+      if (!sampled) this._stats.sampledOutStarts += 1
+    }
 
     const stored = {
       ...entry,
@@ -256,9 +547,10 @@ export class LiveLogCache {
       in_flight: true,
       _live: live,
       _sessionKey: sessionKey,
+      _redisSampled: sampled,
     }
 
-    // Track locally (used for microtask coalescing + Fail-Open fallback)
+    // Track locally (used for coalescing + Fail-Open fallback)
     const existedLocally = this._localInflight.has(id)
     this._localInflight.delete(id)
     this._localInflight.set(id, stored)
@@ -268,37 +560,24 @@ export class LiveLogCache {
     }
     this._pruneLocalInflight(this.reqTtlMs, now)
 
-    if (this.cache?.hasRedis) {
-      try {
-        const pipe = this.cache.redis.pipeline()
-        const reqKey = this.cache.redisKey(`${REQ_PREFIX}${id}`)
-        const inflightKey = this.cache.redisKey(INFLIGHT_ZSET)
-        const serialized = JSON.stringify(formatInflightEntry(stored, startedAt))
-
-        pipe.set(reqKey, serialized, 'PX', this.reqTtlMs)
-        pipe.zadd(inflightKey, startedAt, id)
-        pipe.pexpire(inflightKey, this.reqTtlMs * 2)
-
-        if (sessionKey) {
-          const concKey = this.cache.redisKey(`${SESS_CONC_PREFIX}${sessionKey}`)
-          const activeKey = this.cache.redisKey(SESS_ACTIVE_ZSET)
-          pipe.incr(concKey)
-          pipe.expire(concKey, this.sessionConcTtlSec)
-          pipe.zadd(activeKey, now, sessionKey)
-          pipe.expire(activeKey, this.sessionActiveTtlSec)
-        }
-        await pipe.exec()
-      } catch {
-        this.cache.l2Errors += 1
-      }
+    if (this.cache?.hasRedis && (sampled || sessionKey)) {
+      this._pendingOps.set(id, {
+        kind: 'start',
+        id,
+        startedAt,
+        now,
+        sessionKey,
+        sampled,
+      })
+      this._scheduleMicroBatchFlush()
     }
 
     return true
   }
 
   /**
-   * Non-blocking phase/attempt/TTFT update with microtask coalescing.
-   * Multiple synchronous updates within the same event loop tick merge into 1 Redis write.
+   * Non-blocking phase/attempt/TTFT update coalesced into the 50ms micro-batch pipeline.
+   * Automatically skips `live:req:*` Redis writes when `highConcurrencyMode` is active.
    */
   updatePhase(requestId, patch = {}) {
     if (!requestId || !patch || typeof patch !== 'object') return
@@ -346,44 +625,37 @@ export class LiveLogCache {
       in_flight: true,
       _live: nextLive,
       _sessionKey: existing._sessionKey,
+      _redisSampled: existing._redisSampled,
     }
     this._localInflight.set(id, next)
 
     if (!this.cache?.hasRedis) return
-    if (this._scheduledFlushes.has(id)) return
+    if (this.isHighConcurrencyMode() || existing._redisSampled === false) {
+      this._stats.skippedPhaseWrites += 1
+      return
+    }
 
-    this._scheduledFlushes.add(id)
-    queueMicrotask(() => {
-      this._scheduledFlushes.delete(id)
-      if (this._finishedGuard.has(id)) return
-      const current = this._localInflight.get(id)
-      if (!current || !this.cache?.hasRedis) return
+    // If a start or phase op for this requestId is already queued in the current
+    // micro-batch, the flush reads the latest `_localInflight.get(id)` automatically.
+    const queued = this._pendingOps.get(id)
+    if (queued) return
 
-      const rKey = this.cache.redisKey(`${REQ_PREFIX}${id}`)
-      const payload = JSON.stringify(formatInflightEntry(current, Date.now()))
-      const p = Promise.resolve()
-        .then(() => this.cache.redis.set(rKey, payload, 'PX', this.reqTtlMs))
-        .catch(() => {
-          this.cache.l2Errors += 1
-        })
-        .finally(() => {
-          this._activeFlushPromises.delete(p)
-        })
-      this._activeFlushPromises.add(p)
-    })
+    this._pendingOps.set(id, { kind: 'phase', id })
+    this._scheduleMicroBatchFlush()
   }
 
   /**
    * Mark a request finished:
-   * - Removes from `live:inflight` & deletes `live:req:{id}`
-   * - Atomically decrements `live:sess:conc:{sessionKey}` (DEL if <= 0)
-   * - Writes completed summary into bounded `live:recent` (TTL 15s, max 500) to bridge write-behind delay
+   * - Updates local inflight/session/recent maps immediately
+   * - Coalesces into the 50ms / 64-op Redis micro-batch pipeline (canceling inflight
+   *   churn when start+finish land in the same window; periodic `live:recent` trimming
+   *   runs every 5s instead of per-finish ZREMRANGEBYRANK)
    */
   async finishRequest(requestId, completedSummary = null) {
     if (!requestId) return false
     const id = String(requestId)
+    const alreadyFinished = this._finishedGuard.has(id)
     this._rememberFinished(id)
-    this._scheduledFlushes.delete(id)
 
     const prev = this._localInflight.get(id) || null
     if (prev) {
@@ -393,6 +665,7 @@ export class LiveLogCache {
 
     const now = Date.now()
     const sessionKey = prev?._sessionKey || resolveSessionKey(completedSummary)
+    const sampled = prev ? prev._redisSampled !== false : true
     let recentEntry = null
     if (completedSummary && typeof completedSummary === 'object') {
       const completedAt = Number(completedSummary.completed_at) || now
@@ -411,39 +684,62 @@ export class LiveLogCache {
       if (sessionKey) {
         this._localActiveSessions.set(sessionKey, completedAt)
       }
+      // Always maintain bounded local recent buffer for immediate Fail-Open resilience.
+      this._storeLocalRecent(id, recentEntry, completedAt)
     }
 
     if (this.cache?.hasRedis) {
       const completedAt = recentEntry?.completed_at || now
-      const recentJson = recentEntry ? JSON.stringify(recentEntry) : ''
-      const sessConcKey = sessionKey ? `${SESS_CONC_PREFIX}${sessionKey}` : `${SESS_CONC_PREFIX}__none__`
-      const luaRes = await this.cache.evalLua(
-        FINISH_REQUEST_LUA,
-        [INFLIGHT_ZSET, `${REQ_PREFIX}${id}`, sessConcKey, RECENT_ZSET, `${RECENT_REQ_PREFIX}${id}`],
-        [
+      const prevPending = this._pendingOps.get(id)
+      if (prevPending?.kind === 'start') {
+        // Start was not flushed to Redis yet: collapse start+finish to eliminate
+        // live:inflight and sess:conc INCR/DECR round-trips completely.
+        if ((prevPending.sampled && recentEntry) || sessionKey) {
+          this._pendingOps.set(id, {
+            kind: 'finish_unflushed',
+            id,
+            completedAt,
+            recentEntry: prevPending.sampled ? recentEntry : null,
+            sessionKey,
+            sampled: prevPending.sampled,
+          })
+          this._scheduleMicroBatchFlush()
+        } else {
+          this._pendingOps.delete(id)
+        }
+      } else if (sampled === false && alreadyFinished) {
+        // Idempotent guard for duplicate finish on unsampled high-concurrency request.
+      } else {
+        this._pendingOps.set(id, {
+          kind: 'finish',
           id,
-          String(completedAt),
-          recentJson,
-          String(this.recentTtlMs),
-          String(this.recentMaxEntries),
-          sessionKey ? '1' : '0',
-        ],
-      )
-      if (luaRes != null) return true
+          completedAt,
+          recentEntry: sampled ? recentEntry : null,
+          sessionKey,
+          sampled,
+        })
+        this._scheduleMicroBatchFlush()
+      }
     }
 
-    // Fallback (no Redis or Redis error): keep completed summary in local recent buffer
-    if (recentEntry) {
-      this._storeLocalRecent(id, recentEntry, recentEntry.completed_at || now)
-    }
     return true
   }
 
-  /** Wait for any queued microtask phase flushes (useful for tests & graceful shutdown). */
+  /**
+   * Synchronously drain all queued micro-batch Redis operations and await all
+   * in-flight pipeline flushes (guarantees determinism for tests & graceful shutdown).
+   */
   async flushPending() {
-    await Promise.resolve()
-    if (this._activeFlushPromises.size > 0) {
-      await Promise.allSettled([...this._activeFlushPromises])
+    this._clearFlushTimer()
+    for (;;) {
+      if (this._pendingOps.size > 0) {
+        this._dispatchPendingBatch()
+      }
+      if (this._activeFlushPromises.size > 0) {
+        await Promise.allSettled([...this._activeFlushPromises])
+        continue
+      }
+      if (this._pendingOps.size === 0) break
     }
   }
 
@@ -470,6 +766,10 @@ export class LiveLogCache {
           ? new Set(ownerKeyIds.map(String))
           : null
     const fetchCap = ownerFilter ? Math.min(500, cap * 4) : cap
+
+    if (this.cache?.hasRedis && this._pendingOps.size > 0) {
+      await this.flushPending()
+    }
 
     let inflightItems = null
     let recentItems = null
@@ -607,6 +907,9 @@ export class LiveLogCache {
   /** Total currently in-flight requests (after pruning timed-out orphans). */
   async getInflightCount({ maxAgeMs = this.reqTtlMs, now = Date.now() } = {}) {
     const ageLimit = Math.max(1_000, Number(maxAgeMs) || this.reqTtlMs)
+    if (this.cache?.hasRedis && this._pendingOps.size > 0) {
+      await this.flushPending()
+    }
     if (this.cache?.hasRedis) {
       try {
         const inflightKey = this.cache.redisKey(INFLIGHT_ZSET)
@@ -615,7 +918,14 @@ export class LiveLogCache {
         pipe.zcard(inflightKey)
         const results = await pipe.exec()
         const [err, card] = results?.[1] || []
-        if (!err && card != null) return Math.max(0, Number(card) || 0)
+        if (!err && card != null) {
+          const redisCount = Math.max(0, Number(card) || 0)
+          if (this.isHighConcurrencyMode()) {
+            this._pruneLocalInflight(ageLimit, now)
+            return Math.max(redisCount, this._localInflight.size)
+          }
+          return redisCount
+        }
       } catch {
         this.cache.l2Errors += 1
       }
@@ -633,6 +943,10 @@ export class LiveLogCache {
     if (!Array.isArray(sessionKeys) || !sessionKeys.length) return out
     const unique = [...new Set(sessionKeys.filter((k) => k != null && k !== '').map(String))]
     if (!unique.length) return out
+
+    if (this.cache?.hasRedis && this._pendingOps.size > 0) {
+      await this.flushPending()
+    }
 
     if (this.cache?.hasRedis) {
       try {
@@ -665,6 +979,10 @@ export class LiveLogCache {
     const cap = Math.max(1, Math.min(1_000, Number(limit) || 200))
     const minScore = now - win
 
+    if (this.cache?.hasRedis && this._pendingOps.size > 0) {
+      await this.flushPending()
+    }
+
     if (this.cache?.hasRedis) {
       try {
         const activeKey = this.cache.redisKey(SESS_ACTIVE_ZSET)
@@ -696,11 +1014,14 @@ export class LiveLogCache {
   }
 
   clearLocal() {
+    this._clearFlushTimer()
+    this._pendingOps.clear()
     this._localInflight.clear()
     this._localRecent.clear()
     this._localSessionConc.clear()
     this._localActiveSessions.clear()
-    this._scheduledFlushes.clear()
     this._finishedGuard.clear()
+    this._lastRecentTrimAt = 0
+    this._recentWritesSinceTrim = 0
   }
 }

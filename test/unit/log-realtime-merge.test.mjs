@@ -231,11 +231,13 @@ test('RequestLogStore start -> updatePhase -> finish bridges live in-flight, 15s
   assert.equal(persisted.id, 'log_persisted_real')
   assert.equal(persisted.in_flight, false)
 
-  // Flush PgLogWriter and verify multi-row PG SQL was issued asynchronously.
+  // Flush PgLogWriter and verify async UNNEST PG SQL inside SET LOCAL synchronous_commit = off tx.
   await pgWriter.flush()
   assert.equal(pgWriter.pending(), 0)
-  assert.equal(pool.queries.length, 1)
-  assert.match(pool.queries[0].sql, /^INSERT INTO usage_logs \(/)
+  const usageInserts = pool.queries.filter((q) => /^INSERT INTO usage_logs \(/.test(q.sql))
+  assert.equal(usageInserts.length, 1)
+  assert.match(usageInserts[0].sql, /SELECT \* FROM UNNEST\(/)
+  assert.ok(pool.queries.some((q) => q.sql === 'SET LOCAL synchronous_commit = off'))
 })
 
 test('skip_log, merge_into_request_id, and mode=off never leak orphan in-flight entries', async (t) => {
@@ -439,12 +441,16 @@ test('RequestAttemptsRepo routes PG writes to PgLogWriter and keeps SQLite direc
   assert.equal(pgWriter.stats().queues.attempts, 3)
 
   await pgWriter.flush()
-  assert.equal(pool.queries.length, 1)
-  const { sql, params } = pool.queries[0]
+  const attemptInserts = pool.queries.filter((q) => /^INSERT INTO request_attempts \(/.test(q.sql))
+  assert.equal(attemptInserts.length, 1)
+  assert.ok(pool.queries.some((q) => q.sql === 'SET LOCAL synchronous_commit = off'))
+  const { sql, params } = attemptInserts[0]
   assert.match(sql, /^INSERT INTO request_attempts \(/)
+  assert.match(sql, /SELECT \* FROM UNNEST\(/)
   assert.match(sql, /ON CONFLICT \(request_id, attempt_no\) DO UPDATE/)
-  // begin + complete for attempt 1 merged into 1 row + attempt 2 = 2 rows total (2 * 28 = 56 params)
-  assert.equal(params.length, 56)
+  // UNNEST binds fixed 28 column arrays; begin + complete for attempt 1 merged + attempt 2 = 2 elements per column
+  assert.equal(params.length, 28)
+  assert.equal(params[0].length, 2)
 })
 
 test('listBatchAsync enforces strict tenant isolation, filter matching, and page 1 -> page 2 cursor continuity', async (t) => {

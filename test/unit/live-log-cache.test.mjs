@@ -2,10 +2,12 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { LiveLogCache, MultiTierCacheClient } from '../../src/lib/cache/index.mjs'
 
-/** Minimal in-memory Redis mock supporting LiveLogCache commands + Lua finish script. */
+/** Minimal in-memory Redis mock supporting LiveLogCache commands, pipelines + Lua scripts. */
 function createLiveMockRedis({ nowMs = () => Date.now(), failWrites = false } = {}) {
   const store = new Map()
   const setCalls = []
+  let pipelineExecCount = 0
+  let zremrangebyrankCount = 0
 
   function getEntry(key) {
     const e = store.get(key)
@@ -21,6 +23,12 @@ function createLiveMockRedis({ nowMs = () => Date.now(), failWrites = false } = 
     store,
     setCalls,
     failWrites,
+    get pipelineExecCount() {
+      return pipelineExecCount
+    },
+    get zremrangebyrankCount() {
+      return zremrangebyrankCount
+    },
     async set(key, value, ...args) {
       if (redis.failWrites) throw new Error('redis write error')
       setCalls.push({ key, value })
@@ -101,10 +109,15 @@ function createLiveMockRedis({ nowMs = () => Date.now(), failWrites = false } = 
       return n
     },
     async zremrangebyrank(key, start, stop) {
+      zremrangebyrankCount += 1
       const e = getEntry(key)
       if (!e || e.type !== 'zset') return 0
       const sorted = [...e.value.entries()].sort((a, b) => a[1] - b[1])
-      const slice = sorted.slice(start, stop + 1)
+      const len = sorted.length
+      const s = start < 0 ? Math.max(0, len + start) : start
+      const end = stop < 0 ? len + stop : Math.min(len - 1, stop)
+      if (s > end || s >= len || end < 0) return 0
+      const slice = sorted.slice(s, end + 1)
       for (const [m] of slice) e.value.delete(m)
       return slice.length
     },
@@ -126,11 +139,19 @@ function createLiveMockRedis({ nowMs = () => Date.now(), failWrites = false } = 
       if (redis.failWrites) throw new Error('redis lua error')
       const keys = rest.slice(0, numKeys)
       const args = rest.slice(numKeys)
+      if (numKeys === 1 && script.includes("redis.call('DECR'")) {
+        const [sessConcKey] = keys
+        const next = await this.decr(sessConcKey)
+        if (next <= 0) {
+          await this.del(sessConcKey)
+          return 0
+        }
+        return next
+      }
       const [inflightKey, reqKey, sessConcKey, recentZsetKey, recentReqKey] = keys
-      const [reqId, completedAtRaw, recentJson, recentTtlRaw, recentMaxRaw, hasSess] = args
+      const [reqId, completedAtRaw, recentJson, recentTtlRaw, hasSess] = args
       const completedAt = Number(completedAtRaw) || 0
       const recentTtlMs = Number(recentTtlRaw) || 15_000
-      const recentMax = Number(recentMaxRaw) || 500
 
       const removed = await this.zrem(inflightKey, reqId)
       await this.del(reqKey)
@@ -141,12 +162,6 @@ function createLiveMockRedis({ nowMs = () => Date.now(), failWrites = false } = 
       if (recentJson) {
         await this.set(recentReqKey, recentJson, 'PX', recentTtlMs)
         await this.zadd(recentZsetKey, completedAt, reqId)
-        await this.zremrangebyscore(recentZsetKey, '-inf', completedAt - recentTtlMs)
-        const card = await this.zcard(recentZsetKey)
-        if (card > recentMax) {
-          await this.zremrangebyrank(recentZsetKey, 0, card - recentMax - 1)
-        }
-        await this.pexpire(recentZsetKey, recentTtlMs * 2)
       }
       return removed
     },
@@ -157,8 +172,16 @@ function createLiveMockRedis({ nowMs = () => Date.now(), failWrites = false } = 
           queue.push(() => redis.set(...a))
           return pipe
         },
+        del: (...a) => {
+          queue.push(() => redis.del(...a))
+          return pipe
+        },
         incr: (...a) => {
           queue.push(() => redis.incr(...a))
+          return pipe
+        },
+        decr: (...a) => {
+          queue.push(() => redis.decr(...a))
           return pipe
         },
         expire: (...a) => {
@@ -173,12 +196,20 @@ function createLiveMockRedis({ nowMs = () => Date.now(), failWrites = false } = 
           queue.push(() => redis.zadd(...a))
           return pipe
         },
+        zrem: (...a) => {
+          queue.push(() => redis.zrem(...a))
+          return pipe
+        },
         zcard: (...a) => {
           queue.push(() => redis.zcard(...a))
           return pipe
         },
         zremrangebyscore: (...a) => {
           queue.push(() => redis.zremrangebyscore(...a))
+          return pipe
+        },
+        zremrangebyrank: (...a) => {
+          queue.push(() => redis.zremrangebyrank(...a))
           return pipe
         },
         zrevrange: (...a) => {
@@ -189,7 +220,12 @@ function createLiveMockRedis({ nowMs = () => Date.now(), failWrites = false } = 
           queue.push(() => redis.zrevrangebyscore(...a))
           return pipe
         },
+        eval: (...a) => {
+          queue.push(() => redis.eval(...a))
+          return pipe
+        },
         async exec() {
+          pipelineExecCount += 1
           if (redis.failWrites) throw new Error('redis pipeline error')
           const out = []
           for (const fn of queue) {
@@ -213,6 +249,14 @@ function createLiveMockRedis({ nowMs = () => Date.now(), failWrites = false } = 
 test('LiveLogCache fallback mode tracks full lifecycle, _live shape, recent bridge, orphan eviction, and sessions', async () => {
   const client = new MultiTierCacheClient({ redisConfig: null })
   const live = new LiveLogCache(client, { reqTtlMs: 300_000, recentTtlMs: 15_000, recentMaxEntries: 500 })
+
+  // Verify default high-capacity bounds on default construction
+  const defaults = new LiveLogCache(client)
+  assert.equal(defaults.maxLocalInflight, 15_000)
+  assert.equal(defaults.recentMaxEntries, 2_000)
+  assert.equal(defaults.flushIntervalMs, 50)
+  assert.equal(defaults.batchSize, 64)
+  assert.equal(defaults.highConcurrencyThreshold, 1_000)
 
   const t0 = Date.now()
   await live.startRequest('req_1', {
@@ -302,7 +346,7 @@ test('LiveLogCache fallback mode tracks full lifecycle, _live shape, recent brid
   await client.close()
 })
 
-test('LiveLogCache Redis mode coalesces rapid updatePhase calls in 1 microtask and handles atomic finish + Fail-Open', async () => {
+test('LiveLogCache Redis mode coalesces rapid updatePhase calls in 1 pipeline and handles atomic finish + Fail-Open', async () => {
   const mockRedis = createLiveMockRedis()
   const client = new MultiTierCacheClient({ redisConfig: null })
   client.redis = mockRedis
@@ -316,10 +360,11 @@ test('LiveLogCache Redis mode coalesces rapid updatePhase calls in 1 microtask a
     session_id: 'sess_r1',
     model: 'claude-sonnet-4-5',
   })
+  await live.flushPending()
   const writesAfterStart = mockRedis.setCalls.length
   assert.equal(writesAfterStart, 1)
 
-  // 4 synchronous updates in the same tick MUST coalesce into a SINGLE Redis SET!
+  // 4 synchronous updates in the same window MUST coalesce into a SINGLE Redis SET!
   live.updatePhase('req_redis_1', { phase: 'routing', attempt_count: 1 })
   live.updatePhase('req_redis_1', { vm_id: 'vm_1', account_id: 'acc_1' })
   live.updatePhase('req_redis_1', { phase: 'streaming', ttft_ms: 90 })
@@ -329,7 +374,7 @@ test('LiveLogCache Redis mode coalesces rapid updatePhase calls in 1 microtask a
   assert.equal(
     mockRedis.setCalls.length,
     writesAfterStart + 1,
-    '4 same-tick updatePhase calls must coalesce to 1 Redis SET',
+    '4 same-window updatePhase calls must coalesce to 1 Redis SET',
   )
 
   // Verify Redis stored final merged _live fields
@@ -347,6 +392,7 @@ test('LiveLogCache Redis mode coalesces rapid updatePhase calls in 1 microtask a
 
   // Finish atomically removes inflight, DELs zeroed session counter, writes recent
   await live.finishRequest('req_redis_1', { status: 200, duration_ms: 350, input_tokens: 100, output_tokens: 40 })
+  await live.flushPending()
   assert.equal(mockRedis.store.has('vm2api:live:req:req_redis_1'), false)
   assert.equal(
     mockRedis.store.has('vm2api:live:sess:conc:sess_r1'),
@@ -377,6 +423,141 @@ test('LiveLogCache Redis mode coalesces rapid updatePhase calls in 1 microtask a
     foAfter.some((x) => x.request_id === 'req_fo_1' && x.in_flight === false),
     true,
   )
+
+  live.clearLocal()
+  await client.close()
+})
+
+test('LiveLogCache merges concurrent start/phase/finish into 1 micro-batch Pipeline (50ms timer or 64-op immediate flush) and trims recent periodically', async () => {
+  const mockRedis = createLiveMockRedis()
+  const client = new MultiTierCacheClient({ redisConfig: null })
+  client.redis = mockRedis
+  client.redisReady = true
+  const live = new LiveLogCache(client, {
+    flushIntervalMs: 50,
+    batchSize: 64,
+    recentTrimIntervalMs: 5_000,
+    recentMaxEntries: 100,
+  })
+
+  const t0 = Date.now()
+  // 1. 20 concurrent startRequest + updatePhase calls stay buffered (0 pipeline execs) until 50ms timer or flushPending
+  for (let i = 0; i < 20; i += 1) {
+    await live.startRequest(`mb_${i}`, { started_at: t0 + i, session_id: `sess_${i % 4}`, model: 'claude' })
+    live.updatePhase(`mb_${i}`, { phase: 'streaming', ttft_ms: 40 + i })
+  }
+  assert.equal(mockRedis.pipelineExecCount, 0, 'sub-64 ops should buffer inside 50ms micro-batch window')
+
+  await live.flushPending()
+  assert.equal(mockRedis.pipelineExecCount, 1, '20 starts + 20 phase updates must merge into 1 Redis pipeline')
+  assert.equal(mockRedis.setCalls.length, 20, 'start+phase in same window coalesces to 1 SET per request')
+
+  // 2. Finish all 20 requests across 2 flush cycles within <5s -> ZREMRANGEBYRANK runs ONCE (not 20x!)
+  for (let i = 0; i < 10; i += 1) {
+    await live.finishRequest(`mb_${i}`, { status: 200, completed_at: t0 + 100 + i })
+  }
+  await live.flushPending()
+  assert.equal(mockRedis.pipelineExecCount, 2, '10 finishes must merge into 1 Redis pipeline')
+  assert.equal(mockRedis.zremrangebyrankCount, 1, 'first recent batch runs periodic trim once')
+
+  for (let i = 10; i < 20; i += 1) {
+    await live.finishRequest(`mb_${i}`, { status: 200, completed_at: t0 + 200 + i })
+  }
+  await live.flushPending()
+  assert.equal(mockRedis.pipelineExecCount, 3)
+  assert.equal(mockRedis.zremrangebyrankCount, 1, 'subsequent finishes within 5s must skip ZREMRANGEBYRANK')
+  assert.equal(live.stats().periodicTrims, 1)
+
+  // 3. Hitting 64 queued ops triggers immediate pipeline flush without waiting for 50ms timer
+  const execBefore64 = mockRedis.pipelineExecCount
+  for (let i = 0; i < 64; i += 1) {
+    await live.startRequest(`burst_${i}`, { started_at: t0 + 500 + i, session_id: 'sess_burst' })
+  }
+  await Promise.resolve()
+  assert.equal(mockRedis.pipelineExecCount, execBefore64 + 1, '64 queued ops must flush immediately in 1 pipeline')
+
+  // 4. Below 64 ops flushes automatically on the 50ms timer
+  const execBeforeTimer = mockRedis.pipelineExecCount
+  await live.startRequest('timer_req_1', { started_at: t0 + 900, session_id: 'sess_timer' })
+  assert.equal(mockRedis.pipelineExecCount, execBeforeTimer)
+  await new Promise((r) => setTimeout(r, 90))
+  assert.equal(mockRedis.pipelineExecCount, execBeforeTimer + 1, 'pending ops must auto-flush on 50ms timer')
+
+  live.clearLocal()
+  await client.close()
+})
+
+test('LiveLogCache highConcurrencyMode skips updatePhase Redis writes, preserves session concurrency, and auto-activates above threshold', async () => {
+  const mockRedis = createLiveMockRedis()
+  const client = new MultiTierCacheClient({ redisConfig: null })
+  client.redis = mockRedis
+  client.redisReady = true
+
+  // 1. Auto-activation when in-flight requests reach highConcurrencyThreshold
+  const autoLive = new LiveLogCache(client, {
+    highConcurrencyThreshold: 5,
+    highConcurrencySampleRate: 5,
+    flushIntervalMs: 50,
+  })
+  assert.equal(autoLive.highConcurrencyMode, false)
+  const base = Date.now()
+  for (let i = 0; i < 5; i += 1) {
+    await autoLive.startRequest(`hc_${i}`, { started_at: base + i, session_id: 'sess_hc' })
+  }
+  assert.equal(autoLive.highConcurrencyMode, true, 'must auto-enable highConcurrencyMode at threshold')
+  await autoLive.flushPending()
+
+  const setsBeforePhase = mockRedis.setCalls.length
+  for (let i = 0; i < 5; i += 1) {
+    autoLive.updatePhase(`hc_${i}`, { phase: 'streaming', ttft_ms: 55 })
+  }
+  await autoLive.flushPending()
+  assert.equal(
+    mockRedis.setCalls.length,
+    setsBeforePhase,
+    'highConcurrencyMode must skip live:req:* Redis writes on updatePhase',
+  )
+  assert.equal(autoLive.stats().skippedPhaseWrites, 5)
+  // Local state still updated for in-process readers
+  assert.equal(autoLive._localInflight.get('hc_0')._live.phase, 'streaming')
+
+  // Additional starts under highConcurrencyMode: 1-in-5 homepage sampled, yet session concurrency stays exact!
+  const setsBeforeBurst = mockRedis.setCalls.length
+  for (let i = 5; i < 15; i += 1) {
+    await autoLive.startRequest(`hc_${i}`, { started_at: base + i, session_id: 'sess_hc' })
+  }
+  await autoLive.flushPending()
+  assert.equal(
+    mockRedis.setCalls.length - setsBeforeBurst,
+    2,
+    '10 requests with sampleRate=5 should write only 2 homepage live:req:* samples',
+  )
+  assert.equal(
+    (await autoLive.getActiveSessionCounts(['sess_hc'])).get('sess_hc'),
+    15,
+    'lightweight session concurrency counter must stay exact for all 15 inflight requests',
+  )
+
+  // Finishing all 15 requests cleanly zeroes session concurrency with zero leaks
+  for (let i = 0; i < 15; i += 1) {
+    await autoLive.finishRequest(`hc_${i}`, { status: 200, completed_at: base + 100 + i })
+  }
+  await autoLive.flushPending()
+  assert.equal((await autoLive.getActiveSessionCounts(['sess_hc'])).get('sess_hc'), 0)
+  assert.equal(mockRedis.store.has('vm2api:live:sess:conc:sess_hc'), false)
+  autoLive.clearLocal()
+
+  // 2. Explicit VM2API_HIGH_CONCURRENCY=1 env activation
+  const prevEnv = process.env.VM2API_HIGH_CONCURRENCY
+  process.env.VM2API_HIGH_CONCURRENCY = '1'
+  try {
+    const envLive = new LiveLogCache(client)
+    assert.equal(envLive.highConcurrencyMode, true)
+    envLive.clearLocal()
+  } finally {
+    if (prevEnv === undefined) delete process.env.VM2API_HIGH_CONCURRENCY
+    else process.env.VM2API_HIGH_CONCURRENCY = prevEnv
+  }
 
   await client.close()
 })
@@ -434,5 +615,6 @@ test('LiveLogCache owner filtering matches user_id, owner_user_id, vm_owner_user
   const idsWithKeys = withKeys.map((x) => x.request_id).sort()
   assert.deepEqual(idsWithKeys, ['own_by_key', 'own_by_owner_field', 'own_by_user', 'own_by_vm'])
 
+  live.clearLocal()
   await client.close()
 })
